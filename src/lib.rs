@@ -16,7 +16,8 @@ pub mod transport; // Declare Transport module
 pub use error::ZmqError;
 pub use message::{Blob, Metadata, Msg, MsgFlags}; // Assuming Blob for now
 pub use runtime::{Command, IPipeEvents, MailboxReceiver, MailboxSender};
-// pub use context::Context; // Add later
+pub use context::{Context};
+pub(crate) use socket::core::CoreState;
 pub use socket::types::{Socket, SocketType};
 // pub use socket::options::*; // Add later
 

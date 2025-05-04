@@ -6,8 +6,8 @@ pub mod load_balancer;
 pub mod router;
 pub mod trie;
 
-// pub use distributor::Distributor; // Define Distributor later
-pub use fair_queue::FairQueue;
-pub use load_balancer::LoadBalancer;
-// pub use router::RouterMap; // Define RouterMap later
-// pub use trie::SubscriptionTrie; // Define SubscriptionTrie later
+pub(crate) use distributor::Distributor;
+pub(crate) use fair_queue::FairQueue;
+pub(crate) use load_balancer::LoadBalancer;
+pub(crate) use router::RouterMap;
+pub(crate) use trie::SubscriptionTrie;

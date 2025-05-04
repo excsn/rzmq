@@ -50,6 +50,9 @@ pub enum ZmqError {
   // --- Protocol Errors ---
   #[error("ZMTP protocol violation: {0}")]
   ProtocolViolation(String), // EPROTO
+  
+  #[error("Invalid message format for operation: {0}")]
+  InvalidMessage(String),
 
   #[error("Security error: {0}")]
   SecurityError(String),

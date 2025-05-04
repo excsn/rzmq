@@ -3,17 +3,23 @@
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
-use crate::socket::core::{CoreState, SocketCore}; // Need access to CoreState/Core
-use crate::socket::patterns::LoadBalancer; // Use the load balancer helper
-use crate::socket::ISocket; // Implement the trait
-use async_trait::async_trait;
+use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::patterns::LoadBalancer;
+use crate::socket::ISocket;
+
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{oneshot, MutexGuard}; // For locking CoreState
+
+use async_trait::async_trait;
+use futures::lock::Mutex;
+use tokio::sync::{oneshot, MutexGuard};
 
 #[derive(Debug)]
 pub(crate) struct PushSocket {
   core: Arc<SocketCore>,
   load_balancer: LoadBalancer, // Distributes outgoing messages
+  // Map Read Pipe ID -> Write Pipe ID (needed for pipe_detached cleanup)
+  pipe_read_to_write_id: Mutex<HashMap<usize, usize>>,
 }
 
 impl PushSocket {
@@ -22,6 +28,7 @@ impl PushSocket {
     Self {
       core,
       load_balancer: LoadBalancer::new(), // Create a new load balancer
+      pipe_read_to_write_id: Mutex::new(HashMap::new()),
     }
   }
 
@@ -33,6 +40,10 @@ impl PushSocket {
 
 #[async_trait]
 impl ISocket for PushSocket {
+  fn core(&self) -> &Arc<SocketCore> {
+    &self.core
+  }
+
   fn mailbox(&self) -> &MailboxSender {
     self.core.mailbox_sender()
   }
@@ -115,10 +126,7 @@ impl ISocket for PushSocket {
         // ZMQ behavior for PUSH with no connected peers depends on HWM/blocking mode.
         // For now, return an error indicating no peer available.
         // TODO: Implement blocking/HWM behavior if SNDHWM > 0 or timeout set.
-        tracing::debug!(
-          handle = self.core.handle,
-          "PUSH send failed: No connected peers"
-        );
+        tracing::debug!(handle = self.core.handle, "PUSH send failed: No connected peers");
         return Err(ZmqError::ResourceLimitReached); // Simulate EAGAIN/HWM
       }
     };
@@ -162,9 +170,7 @@ impl ISocket for PushSocket {
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
     // PUSH sockets cannot receive messages
-    Err(ZmqError::InvalidState(
-      "PUSH sockets cannot receive messages",
-    ))
+    Err(ZmqError::InvalidState("PUSH sockets cannot receive messages"))
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -235,7 +241,7 @@ impl ISocket for PushSocket {
     // PUSH socket has no specific readable pattern options
     Err(ZmqError::UnsupportedOption(option))
   }
-  
+
   // --- Internal Methods ---
 
   async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
@@ -256,7 +262,7 @@ impl ISocket for PushSocket {
 
   async fn pipe_attached(
     &self,
-    _pipe_read_id: usize, // PUSH doesn't use the read pipe
+    pipe_read_id: usize, // PUSH doesn't use the read pipe
     pipe_write_id: usize, // Core writes TO peer using this ID
     _peer_identity: Option<&[u8]>,
   ) {
@@ -266,28 +272,32 @@ impl ISocket for PushSocket {
       pipe_write_id = pipe_write_id,
       "PUSH attaching pipe"
     );
+
+    self
+      .pipe_read_to_write_id
+      .lock()
+      .await
+      .insert(pipe_read_id, pipe_write_id);
+
     self.load_balancer.add_pipe(pipe_write_id).await;
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
-    // PUSH socket uses the write ID to send, but detached event comes with read ID?
-    // This highlights a need to store the mapping (read_id -> write_id) or pass both
-    // Let's assume for now pipe_detached gives the ID that needs removing from LB
-    // TODO: Clarify ID mapping for detachment. Assuming read_id corresponds to the connection.
-    // Need to find the associated write_id to remove from LB.
-    // This requires CoreState.endpoints to store both IDs.
     tracing::debug!(
       handle = self.core.handle,
       pipe_read_id = pipe_read_id,
       "PUSH detaching pipe"
     );
-    // Placeholder: We need the write_id associated with this connection/read_id!
-    // self.load_balancer.remove_pipe(associated_write_id).await;
-    tracing::warn!(
-      handle = self.core.handle,
-      pipe_read_id = pipe_read_id,
-      "TODO: Implement proper removal from LoadBalancer on pipe_detached"
-    );
+
+    let maybe_write_id = self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
+    if let Some(write_id) = maybe_write_id {
+      self.load_balancer.remove_pipe(write_id).await;
+    } else {
+      tracing::warn!(
+        handle = self.core.handle,
+        pipe_read_id = pipe_read_id,
+        "PUSH detach: Write ID not found for read ID"
+      );
+    }
   }
 }
-// <<< ADDED PushSocket IMPLEMENTATION END >>>

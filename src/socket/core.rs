@@ -29,18 +29,16 @@ use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use tokio::sync::{oneshot, Mutex}; // Use Tokio's Mutex for CoreState
 use tokio::task::JoinHandle;
 
-use super::pull_socket::PullSocket;
-use super::push_socket::PushSocket;
+use super::{DealerSocket, PubSocket, PullSocket, PushSocket, RepSocket, ReqSocket, RouterSocket, SubSocket};
 
 // Information stored for each active endpoint (listener or connection)
 #[derive(Debug)]
 pub(crate) struct EndpointInfo {
-  pub mailbox: MailboxSender, // Mailbox of the child actor (Listener/Connecter/Session)
+  pub mailbox: MailboxSender,      // Mailbox of the child actor (Listener/Connecter/Session)
   pub task_handle: JoinHandle<()>, // Task handle of the child actor
   pub endpoint_type: EndpointType, // Listener or Session (Connecter transitions to Session)
-  pub endpoint_uri: String,   // The normalized endpoint string
+  pub endpoint_uri: String,        // The normalized endpoint string
   pub pipe_ids: Option<(usize, usize)>, // (ID for core->sess chan, ID for sess->core chan)
-                              // <<< ADDED END >>>
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,13 +59,6 @@ pub(crate) struct CoreState {
 
   // Map pipe ID -> Sender for messages Core sends TO Sessions/Inproc
   pub pipes_tx: HashMap<usize, AsyncSender<Msg>>,
-  // Map pipe ID -> Receiver for messages Core receives FROM Sessions/Inproc
-  // Note: Receivers usually need to be polled concurrently. Storing them directly
-  // in a HashMap makes polling complex in the core loop.
-  // Alternative: Spawn a dedicated task per receiver that sends received messages
-  // as Commands back to the core mailbox? Or use a StreamMux?
-  // Let's keep the receivers for now, but acknowledge polling complexity.
-  pub pipes_rx: HashMap<usize, AsyncReceiver<Msg>>,
 
   // Map pipe READ ID -> Info about the task reading from that pipe
   pub pipe_reader_task_handles: HashMap<usize, JoinHandle<()>>,
@@ -87,13 +78,37 @@ impl CoreState {
       options,
       socket_type,
       pipes_tx: HashMap::new(),
-      pipes_rx: HashMap::new(),
       pipe_reader_task_handles: HashMap::new(),
       endpoints: HashMap::new(),
     }
   }
+
+  /// Gets a clone of the sender for a specific write pipe ID.
+  /// Used by ISocket implementations (e.g., PushSocket::send).
+  pub(crate) fn get_pipe_sender(&self, pipe_write_id: usize) -> Option<AsyncSender<Msg>> {
+    self.pipes_tx.get(&pipe_write_id).cloned()
+  }
+
+  /// Gets the JoinHandle for a specific pipe reader task ID.
+  /// Used during cleanup.
+  pub(crate) fn get_reader_task_handle(&self, pipe_read_id: usize) -> Option<&JoinHandle<()>> {
+    self.pipe_reader_task_handles.get(&pipe_read_id)
+  }
+
+  /// Removes all state associated with a pipe pair.
+  /// Aborts the reader task. Returns true if elements were removed.
+  pub(crate) fn remove_pipe_state(&mut self, pipe_write_id: usize, pipe_read_id: usize) -> bool {
+    let tx_removed = self.pipes_tx.remove(&pipe_write_id).is_some();
+    let reader_removed = if let Some(handle) = self.pipe_reader_task_handles.remove(&pipe_read_id) {
+      handle.abort(); // Abort the reader task forcefully
+      true
+    } else {
+      false
+    };
+    // Log removals inside the calling function if needed
+    tx_removed || reader_removed
+  }
 }
-// <<< ADDED CoreState STRUCT END >>>
 
 /// The core actor managing the state and lifecycle of a single rzmq socket.
 #[derive(Debug)]
@@ -152,13 +167,8 @@ impl SocketCore {
     if let Ok(mut socket_logic_guard) = core_arc.socket_logic.try_lock() {
       *socket_logic_guard = Some(weak_isocket);
     } else {
-      tracing::error!(
-        handle = handle,
-        "Failed to lock socket_logic mutex during init"
-      );
-      return Err(ZmqError::Internal(
-        "Failed to initialize socket weak reference".into(),
-      ));
+      tracing::error!(handle = handle, "Failed to lock socket_logic mutex during init");
+      return Err(ZmqError::Internal("Failed to initialize socket weak reference".into()));
     }
 
     // 4. Spawn the main command loop task
@@ -175,9 +185,7 @@ impl SocketCore {
         handle = handle,
         "Failed to lock task handle mutex during init, task aborted"
       );
-      return Err(ZmqError::Internal(
-        "Failed to store socket task handle".into(),
-      ));
+      return Err(ZmqError::Internal("Failed to store socket task handle".into()));
     }
 
     // 6. Return the public handle and mailbox sender
@@ -284,10 +292,7 @@ impl SocketCore {
                     "ISocket logic weak reference was never set! Shutting down."
                   );
                 } else {
-                  tracing::warn!(
-                    handle = handle,
-                    "ISocket logic weak reference expired. Shutting down."
-                  );
+                  tracing::warn!(handle = handle, "ISocket logic weak reference expired. Shutting down.");
                 }
                 drop(guard); // Release lock before calling shutdown_logic
                 Self::shutdown_logic(core_arc.clone()).await;
@@ -307,10 +312,7 @@ impl SocketCore {
               // <--- START match command
               // --- Stop / Close ---
               Command::Stop => {
-                tracing::info!(
-                  handle = handle,
-                  "Stop command received, initiating shutdown."
-                );
+                tracing::info!(handle = handle, "Stop command received, initiating shutdown.");
                 Self::shutdown_logic(core_arc.clone()).await;
                 should_break_loop = true;
               }
@@ -360,17 +362,15 @@ impl SocketCore {
                       // --- Spawn IPC Listener ---
                       // Need #[cfg(feature = "ipc")]
                       // IpcListener::create_and_spawn(...)
-                      Err(ZmqError::UnsupportedTransport(
-                        "IPC not implemented yet".into(),
-                      )) // Placeholder
+                      Err(ZmqError::UnsupportedTransport("IPC not implemented yet".into()))
+                    // Placeholder
                     } else if endpoint.starts_with("inproc://") {
                       // --- Handle Inproc Bind ---
                       // Inproc bind registers directly in ContextInner, no separate actor needed usually
                       // Needs async block to call async register_inproc
                       // TODO: Implement inproc logic
-                      Err(ZmqError::UnsupportedTransport(
-                        "Inproc not implemented yet".into(),
-                      )) // Placeholder
+                      Err(ZmqError::UnsupportedTransport("Inproc not implemented yet".into()))
+                    // Placeholder
                     } else {
                       // Should be caught by initial check, but defensively handle
                       unreachable!("Invalid scheme passed initial check")
@@ -441,17 +441,14 @@ impl SocketCore {
                     // --- Spawn IPC Connecter ---
                     // #[cfg(feature = "ipc")]
                     // IpcConnecter::create_and_spawn(...)
-                    Err(ZmqError::UnsupportedTransport(
-                      "IPC not implemented yet".into(),
-                    ))
+                    Err(ZmqError::UnsupportedTransport("IPC not implemented yet".into()))
                   } else if endpoint.starts_with("inproc://") {
                     // --- Handle Inproc Connect ---
                     // Inproc connect finds binder in registry and creates pipes directly.
                     // Needs async block to call async lookup_inproc / pipepair logic.
                     // TODO: Implement inproc logic
-                    Err(ZmqError::UnsupportedTransport(
-                      "Inproc not implemented yet".into(),
-                    )) // Placeholder
+                    Err(ZmqError::UnsupportedTransport("Inproc not implemented yet".into()))
+                  // Placeholder
                   } else {
                     unreachable!("Invalid scheme passed initial check")
                   }; // End spawn_result determination
@@ -510,14 +507,11 @@ impl SocketCore {
                 value,
                 reply_tx,
               } => {
-                let result =
-                  Self::handle_set_option(core_arc.clone(), &socket_logic_strong, option, &value)
-                    .await;
+                let result = Self::handle_set_option(core_arc.clone(), &socket_logic_strong, option, &value).await;
                 let _ = reply_tx.send(result);
               }
               Command::UserGetOpt { option, reply_tx } => {
-                let result =
-                  Self::handle_get_option(core_arc.clone(), &socket_logic_strong, option).await;
+                let result = Self::handle_get_option(core_arc.clone(), &socket_logic_strong, option).await;
                 let _ = reply_tx.send(result);
               }
 
@@ -529,38 +523,35 @@ impl SocketCore {
                 session_handle,
               } => {
                 tracing::info!(handle = handle, %endpoint, "Connection successful reported");
-                let session_handle_id =
-                  session_handle.unwrap_or_else(|| core_arc.context.inner().next_handle());
+
+                let session_handle_id = session_handle.unwrap_or_else(|| core_arc.context.inner().next_handle());
 
                 // 1. Create Pipe Channels
-                let mut state = core_arc.core_state.lock().await;
                 let pipe_id_core_write = core_arc.context.inner().next_handle();
-                let pipe_id_core_read = pipe_id_core_write + 1;
+                let pipe_id_core_read = core_arc.context.inner().next_handle();
+
+                let mut state = core_arc.core_state.lock().await;
                 let hwm = state.options.rcvhwm.max(state.options.sndhwm).max(1000);
                 let (tx_core_to_sess, rx_core_to_sess) = async_channel::bounded::<Msg>(hwm);
                 let (tx_sess_to_core, rx_sess_to_core) = async_channel::bounded::<Msg>(hwm);
 
-                let mut state = core_arc.core_state.lock().await;
-
                 // 2. Store Core's Ends & Spawn Reader Task
-                state
-                  .pipes_tx
-                  .insert(pipe_id_core_write, tx_core_to_sess.clone()); // Clone Sender for AttachPipe
-                let reader_task = tokio::spawn(Self::run_pipe_reader_task(
+                state.pipes_tx.insert(pipe_id_core_write, tx_core_to_sess.clone()); // Store Core's Sender
+
+                let reader_task_handle = tokio::spawn(Self::run_pipe_reader_task(
                   core_arc.handle,
                   core_arc.mailbox_sender().clone(),
-                  pipe_id_core_read,
-                  rx_sess_to_core, // Pass receiver to task
+                  pipe_id_core_read, // This task reads pipe 'read_id'
+                  rx_sess_to_core,   // The actual receiver end Session writes to
                 ));
-
                 state
                   .pipe_reader_task_handles
-                  .insert(pipe_id_core_read, reader_task);
+                  .insert(pipe_id_core_read, reader_task_handle);
 
                 // 3. Store Endpoint Info (associating session with pipe IDs)
                 let info = EndpointInfo {
                   mailbox: session_mailbox.clone(), // Session's command mailbox
-                  task_handle: session_task_handle.expect("ConnSuccess must provide task handle"),
+                  task_handle: session_task_handle.expect("ConnSuccess must provide Session task handle"),
                   endpoint_type: EndpointType::Session,
                   endpoint_uri: endpoint.clone(),
                   pipe_ids: Some((pipe_id_core_write, pipe_id_core_read)), // Store BOTH IDs
@@ -575,26 +566,25 @@ impl SocketCore {
                   pipe_read_id: pipe_id_core_write, // Let Session know ID Core writes to
                   pipe_write_id: pipe_id_core_read, // Let Session know ID Core reads from
                 };
+
                 if session_mailbox.send(attach_pipe_cmd).await.is_err() {
                   tracing::error!(
                     handle = handle,
                     session_handle = session_handle_id,
                     "Failed to send AttachPipe to session. Cleaning up."
                   );
-                  
-                  // If we can't attach pipe, session is useless. Clean up.
-                  // Clean up based on the endpoint URI we have
-                  Self::cleanup_session_state_by_uri(
-                    core_arc.clone(),     // Pass Arc<SocketCore>
-                    &endpoint,            // Pass endpoint URI
-                    &socket_logic_strong, // Pass Arc<dyn ISocket>
+
+                  // Use the cleanup helper! Pass IDs directly.
+                  Self::cleanup_session_state_by_pipe_ids(
+                    core_arc.clone(),
+                    pipe_id_core_write,
+                    pipe_id_core_read,
+                    &socket_logic_strong,
                   )
                   .await;
-                  // Abort session task?
-                  // session_task_handle.unwrap().abort();
                 } else {
                   // 5. Notify ISocket logic (only after pipe successfully attached to Session)
-                  let peer_identity: Option<&[u8]> = None;
+                  let peer_identity: Option<&[u8]> = None; // TODO
                   socket_logic_strong
                     .pipe_attached(
                       pipe_id_core_read,  // Read ID
@@ -637,32 +627,8 @@ impl SocketCore {
                 endpoint_uri,
               } => {
                 tracing::debug!(handle = handle, session_uri = %endpoint_uri, "Session stopped reported");
-                let mut state = core_arc.core_state.lock().await;
-
-                // Remove endpoint state using the URI
-                let removed_endpoint_info = state.endpoints.remove(&endpoint_uri);
-
-                if removed_endpoint_info.is_none() {
-                  tracing::warn!(handle=handle, session_uri=%endpoint_uri, "Session stopped, but no corresponding endpoint state found");
-                }
-
-                // --- Pipe Cleanup ---
-                // TODO: How to find the correct pipe channels to remove/close?
-                // We need to associate pipe IDs (e.g., pipe_id_core_write, pipe_id_core_read)
-                // with the endpoint/session when ConnSuccess happens and store them,
-                // perhaps in EndpointInfo or a separate map `HashMap<String(uri), (usize, usize)>`.
-                let pipe_id_to_detach = {
-                  // Placeholder ID
-                  tracing::warn!(handle=handle, session_uri=%endpoint_uri, "TODO: Need correct pipe ID for stopped session cleanup!");
-                  0 // Need the actual pipe ID associated with this session!
-                };
-                // state.pipes_tx.remove(&pipe_id_core_write?); // Remove sender if stored
-                // state.pipes_rx.remove(&pipe_id_core_read?); // Remove receiver if stored
-                drop(state); // Release lock
-
-                // Notify ISocket logic that the pipe is gone
-                // Still need the correct pipe ID here
-                socket_logic_strong.pipe_detached(pipe_id_to_detach).await;
+                // Use helper to clean up state using URI
+                Self::cleanup_session_state_by_uri(core_arc.clone(), &endpoint_uri, &socket_logic_strong).await;
               }
               Command::ReportError {
                 handle: child_handle,
@@ -678,14 +644,8 @@ impl SocketCore {
                 // Self::shutdown_logic(core_arc.clone()).await;
                 // should_break_loop = true;
               }
-              Command::CleanupComplete {
-                handle: child_handle,
-              } => {
-                tracing::debug!(
-                  handle = handle,
-                  child = child_handle,
-                  "Child actor cleanup complete"
-                );
+              Command::CleanupComplete { handle: child_handle } => {
+                tracing::debug!(handle = handle, child = child_handle, "Child actor cleanup complete");
                 // Usually no action needed if state removed on *Stopped/ReportError
               }
               Command::PipeMessageReceived { pipe_id, msg } => {
@@ -712,53 +672,21 @@ impl SocketCore {
                   );
                 }
               }
-              Command::PipeClosedByPeer { pipe_id } => {
-                // This means the Session closed its *sending* end (tx_sess_to_core)
-                // The corresponding PipeReaderTask will have exited.
+              Command::PipeClosedByPeer {
+                pipe_id: closed_pipe_read_id,
+              } => {
                 tracing::debug!(
                   handle = handle,
-                  pipe_id = pipe_id,
-                  "Pipe closed by session peer (reader task should stop)"
+                  pipe_id = closed_pipe_read_id,
+                  "Pipe closed by session peer"
                 );
-                let mut state = core_arc.core_state.lock().await;
-                // Remove the reader task info
-                if let Some(reader_info) = state.pipe_reader_task_handles.remove(&pipe_id) {
-                  // Optionally abort just in case?
-                  // reader_info.task_handle.abort();
-                } else {
-                  tracing::warn!(
-                    handle = handle,
-                    pipe_id = pipe_id,
-                    "PipeClosedByPeer received, but reader task info not found"
-                  );
-                }
-                // Find associated endpoint and clean it up too? Yes, if session didn't send SessionStopped.
-                let mut endpoint_to_remove = None;
-                for (uri, info) in state.endpoints.iter() {
-                  if let Some((_, read_id)) = info.pipe_ids {
-                    if read_id == pipe_id {
-                      endpoint_to_remove = Some(uri.clone());
-                      break;
-                    }
-                  }
-                }
-                if let Some(uri) = endpoint_to_remove {
-                  state.endpoints.remove(&uri);
-                  tracing::debug!(handle=handle, pipe=pipe_id, uri=%uri, "Removed endpoint for closed pipe");
-                }
-
-                drop(state); // Release lock
-                             // Notify ISocket logic
-                socket_logic_strong.pipe_detached(pipe_id).await;
+                // Use helper to clean up state based on the READ pipe ID
+                Self::cleanup_session_state_by_pipe(core_arc.clone(), closed_pipe_read_id, &socket_logic_strong).await;
               }
 
               // --- Unhandled ---
               _ => {
-                tracing::warn!(
-                  handle = handle,
-                  "Unhandled command in SocketCore loop: {:?}",
-                  command
-                );
+                tracing::warn!(handle = handle, "Unhandled command in SocketCore loop: {:?}", command);
               }
             } // <--- END match command
           } // <--- END else block (socket_logic_strong is valid)
@@ -784,11 +712,211 @@ impl SocketCore {
     tracing::info!(handle = handle, "SocketCore task fully stopped.");
   }
 
-  // ... (shutdown_logic helper - needs refinement based on how child handles are stored/identified) ...
+  /// Helper to clean up state associated with a session endpoint URI.
+  async fn cleanup_session_state_by_uri(
+    core_arc: Arc<SocketCore>,
+    endpoint_uri: &str,
+    socket_logic: &Arc<dyn ISocket>,
+  ) {
+    let mut state = core_arc.core_state.lock().await;
+    if let Some(removed_info) = state.endpoints.remove(endpoint_uri) {
+      tracing::debug!("Removed endpoint state for: {}", endpoint_uri);
+      if let Some((write_pipe_id, read_pipe_id)) = removed_info.pipe_ids {
+        if state.remove_pipe_state(write_pipe_id, read_pipe_id) {
+          tracing::debug!("Removed pipe state for endpoint {}", endpoint_uri);
+        }
+        drop(state); // Release lock before await
+        socket_logic.pipe_detached(read_pipe_id).await; // Notify based on read ID
+      } else {
+        drop(state);
+      }
+    } else {
+      tracing::warn!(handle=core_arc.handle, uri=%endpoint_uri, "Cleanup by URI attempted, but no endpoint state found");
+    }
+  }
+
+  /// Helper to clean up state associated with a session pipe read ID.
+  async fn cleanup_session_state_by_pipe(
+    core_arc: Arc<SocketCore>,
+    pipe_read_id: usize,
+    socket_logic: &Arc<dyn ISocket>,
+  ) {
+    let mut state = core_arc.core_state.lock().await;
+    let mut endpoint_to_remove = None;
+    let mut write_pipe_id_to_remove = None;
+
+    // Find endpoint URI and write pipe ID associated with the read pipe ID
+    for (uri, info) in state.endpoints.iter() {
+      if let Some((write_id, read_id)) = info.pipe_ids {
+        if read_id == pipe_read_id {
+          endpoint_to_remove = Some(uri.clone());
+          write_pipe_id_to_remove = Some(write_id);
+          break;
+        }
+      }
+    }
+
+    let write_pipe_id = match write_pipe_id_to_remove {
+      Some(id) => id,
+      None => {
+        tracing::warn!(
+          handle = core_arc.handle,
+          pipe_id = pipe_read_id,
+          "Cleanup by pipe attempted, but couldn't find write pipe ID"
+        );
+        // Still try to remove reader task if possible
+        if state.pipe_reader_task_handles.remove(&pipe_read_id).is_some() {
+          // handle.abort(); // Abort handled in remove_pipe_state
+        }
+        drop(state);
+        socket_logic.pipe_detached(pipe_read_id).await; // Still notify detached
+        return;
+      }
+    };
+
+    // Remove endpoint entry first
+    if let Some(uri) = endpoint_to_remove {
+      if state.endpoints.remove(&uri).is_some() {
+        tracing::debug!(handle=core_arc.handle, pipe=pipe_read_id, uri=%uri, "Removed endpoint for closed pipe");
+      }
+    }
+
+    // Remove pipe state using helper
+    let removed = state.remove_pipe_state(write_pipe_id, pipe_read_id);
+    drop(state); // Release lock
+
+    if removed {
+      tracing::debug!("Removed pipe state for pipe_id {}", pipe_read_id);
+    } else {
+      tracing::warn!(
+        handle = core_arc.handle,
+        pipe_id = pipe_read_id,
+        "Cleanup by pipe attempted, but no pipe state found"
+      );
+    }
+
+    // Notify ISocket
+    socket_logic.pipe_detached(pipe_read_id).await;
+  }
+
+  async fn cleanup_session_state_by_pipe_ids(
+    core_arc: Arc<SocketCore>,
+    pipe_write_id: usize,
+    pipe_read_id: usize,
+    socket_logic: &Arc<dyn ISocket>,
+  ) {
+    let mut state = core_arc.core_state.lock().await;
+    let removed = state.remove_pipe_state(pipe_write_id, pipe_read_id);
+    drop(state);
+    if removed {
+      tracing::debug!(
+        "Cleaned up pipe state after AttachPipe failure for write_id={}, read_id={}",
+        pipe_write_id,
+        pipe_read_id
+      );
+      // Notify detached only if pipe_attached might have been called (unlikely here)
+      // socket_logic.pipe_detached(pipe_read_id).await;
+    }
+  }
+
+  /// Helper to contain the shutdown sequence logic.
   async fn shutdown_logic(core_arc: Arc<SocketCore>) {
-    // ... (Implementation needs refinement for identifying children) ...
-    tracing::debug!("Executing shutdown logic (Refinement needed)...");
-    // Stop children... Await... Close pipes... Linger...
+    let handle = core_arc.handle; // Get handle early for logging if needed outside loop
+    tracing::debug!(handle = handle, "Executing shutdown logic...");
+
+    // 1. Stop child endpoint actors (Listeners, Sessions)
+    // Take ownership of the endpoints map to avoid holding lock during await
+    let endpoints_to_stop = {
+      let mut state = core_arc.core_state.lock().await;
+      std::mem::take(&mut state.endpoints) // Efficiently clears the map
+    };
+
+    let stop_futures = endpoints_to_stop.into_iter().map(|(uri, info)| {
+      let core_arc = core_arc.clone();
+      async move {
+        tracing::debug!(parent_handle=core_arc.handle, child_uri=%uri, child_type=?info.endpoint_type, "Sending Stop to child actor");
+        // Ignore error if mailbox is already closed
+        let _ = info.mailbox.send(Command::Stop).await;
+        // Await child task completion
+        if let Err(e) = info.task_handle.await {
+            // Log join errors (e.g., panic in child task)
+            tracing::error!(parent_handle=core_arc.handle, child_uri=%uri, "Child task join error: {:?}", e);
+        } else {
+            tracing::debug!(parent_handle=core_arc.handle, child_uri=%uri, "Child task joined successfully");
+        }
+      }
+    });
+    futures::future::join_all(stop_futures).await;
+    tracing::debug!(handle = core_arc.handle, "All endpoint actors stopped and joined.");
+
+    // 2. Apply Linger
+    // Check linger option *before* forcefully closing/aborting pipes/readers
+    let linger_opt = { core_arc.core_state.lock().await.options.linger };
+
+    if let Some(duration) = linger_opt {
+      if duration == Duration::MAX {
+        // Infinite Linger (-1)
+        tracing::warn!(
+          handle = handle,
+          "Infinite Linger (-1) requested, not fully supported (skipping indefinite wait)."
+        );
+        // TODO: Proper infinite linger would involve checking if pipes_tx queues are empty.
+        // This requires access to async_channel::Sender::is_empty() or len().
+        // Loop with sleep until all pipes_tx len == 0 or a timeout? Complex. Skip for now.
+      } else if !duration.is_zero() {
+        // Positive Linger (> 0)
+        tracing::debug!(handle = handle, ?duration, "Applying Linger delay");
+        // Wait for the specified duration to allow outbound messages to flush
+        tokio::time::sleep(duration).await;
+        tracing::debug!(handle = handle, "Linger delay complete.");
+      } else {
+        // Zero Linger (0)
+        tracing::trace!(handle = handle, "Linger is zero, proceeding immediately.");
+      }
+    } else {
+      // This case represents Linger = -1 (Option is None after parsing)
+      tracing::warn!(
+        handle = handle,
+        "Infinite Linger (-1) requested, not fully supported (skipping indefinite wait)."
+      );
+    }
+
+    // 3. Close owned pipe senders (core -> session) and Abort pipe reader tasks
+    // Take ownership of maps
+    let pipes_tx_to_close = {
+      let mut state = core_arc.core_state.lock().await;
+      std::mem::take(&mut state.pipes_tx)
+    };
+    let reader_tasks_to_abort = {
+      let mut state = core_arc.core_state.lock().await;
+      std::mem::take(&mut state.pipe_reader_task_handles)
+    };
+
+    // Close senders (signals EOF to corresponding Session reader)
+    for (id, sender) in pipes_tx_to_close {
+      sender.close();
+      tracing::trace!(
+        handle = core_arc.handle,
+        pipe_id = id,
+        "Closed pipe sender during shutdown"
+      );
+    }
+    tracing::debug!(handle = core_arc.handle, "All pipe senders closed.");
+
+    // Abort reader tasks forcefully (they should exit on channel close, but abort ensures cleanup)
+    for (id, handle) in reader_tasks_to_abort {
+      tracing::debug!(
+        handle = core_arc.handle,
+        pipe_id = id,
+        "Aborting pipe reader task during shutdown"
+      );
+      handle.abort();
+      // Optionally await aborted handles? Usually not necessary.
+    }
+    tracing::debug!(handle = core_arc.handle, "All pipe reader tasks aborted.");
+
+    tracing::debug!(handle = core_arc.handle, "Shutdown logic complete.");
+    // Unregistering from context now happens *after* run_command_loop exits.
   }
 
   /// Handles setting socket options. Modifies CoreState or delegates.
@@ -829,11 +957,7 @@ impl SocketCore {
         }
         state.options.sndhwm = hwm as usize;
         // TODO: Apply change to existing pipes? Or only new ones?
-        tracing::info!(
-          handle = core_arc.handle,
-          hwm = state.options.sndhwm,
-          "Set SNDHWM"
-        );
+        tracing::info!(handle = core_arc.handle, hwm = state.options.sndhwm, "Set SNDHWM");
       }
       options::RCVHWM => {
         let hwm = parse_i32_option(value).map_err(|_| ZmqError::InvalidOptionValue(option))?;
@@ -842,11 +966,7 @@ impl SocketCore {
         }
         state.options.rcvhwm = hwm as usize;
         // TODO: Apply change to existing pipes?
-        tracing::info!(
-          handle = core_arc.handle,
-          hwm = state.options.rcvhwm,
-          "Set RCVHWM"
-        );
+        tracing::info!(handle = core_arc.handle, hwm = state.options.rcvhwm, "Set RCVHWM");
       }
       options::LINGER => {
         state.options.linger = parse_linger_option(value)?; // Use Option<Duration> parser
@@ -855,18 +975,15 @@ impl SocketCore {
 
       options::ROUTING_ID => {
         // Core might still store it even if pattern uses it
-        state.options.routing_id =
-          Some(parse_blob_option(value).map_err(|_| ZmqError::InvalidOptionValue(option))?);
+        state.options.routing_id = Some(parse_blob_option(value).map_err(|_| ZmqError::InvalidOptionValue(option))?);
         tracing::info!(handle = core_arc.handle, "Set ROUTING_ID (core state)");
       }
       options::RCVTIMEO => {
-        state.options.rcvtimeo =
-          parse_duration_ms_option(value).map_err(|_| ZmqError::InvalidOptionValue(option))?;
+        state.options.rcvtimeo = parse_duration_ms_option(value).map_err(|_| ZmqError::InvalidOptionValue(option))?;
         tracing::info!(handle=core_arc.handle, timeout=?state.options.rcvtimeo, "Set RCVTIMEO");
       }
       options::SNDTIMEO => {
-        state.options.sndtimeo =
-          parse_duration_ms_option(value).map_err(|_| ZmqError::InvalidOptionValue(option))?;
+        state.options.sndtimeo = parse_duration_ms_option(value).map_err(|_| ZmqError::InvalidOptionValue(option))?;
         tracing::info!(handle=core_arc.handle, timeout=?state.options.sndtimeo, "Set SNDTIMEO");
       }
 
@@ -1035,84 +1152,6 @@ impl SocketCore {
       }
     }
   }
-
-  /// Helper to clean up state associated with a session endpoint URI.
-  async fn cleanup_session_state_by_uri(
-    core_arc: Arc<SocketCore>,
-    endpoint_uri: &str,
-    socket_logic: &Arc<dyn ISocket>,
-  ) {
-    let mut state = core_arc.core_state.lock().await;
-    if let Some(removed_info) = state.endpoints.remove(endpoint_uri) {
-      tracing::debug!("Removed endpoint state for: {}", endpoint_uri);
-      if let Some((write_pipe_id, read_pipe_id)) = removed_info.pipe_ids {
-        state.pipes_tx.remove(&write_pipe_id);
-        if let Some(task_handle) = state.pipe_reader_task_handles.remove(&read_pipe_id) {
-          task_handle.abort(); // Stop the reader task
-          tracing::debug!(
-            "Removed & aborted pipe reader task for pipe_id {}",
-            read_pipe_id
-          );
-        }
-        drop(state); // Release lock before await
-        socket_logic.pipe_detached(read_pipe_id).await;
-      } else {
-        drop(state);
-      }
-    } else {
-      tracing::warn!(handle=core_arc.handle, uri=%endpoint_uri, "Cleanup attempted, but no endpoint state found");
-    }
-  }
-
-  /// Helper to clean up state associated with a session pipe read ID.
-  async fn cleanup_session_state_by_pipe(
-    core_arc: Arc<SocketCore>,
-    pipe_read_id: usize,
-    socket_logic: &Arc<dyn ISocket>,
-  ) {
-    let mut state = core_arc.core_state.lock().await;
-    let mut endpoint_to_remove = None;
-    let mut write_pipe_id_to_remove = None;
-
-    // Find endpoint URI and write pipe ID associated with the read pipe ID
-    for (uri, info) in state.endpoints.iter() {
-      if let Some((write_id, read_id)) = info.pipe_ids {
-        if read_id == pipe_read_id {
-          endpoint_to_remove = Some(uri.clone());
-          write_pipe_id_to_remove = Some(write_id);
-          break;
-        }
-      }
-    }
-
-    // Remove reader task
-    if let Some(task_handle) = state.pipe_reader_task_handles.remove(&pipe_read_id) {
-      task_handle.abort(); // Stop the reader task
-      tracing::debug!(
-        "Removed & aborted pipe reader task for pipe_id {}",
-        pipe_read_id
-      );
-    } else {
-      tracing::warn!(
-        handle = core_arc.handle,
-        pipe_id = pipe_read_id,
-        "PipeClosedByPeer cleanup, but reader task info not found"
-      );
-    }
-    // Remove sender pipe
-    if let Some(write_id) = write_pipe_id_to_remove {
-      state.pipes_tx.remove(&write_id);
-    }
-    // Remove endpoint entry
-    if let Some(uri) = endpoint_to_remove {
-      state.endpoints.remove(&uri);
-      tracing::debug!(handle=core_arc.handle, pipe=pipe_read_id, uri=%uri, "Removed endpoint for closed pipe");
-    }
-    drop(state); // Release lock
-
-    // Notify ISocket (even if state was inconsistent)
-    socket_logic.pipe_detached(pipe_read_id).await;
-  }
 }
 
 // These need to be defined in their respective files (pub_socket.rs etc.)
@@ -1132,6 +1171,10 @@ mod dummy_sockets {
       }
       #[async_trait::async_trait]
       impl ISocket for $name {
+        fn core(&self) -> &Arc<SocketCore> {
+          &self.core
+        }
+
         fn mailbox(&self) -> &MailboxSender {
           self.core.mailbox_sender()
         }
@@ -1213,10 +1256,7 @@ mod dummy_sockets {
           self
             .core
             .mailbox_sender()
-            .send(Command::UserGetOpt {
-              option,
-              reply_tx: tx,
-            })
+            .send(Command::UserGetOpt { option, reply_tx: tx })
             .await
             .map_err(|_| ZmqError::Internal("Mailbox send error".into()))?;
           rx.await
@@ -1271,12 +1311,7 @@ mod dummy_sockets {
           }
           Ok(())
         }
-        async fn pipe_attached(
-          &self,
-          pipe_read_id: usize,
-          pipe_write_id: usize,
-          _peer_identity: Option<&[u8]>,
-        ) {
+        async fn pipe_attached(&self, pipe_read_id: usize, pipe_write_id: usize, _peer_identity: Option<&[u8]>) {
           tracing::trace!(
             socket_type = stringify!($name),
             pipe_read_id = pipe_read_id,
@@ -1294,11 +1329,4 @@ mod dummy_sockets {
       }
     };
   }
-  // Instantiate dummies
-  dummy_socket_impl!(PubSocket);
-  dummy_socket_impl!(SubSocket);
-  dummy_socket_impl!(ReqSocket);
-  dummy_socket_impl!(RepSocket);
-  dummy_socket_impl!(DealerSocket);
-  dummy_socket_impl!(RouterSocket);
 }

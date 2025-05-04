@@ -35,6 +35,10 @@ impl PullSocket {
 
 #[async_trait]
 impl ISocket for PullSocket {
+  fn core(&self) -> &Arc<SocketCore> {
+    &self.core
+  }
+  
   fn mailbox(&self) -> &MailboxSender {
     self.core.mailbox_sender()
   }

@@ -5,7 +5,7 @@ use tokio::sync::Mutex; // Use Mutex for interior mutability needed by ISocket::
 
 /// Distributes messages to available pipes in a round-robin fashion.
 #[derive(Debug, Default)]
-pub struct LoadBalancer {
+pub(crate) struct LoadBalancer {
   // Store the pipe IDs (specifically, the IDs used to look up the
   // sending channel `AsyncSender<Msg>` in SocketCore's `pipes_tx` map).
   pipes: Mutex<VecDeque<usize>>, // VecDeque supports efficient pop_front/push_back

@@ -11,7 +11,7 @@ use std::sync::Arc; // Use Arc if queue needs shared access (e.g. for HWM tracki
 /// Buffers incoming messages from multiple pipes in a single queue
 /// for fair consumption by the socket's `recv()` method.
 #[derive(Debug)]
-pub struct FairQueue {
+pub(crate) struct FairQueue {
   // Use an async channel internally. `recv()` will await on this.
   // The capacity acts as the effective RCVHWM for the socket.
   receiver: Receiver<Msg>,

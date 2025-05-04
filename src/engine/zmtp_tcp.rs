@@ -2,6 +2,7 @@
 
 use crate::engine::IEngine; // Import the trait
 use crate::error::ZmqError;
+use crate::protocol::zmtp::ZmtpCommand;
 use crate::protocol::zmtp::{
   codec::ZmtpCodec, // Import the codec
   greeting::{ZmtpGreeting, GREETING_LENGTH}, // Import greeting logic
@@ -17,7 +18,8 @@ use std::fmt;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::sink::SinkExt; // For Framed::send
-use futures::stream::StreamExt; use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures::stream::StreamExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // For Framed::next
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -76,7 +78,11 @@ impl ZmtpTcpEngine {
   }
 
   async fn run_loop(mut self) {
-    tracing::info!(handle = self.handle, "ZmtpTcpEngine actor started");
+    tracing::info!(
+      handle = self.handle,
+      server = self.is_server,
+      "ZmtpTcpEngine actor started"
+    );
 
     let mut framed = match self.framed_stream.take() {
       Some(f) => f,
@@ -151,26 +157,36 @@ impl ZmtpTcpEngine {
                   self.framed_stream = None; // Mark as gone
                   break;
               }
-          };
-              match command {
-                  Command::SessionPushCmd { msg } => {
+            };
+            match command {
+              Command::SessionPushCmd { msg } => {
 
-                    tracing::trace!(handle=self.handle, msg_size=msg.size(), "Engine received push from Session");
-                    if let Err(e) = framed.send(msg).await {
-                      tracing::error!(handle=self.handle, error=%e, "Engine failed to send message via Framed stream");
-                      // Treat stream write error as fatal
-                      let _ = self.session_mailbox.send(Command::EngineError { error: e }).await;
-                      break; // Exit loop
-                    }
+                tracing::trace!(handle=self.handle, msg_size=msg.size(), "Engine sending message");
+
+                if let Err(e) = framed.send(msg).await {
+                  tracing::error!(handle=self.handle, error=%e, "Engine failed to send message via Framed stream");
+                  let _ = self.session_mailbox.send(Command::EngineError { error: e }).await;
+                  break; // Exit loop on fatal write error
+                }
+                // Ensure data is flushed if needed (e.g., TCP_CORK)
+                // TODO: Implement optional flush based on config/flags
+                if self.config.use_cork {
+                  if let Err(e) = framed.flush().await {
+                    tracing::error!(handle=self.handle, error=%e, "Engine failed to flush stream");
+                    let _ = self.session_mailbox.send(Command::EngineError { error: e.into() }).await;
+                    break;
                   }
-                  Command::Stop => {
-                    let _ = framed.close().await; // Close stream gracefully
-                    self.framed_stream = None; // Mark as gone
-                      break; // Exit loop
-                  }
-                  _ => tracing::warn!(handle = self.handle, "Engine received unhandled command: {:?}", command),
+                }
               }
+              Command::Stop => {
+                let _ = framed.close().await; // Close stream gracefully
+                self.framed_stream = None; // Mark as gone
+                  break; // Exit loop
+              }
+              _ => tracing::warn!(handle = self.handle, "Engine received unhandled command: {:?}", command),
+            }
           }
+
           // --- Receive Messages from TCP Stream (via Framed) ---
           frame_result = framed.next() => {
             match frame_result {
@@ -178,16 +194,49 @@ impl ZmtpTcpEngine {
                   // Successfully decoded a message/command frame
                   tracing::trace!(handle=self.handle, msg_size=msg.size(), flags=?msg.flags(), "Engine decoded frame");
                   if msg.is_command() {
-                      // --- Handle ZMTP Command Frame ---
-                      // TODO: Implement command handling (PING/PONG, ERROR?, etc.)
-                      tracing::warn!(handle=self.handle, "Received unhandled ZMTP command frame");
-                  } else {
-                      // --- Handle Data Message Frame ---
-                      // Send EnginePushCmd up to Session
-                      if self.session_mailbox.send(Command::EnginePushCmd { msg }).await.is_err() {
-                            tracing::warn!(handle=self.handle, "Session mailbox closed while sending EnginePushCmd. Stopping engine.");
-                            break; // Session is gone
+                    if let Some(command) = ZmtpCommand::parse(&msg) {
+                      match command {
+                          ZmtpCommand::Ping(context) => {
+                              tracing::debug!(handle=self.handle, "Received PING, sending PONG");
+                              // Respond with PONG, echoing context
+                              let pong_msg = ZmtpCommand::create_pong(&context);
+                              if let Err(e) = framed.send(pong_msg).await {
+                                  tracing::error!(handle=self.handle, error=%e, "Failed to send PONG");
+                                  let _ = self.session_mailbox.send(Command::EngineError { error: e }).await;
+                                  break; // Exit loop
+                              }
+                              // TODO: Flush if needed
+                              if self.config.use_cork { if let Err(e) = framed.flush().await { /*...*/ break; } }
+                          }
+                          ZmtpCommand::Pong(context) => {
+                              tracing::debug!(handle=self.handle, "Received PONG");
+                              // TODO: Handle PONG (e.g., reset keepalive timer)
+                              let _ = context; // Mark as used
+                          }
+                          ZmtpCommand::Ready => {
+                              tracing::warn!(handle=self.handle, "Received unexpected READY command after handshake");
+                              // Ignore or treat as error?
+                          }
+                          ZmtpCommand::Error => {
+                              tracing::error!(handle=self.handle, "Received ERROR command from peer");
+                              // TODO: Parse reason, report up? Stop engine?
+                              let _ = self.session_mailbox.send(Command::EngineError { error: ZmqError::ProtocolViolation("Received ERROR command".into()) }).await;
+                              break;
+                          }
+                          ZmtpCommand::Unknown(body) => {
+                                tracing::warn!(handle=self.handle, cmd_body=?body, "Received unhandled ZMTP command frame");
+                          }
                       }
+                    } else {
+                        tracing::warn!(handle=self.handle, "Failed to parse received ZMTP command frame");
+                    }
+                  } else {
+                    // --- Handle Data Message Frame ---
+                    // Send EnginePushCmd up to Session
+                    if self.session_mailbox.send(Command::EnginePushCmd { msg }).await.is_err() {
+                      tracing::warn!(handle=self.handle, "Session mailbox closed while sending EnginePushCmd. Stopping engine.");
+                      break; // Session is gone
+                    }
                   }
               }
               Some(Err(e)) => {
@@ -204,22 +253,6 @@ impl ZmtpTcpEngine {
               }
             } // end match frame_result
           } // end frame_result = framed.next() arm
-          _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-            
-            // Check framed_stream again just before sending simulation
-            if self.framed_stream.is_none() { continue; }
-
-            message_counter += 1;
-            let dummy_payload = format!("Engine Message {} from handle {}", message_counter, self.handle);
-            let dummy_msg = Msg::from_vec(dummy_payload.into_bytes());
-            tracing::trace!(handle=self.handle, msg_size=dummy_msg.size(), "Engine simulating received TCP message");
-
-            // <<< ADDED: Send EnginePushCmd Up >>>
-            if self.session_mailbox.send(Command::EnginePushCmd { msg: dummy_msg }).await.is_err() {
-                  tracing::warn!(handle=self.handle, "Session mailbox closed while sending EnginePushCmd. Stopping engine.");
-                  break; // Session is gone
-            }
-          }
       }
     }
     tracing::info!(handle = self.handle, "ZmtpTcpEngine actor stopped");

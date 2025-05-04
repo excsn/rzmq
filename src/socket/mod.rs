@@ -25,11 +25,42 @@ use async_trait::async_trait;
 use options::SocketOptions;
 use std::sync::Arc; // Likely needed for Arc<SocketCore>
 
+/// Helper macro to implement API methods that just send a command to SocketCore's mailbox
+/// and await the oneshot reply. Requires the struct implementing ISocket to have
+/// a `core: Arc<SocketCore>` field accessible.
+#[macro_export] // Export the macro so other modules can use it!
+macro_rules! delegate_to_core {
+    // Case for commands with fields
+    ($self:ident, $variant:ident, $($field:ident : $value:expr),+ $(,)?) => {
+        {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel(); // Use $crate path
+            let cmd = $crate::runtime::Command::$variant { $($field : $value),+, reply_tx };
+            // Assumes self.core exists and has mailbox_sender() method or field
+            $self.core.mailbox_sender()
+                .send(cmd)
+                .await.map_err(|_| $crate::error::ZmqError::Internal("Mailbox send error".into()))?;
+            reply_rx.await.map_err(|_| $crate::error::ZmqError::Internal("Reply channel error".into()))?
+        }
+    };
+    // Case for commands with NO fields (except reply_tx)
+    ($self:ident, $variant:ident $(,)?) => {
+        {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let cmd = $crate::runtime::Command::$variant { reply_tx };
+            $self.core.mailbox_sender()
+                .send(cmd)
+                .await.map_err(|_| $crate::error::ZmqError::Internal("Mailbox send error".into()))?;
+            reply_rx.await.map_err(|_| $crate::error::ZmqError::Internal("Reply channel error".into()))?
+        }
+    };
+}
+
 /// Defines the internal behavior and pattern logic for a specific socket type.
 /// Implementations will typically embed `Arc<SocketCore>`.
 #[async_trait]
 pub trait ISocket: Send + Sync + 'static {
-  // Ensure Send + Sync + 'static for Arc<dyn ...>
+
+  fn core(&self) -> &Arc<SocketCore>;
 
   /// Returns a reference to the underlying SocketCore actor's mailbox sender.
   /// Needed for the public `Socket` handle to send commands.
@@ -108,11 +139,10 @@ pub trait ISocket: Send + Sync + 'static {
 use crate::context::Context;
 use core::SocketCore;
 use crate::socket::{
-  pull_socket::PullSocket, // Use real type
-  // pub_socket::PubSocket, sub_socket::SubSocket,
-  // req_socket::ReqSocket, rep_socket::RepSocket,
-  // dealer_socket::DealerSocket, router_socket::RouterSocket,
-  push_socket::PushSocket, // Use real type
+  push_socket::PushSocket, pull_socket::PullSocket,
+  pub_socket::PubSocket, sub_socket::SubSocket,
+  req_socket::ReqSocket, rep_socket::RepSocket,
+  dealer_socket::DealerSocket, router_socket::RouterSocket,
 };
 
 /// Placeholder internal function to create and spawn the socket actor.
