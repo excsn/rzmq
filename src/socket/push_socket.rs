@@ -9,10 +9,14 @@ use crate::socket::ISocket;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use tokio::sync::{oneshot, MutexGuard};
+use tokio::time::{timeout as tokio_timeout, Instant};
+
+use super::core::send_msg_with_timeout;
 
 #[derive(Debug)]
 pub(crate) struct PushSocket {
@@ -117,54 +121,98 @@ impl ISocket for PushSocket {
   }
 
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
-    // 1. Select a peer using the load balancer
-    let maybe_pipe_id = self.load_balancer.get_next_pipe().await;
+    // 1. Get SNDTIMEO setting *before* potentially blocking on peer selection
+    let timeout_opt: Option<Duration> = { self.core_state().await.options.sndtimeo };
 
-    let pipe_id = match maybe_pipe_id {
-      Some(id) => id,
-      None => {
-        // ZMQ behavior for PUSH with no connected peers depends on HWM/blocking mode.
-        // For now, return an error indicating no peer available.
-        // TODO: Implement blocking/HWM behavior if SNDHWM > 0 or timeout set.
-        tracing::debug!(handle = self.core.handle, "PUSH send failed: No connected peers");
-        return Err(ZmqError::ResourceLimitReached); // Simulate EAGAIN/HWM
+    // 2. Try to select a peer using the load balancer
+    // --- Loop to get a peer, potentially waiting ---
+    let pipe_write_id = loop {
+      if let Some(id) = self.load_balancer.get_next_pipe().await {
+        break id; // Found a peer immediately
       }
-    };
 
-    // 2. Get the sender channel from CoreState
-    let pipe_tx = {
-      // Limit lock scope
-      let state = self.core_state().await;
-      match state.pipes_tx.get(&pipe_id) {
-        Some(tx) => tx.clone(), // Clone the sender end
-        None => {
-          tracing::error!(
-            handle = self.core.handle,
-            pipe_id = pipe_id,
-            "PUSH send failed: Pipe sender not found in core state (consistency issue?)"
-          );
-          // This indicates a state inconsistency, maybe pipe detached but not removed from LB?
-          // Remove the stale pipe from LB
-          self.load_balancer.remove_pipe(pipe_id).await;
-          return Err(ZmqError::Internal("Pipe sender not found".into()));
+      // No peer found, behavior depends on timeout
+      match timeout_opt {
+        Some(duration) if duration.is_zero() => {
+          // SNDTIMEO = 0 (Non-blocking) -> Return error immediately
+          tracing::trace!(handle = self.core.handle, "PUSH send failed (non-blocking): No connected peers");
+          return Err(ZmqError::ResourceLimitReached); // EAGAIN
         }
-      }
+        None => {
+          // SNDTIMEO = -1 (Block Indefinitely) -> Wait for notification
+          tracing::trace!(handle = self.core.handle, "PUSH send blocking: Waiting for available peer...");
+          self.load_balancer.wait_for_pipe().await; // Wait for Notify signal
+          // After waiting, loop back to try get_next_pipe() again
+          continue;
+        }
+        Some(duration) => {
+          // SNDTIMEO > 0 (Timed Block) -> Wait with timeout
+          tracing::trace!(handle = self.core.handle, ?duration, "PUSH send timed wait: Waiting for available peer...");
+          // <<< MODIFIED: Use tokio::time::timeout on wait_for_pipe >>>
+          match tokio_timeout(duration, self.load_balancer.wait_for_pipe()).await {
+              Ok(()) => {
+                  // Wait succeeded within timeout, loop back to try get_next_pipe()
+                  continue;
+              }
+              Err(_elapsed) => {
+                  // Timeout elapsed while waiting for a peer
+                  tracing::debug!(handle = self.core.handle, ?duration, "PUSH send timed out waiting for peer");
+                  return Err(ZmqError::Timeout); // Return Timeout error
+              }
+          }
+        }
+      } // end match timeout_opt
     };
 
-    // 3. Send the message via the channel
-    // Use send().await - this handles backpressure if the channel buffer (SNDHWM) is full.
-    if let Err(_e) = pipe_tx.send(msg).await {
-      tracing::warn!(
-        handle = self.core.handle,
-        pipe_id = pipe_id,
-        "PUSH send failed: Pipe channel closed by session/engine"
-      );
-      // Peer likely disconnected. Remove it from the load balancer.
-      self.load_balancer.remove_pipe(pipe_id).await;
-      // Return error, maybe ResourceLimitReached or ConnectionClosed?
-      Err(ZmqError::ConnectionClosed) // Indicate peer is gone
-    } else {
-      Ok(())
+    // 3. Peer selected (pipe_write_id is valid), get the sender channel
+    let pipe_tx = {
+      let core_state_guard = self.core_state().await;
+      // If the pipe disappeared between selection and getting sender (unlikely but possible)
+      core_state_guard.get_pipe_sender(pipe_write_id).ok_or_else(|| {
+        tracing::error!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          "PUSH send failed: Pipe sender disappeared after selection."
+        );
+        // TODO: Should we remove this apparently stale pipe_write_id from LoadBalancer here?
+        ZmqError::Internal("Pipe sender consistency error".into())
+      })?
+    };
+
+    // 4. Send using the helper function (which respects timeout_opt for HWM)
+    match send_msg_with_timeout(&pipe_tx, msg, timeout_opt, self.core.handle, pipe_write_id).await {
+      Ok(()) => Ok(()),
+      Err(ZmqError::ConnectionClosed) => {
+        tracing::warn!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          "PUSH send failed: Pipe channel closed"
+        );
+        self.load_balancer.remove_pipe(pipe_write_id).await; // Cleanup LB
+                                                             // PUSH doesn't typically *return* this error unless maybe SNDTIMEO=0?
+                                                             // ZMQ often silently drops or waits again depending on config.
+                                                             // Let's return the error for now, matches helper behavior.
+        Err(ZmqError::ConnectionClosed)
+      }
+      Err(ZmqError::ResourceLimitReached) => {
+        tracing::trace!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          "PUSH send failed due to HWM (EAGAIN/Timeout)"
+        );
+        // This is the expected error for SNDTIMEO=0 or SNDTIMEO>0 timeout on HWM.
+        Err(ZmqError::ResourceLimitReached)
+      }
+      Err(ZmqError::Timeout) => {
+        tracing::debug!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          "PUSH send timed out on HWM"
+        );
+        // This is the expected error for SNDTIMEO>0 timeout on HWM.
+        Err(ZmqError::Timeout)
+      }
+      Err(e) => Err(e), // Propagate other unexpected errors
     }
   }
 
@@ -262,7 +310,7 @@ impl ISocket for PushSocket {
 
   async fn pipe_attached(
     &self,
-    pipe_read_id: usize, // PUSH doesn't use the read pipe
+    pipe_read_id: usize,  // PUSH doesn't use the read pipe
     pipe_write_id: usize, // Core writes TO peer using this ID
     _peer_identity: Option<&[u8]>,
   ) {

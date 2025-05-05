@@ -14,10 +14,11 @@ license = "MPL-2.0"
 [dependencies]
 url = "2.5.4"
 radix_trie = "^0.2.1"
+
 # --- Core Async Runtime & Concurrency ---
 async-channel = "1.8" # Using async-channel for Mailbox
 async-trait = "0.1.88"
-tokio = { version = "1.20", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
+tokio = { version = "1.20", features = ["fs", "rt", "rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3" # General async utilities
 crossbeam-channel = { version = "0.5", optional = true } # Optional for specific channel needss
@@ -29,7 +30,6 @@ tokio-uring = { version = "0.5", optional = true } # For io-uring feature
 
 # --- Utilities ---
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true } # Optional for easy logging setup
 rand = "0.9"
 libc = { version = "0.2", optional = true } # For OS constants/types if needed (e.g., socket options)
 bitflags = "2.4"
@@ -39,6 +39,10 @@ thiserror = "1.0"
 static_assertions = "1.1.0"
 
 socket2 = "^0"
+
+nix = { version = "0.27", features = ["net"], optional = true }
+
+libsodium-rs = { version = "^0", optional = true }
 
 # --- Platform Specific (if mio doesn't cover everything) ---
 # Example: Add specific windows deps if needed beyond mio
@@ -55,13 +59,14 @@ tokio-test = "0.4"
 
 # For fuzzing tests
 # cargo-fuzz = { version = "0.11", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] } # Optional for easy logging setup
 
 [[bench]]
 name = "rzmq_benchmarks" # Example benchmark target name
 harness = false
 
 [features]
-full = ["default"]
+full = ["default", "ipc", "inproc", "curve"]
 # --- Default Poller ---
 # By default, we enable mio-poll which uses epoll/kqueue/IOCP via mio.
 # On Linux, users can opt-in to io-uring explicitly.
@@ -73,16 +78,14 @@ io-uring = ["dep:tokio-uring", "dep:libc"] # io_uring often needs libc extras
 mio-poll = ["dep:mio", "dep:libc"]         # mio might also pull in libc details depending on usage
 
 # --- Optional Components (Initially Disabled) ---
+ipc = ["dep:nix"]
+inproc = []
 # tls = ["dep:rustls", "dep:tokio-rustls"] # Example for later WSS
-# curve = ["dep:libsodium-sys"]
+curve = ["dep:libsodium-rs"]
 # gssapi = ["dep:libgssapi-sys"]
 # websocket = ["dep:tokio-tungstenite", "tls"] # WS depends on TLS feature for WSS
-# ipc = [] # Feature flag for IPC transport (needs platform cfgs too)
 # tipc = [] # Feature flag for TIPC transport
 # draft = [] # Enables DRAFT API sockets and options
-
-# --- Utility Features ---
-log = ["dep:tracing-subscriber"] # Enable easy logging setup
 
 # --- Testing Features ---
 # fuzz = ["cargo-fuzz"]

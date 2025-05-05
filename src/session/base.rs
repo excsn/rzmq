@@ -3,7 +3,7 @@
 use crate::error::ZmqError;
 use crate::runtime::{mailbox, Command, MailboxReceiver, MailboxSender};
 use crate::session::ISession;
-use crate::Msg;
+use crate::{Blob, Msg};
 
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use async_trait::async_trait;
@@ -14,13 +14,13 @@ use tokio::task::JoinHandle;
 #[derive(Debug)] // Basic Debug
 pub(crate) struct SessionBase {
   handle: usize,
-  endpoint_uri: String,          // Store the URI for reporting SessionStopped
-  socket_mailbox: MailboxSender, // Mailbox TO SocketCore
-  engine_mailbox: Option<MailboxSender>, // Mailbox TO Engine
+  endpoint_uri: String,                       // Store the URI for reporting SessionStopped
+  socket_mailbox: MailboxSender,              // Mailbox TO SocketCore
+  engine_mailbox: Option<MailboxSender>,      // Mailbox TO Engine
   engine_task_handle: Option<JoinHandle<()>>, // Handle TO Engine Task
-  mailbox_receiver: MailboxReceiver, // Mailbox FROM SocketCore/Engine
-  rx_from_core: Option<AsyncReceiver<Msg>>, // READ messages FROM SocketCore
-  tx_to_core: Option<AsyncSender<Msg>>,     // WRITE messages TO SocketCore
+  mailbox_receiver: MailboxReceiver,          // Mailbox FROM SocketCore/Engine
+  rx_from_core: Option<AsyncReceiver<Msg>>,   // READ messages FROM SocketCore
+  tx_to_core: Option<AsyncSender<Msg>>,       // WRITE messages TO SocketCore
   // Store IDs received from AttachPipe
   pipe_read_id: Option<usize>,
   pipe_write_id: Option<usize>,
@@ -50,19 +50,18 @@ impl SessionBase {
       pipe_read_id: None,
       pipe_write_id: None,
       pipe_attached: false, // Pipe not attached yet
-      engine_ready: false, // Engine not ready yet
+      engine_ready: false,  // Engine not ready yet
     };
     let task_handle = tokio::spawn(session.run_loop());
     (tx, task_handle) // Return mailbox sender for *this* actor and its task handle
   }
 
   async fn run_loop(mut self) {
-    tracing::info!(
-      handle = self.handle,
-      "SessionBase actor started (Placeholder)"
-    );
+    tracing::info!(handle = self.handle, uri=%self.endpoint_uri, "SessionBase actor started");
+
     let mut engine_stopped_cleanly = false;
-    let mut engine_ready = false; // Track if engine handshake complete
+    let mut peer_identity: Option<Blob> = None;
+    let mut error_reported = false;
 
     loop {
       let should_read_core_pipe = self.pipe_attached && self.engine_ready && self.rx_from_core.is_some();
@@ -83,7 +82,7 @@ impl SessionBase {
                      }
                  };
 
-                 tracing::trace!(handle=self.handle, ?command, "Session received command");
+                 tracing::trace!(handle=self.handle, uri=%self.endpoint_uri, ?command, "Session received command");
                  match command {
                   Command::Attach { engine_mailbox, engine_task_handle: handle_opt, .. } => {
                       tracing::debug!(handle = self.handle, "Session received Attach");
@@ -133,7 +132,7 @@ impl SessionBase {
                   }
                   // Message FROM Engine -> TO SocketCore
                   Command::EnginePushCmd { msg } => {
-                    if engine_ready { // Only forward data if engine handshake is complete
+                    if self.engine_ready { // Only forward data if engine handshake is complete
                       tracing::trace!(handle = self.handle, msg_size=msg.size(), "Session forwarding push from Engine to Core");
                       // Write message TO SocketCore via channel
                       if let Err(e) = self.tx_to_core.as_ref().unwrap().send(msg).await {
@@ -146,23 +145,42 @@ impl SessionBase {
                     }
                   }
                   // Engine Status Reports
-                  Command::EngineReady => {
+
+                  Command::EngineReady { peer_identity: received_identity } => {
                     tracing::debug!(handle = self.handle, "Session received EngineReady");
-                    engine_ready = true;
-                    // Maybe signal SocketCore that connection is usable? Or ConnSuccess implies this?
+                    self.engine_ready = true; // Update internal state flag if you added one
+                    // Store the received identity
+                    if received_identity.is_some() {
+                         tracing::info!(handle=self.handle, "Session received peer identity: {:?}", received_identity);
+                         peer_identity = received_identity; // Store it
+                         // TODO: Send PeerIdentityKnown command up to SocketCore?
+                         // let _ = self.socket_mailbox.send(Command::PeerIdentityKnown {
+                         //      pipe_read_id: self.pipe_write_id.unwrap_or(0), // Need correct ID!
+                         //      identity: peer_identity.clone().unwrap()
+                         // }).await;
+                    }
+                    // Now that engine is ready and pipe is attached, Session is fully operational
                   }
                   Command::EngineStopped => {
 
-                    tracing::debug!(handle = self.handle, "Session received EngineStopped signal");
+                    tracing::debug!(handle = self.handle, uri=%self.endpoint_uri, "Session received EngineStopped signal");
                     engine_stopped_cleanly = true;
-                    engine_ready = false; // Engine stopped, not ready anymore
+                    self.engine_ready = false;
                     // If session isn't already stopping, maybe break loop?
                     // Or rely on socket core/pipe closure to trigger stop? Let's rely on that for now.
                   }
                   Command::EngineError{ error } => {
-                    tracing::error!(handle = self.handle, error=%error, "Session received EngineError");
-                    engine_ready = false;
-                    let _ = self.socket_mailbox.send(Command::ReportError { handle: self.handle, error }).await;
+                    tracing::error!(handle = self.handle, uri=%self.endpoint_uri, error=%error, "Session received EngineError");
+                    self.engine_ready = false;
+                    let report_cmd = Command::ReportError {
+                      handle: self.handle,
+                      endpoint_uri: self.endpoint_uri.clone(),
+                      error, // error is moved here
+                    };
+                    if self.socket_mailbox.send(report_cmd).await.is_err() {
+                      tracing::warn!(handle=self.handle, uri=%self.endpoint_uri, "Failed to send ReportError to SocketCore (mailbox closed).");
+                    }
+                    error_reported = true; // Mark that we sent an error report
                     if let Some(engine_handle) = self.engine_task_handle.take() { engine_handle.abort(); }
                     break; // Exit loop
                   }
@@ -175,7 +193,7 @@ impl SessionBase {
                         tracing::error!(handle=self.handle, "Session received SessionPushCmd - Should arrive via Pipe read!");
                         // This indicates a logic error if received via mailbox
                   }
-                  _ => tracing::warn!(handle = self.handle, "Session received unhandled command: {:?}", command),
+                  _ => tracing::warn!(handle = self.handle, uri=%self.endpoint_uri, "Session received unhandled command: {:?}", command),
                }
            } // end cmd_result = recv() arm
 
@@ -192,23 +210,39 @@ impl SessionBase {
                   Ok(msg) => {
                     tracing::trace!(handle = self.handle, msg_size=msg.size(), "Session received push from Socket pipe");
                     /// Check engine_mailbox again in case it stopped concurrently
-                    if let Some(ref engine_mb) = self.engine_mailbox {
-                      // Send SessionPushCmd to Engine
-                      if let Err(e) = engine_mb.send(Command::SessionPushCmd { msg }).await {
-                        tracing::error!("Failed to send msg to engine: {:?}, stopping.", e);
-                        self.engine_mailbox = None; // Engine is gone
-                        if let Some(h) = self.engine_task_handle.take() { h.abort(); }
-                        break; // Stop session
+                    if self.engine_ready {
+                      if let Some(ref engine_mb) = self.engine_mailbox {
+                        if let Err(e) = engine_mb.send(Command::SessionPushCmd { msg }).await {
+                            tracing::error!(handle=self.handle, uri=%self.endpoint_uri, "Failed to send msg to engine: {:?}, stopping.", e);
+                            let report_cmd = Command::ReportError {
+                                handle: self.handle,
+                                endpoint_uri: self.endpoint_uri.clone(),
+                                error: ZmqError::Internal(format!("Engine send failed: {:?}", e)),
+                            };
+                            if self.socket_mailbox.send(report_cmd).await.is_err() {
+                                tracing::warn!(handle=self.handle, uri=%self.endpoint_uri, "Failed to send ReportError to SocketCore (mailbox closed).");
+                            }
+                            error_reported = true;
+                            self.engine_mailbox = None; // Engine is gone
+                            if let Some(h) = self.engine_task_handle.take() { h.abort(); }
+                            break; // Stop session
+                        }
+                      } else {
+                          tracing::warn!(handle=self.handle, "Engine not attached/ready when message received from core, dropping message.");
+                          // Should ideally not happen if engine_ready flag is checked
                       }
                     } else {
-                      tracing::warn!(handle=self.handle, "Engine not attached/ready when message received from core, dropping message.");
-                      // Should ideally not happen if engine_ready flag is checked
+                      tracing::warn!(handle=self.handle, "Engine not ready when message received from core, dropping message.");
+                      // Drop message if engine handshake isn't complete yet.
+                      // Alternatively, buffer it here if needed, but dropping is simpler for now.
                     }
                   }
                   Err(e) => {
                     // Channel closed by SocketCore
-                    tracing::info!(handle=self.handle, "Channel from SocketCore closed, stopping session.");
-                    if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                    tracing::info!(handle=self.handle, uri=%self.endpoint_uri, "Channel from SocketCore closed, stopping session.");
+                    if let Some(engine_mb) = self.engine_mailbox.take() {
+                      let _ = engine_mb.send(Command::Stop).await;
+                    }
                     break; // Exit loop
                   }
               } // end match msg_result
@@ -219,34 +253,23 @@ impl SessionBase {
 
     // --- Cleanup ---
     tracing::info!(handle = self.handle, uri=%self.endpoint_uri, "SessionBase actor stopping");
-    // Only report SessionStopped if we weren't stopped due to an engine error that was already reported
-    // And maybe check if socket_mailbox itself is closed?
-    if !engine_stopped_cleanly && self.engine_mailbox.is_none() {
-      // Infer error if engine_mailbox was taken/aborted
-      // Don't send SessionStopped if ReportError was likely sent
-      tracing::debug!(
-        handle = self.handle,
-        "Skipping SessionStopped notification due to likely prior error report."
-      );
-    } else if self.socket_mailbox.is_closed() {
-      tracing::debug!(
-        handle = self.handle,
-        "Skipping SessionStopped notification as socket core mailbox is closed."
-      );
-    } else {
-      // Send SessionStopped for clean shutdown or unexpected closure
-      let stopped_cmd = Command::SessionStopped {
-        handle: self.handle,
-        endpoint_uri: self.endpoint_uri.clone(),
-        // pipe_id: self.pipe_id, // Need to get relevant pipe ID back from Core/EndpointInfo?
-      };
-      if let Err(e) = self.socket_mailbox.send(stopped_cmd).await {
-        tracing::warn!(
-          handle = self.handle,
-          "Failed to send SessionStopped to SocketCore: {:?}",
-          e
-        );
+
+    if !error_reported {
+      if self.socket_mailbox.is_closed() {
+        tracing::debug!(handle=self.handle, uri=%self.endpoint_uri, "Skipping CleanupComplete notification as socket core mailbox is closed.");
+      } else {
+        let cleanup_cmd = Command::CleanupComplete {
+          handle: self.handle,
+          endpoint_uri: Some(self.endpoint_uri.clone()),
+        };
+        if let Err(e) = self.socket_mailbox.send(cleanup_cmd).await {
+          tracing::warn!(handle = self.handle, uri=%self.endpoint_uri, "Failed to send CleanupComplete to SocketCore: {:?}", e);
+        } else {
+          tracing::debug!(handle=self.handle, uri=%self.endpoint_uri, "Sent CleanupComplete to SocketCore.");
+        }
       }
+    } else {
+      tracing::debug!(handle=self.handle, uri=%self.endpoint_uri, "Skipping CleanupComplete notification because ReportError was sent.");
     }
   } // end run_loop
 }

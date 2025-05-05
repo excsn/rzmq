@@ -1,5 +1,6 @@
 // src/engine/mod.rs
 
+pub(crate) mod core;
 pub mod zmtp_tcp;
 #[cfg(feature = "ipc")]
 pub mod zmtp_ipc;
@@ -7,9 +8,9 @@ pub mod zmtp_ipc;
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::security::MechanismStatus; // Needs security module defined
-use async_trait::async_trait;
 
-pub(crate) use zmtp_tcp::ZmtpTcpEngine;
+use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Defines the behavior of an Engine actor, handling protocol and transport I/O.
 #[async_trait]
@@ -33,3 +34,10 @@ pub trait IEngine: Send + Sync + 'static {
   /// Returns the current status of the security mechanism being used.
   fn get_security_status(&self) -> MechanismStatus;
 }
+
+/// Trait alias for streams usable by ZMTP engines.
+pub(crate) trait ZmtpStream: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug + 'static {}
+// Implement the marker trait for Tokio's streams
+impl ZmtpStream for tokio::net::TcpStream {}
+#[cfg(feature = "ipc")]
+impl ZmtpStream for tokio::net::UnixStream {}

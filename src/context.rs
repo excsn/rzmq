@@ -3,21 +3,32 @@
 use crate::error::ZmqError;
 use crate::runtime::{mailbox, Command, MailboxReceiver, MailboxSender}; // Use mailbox fn
 use crate::socket::{self, ISocket, Socket, SocketType};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[cfg(feature = "curve")]
+use libsodium_rs as libsodium;
 use tokio::sync::{Notify, RwLock}; // Use Tokio's RwLock for async access
 
-// Placeholder for Inproc binding information - Define properly later in transport/inproc.rs
+/// Information stored in the inproc registry for a bound endpoint.
 #[derive(Debug, Clone)]
-pub(crate) struct InprocBinding {}
+#[cfg(feature = "inproc")]
+pub(crate) struct InprocBinding {
+  /// The mailbox of the SocketCore actor that bound to this name.
+  /// The connector sends an `InprocConnectRequest` command here.
+  pub(crate) binder_command_mailbox: MailboxSender,
+  // Store socket type? Optional, for validation.
+  // socket_type: crate::socket::SocketType,
+}
 
 /// Holds the internal state shared by multiple Context handles.
 #[derive(Debug)] // Basic Debug for now
 pub(crate) struct ContextInner {
   /// Next available unique handle ID for sockets, pipes, etc.
-  pub(crate) next_handle: Arc<AtomicUsize>,// Use Atomic for simple counter
+  pub(crate) next_handle: Arc<AtomicUsize>, // Use Atomic for simple counter
 
   /// Map of active socket handles to their command mailboxes.
   pub(crate) sockets: RwLock<HashMap<usize, MailboxSender>>, // Async RwLock
@@ -38,6 +49,18 @@ pub(crate) struct ContextInner {
 impl ContextInner {
   /// Creates new shared context state.
   fn new() -> Self {
+    #[cfg(feature = "curve")]
+    {
+      // libsodium::init() returns Result, handle potential error
+      if let Err(_) = libsodium::ensure_init() {
+        // Log error, decide if this should be fatal for the context/app
+        tracing::error!("Failed to initialize libsodium! CURVE security will not work.");
+        // Consider returning an error:
+        // return Err(ZmqError::Internal("Libsodium initialization failed".to_string()));
+      } else {
+        tracing::debug!("Libsodium initialized successfully.");
+      }
+    }
     Self {
       next_handle: Arc::new(AtomicUsize::new(1)),
       sockets: RwLock::new(HashMap::new()),
@@ -59,7 +82,7 @@ impl ContextInner {
   pub(crate) async fn register_socket(&self, handle: usize, mailbox: MailboxSender) {
     let mut sockets_w = self.sockets.write().await;
     sockets_w.insert(handle, mailbox);
-    self.active_sockets.fetch_add(1, Ordering::Relaxed);
+    self.active_sockets.fetch_add(1, Ordering::AcqRel);
     tracing::debug!(socket_handle = handle, "Socket registered");
   }
 
@@ -67,18 +90,15 @@ impl ContextInner {
   pub(crate) async fn unregister_socket(&self, handle: usize) {
     let mut sockets_w = self.sockets.write().await;
     if sockets_w.remove(&handle).is_some() {
-      let prev_count = self.active_sockets.fetch_sub(1, Ordering::Relaxed);
+      let prev_count = self.active_sockets.fetch_sub(1, Ordering::AcqRel);
       tracing::debug!(socket_handle = handle, "Socket unregistered");
       // If this was the last socket AND shutdown was initiated, notify waiters.
-      if prev_count == 1 && self.shutdown_initiated.load(Ordering::Relaxed) {
+      if prev_count == 1 && self.shutdown_initiated.load(Ordering::Acquire) {
         tracing::debug!("Last socket unregistered during shutdown, notifying term waiters.");
         self.shutdown_notify.notify_waiters();
       }
     } else {
-      tracing::warn!(
-        socket_handle = handle,
-        "Attempted to unregister non-existent socket"
-      );
+      tracing::warn!(socket_handle = handle, "Attempted to unregister non-existent socket");
     }
   }
 
@@ -86,7 +106,7 @@ impl ContextInner {
   pub(crate) async fn shutdown(&self) {
     if self
       .shutdown_initiated
-      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
       .is_ok()
     {
       tracing::info!("Context shutdown initiated.");
@@ -116,25 +136,20 @@ impl ContextInner {
 
   /// Waits until all sockets are unregistered after shutdown is initiated.
   pub(crate) async fn wait_for_termination(&self) {
-    if !self.shutdown_initiated.load(Ordering::Relaxed) {
-      tracing::warn!(
-        "Context::term called before shutdown initiated. Call shutdown() first or just use term()."
-      );
+    if !self.shutdown_initiated.load(Ordering::Acquire) {
+      tracing::warn!("Context::term called before shutdown initiated. Call shutdown() first or just use term().");
       // If we didn't initiate shutdown, there's nothing to wait for in this logic.
       // Alternatively, call self.shutdown().await here? Decided against it for clarity.
       return;
     }
 
     loop {
-      let count = self.active_sockets.load(Ordering::Relaxed);
+      let count = self.active_sockets.load(Ordering::Acquire);
       if count == 0 {
         tracing::info!("Context termination complete (all sockets stopped).");
         break;
       }
-      tracing::debug!(
-        active_sockets = count,
-        "Waiting for sockets to terminate..."
-      );
+      tracing::debug!(active_sockets = count, "Waiting for sockets to terminate...");
       // Wait for a notification OR a timeout to avoid infinite loop if something goes wrong
       tokio::select! {
           _ = self.shutdown_notify.notified() => {
@@ -150,28 +165,31 @@ impl ContextInner {
     }
   }
 
-  // --- Inproc Methods (Placeholders - requires transport/inproc.rs) ---
   #[cfg(feature = "inproc")]
-  pub(crate) async fn register_inproc(&self, _name: String, _binding: InprocBinding) -> Result<(), ZmqError> {
-    // let mut registry = self.inproc_registry.write().await;
-    // if registry.contains_key(&name) { Error } else { insert }
-    unimplemented!("Inproc registration not implemented")
+  pub(crate) async fn register_inproc(&self, name: String, binding_info: InprocBinding) -> Result<(), ZmqError> {
+    let mut registry = self.inproc_registry.write().await;
+    if registry.contains_key(&name) {
+      Err(ZmqError::AddrInUse(format!("inproc://{}", name))) // Address already bound
+    } else {
+      tracing::debug!(inproc_name = %name, "Registering inproc binding");
+      registry.insert(name, binding_info);
+      Ok(())
+    }
   }
 
   #[cfg(feature = "inproc")]
-  pub(crate) async fn unregister_inproc(&self, _name: &str) {
-    // let mut registry = self.inproc_registry.write().await;
-    // registry.remove(name);
-    unimplemented!("Inproc unregistration not implemented")
+  pub(crate) async fn unregister_inproc(&self, name: &str) {
+    let mut registry = self.inproc_registry.write().await;
+    if registry.remove(name).is_some() {
+      tracing::debug!(inproc_name = %name, "Unregistered inproc binding");
+    }
   }
 
   #[cfg(feature = "inproc")]
-  pub(crate) async fn lookup_inproc(&self, _name: &str) -> Option<InprocBinding> {
-    // let registry = self.inproc_registry.read().await;
-    // registry.get(name).cloned()
-    unimplemented!("Inproc lookup not implemented")
+  pub(crate) async fn lookup_inproc(&self, name: &str) -> Option<InprocBinding> {
+    self.inproc_registry.read().await.get(name).cloned()
   }
-
+  
   /// Gets the mailbox for a specific registered socket.
   pub(crate) async fn get_socket_mailbox(&self, handle: usize) -> Option<MailboxSender> {
     self.sockets.read().await.get(&handle).cloned()
@@ -211,8 +229,7 @@ impl Context {
     // We'll defer the full implementation to SocketCore::create_and_spawn.
 
     // Placeholder for the actual socket creation logic:
-    let (socket_handle, socket_mailbox) =
-      crate::socket::create_socket_actor(handle, self.clone(), socket_type)?;
+    let (socket_handle, socket_mailbox) = crate::socket::create_socket_actor(handle, self.clone(), socket_type)?;
     // `create_socket_actor` needs to:
     // 1. Create SocketCore + ISocket impl (e.g., PubSocket) via Arc::new_cyclic
     // 2. Spawn SocketCore::run_command_loop task
@@ -256,13 +273,13 @@ impl Context {
 
 // <<< ADDED DEBUG IMPL FOR CONTEXT >>>
 impl fmt::Debug for Context {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Avoid trying to display the full inner state, just identify it
-        f.debug_struct("Context")
-         // Optionally include a unique ID or pointer address if helpful
-         // .field("inner_ptr", &Arc::as_ptr(&self.inner))
-         .finish_non_exhaustive()
-    }
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    // Avoid trying to display the full inner state, just identify it
+    f.debug_struct("Context")
+      // Optionally include a unique ID or pointer address if helpful
+      // .field("inner_ptr", &Arc::as_ptr(&self.inner))
+      .finish_non_exhaustive()
+  }
 }
 // <<< ADDED DEBUG IMPL FOR CONTEXT END >>>
 

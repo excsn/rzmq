@@ -9,6 +9,9 @@ pub enum ZmqError {
   #[error("I/O error: {0}")]
   Io(#[from] io::Error), // Allows easy conversion from std::io::Error
 
+  #[error("Invalid argument provided: {0}")]
+  InvalidArgument(String), // Corresponds to EINVAL for non-option errors
+  
   // --- Timeouts ---
   #[error("Operation timed out")]
   Timeout, // Corresponds to ETIMEDOUT

@@ -4,13 +4,19 @@ use crate::delegate_to_core;
 use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
-use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
 use crate::socket::patterns::{FairQueue, RouterMap}; // Use RouterMap and FairQueue
 use crate::socket::ISocket;
-use async_trait::async_trait;
-use std::collections::{HashMap, VecDeque};
+
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex, MutexGuard};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::timeout;
+
+use super::options::SocketOptions;
 
 #[derive(Debug)]
 pub(crate) struct RouterSocket {
@@ -28,13 +34,12 @@ pub(crate) struct RouterSocket {
 }
 
 impl RouterSocket {
-  pub fn new(core: Arc<SocketCore>) -> Self {
-    // TODO: Get RCVHWM from core options
-    let initial_hwm = 1000;
+  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
+    let queue_capacity = options.rcvhwm.max(1);
     Self {
       core,
       router_map: RouterMap::new(),
-      incoming_queue: FairQueue::new(initial_hwm),
+      incoming_queue: FairQueue::new(queue_capacity),
       partial_incoming: Mutex::new(HashMap::new()),
       current_send_target: Mutex::new(None),
       pipe_to_identity: Mutex::new(HashMap::new()),
@@ -47,7 +52,7 @@ impl RouterSocket {
 
   /// Creates a temporary identity Blob from a pipe ID.
   /// TODO: Replace this with real identity management later.
-  fn pipe_id_to_identity(pipe_read_id: usize) -> Blob {
+  fn pipe_id_to_placeholder_identity(pipe_read_id: usize) -> Blob {
     Blob::from(pipe_read_id.to_be_bytes().to_vec())
   }
 }
@@ -90,7 +95,12 @@ impl ISocket for RouterSocket {
     // ROUTER send expects Identity frame first, then payload frame(s).
     // We implement stateful send based on current_send_target.
 
+    // Lock the target state for the whole operation if possible,
+    // or carefully manage its setting/clearing around awaits.
     let mut current_target_guard = self.current_send_target.lock().await;
+
+    // 1. Get SNDTIMEO setting (needed for potentially sending first frame)
+    let timeout_opt: Option<Duration> = { self.core_state().await.options.sndtimeo };
 
     if current_target_guard.is_none() {
       // --- First Frame: Must be the Destination Identity ---
@@ -107,80 +117,153 @@ impl ISocket for RouterSocket {
       }
 
       // Find target pipe write ID
-      if let Some(pipe_write_id) = self.router_map.get_pipe(&destination_id).await {
-        // Store target for subsequent payload frames
-        *current_target_guard = Some(pipe_write_id);
-        tracing::trace!(
-          handle = self.core.handle,
-          ?destination_id,
-          pipe_id = pipe_write_id,
-          "ROUTER send target locked"
-        );
-        // Send the identity frame itself down the pipe
-        let pipe_tx = {
-          let core_state_guard = self.core_state().await;
-          match core_state_guard.get_pipe_sender(pipe_write_id) {
-            Some(tx) => tx,
-            None => {
-              *current_target_guard = None; // Clear target
-              return Err(ZmqError::Internal("Pipe sender consistency error".into()));
-            }
+      let pipe_write_id = match self.router_map.get_pipe(&destination_id).await {
+        Some(id) => id,
+        None => {
+          // Identity not found
+          tracing::debug!(
+            handle = self.core.handle,
+            ?destination_id,
+            "ROUTER send failed: Destination identity unknown"
+          );
+
+          let router_mandatory = { self.core_state().await.options.router_mandatory };
+          if router_mandatory {
+            tracing::debug!(
+              handle = self.core.handle,
+              ?destination_id,
+              "ROUTER send failed (mandatory=true): Destination identity unknown"
+            );
+            return Err(ZmqError::HostUnreachable("Peer identity not connected".into()));
+          // Return EHOSTUNREACH
+          } else {
+            // Default: Drop message silently
+            tracing::trace!(
+              handle = self.core.handle,
+              ?destination_id,
+              "ROUTER dropping message for unknown identity (mandatory=false)"
+            );
+            // We need to consume the rest of the message parts from the user perspective,
+            // even though we drop them. The `send` call should appear successful.
+            // If the identity frame was the *only* frame (no MORE flag), we just return Ok.
+            // If it had MORE, the state logic needs care.
+
+            // Simplest approach: Return Ok(()) here. The subsequent calls to send()
+            // for payload parts will fail because current_target_guard is None.
+            // This isn't perfect ZMQ fidelity (it silently drops subsequent parts too).
+            // A better way would involve state to track "dropping mode".
+            // Let's return Ok for now for simplicity.
+            return Ok(());
           }
-        };
-        // Ensure MORE flag IS set on the identity frame being sent
-        msg.set_flags(msg.flags() | MsgFlags::MORE);
-        if let Err(_e) = pipe_tx.send(msg).await {
-          *current_target_guard = None; // Clear target on error
-          self
-            .router_map
-            .remove_peer_by_read_pipe(pipe_write_id)
-            .await; // Need read ID? Complex cleanup.
+        }
+      };
+
+      // Get sender channel
+      let pipe_tx = {
+        let core_state_guard = self.core_state().await;
+        match core_state_guard.get_pipe_sender(pipe_write_id) {
+          Some(tx) => tx,
+          None => {
+            // Peer likely disconnected between router_map lookup and getting sender
+            tracing::error!(
+              handle = self.core.handle,
+              pipe_id = pipe_write_id,
+              ?destination_id,
+              "ROUTER send failed: Pipe sender disappeared after lookup."
+            );
+            // TODO: Cleanup RouterMap? Needs coordination.
+            return Err(ZmqError::HostUnreachable("Peer disconnected".into())); // EHOSTUNREACH
+          }
+        }
+      };
+
+      // Ensure MORE flag IS set on the identity frame being sent
+      msg.set_flags(msg.flags() | MsgFlags::MORE);
+
+      // Send the identity frame using the timeout helper
+      match send_msg_with_timeout(&pipe_tx, msg, timeout_opt, self.core.handle, pipe_write_id).await {
+        Ok(()) => {
+          // Store target for subsequent payload frames
+          *current_target_guard = Some(pipe_write_id);
+          tracing::trace!(
+            handle = self.core.handle,
+            ?destination_id,
+            pipe_id = pipe_write_id,
+            "ROUTER send target locked"
+          );
+          Ok(()) // Ready for payload frame(s)
+        }
+        Err(e @ ZmqError::ConnectionClosed) => {
           tracing::warn!(
             handle = self.core.handle,
             pipe_id = pipe_write_id,
-            "ROUTER send (identity) failed: Pipe channel closed"
+            "ROUTER send (identity) failed: {}",
+            e
           );
-          return Err(ZmqError::ConnectionClosed);
+          // TODO: Remove peer from RouterMap? Needs read ID. Complex cleanup.
+          Err(ZmqError::HostUnreachable("Peer disconnected during send".into()))
+          // Return EHOSTUNREACH
         }
-        Ok(()) // Ready for payload frame(s)
-      } else {
-        // Identity not found
-        tracing::debug!(
-          handle = self.core.handle,
-          ?destination_id,
-          "ROUTER send failed: Destination identity unknown"
-        );
-        // TODO: Handle ZMQ_ROUTER_MANDATORY etc. options
-        Err(ZmqError::HostUnreachable(
-          "Peer identity not connected".into(),
-        ))
+        Err(e @ ZmqError::Internal(_)) => {
+          // Treat internal errors as fatal for this attempt
+          tracing::warn!(
+            handle = self.core.handle,
+            pipe_id = pipe_write_id,
+            "ROUTER send (identity) failed: {}",
+            e
+          );
+          Err(e)
+        }
+        Err(e @ ZmqError::ResourceLimitReached) | Err(e @ ZmqError::Timeout) => {
+          tracing::debug!(
+            handle = self.core.handle,
+            pipe_id = pipe_write_id,
+            "ROUTER send (identity) failed HWM/Timeout: {}",
+            e
+          );
+          Err(e) // Return EAGAIN or Timeout
+        }
+        Err(e) => Err(e), // Other errors
       }
+      // Note: current_target_guard lock is held until this branch returns
     } else {
       // --- Subsequent Frame(s): Payload ---
       let target_pipe_id = current_target_guard.unwrap(); // We know it's Some
 
-      // Get sender
+      // Get sender (potentially locking CoreState again)
       let pipe_tx = {
         let core_state_guard = self.core_state().await;
         match core_state_guard.get_pipe_sender(target_pipe_id) {
           Some(tx) => tx,
           None => {
-            /* ... consistency error ... */
-            *current_target_guard = None;
-            return Err(ZmqError::Internal("Pipe sender consistency error".into()));
+            // Target pipe disappeared while we were holding the lock! Should be rare.
+            tracing::error!(
+              handle = self.core.handle,
+              pipe_id = target_pipe_id,
+              "ROUTER send (payload): Target pipe disappeared!"
+            );
+            *current_target_guard = None; // Clear target state
+            return Err(ZmqError::HostUnreachable("Peer disconnected mid-message".into()));
+            // EHOSTUNREACH
           }
         }
       };
 
-      // Ensure MORE flag is correct for the *final* user payload part
-      let is_last_part = !msg.is_more();
-      // The ZMTP frame for this payload part should have the same MORE flag as the user provided msg.
+      // Determine if this is the last part *intended by the user* for this message
+      let is_last_user_part = !msg.is_more();
 
-      // Send the payload frame
-      let send_result = pipe_tx.send(msg).await;
+      // Send payload frame using the *same timeout setting* as the identity frame
+      let send_result = send_msg_with_timeout(
+        &pipe_tx,
+        msg,         // msg already has correct MORE flag from user perspective
+        timeout_opt, // Reuse timeout setting
+        self.core.handle,
+        target_pipe_id,
+      )
+      .await;
 
-      // If this was the last part, clear the target pipe ID
-      if is_last_part {
+      // If this was the last part intended by the user, clear the target state
+      if is_last_user_part {
         *current_target_guard = None;
         tracing::trace!(
           handle = self.core.handle,
@@ -189,71 +272,70 @@ impl ISocket for RouterSocket {
         );
       }
 
-      send_result.map_err(|_| {
-        // Pipe likely closed by peer
-        *current_target_guard = None; // Clear target
-        tracing::warn!(
-          handle = self.core.handle,
-          pipe_id = target_pipe_id,
-          "ROUTER send (payload) failed: Pipe channel closed"
-        );
-        // TODO: Remove peer from RouterMap? Need better cleanup coordination.
-        ZmqError::ConnectionClosed
-      })
+      // Process send result
+      match send_result {
+        Ok(()) => Ok(()),
+        Err(e @ ZmqError::ConnectionClosed) => {
+          tracing::warn!(
+            handle = self.core.handle,
+            pipe_id = target_pipe_id,
+            "ROUTER send (payload) failed: Pipe channel closed"
+          );
+          *current_target_guard = None; // Ensure target is cleared on error too
+                                        // TODO: Remove peer from RouterMap?
+          Err(ZmqError::HostUnreachable("Peer disconnected during send".into()))
+          // Return EHOSTUNREACH
+        }
+        Err(e @ ZmqError::Internal(_)) => {
+          *current_target_guard = None; // Clear target
+          Err(e)
+        }
+        Err(e @ ZmqError::ResourceLimitReached) | Err(e @ ZmqError::Timeout) => {
+          // Don't clear target state here, user might retry the *same* payload part
+          tracing::debug!(
+            handle = self.core.handle,
+            pipe_id = target_pipe_id,
+            "ROUTER send (payload) failed HWM/Timeout: {}",
+            e
+          );
+          Err(e) // Return EAGAIN or Timeout
+        }
+        Err(e) => {
+          *current_target_guard = None; // Clear target on unknown errors
+          Err(e)
+        }
+      }
+      // Note: current_target_guard lock is held until this branch returns
     } // end else (payload frame)
   } // end send
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    let mut message_parts: Vec<Msg> = Vec::new();
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
 
-    // 1. Receive the first part - this MUST be the Identity
-    let first_part = match self.incoming_queue.pop_message().await? {
-      Some(msg) => msg,
-      None => return Err(ZmqError::Internal("Receive queue closed".into())),
-    };
+    // Pop message frame (could be Identity or Payload part) from the fair queue
+    let pop_future = self.incoming_queue.pop_message();
 
-    // Check if it looks like an identity (e.g., non-empty? maybe store metadata?)
-    // We assume the first part IS the identity based on handle_pipe_event logic.
-    message_parts.push(first_part);
-
-    // 2. Receive subsequent parts until MORE flag is not set
-    loop {
-      let next_part = match self.incoming_queue.pop_message().await? {
-        Some(msg) => msg,
-        None => {
-          // Queue closed unexpectedly after receiving only identity/partial message
-          tracing::error!(
-            handle = self.core.handle,
-            "Receive queue closed mid-message"
-          );
-          return Err(ZmqError::ProtocolViolation(
-            "Incomplete message received".into(),
-          ));
+    let result = match rcvtimeo_opt {
+      Some(duration) if !duration.is_zero() => {
+        tracing::trace!(handle = self.core.handle, ?duration, "Applying RCVTIMEO to ROUTER recv");
+        match timeout(duration, pop_future).await {
+          Ok(Ok(Some(msg))) => Ok(msg), // Got a frame
+          Ok(Ok(None)) => Err(ZmqError::Internal("Receive queue closed".into())),
+          Ok(Err(e)) => Err(e),
+          Err(_timeout_elapsed) => Err(ZmqError::Timeout),
         }
-      };
-      let is_last = !next_part.is_more();
-      message_parts.push(next_part);
-      if is_last {
-        break; // End of logical message
       }
-    }
-
-    // Combine parts? No, ZMQ recv returns one part at a time usually.
-    // RETHINK: The user calls recv() multiple times for multi-part.
-    // Our FairQueue stores individual Msg parts.
-    // `recv` should just return the *next available* part from the queue.
-
-    // --- Corrected recv() Logic ---
-    // Get the next frame (could be ID or payload part) from the queue
-    match self.incoming_queue.pop_message().await? {
-      Some(msg) => {
-        tracing::trace!(handle=self.core.handle, msg_size=msg.size(), flags=?msg.flags(), "ROUTER recv returning message part");
-        Ok(msg) // Return the single frame (could be ID or data)
+      _ => {
+        // No timeout
+        match pop_future.await? {
+          Some(msg) => Ok(msg),
+          None => Err(ZmqError::Internal("Receive queue closed".into())),
+        }
       }
-      None => Err(ZmqError::Internal("Receive queue closed".into())),
-    }
-    // The USER is responsible for calling recv() repeatedly and checking the MORE flag
-    // to reconstruct the full message (Identity + Payload Parts).
+    };
+    // User is responsible for reading frames (Identity first) and checking MORE flag.
+
+    result
   }
 
   // --- Pattern Specific Options ---
@@ -275,46 +357,102 @@ impl ISocket for RouterSocket {
       Command::PipeMessageReceived { msg, .. } => {
         let mut partial_guard = self.partial_incoming.lock().await;
         let buffer = partial_guard.entry(pipe_read_id).or_insert_with(Vec::new);
-        let is_last_part = !msg.is_more();
-        buffer.push(msg);
+
+        let is_first_part_for_peer = buffer.is_empty();
+        let mut current_msg = msg; // Shadow msg
+
+        if is_first_part_for_peer && current_msg.size() == 0 && current_msg.is_more() {
+          // This looks like the empty delimiter from a DEALER.
+          // We consume it and wait for the next part (the actual identity).
+          tracing::trace!(
+            handle = self.core.handle,
+            pipe_id = pipe_read_id,
+            "ROUTER consumed empty delimiter from DEALER"
+          );
+          // Don't add it to the buffer, just drop it and return Ok(())
+          // The next PipeMessageReceived event will contain the identity.
+          drop(partial_guard); // Release lock
+          return Ok(());
+        }
+
+        let is_last_part = !current_msg.is_more();
+        buffer.push(current_msg);
 
         if is_last_part {
           // Message complete, process it
-          let complete_message_parts = partial_guard.remove(&pipe_read_id).unwrap();
+          let complete_message_parts = partial_guard.remove(&pipe_read_id).unwrap_or_default();
           drop(partial_guard); // Release lock
 
           // Get identity associated with this pipe
+
           let identity_blob = {
-            let map_guard = self.pipe_to_identity.lock().await; // Use local map
-            map_guard.get(&pipe_read_id).cloned().unwrap_or_else(|| {
-              tracing::warn!(
-                handle = self.core.handle,
-                pipe_id = pipe_read_id,
-                "Could not find identity for pipe, using placeholder."
-              );
-              Self::pipe_id_to_identity(pipe_read_id) // Fallback
-            })
+            let map_guard = self.pipe_to_identity.lock().await;
+            map_guard.get(&pipe_read_id).cloned() // Clone the Blob
           };
 
-          // --- Push "Identity frame" then "Payload frame(s)" to FairQueue ---
-          // 1. Push Identity Frame
+          let identity_blob = match identity_blob {
+            Some(id) => id,
+            None => {
+              // This case should ideally not happen if pipe_attached worked correctly,
+              // but handle it defensively.
+              tracing::error!(
+                handle = self.core.handle,
+                pipe_id = pipe_read_id,
+                "ROUTER handle_pipe_event: Identity not found for pipe! Using placeholder."
+              );
+              // Maybe return error instead of using placeholder? Depends on desired strictness.
+              // For now, use placeholder to avoid breaking receive loop.
+              Self::pipe_id_to_placeholder_identity(pipe_read_id)
+            }
+          };
+
+          // Construct the logical message to queue for user recv(): Identity + Payload(s)
+
+          // 1. Create Identity Frame
           let mut id_msg = Msg::from_vec(identity_blob.to_vec());
-          id_msg.set_flags(MsgFlags::MORE); // Identity frame *always* has MORE flag for ROUTER recv
-          self.incoming_queue.push_message(id_msg).await?;
+          // Must set MORE flag if payload follows
+          if !complete_message_parts.is_empty() {
+            id_msg.set_flags(MsgFlags::MORE);
+          }
+
+          // Push identity frame FIRST
+          if let Err(e) = self.incoming_queue.push_message(id_msg).await {
+            tracing::error!(
+                handle=self.core.handle,
+                pipe_id=pipe_read_id,
+                error=?e,
+                "ROUTER failed to push Identity frame to queue. Dropping message."
+            );
+            // If we can't queue the identity, don't queue the payload either.
+            // Return the error? Or just log and drop? Log and drop for now.
+            return Ok(()); // Or return Err(e)? Decide on error propagation strategy.
+          }
 
           // 2. Push Original Payload Frame(s)
-          let num_payload_parts = complete_message_parts.len(); // Get length first
+          let num_payload_parts = complete_message_parts.len();
           for (i, mut part) in complete_message_parts.into_iter().enumerate() {
-            // Consumes vector
-            // Ensure MORE flag is correct relative to *original* message parts
+            // Ensure MORE flag is correct for the logical message being queued
             if i < num_payload_parts - 1 {
-              // Use stored length
-              part.set_flags(part.flags() | MsgFlags::MORE);
+              part.set_flags(part.flags() | MsgFlags::MORE); // Set MORE on intermediate parts
             } else {
-              part.set_flags(part.flags() & !MsgFlags::MORE);
+              part.set_flags(part.flags() & !MsgFlags::MORE); // Ensure MORE is unset on the very last part
             }
-            self.incoming_queue.push_message(part).await?;
+
+            if let Err(e) = self.incoming_queue.push_message(part).await {
+              tracing::error!(
+                  handle=self.core.handle,
+                  pipe_id=pipe_read_id,
+                  error=?e,
+                  part_index=i+1, // 1-based index for logging
+                  "ROUTER failed to push Payload frame to queue. Message incomplete."
+              );
+              // Message is now incomplete in the queue. This is problematic.
+              // Maybe try to clear the queue for this peer? Complex.
+              // For now, just log the error. User might get partial message if they recv before error.
+              return Ok(()); // Or return Err(e)?
+            }
           }
+
           tracing::trace!(
             handle = self.core.handle,
             pipe_id = pipe_read_id,
@@ -334,24 +472,30 @@ impl ISocket for RouterSocket {
     Ok(())
   }
 
-  async fn pipe_attached(
-    &self,
-    pipe_read_id: usize,
-    pipe_write_id: usize,
-    peer_identity_opt: Option<&[u8]>,
-  ) {
-    // Determine identity
+  async fn pipe_attached(&self, pipe_read_id: usize, pipe_write_id: usize, peer_identity_opt: Option<&[u8]>) {
+    // Determine identity: Use provided identity, or generate placeholder
     let identity = match peer_identity_opt {
-      Some(id_bytes) => Blob::from(id_bytes.to_vec()),
-      None => {
-        tracing::warn!(
+      // Use provided ID if available and non-empty
+      Some(id_bytes) if !id_bytes.is_empty() => {
+        tracing::debug!(
           handle = self.core.handle,
           pipe_read_id = pipe_read_id,
-          "Peer did not provide ROUTING_ID/Identity, generating one."
+          "ROUTER using ZMTP peer identity from handshake"
         );
-        Self::pipe_id_to_identity(pipe_read_id) // Fallback to pipe ID
+        Blob::from(id_bytes.to_vec())
+      }
+      _ => {
+        // Fallback if no ZMTP ID provided or it's empty
+        tracing::debug!(
+          // Changed level to debug, this is expected if peer has no ID set
+          handle = self.core.handle,
+          pipe_read_id = pipe_read_id,
+          "ROUTER Peer did not provide ZMTP identity, generating placeholder based on pipe ID."
+        );
+        Self::pipe_id_to_placeholder_identity(pipe_read_id)
       }
     };
+
     tracing::debug!(
       handle = self.core.handle,
       pipe_read_id = pipe_read_id,
@@ -364,12 +508,8 @@ impl ISocket for RouterSocket {
       .router_map
       .add_peer(identity.clone(), pipe_read_id, pipe_write_id)
       .await;
-    self
-      .pipe_to_identity
-      .lock()
-      .await
-      .insert(pipe_read_id, identity);
-    // Notify FairQueue
+    self.pipe_to_identity.lock().await.insert(pipe_read_id, identity); // Store the chosen identity
+                                                                       // Notify FairQueue
     self.incoming_queue.pipe_attached(pipe_read_id);
   }
 
@@ -379,14 +519,53 @@ impl ISocket for RouterSocket {
       pipe_read_id = pipe_read_id,
       "ROUTER detaching pipe"
     );
-    // Remove peer from router map and local reverse map
-    self.router_map.remove_peer_by_read_pipe(pipe_read_id).await; // Removes both forward/reverse in helper
-    self.pipe_to_identity.lock().await.remove(&pipe_read_id); // Remove from local map too
-                                                              // Notify FairQueue
+
+    // 1. Try to find the identity and write pipe ID for the detaching read pipe ID
+    let maybe_identity: Option<Blob> = {
+      let id_map_guard = self.pipe_to_identity.lock().await;
+      id_map_guard.get(&pipe_read_id).cloned()
+      // id_map_guard lock released here
+    };
+
+    // We need the write_id associated with this identity to check against current_send_target
+    let maybe_write_id: Option<usize> = if let Some(ref identity) = maybe_identity {
+      // Use the public get_pipe method BEFORE removing the mapping
+      self.router_map.get_pipe(identity).await
+    } else {
+      None
+    };
+
+    // 2. Remove peer from router map (uses read ID)
+    self.router_map.remove_peer_by_read_pipe(pipe_read_id).await;
+
+    // 3. Remove from local identity map
+    let _removed_identity = self.pipe_to_identity.lock().await.remove(&pipe_read_id);
+
+    // 4. Notify FairQueue helper
     self.incoming_queue.pipe_detached(pipe_read_id);
-    // Clear any partial messages from this pipe
+
+    // 5. Clear any partial messages from this pipe
     self.partial_incoming.lock().await.remove(&pipe_read_id);
-    // Clear pending send target if it was for this peer? Difficult without write_id here.
-    // TODO: Improve cleanup of current_send_target on peer disconnect.
+
+    // 6. Clear pending send target if it matched the detached pipe's write ID
+    if let Some(write_pipe_id) = maybe_write_id {
+      let mut target_guard = self.current_send_target.lock().await;
+      if *target_guard == Some(write_pipe_id) {
+        tracing::warn!(
+          handle = self.core.handle,
+          pipe_read_id = pipe_read_id,
+          pipe_write_id = write_pipe_id,
+          "Current ROUTER send target pipe detached. Clearing target."
+        );
+        *target_guard = None;
+      }
+    } else {
+      // If we couldn't find the identity or write_id (e.g., mapping was already gone), we can't reliably check the target.
+      tracing::trace!(
+        handle = self.core.handle,
+        pipe_read_id = pipe_read_id,
+        "Could not verify write_id for detached pipe to clear send target."
+      );
+    }
   }
 } // end impl ISocket for RouterSocket

@@ -7,8 +7,12 @@ use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::FairQueue; // Use the fair queue helper
 use crate::socket::ISocket;
 use async_trait::async_trait;
+use tokio::time::timeout;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{oneshot, MutexGuard};
+
+use super::options::SocketOptions;
 
 #[derive(Debug)]
 pub(crate) struct PullSocket {
@@ -18,12 +22,11 @@ pub(crate) struct PullSocket {
 
 impl PullSocket {
   /// Creates a new PullSocket.
-  pub fn new(core: Arc<SocketCore>) -> Self {
-    // TODO: Get RCVHWM from core options when creating FairQueue
-    let initial_hwm = 1000; // Placeholder
+  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
+    let queue_capacity = options.rcvhwm.max(1);
     Self {
       core,
-      fair_queue: FairQueue::new(initial_hwm),
+      fair_queue: FairQueue::new(queue_capacity),
     }
   }
 
@@ -38,7 +41,7 @@ impl ISocket for PullSocket {
   fn core(&self) -> &Arc<SocketCore> {
     &self.core
   }
-  
+
   fn mailbox(&self) -> &MailboxSender {
     self.core.mailbox_sender()
   }
@@ -56,9 +59,7 @@ impl ISocket for PullSocket {
       })
       .await
       .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx
-      .await
-      .map_err(|_| ZmqError::Internal("Reply error".into()))?
+    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
   }
 
   async fn connect(&self, endpoint: &str) -> Result<(), ZmqError> {
@@ -72,9 +73,7 @@ impl ISocket for PullSocket {
       })
       .await
       .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx
-      .await
-      .map_err(|_| ZmqError::Internal("Reply error".into()))?
+    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
   }
 
   async fn disconnect(&self, endpoint: &str) -> Result<(), ZmqError> {
@@ -88,9 +87,7 @@ impl ISocket for PullSocket {
       })
       .await
       .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx
-      .await
-      .map_err(|_| ZmqError::Internal("Reply error".into()))?
+    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
   }
 
   async fn unbind(&self, endpoint: &str) -> Result<(), ZmqError> {
@@ -104,9 +101,7 @@ impl ISocket for PullSocket {
       })
       .await
       .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx
-      .await
-      .map_err(|_| ZmqError::Internal("Reply error".into()))?
+    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
   }
 
   async fn send(&self, _msg: Msg) -> Result<(), ZmqError> {
@@ -116,17 +111,47 @@ impl ISocket for PullSocket {
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
     // Pop message from the fair queue (awaits if empty)
-    match self.fair_queue.pop_message().await? {
-      Some(msg) => Ok(msg),
-      None => {
-        // Queue was closed - this indicates a problem, maybe socket is closing?
-        tracing::warn!(
-          handle = self.core.handle,
-          "PULL recv failed: FairQueue closed unexpectedly"
-        );
-        Err(ZmqError::Internal("Receive queue closed".into())) // Or ConnectionClosed?
+    // 1. Get configured timeout from core state
+    let rcvtimeo_opt: Option<Duration> = {
+      // Limit lock scope
+      self.core_state().await.options.rcvtimeo
+    };
+
+    // 2. Pop message from the fair queue, applying timeout if set
+    let pop_future = self.fair_queue.pop_message();
+
+    let result = match rcvtimeo_opt {
+      Some(duration) if !duration.is_zero() => {
+        // Timeout > 0
+        tracing::trace!(handle = self.core.handle, ?duration, "Applying RCVTIMEO to recv");
+        match timeout(duration, pop_future).await {
+          Ok(Ok(Some(msg))) => Ok(msg), // Message received within timeout
+          Ok(Ok(None)) => {
+            // Queue closed while waiting (unexpected)
+            tracing::error!(handle = self.core.handle, "PULL recv failed: FairQueue closed");
+            Err(ZmqError::Internal("Receive queue closed".into()))
+          }
+          Ok(Err(e)) => Err(e), // Internal error from pop_message
+          Err(_timeout_elapsed) => {
+            tracing::trace!(handle = self.core.handle, "PULL recv timed out");
+            Err(ZmqError::Timeout) // Timeout occurred
+          }
+        }
       }
-    }
+      _ => {
+        // No timeout (None) or zero timeout (immediate check - though pop_message awaits)
+        // Await indefinitely (or until queue closes)
+        match pop_future.await? {
+          // Use ? to propagate internal errors
+          Some(msg) => Ok(msg),
+          None => {
+            tracing::error!(handle = self.core.handle, "PULL recv failed: FairQueue closed");
+            Err(ZmqError::Internal("Receive queue closed".into()))
+          }
+        }
+      }
+    };
+    result
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -143,9 +168,7 @@ impl ISocket for PullSocket {
       })
       .await
       .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx
-      .await
-      .map_err(|_| ZmqError::Internal("Reply error".into()))?
+    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
   }
 
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
@@ -157,9 +180,7 @@ impl ISocket for PullSocket {
       .send(Command::UserGetOpt { option, reply_tx })
       .await
       .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx
-      .await
-      .map_err(|_| ZmqError::Internal("Reply error".into()))?
+    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
   }
 
   async fn close(&self) -> Result<(), ZmqError> {
@@ -170,9 +191,7 @@ impl ISocket for PullSocket {
       .send(Command::UserClose { reply_tx })
       .await
       .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx
-      .await
-      .map_err(|_| ZmqError::Internal("Reply error".into()))?
+    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
@@ -196,7 +215,7 @@ impl ISocket for PullSocket {
     // PULL socket has no specific readable pattern options
     Err(ZmqError::UnsupportedOption(option))
   }
-  
+
   // --- Internal Methods ---
 
   async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {

@@ -2,7 +2,9 @@
 
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::runtime::MailboxSender; // Needed if sending commands back for cleanup
+use crate::runtime::MailboxSender;
+use crate::socket::core::send_msg_with_timeout;
+// Needed if sending commands back for cleanup
 use crate::CoreState; // Need CoreState to get Senders
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -36,39 +38,52 @@ impl Distributor {
     }
   }
 
+  /// Returns a snapshot of the current peer pipe write IDs.
+  pub async fn get_peer_ids(&self) -> Vec<usize> {
+    let peers_guard = self.peers.lock().await;
+    peers_guard.iter().copied().collect() // Clone IDs into a new Vec
+  }
+
   /// Sends a message to all currently registered peer pipes.
   /// Acquires the necessary senders from CoreState.
   /// Errors are collected, but sending continues to other peers.
   pub async fn send_to_all(
     &self,
     msg: &Msg,                     // Send borrowed message
-    core_state: &Mutex<CoreState>, // Need access to get pipe senders
+    core_state_mutex: &Mutex<CoreState>, // Need access to get pipe senders
   ) -> Result<(), Vec<(usize, ZmqError)>> {
-    // Return collected errors
-    let core_state_guard = core_state.lock().await;
-    let peers_guard = self.peers.lock().await;
-
-    if peers_guard.is_empty() {
-      tracing::trace!("Distributor: No peers to send to.");
+    let peer_ids = self.get_peer_ids().await;
+    if peer_ids.is_empty() {
       return Ok(());
     }
 
-    let mut errors = Vec::new();
+    let core_state_guard = core_state_mutex.lock().await;
+    let mut failed_pipes = Vec::new(); // Store pipes that failed fatally
     let mut send_futures = Vec::new();
+    let timeout_opt = core_state_guard.options.sndtimeo;
+    // Need core handle for logging inside helper call
+    let core_handle = core_state_guard.socket_type as usize; // Hacky: use socket type num as handle? No. Need real handle.
+                                                             // TODO: Pass core_handle properly to Distributor methods or get from state?
 
-    for &pipe_write_id in peers_guard.iter() {
+    for pipe_write_id in peer_ids {
       if let Some(sender) = core_state_guard.get_pipe_sender(pipe_write_id) {
-        // Clone message for each send? No, Bytes is cheap to clone.
         let msg_clone = msg.clone();
+        // Pass dummy handle for now
         send_futures.push(async move {
-          // Use send().await to respect backpressure (SNDHWM)
-          if let Err(_e) = sender.send(msg_clone).await {
-            // Return error tuple (pipe_id, error)
-            // Don't trace error here, let caller decide based on collected errors
-            // Session/Engine closing is expected, ZmqError::ConnectionClosed is suitable
-            Some((pipe_write_id, ZmqError::ConnectionClosed))
-          } else {
-            None // Indicate success
+          match send_msg_with_timeout(&sender, msg_clone, timeout_opt, 0/*core_handle*/, pipe_write_id).await {
+              Ok(()) => Ok(pipe_write_id), // Indicate success for this pipe
+              Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
+                  tracing::trace!(/*handle=core_handle,*/ pipe_id=pipe_write_id, "PUB dropping message due to HWM/Timeout");
+                  Err(None) // Indicate non-fatal drop, no cleanup needed
+              }
+              Err(e @ ZmqError::ConnectionClosed) => {
+                  tracing::debug!(/*handle=core_handle,*/ pipe_id=pipe_write_id, "PUB peer disconnected during send");
+                  Err(Some((pipe_write_id, e))) // Indicate fatal error for cleanup
+              }
+              Err(e) => {
+                  tracing::error!(/*handle=core_handle,*/ pipe_id=pipe_write_id, error=%e, "PUB send encountered unexpected error");
+                  Err(Some((pipe_write_id, e))) // Indicate fatal error for cleanup
+              }
           }
         });
       } else {
@@ -76,32 +91,30 @@ impl Distributor {
           pipe_id = pipe_write_id,
           "Distributor: Pipe sender not found in core state during send."
         );
-        // Indicates inconsistency - pipe likely detached but not removed from distributor?
-        errors.push((
+        // Treat as fatal error for this pipe ID?
+        failed_pipes.push((
           pipe_write_id,
           ZmqError::Internal("Distributor found stale pipe ID".into()),
         ));
       }
     }
+    drop(core_state_guard); // Release lock
 
-    // Release locks before awaiting futures
-    drop(peers_guard);
-    drop(core_state_guard);
-
-    // Execute all sends concurrently
+    // Execute sends concurrently
     let results = futures::future::join_all(send_futures).await;
 
-    // Collect errors from send results
+    // Collect fatal errors/closed pipes
     for result in results {
-      if let Some(error_tuple) = result {
-        errors.push(error_tuple);
+      if let Err(Some(error_tuple)) = result {
+        failed_pipes.push(error_tuple);
       }
+      // Ignore Ok(_) and Err(None)
     }
 
-    if errors.is_empty() {
+    if failed_pipes.is_empty() {
       Ok(())
     } else {
-      Err(errors)
+      Err(failed_pipes) // Return list of pipes needing cleanup
     }
   }
 }

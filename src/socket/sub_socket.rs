@@ -11,9 +11,13 @@ use crate::socket::patterns::{FairQueue, SubscriptionTrie}; // Use Trie and Fair
 use crate::socket::ISocket;
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use async_trait::async_trait;
+use tokio::time::timeout;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex, MutexGuard}; // Mutex needed for pipe_tx map
+use std::time::Duration;
+use tokio::sync::{oneshot, Mutex, MutexGuard};
+
+use super::options::SocketOptions; // Mutex needed for pipe_tx map
 
 #[derive(Debug)]
 pub(crate) struct SubSocket {
@@ -26,13 +30,12 @@ pub(crate) struct SubSocket {
 }
 
 impl SubSocket {
-  pub fn new(core: Arc<SocketCore>) -> Self {
-    // TODO: Get RCVHWM from core options for FairQueue
-    let initial_hwm = 1000;
+  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
+    let queue_capacity = options.rcvhwm.max(1);
     Self {
       core,
       subscriptions: SubscriptionTrie::new(),
-      fair_queue: FairQueue::new(initial_hwm),
+      fair_queue: FairQueue::new(queue_capacity),
       pipe_read_to_write_id: Mutex::new(HashMap::new()),
     }
   }
@@ -53,7 +56,8 @@ impl SubSocket {
     let mut targets: Vec<(usize, AsyncSender<Msg>)>;
 
     // --- Acquire Locks and Collect Data ---
-    { // Scope to limit lock guards
+    {
+      // Scope to limit lock guards
       let state_guard = self.core_state().await; // Lock core state
       let pipe_map_guard = self.pipe_read_to_write_id.lock().await; // Lock pipe map
 
@@ -64,16 +68,16 @@ impl SubSocket {
       }
 
       targets.reserve(pipe_map_guard.len()); // Reserve capacity now
-      // Collect pairs of (pipe_write_id, Sender<Msg>)
+                                             // Collect pairs of (pipe_write_id, Sender<Msg>)
       for write_pipe_id in pipe_map_guard.values() {
         if let Some(sender) = state_guard.get_pipe_sender(*write_pipe_id) {
-             targets.push((*write_pipe_id, sender)); // Store ID and cloned sender
+          targets.push((*write_pipe_id, sender)); // Store ID and cloned sender
         } else {
-             tracing::warn!(
-                 pipe_id = write_pipe_id,
-                 "Sub command: Pipe sender not found in core state (consistency issue?). Skipping."
-             );
-             // TODO: Should this inconsistency trigger removal from pipe_read_to_write_id map? Needs careful thought.
+          tracing::warn!(
+            pipe_id = write_pipe_id,
+            "Sub command: Pipe sender not found in core state (consistency issue?). Skipping."
+          );
+          // TODO: Should this inconsistency trigger removal from pipe_read_to_write_id map? Needs careful thought.
         }
       }
 
@@ -82,7 +86,7 @@ impl SubSocket {
 
     // --- Create Futures After Locks Released ---
     if targets.is_empty() {
-        return; // No valid targets found
+      return; // No valid targets found
     }
 
     let mut send_futures = Vec::new();
@@ -111,7 +115,7 @@ impl ISocket for SubSocket {
   fn core(&self) -> &Arc<SocketCore> {
     &self.core
   }
-  
+
   fn mailbox(&self) -> &MailboxSender {
     self.core.mailbox_sender()
   }
@@ -131,17 +135,34 @@ impl ISocket for SubSocket {
   }
 
   async fn send(&self, _msg: Msg) -> Result<(), ZmqError> {
-    Err(ZmqError::InvalidState(
-      "SUB sockets cannot send data messages",
-    ))
+    Err(ZmqError::InvalidState("SUB sockets cannot send data messages"))
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    // Pop message from the fair queue
-    match self.fair_queue.pop_message().await? {
-      Some(msg) => Ok(msg),
-      None => Err(ZmqError::Internal("Receive queue closed".into())), // Or ConnectionClosed?
-    }
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
+
+    let pop_future = self.fair_queue.pop_message(); // Waits on internal queue
+
+    let result = match rcvtimeo_opt {
+      Some(duration) if !duration.is_zero() => {
+        tracing::trace!(handle = self.core.handle, ?duration, "Applying RCVTIMEO to SUB recv");
+        match timeout(duration, pop_future).await {
+          Ok(Ok(Some(msg))) => Ok(msg), // Matched message received within timeout
+          Ok(Ok(None)) => Err(ZmqError::Internal("Receive queue closed".into())),
+          Ok(Err(e)) => Err(e),
+          Err(_timeout_elapsed) => Err(ZmqError::Timeout),
+        }
+      }
+      _ => {
+        // No timeout
+        match pop_future.await? {
+          Some(msg) => Ok(msg),
+          None => Err(ZmqError::Internal("Receive queue closed".into())),
+        }
+      }
+    };
+
+    result
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -161,9 +182,7 @@ impl ISocket for SubSocket {
           })
           .await
           .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-        reply_rx
-          .await
-          .map_err(|_| ZmqError::Internal("Reply error".into()))?
+        reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
       }
     }
   }
@@ -178,9 +197,7 @@ impl ISocket for SubSocket {
       .send(Command::UserGetOpt { option, reply_tx })
       .await
       .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx
-      .await
-      .map_err(|_| ZmqError::Internal("Reply error".into()))?
+    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
   }
 
   async fn close(&self) -> Result<(), ZmqError> {
@@ -194,18 +211,14 @@ impl ISocket for SubSocket {
         tracing::debug!(handle=self.core.handle, topic=?String::from_utf8_lossy(value), "Subscribing");
         self.subscriptions.subscribe(value).await;
         // Send SUBSCRIBE command message upstream to all connected peers
-        self
-          .send_subscription_command(ZMTP_CMD_SUBSCRIBE_NAME, value)
-          .await;
+        self.send_subscription_command(ZMTP_CMD_SUBSCRIBE_NAME, value).await;
         Ok(())
       }
       UNSUBSCRIBE => {
         tracing::debug!(handle=self.core.handle, topic=?String::from_utf8_lossy(value), "Unsubscribing");
         if self.subscriptions.unsubscribe(value).await {
           // Send CANCEL command message upstream to all connected peers
-          self
-            .send_subscription_command(ZMTP_CMD_CANCEL_NAME, value)
-            .await;
+          self.send_subscription_command(ZMTP_CMD_CANCEL_NAME, value).await;
         }
         Ok(())
       }
@@ -251,12 +264,7 @@ impl ISocket for SubSocket {
     Ok(())
   }
 
-  async fn pipe_attached(
-    &self,
-    pipe_read_id: usize,
-    pipe_write_id: usize,
-    _peer_identity: Option<&[u8]>,
-  ) {
+  async fn pipe_attached(&self, pipe_read_id: usize, pipe_write_id: usize, _peer_identity: Option<&[u8]>) {
     tracing::debug!(
       handle = self.core.handle,
       pipe_read_id = pipe_read_id,
@@ -281,11 +289,7 @@ impl ISocket for SubSocket {
       "SUB detaching pipe"
     );
     // Remove from map
-    self
-      .pipe_read_to_write_id
-      .lock()
-      .await
-      .remove(&pipe_read_id);
+    self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
     // Notify FairQueue helper
     self.fair_queue.pipe_detached(pipe_read_id);
   }

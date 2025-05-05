@@ -29,7 +29,6 @@ impl FairQueue {
       receiver,
       sender,
       hwm: capacity.max(1),
-      // pipe_count: Arc::new(AtomicUsize::new(0)),
     }
   }
 

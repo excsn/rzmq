@@ -2,9 +2,11 @@
 
 // <<< ADDED ZMTP FRAMING CONSTANTS >>>
 
-use bytes::Bytes;
+use std::collections::HashMap;
 
-use crate::{Msg, MsgFlags};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use crate::{Msg, MsgFlags, ZmqError};
 
 // --- ZMTP Frame Flags ---
 // Located in the first byte of the length field for messages/commands.
@@ -25,10 +27,10 @@ pub const ZMTP_CMD_PONG_NAME: &[u8] = b"PONG";
 /// Represents known ZMTP commands relevant to basic operation.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ZmtpCommand {
-  Ping(Bytes), // Contains TTL and Context
-  Pong(Bytes), // Contains Context
-  Ready,       // TODO: Add properties map later
-  Error,       // TODO: Add error reason later
+  Ping(Bytes),      // Contains TTL and Context
+  Pong(Bytes),      // Contains Context
+  Ready(ZmtpReady), // Store parsed READY info
+  Error,            // TODO: Add reason Vec<u8>
   // Add other commands like Subscribe, Cancel as needed
   Unknown(Bytes), // For commands we don't handle specifically
 }
@@ -52,10 +54,15 @@ impl ZmtpCommand {
       // Extract context after "PONG"
       let context = Bytes::copy_from_slice(&body[5..]);
       Some(ZmtpCommand::Pong(context))
-    } else if body.starts_with(b"\x05READY") {
-      // READY command format: <length=5>READY<Properties>
-      // TODO: Parse properties map later
-      Some(ZmtpCommand::Ready)
+    } else if body.starts_with(b"\x05READY") && body.len() >= 6 {
+      // Body = <length=5>READY<Properties...>
+      match ZmtpReady::parse_properties(&body[6..]) {
+        Ok(ready_cmd) => Some(ZmtpCommand::Ready(ready_cmd)),
+        Err(e) => {
+          tracing::error!("Failed to parse READY properties: {}", e);
+          None // Treat parse failure as unknown/error
+        }
+      }
     } else if body.starts_with(b"\x05ERROR") {
       // ERROR command format: <length=5>ERROR<Reason>
       // TODO: Parse reason later
@@ -86,6 +93,84 @@ impl ZmtpCommand {
     body.extend_from_slice(context);
 
     let mut msg = Msg::from_vec(body);
+    msg.set_flags(MsgFlags::COMMAND);
+    msg
+  }
+}
+
+/// Represents a parsed ZMTP READY command.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ZmtpReady {
+  /// Key-value properties map (e.g., "Socket-Type", "Identity"). Keys are case-sensitive.
+  pub properties: HashMap<String, Vec<u8>>, // Store values as bytes for flexibility
+}
+
+impl ZmtpReady {
+  /// Parses the properties map from the body of a READY command frame.
+  /// Expects ZMTP metadata format: (name-len(u8) name(str) value-len(u32) value(bytes))...
+  pub fn parse_properties(body: &[u8]) -> Result<Self, ZmqError> {
+    let mut props = HashMap::new();
+    let mut cursor = std::io::Cursor::new(body);
+
+    while cursor.position() < body.len() as u64 {
+      // Read name
+      let name_len = cursor.get_u8() as usize;
+      if cursor.remaining() < name_len {
+        return Err(ZmqError::ProtocolViolation("Invalid metadata name length".into()));
+      }
+      let name_bytes = cursor.copy_to_bytes(name_len);
+      let name = String::from_utf8(name_bytes.to_vec())
+        .map_err(|_| ZmqError::ProtocolViolation("Metadata name not valid UTF-8".into()))?;
+
+      // Read value
+      if cursor.remaining() < 4 {
+        return Err(ZmqError::ProtocolViolation("Invalid metadata value length".into()));
+      }
+      let value_len = cursor.get_u32() as usize; // Big Endian from get_u32
+      if cursor.remaining() < value_len {
+        return Err(ZmqError::ProtocolViolation("Invalid metadata value length".into()));
+      }
+      let value_bytes = cursor.copy_to_bytes(value_len);
+
+      props.insert(name, value_bytes.to_vec());
+    }
+
+    Ok(Self { properties: props })
+  }
+
+  /// Encodes the READY command properties into a buffer for sending.
+  pub fn encode_properties(&self, dst: &mut BytesMut) {
+    for (name, value) in &self.properties {
+      let name_bytes = name.as_bytes();
+      // ZMQ limits name length
+      if name_bytes.len() > 255 {
+        tracing::warn!(
+          "Skipping ZMTP metadata property with name longer than 255 bytes: {}",
+          name
+        );
+        continue;
+      }
+      dst.put_u8(name_bytes.len() as u8);
+      dst.put_slice(name_bytes);
+      // ZMQ limits value length to u32::MAX
+      dst.put_u32(value.len() as u32); // Big Endian
+      dst.put_slice(value);
+    }
+  }
+
+  /// Creates a READY command Msg with the given properties.
+  pub fn create_msg(properties: HashMap<String, Vec<u8>>) -> Msg {
+    let cmd = ZmtpReady { properties };
+    let mut body = BytesMut::new();
+    // Prepend command name (length prefixed)
+    let name = ZMTP_CMD_READY_NAME;
+    body.put_u8(name.len() as u8); // Not ZMTP standard? Check spec 4.1 Command frame
+                                   // Re-checking: Yes, command name is length-prefixed string in body.
+    body.put_slice(name);
+    // Append encoded properties
+    cmd.encode_properties(&mut body);
+
+    let mut msg = Msg::from_bytes(body.freeze());
     msg.set_flags(MsgFlags::COMMAND);
     msg
   }

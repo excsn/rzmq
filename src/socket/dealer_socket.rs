@@ -8,10 +8,16 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::{FairQueue, LoadBalancer}; // Use LB (out) and FQ (in)
 use crate::socket::ISocket;
+
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{oneshot, Mutex, MutexGuard};
+use tokio::time::{timeout, Instant};
+
+use super::core::send_msg_with_timeout;
+use super::options::SocketOptions;
 
 #[derive(Debug)]
 pub(crate) struct DealerSocket {
@@ -20,20 +26,21 @@ pub(crate) struct DealerSocket {
   incoming_queue: FairQueue,   // For incoming messages
   // Map Read Pipe ID -> Write Pipe ID (needed for pipe_detached)
   pipe_read_to_write_id: Mutex<HashMap<usize, usize>>,
+  partial_incoming: Mutex<HashMap<usize, Vec<Msg>>>,
   // TODO: Option to configure if empty delimiter should be added/expected?
   // connect_to_router: bool, // Example config flag
 }
 
 impl DealerSocket {
-  pub fn new(core: Arc<SocketCore>) -> Self {
-    // TODO: Get HWMs from core options
-    let initial_hwm = 1000;
+  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
+    let queue_capacity = options.rcvhwm.max(1);
     Self {
       core,
       load_balancer: LoadBalancer::new(),
-      incoming_queue: FairQueue::new(initial_hwm),
+      incoming_queue: FairQueue::new(queue_capacity),
       pipe_read_to_write_id: Mutex::new(HashMap::new()),
-      // connect_to_router: true, // Default? Or detect?
+      partial_incoming: Mutex::new(HashMap::new()), // Initialize new state
+                                                    // connect_to_router: true, // Default? Or detect?
     }
   }
 
@@ -76,109 +83,160 @@ impl ISocket for DealerSocket {
 
   // --- Pattern-Specific Logic ---
   async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
-    // 1. Select peer using LoadBalancer
-    let pipe_write_id = match self.load_balancer.get_next_pipe().await {
-      Some(id) => id,
-      None => return Err(ZmqError::ResourceLimitReached), // No peers (EAGAIN)
+    // 1. Get SNDTIMEO setting *before* potentially blocking on peer selection
+    let timeout_opt: Option<Duration> = { self.core_state().await.options.sndtimeo };
+
+    // 2. Try to select peer using LoadBalancer
+    let pipe_write_id = loop {
+      if let Some(id) = self.load_balancer.get_next_pipe().await {
+        break id; // Found peer
+      }
+      // No peer found, check timeout
+      match timeout_opt {
+        Some(duration) if duration.is_zero() => {
+          tracing::trace!(
+            handle = self.core.handle,
+            "DEALER send failed (non-blocking): No connected peers"
+          );
+          return Err(ZmqError::ResourceLimitReached);
+        }
+        None => {
+          tracing::trace!(
+            handle = self.core.handle,
+            "DEALER send blocking: Waiting for available peer..."
+          );
+          self.load_balancer.wait_for_pipe().await;
+          continue; // Loop back after waiting
+        }
+        Some(duration) => {
+          tracing::trace!(
+            handle = self.core.handle,
+            ?duration,
+            "DEALER send timed wait: Waiting for available peer..."
+          );
+          match timeout(duration, self.load_balancer.wait_for_pipe()).await {
+            Ok(()) => continue, // Wait succeeded, loop back
+            Err(_elapsed) => {
+              tracing::debug!(
+                handle = self.core.handle,
+                ?duration,
+                "DEALER send timed out waiting for peer"
+              );
+              return Err(ZmqError::Timeout);
+            }
+          }
+        }
+      } // end match timeout_opt
     };
 
-    // 2. Get sender channel
+    // 3. Peer selected (pipe_write_id is valid), get the sender channel
     let pipe_tx = {
       let core_state_guard = self.core_state().await;
-      match core_state_guard.get_pipe_sender(pipe_write_id) {
-        Some(tx) => tx,
-        None => {
-          /* ... consistency error, remove from LB, return error ... */
-          tracing::error!(
-            handle = self.core.handle,
-            pipe_id = pipe_write_id,
-            "DEALER send failed: Pipe sender not found"
-          );
+      // Handle potential consistency error
+      core_state_guard.get_pipe_sender(pipe_write_id).ok_or_else(|| {
+        tracing::error!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          "DEALER send failed: Pipe sender disappeared after selection."
+        );
+        // TODO: Remove stale pipe_write_id from LoadBalancer?
+        ZmqError::Internal("Pipe sender consistency error".into())
+      })?
+    }; // Release lock
+
+    // 4. Prepend empty delimiter frame (conditionally? Assume always for now)
+    // TODO: Make conditional based on peer type detection or option?
+    let mut delimiter = Msg::new();
+    delimiter.set_flags(MsgFlags::MORE);
+
+    // 5. Send delimiter (respect timeout/hwm for the *first* part)
+    // Assume for now DEALER always talks to ROUTER and needs delimiter.
+    // Could be made optional later via config.
+    tracing::trace!(
+      handle = self.core.handle,
+      pipe_id = pipe_write_id,
+      "DEALER prepending empty delimiter"
+    );
+    let mut delimiter = Msg::new(); // Empty payload
+    delimiter.set_flags(MsgFlags::MORE); // Must have MORE flag
+
+    // Send delimiter first
+    match send_msg_with_timeout(&pipe_tx, delimiter, timeout_opt, self.core.handle, pipe_write_id).await {
+      Ok(()) => {} // Proceed
+      Err(e) => {
+        /* handle fatal errors (remove pipe), return transient errors */
+        // Ensure pipe is removed on fatal error before returning
+        if matches!(e, ZmqError::ConnectionClosed | ZmqError::Internal(_)) {
           self.load_balancer.remove_pipe(pipe_write_id).await;
-          return Err(ZmqError::Internal("Pipe sender consistency error".into()));
+        }
+        return Err(e);
+      }
+    }
+
+    // 6. Send original message part(s)
+    // Ensure MORE flag is correct on the final payload part
+    let is_last_user_part = !msg.is_more(); // Check flag BEFORE potentially modifying it
+    if is_last_user_part {
+      msg.set_flags(msg.flags() & !MsgFlags::MORE); // Ensure last part has MORE unset
+    } else {
+      msg.set_flags(msg.flags() | MsgFlags::MORE); // Ensure intermediate parts have MORE set
+    }
+
+    // Send payload using the same timeout logic
+    match send_msg_with_timeout(&pipe_tx, msg, timeout_opt, self.core.handle, pipe_write_id).await {
+      Ok(()) => {
+        tracing::trace!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          "DEALER sent message payload"
+        );
+        Ok(()) // Success
+      }
+      Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::Internal(_)) => {
+        // Fatal error sending payload, remove pipe
+        tracing::warn!(handle=self.core.handle, pipe_id=pipe_write_id, error=%e, "DEALER send (payload) failed");
+        self.load_balancer.remove_pipe(pipe_write_id).await; // Cleanup LB
+        Err(e) // Return fatal error
+      }
+      Err(e @ ZmqError::ResourceLimitReached) | Err(e @ ZmqError::Timeout) => {
+        // Failed due to HWM/timeout sending payload
+        tracing::trace!(handle=self.core.handle, pipe_id=pipe_write_id, error=%e, "DEALER send (payload) failed HWM/Timeout");
+        // Note: Delimiter was already sent! Peer might get partial message. ZMQ doesn't guarantee atomicity here.
+        Err(e) // Return EAGAIN or Timeout
+      }
+      Err(e) => Err(e), // Propagate other unexpected errors
+    }
+  }
+
+  async fn recv(&self) -> Result<Msg, ZmqError> {
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
+
+    // Pop message from the fair queue, applying timeout
+    let pop_future = self.incoming_queue.pop_message();
+
+    let result = match rcvtimeo_opt {
+      Some(duration) if !duration.is_zero() => {
+        tracing::trace!(handle = self.core.handle, ?duration, "Applying RCVTIMEO to DEALER recv");
+        match timeout(duration, pop_future).await {
+          Ok(Ok(Some(msg))) => Ok(msg), // Got a frame
+          Ok(Ok(None)) => Err(ZmqError::Internal("Receive queue closed".into())),
+          Ok(Err(e)) => Err(e),
+          Err(_timeout_elapsed) => Err(ZmqError::Timeout),
+        }
+      }
+      _ => {
+        // No timeout
+        match pop_future.await? {
+          Some(msg) => Ok(msg),
+          None => Err(ZmqError::Internal("Receive queue closed".into())),
         }
       }
     };
 
-    // 3. Prepend empty delimiter frame if talking to ROUTER (assume yes for now)
-    // TODO: Make this conditional
-    let mut delimiter = Msg::new(); // Empty message
-    delimiter.set_flags(MsgFlags::MORE); // Set MORE flag on delimiter
+    // Post-process: Strip delimiter? Depends on FQ/handle_pipe_event storing parts/metadata
+    // Assuming recv just returns the next frame for now. User handles delimiter/identity.
 
-    // 4. Send delimiter then message part(s)
-    // Need to handle multi-part messages from the user correctly.
-    // Send delimiter first
-    if let Err(_e) = pipe_tx.send(delimiter).await {
-      tracing::warn!(
-        handle = self.core.handle,
-        pipe_id = pipe_write_id,
-        "DEALER send (delimiter) failed: Pipe channel closed"
-      );
-      self.load_balancer.remove_pipe(pipe_write_id).await;
-      return Err(ZmqError::ConnectionClosed);
-    }
-
-    // Send original message (part)
-    // If original msg had MORE flag, subsequent parts must be sent by user immediately.
-    if let Err(_e) = pipe_tx.send(msg).await {
-      // Send original msg
-      tracing::warn!(
-        handle = self.core.handle,
-        pipe_id = pipe_write_id,
-        "DEALER send (payload) failed: Pipe channel closed"
-      );
-      self.load_balancer.remove_pipe(pipe_write_id).await;
-      // Note: Delimiter was already sent. This might break peer state.
-      return Err(ZmqError::ConnectionClosed);
-    }
-
-    tracing::trace!(
-      handle = self.core.handle,
-      pipe_id = pipe_write_id,
-      "DEALER sent message"
-    );
-    Ok(())
-  }
-
-  async fn recv(&self) -> Result<Msg, ZmqError> {
-    // Pop message from the fair queue (awaits if empty)
-    let mut msg = match self.incoming_queue.pop_message().await? {
-      Some(m) => m,
-      None => return Err(ZmqError::Internal("Receive queue closed".into())),
-    };
-
-    // Strip leading empty delimiter if present (assume peer is ROUTER)
-    // TODO: Make this conditional
-    if msg.size() == 0 {
-      tracing::trace!(
-        handle = self.core.handle,
-        "DEALER stripping empty delimiter"
-      );
-      // This was the delimiter, the *next* message part is the payload.
-      // This implies recv needs to handle multi-part messages internally if
-      // the delimiter and payload arrive separately via handle_pipe_event.
-      // RETHINK: FairQueue needs to store Vec<Msg> or recv needs to loop.
-      // Let's assume FQ stores single Msg and handle_pipe_event adds metadata.
-
-      // --- Assuming single Msg from FQ, check metadata ---
-      #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-      struct IsDelimiter;
-      if msg.metadata().get::<IsDelimiter>().await.is_some() {
-        // This was marked as a delimiter by handle_pipe_event. Get next part.
-        msg = match self.incoming_queue.pop_message().await? {
-          Some(m) => m,
-          None => {
-            return Err(ZmqError::ProtocolViolation(
-              "Received delimiter but no payload".into(),
-            ))
-          }
-        };
-      } else {
-        // It's a zero-byte message, but wasn't marked as delimiter? Treat as payload.
-      }
-    }
-
-    Ok(msg)
+    result
   }
 
   // --- Pattern Specific Options ---
@@ -194,32 +252,80 @@ impl ISocket for DealerSocket {
     Ok(false)
   }
 
-  async fn handle_pipe_event(&self, pipe_id: usize, event: Command) -> Result<(), ZmqError> {
+  async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { mut msg, .. } => {
-        // Optional: Check if first part is empty delimiter (if peer is ROUTER)
-        // Add metadata if it is, before pushing.
-        // TODO: Make conditional
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        struct IsDelimiter;
-        if msg.size() == 0 && !msg.is_more() {
-          // Simplistic check for delimiter-only message
-          // Don't queue delimiter? Or queue it with metadata? Queue with metadata.
-          msg.metadata_mut().insert_typed(IsDelimiter).await;
+        let mut partial_guard = self.partial_incoming.lock().await;
+        let is_last_part = !msg.is_more();
+        let msg_size = msg.size(); // Get size for logging
+
+        tracing::trace!(
+          handle = self.core.handle,
+          pipe_id = pipe_read_id,
+          size = msg_size,
+          more = msg.is_more(),
+          expecting_payload = partial_guard.contains_key(&pipe_read_id),
+          "DEALER handle_pipe_event received frame"
+        );
+
+        if partial_guard.contains_key(&pipe_read_id) {
+          // --- Payload Frame ---
           tracing::trace!(
             handle = self.core.handle,
-            pipe_id = pipe_id,
-            "DEALER queuing delimiter"
+            pipe_id = pipe_read_id,
+            size = msg_size,
+            "DEALER queuing payload frame"
           );
-          self.incoming_queue.push_message(msg).await?;
+          // Add metadata indicating source pipe?
+          #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+          struct SourcePipeReadId(usize);
+          let mut current_msg = msg;
+          current_msg
+            .metadata_mut()
+            .insert_typed(SourcePipeReadId(pipe_read_id))
+            .await;
+
+          self.incoming_queue.push_message(current_msg).await?;
+
+          if is_last_part {
+            tracing::trace!(
+              handle = self.core.handle,
+              pipe_id = pipe_read_id,
+              "DEALER removing pipe state (last payload part)"
+            );
+            partial_guard.remove(&pipe_read_id);
+          } else {
+            tracing::trace!(
+              handle = self.core.handle,
+              pipe_id = pipe_read_id,
+              "DEALER keeping pipe state (more payload parts expected)"
+            );
+          }
         } else {
+          // --- Identity Frame ---
           tracing::trace!(
             handle = self.core.handle,
-            pipe_id = pipe_id,
-            msg_size = msg.size(),
-            "DEALER queuing message"
+            pipe_id = pipe_read_id,
+            size = msg_size,
+            "DEALER received/discarded identity frame"
           );
-          self.incoming_queue.push_message(msg).await?;
+
+          if is_last_part {
+            tracing::warn!(
+              handle = self.core.handle,
+              pipe_id = pipe_read_id,
+              "DEALER received only identity frame from peer (no payload)"
+            );
+            // No entry was created, nothing to remove.
+          } else {
+            tracing::trace!(
+              handle = self.core.handle,
+              pipe_id = pipe_read_id,
+              "DEALER inserting pipe state (payload expected)"
+            );
+            // Insert an empty Vec just to mark that we are waiting.
+            partial_guard.insert(pipe_read_id, Vec::new());
+          }
         }
       }
       _ => { /* DEALER ignores other pipe events */ }
@@ -227,12 +333,7 @@ impl ISocket for DealerSocket {
     Ok(())
   }
 
-  async fn pipe_attached(
-    &self,
-    pipe_read_id: usize,
-    pipe_write_id: usize,
-    _peer_identity: Option<&[u8]>,
-  ) {
+  async fn pipe_attached(&self, pipe_read_id: usize, pipe_write_id: usize, _peer_identity: Option<&[u8]>) {
     tracing::debug!(
       handle = self.core.handle,
       pipe_read_id = pipe_read_id,
@@ -254,14 +355,12 @@ impl ISocket for DealerSocket {
       pipe_read_id = pipe_read_id,
       "DEALER detaching pipe"
     );
-    let maybe_write_id = self
-      .pipe_read_to_write_id
-      .lock()
-      .await
-      .remove(&pipe_read_id);
+    let maybe_write_id = self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
     if let Some(write_id) = maybe_write_id {
       self.load_balancer.remove_pipe(write_id).await;
     }
     self.incoming_queue.pipe_detached(pipe_read_id);
+
+    self.partial_incoming.lock().await.remove(&pipe_read_id);
   }
 } // end impl ISocket for DealerSocket

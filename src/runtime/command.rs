@@ -1,6 +1,6 @@
 // src/runtime/command.rs
 
-use crate::error::ZmqError;
+use crate::{error::ZmqError, Blob};
 use crate::message::Msg;
 
 use std::fmt;
@@ -57,10 +57,12 @@ pub enum Command {
   /// Sent from child to parent confirming clean shutdown.
   CleanupComplete {
     handle: usize,
-  }, // Identify child by handle (TBD)
+    endpoint_uri: Option<String>,
+  }, // Identify child by handle
   /// Sent from child to parent reporting a fatal error.
   ReportError {
     handle: usize,
+    endpoint_uri: String, // Make URI mandatory for error reporting
     error: ZmqError,
   },
 
@@ -112,7 +114,7 @@ pub enum Command {
   // Placeholder if Engine needs to request something from Session:
   // SessionPullRequestCmd { reply_tx: oneshot::Sender<Result<SomeData, ZmqError>> },
   /// Sent from Engine -> Session when ZMTP handshake is complete
-  EngineReady,
+    EngineReady { peer_identity: Option<Blob> },
   /// Sent from Engine -> Session upon fatal error
   EngineError {
     error: ZmqError,
@@ -150,6 +152,23 @@ pub enum Command {
     // Pass IDs for potential future use/logging in Session
     pipe_read_id: usize,  // ID Session uses to read (Core writes to this)
     pipe_write_id: usize, // ID Session uses to write (Core reads from this)
+  },
+  /// Sent from Connector's SocketCore -> Binder's SocketCore via Context registry.
+  #[cfg(feature = "inproc")]
+  InprocConnectRequest {
+    connector_uri: String,                           // Identify the connector
+    connector_pipe_tx: AsyncSender<Msg>,             // Connector's SENDING end (Binder writes here)
+    connector_pipe_rx: AsyncReceiver<Msg>,           // Connector's RECEIVING end (Binder reads from here)
+    connector_pipe_write_id: usize,                  // ID Binder uses to write to connector
+    connector_pipe_read_id: usize,                   // ID Binder uses to read from connector
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Confirm connection accepted/rejected
+  },
+  /// Sent from Connector's SocketCore -> Binder's SocketCore when connector closes pipe.
+  /// Needed because Binder holds the other ends of the channels directly.
+  #[cfg(feature = "inproc")]
+  InprocPipeClosed {
+    // Identify which pipe closed (e.g., the ID Binder uses to read from connector)
+    pipe_read_id: usize,
   },
 }
 

@@ -12,7 +12,15 @@ use async_trait::async_trait;
 use bitflags::bitflags;
 use std::collections::{HashMap, VecDeque}; // To temporarily store routing parts
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{oneshot, Mutex, MutexGuard};
+use tokio::time::timeout;
+
+use super::options::SocketOptions;
+
+/// Metadata key type for associating the source pipe ID with a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SourcePipeReadId(usize);
 
 /// Information about the peer from which the last request was received.
 #[derive(Debug, Clone)]
@@ -44,12 +52,11 @@ pub(crate) struct RepSocket {
 
 impl RepSocket {
   /// Creates a new RepSocket.
-  pub fn new(core: Arc<SocketCore>) -> Self {
-    // TODO: Get RCVHWM from core options
-    let initial_hwm = 1000;
+  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
+    let queue_capacity = options.rcvhwm.max(1);
     Self {
       core,
-      incoming_request_queue: FairQueue::new(initial_hwm),
+      incoming_request_queue: FairQueue::new(queue_capacity),
       state: Mutex::new(RepState::ReadyToReceive),
       pipe_read_to_write_id: Mutex::new(HashMap::new()),
     }
@@ -103,85 +110,76 @@ impl ISocket for RepSocket {
       ));
     }
 
-    // Pop the *full* incoming request (including routing prefix) from the queue
-    let full_request = match self.incoming_request_queue.pop_message().await? {
-      Some(msg) => msg,
-      None => {
-        return Err(ZmqError::Internal(
-          "Request queue closed unexpectedly".into(),
-        ))
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
+
+    // Need to loop reading parts until last part received, applying timeout to EACH part?
+    // ZMQ RCVTIMEO usually applies to the *whole logical message* arrival.
+    // Our FairQueue stores individual frames. This makes timeout complex.
+
+    // --- RETHINK: Timeout on the *first* part read? ---
+    let first_part_pop_future = self.incoming_request_queue.pop_message();
+    let first_part_result = match rcvtimeo_opt {
+      Some(duration) if !duration.is_zero() => {
+        timeout(duration, first_part_pop_future)
+          .await
+          .map_err(|_| ZmqError::Timeout)? // Map timeout error
       }
+      _ => first_part_pop_future.await, // No timeout
     };
 
-    // Now, parse the received message(s) to separate routing info from payload
-    // ZMTP guarantees multi-part messages arrive contiguously. We expect handle_pipe_event
-    // to push one "logical" message (which might be multi-part internally) to the queue.
-    // For now, assume handle_pipe_event pushes a Vec<Msg> or similar if multi-part needed.
-    // Let's simplify: assume incoming is single Msg, routing info is in metadata? NO.
-    // Backtrack: FairQueue holds Msg. handle_pipe_event needs to reconstruct logical requests.
+    let first_part = match first_part_result? {
+      Some(msg) => msg,
+      None => return Err(ZmqError::Internal("Request queue closed".into())),
+    };
+    // <<< NOTE: Renamed first_part variable here for clarity >>>
 
-    // --- RETHINK handle_pipe_event / FairQueue interaction for multi-part ---
-    // Option 1: FairQueue stores Vec<Msg>. handle_pipe_event collects frames until MORE flag is unset.
-    // Option 2: FairQueue stores Msg. recv() loops calling pop_message until MORE flag is unset.
-    // Option 3: Pass Pipe ID with message? FQ stores (usize, Msg). recv gets ID.
-
-    // Let's try Option 2: recv loops here. Requires FQ stores single Msgs.
     let mut request_parts: Vec<Msg> = Vec::new();
     let mut source_pipe_read_id: Option<usize> = None;
 
-    // Assume FQ stores Msg, and metadata *might* contain source pipe ID added by handle_pipe_event
-    // TODO: Ensure handle_pipe_event adds PipeReadId metadata!
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    struct PipeReadId(usize); // Metadata key
+    // Process first part
+    // Use the externally defined struct
+    if let Some(id_meta) = first_part.metadata().get::<SourcePipeReadId>().await {
+      source_pipe_read_id = Some(id_meta.0);
+    } else {
+      // Handle missing metadata gracefully
+      tracing::error!(handle = self.core.handle, msg = ?first_part, "REP recv: Message part missing expected SourcePipeReadId metadata!");
+      // Decide how to handle: Return error? Panic (like now)? Drop message?
+      // Returning an error seems safest.
+      return Err(ZmqError::Internal(
+        "Missing pipe ID metadata on received message".into(),
+      ));
+    }
+    let mut is_last = !first_part.is_more();
+    request_parts.push(first_part);
 
-    loop {
-      let part = match self.incoming_request_queue.pop_message().await? {
+    // Loop for subsequent parts (no timeout applied here)
+    while !is_last {
+      let next_part = match self.incoming_request_queue.pop_message().await? {
         Some(msg) => msg,
-        None => {
-          return Err(ZmqError::Internal(
-            "Request queue closed unexpectedly".into(),
-          ))
-        }
+        None => return Err(ZmqError::ProtocolViolation("Incomplete message received".into())),
       };
-
-      // Store source pipe from the *first* part
-      if source_pipe_read_id.is_none() {
-        // Attempt to get source_pipe_read_id from metadata
-        // This requires handle_pipe_event to add it!
-        if let Some(id_meta) = part.metadata().get::<PipeReadId>().await {
-          source_pipe_read_id = Some(id_meta.0);
-        } else {
-          tracing::error!(
-            handle = self.core.handle,
-            "Received message part without PipeReadId metadata!"
-          );
-          // Cannot proceed without knowing the source
-          // Discard parts received so far and return error?
-          return Err(ZmqError::Internal(
-            "Missing source pipe ID on request".into(),
-          ));
-        }
+      // Verify subsequent parts also have metadata? Optional but safer
+      if next_part.metadata().get::<SourcePipeReadId>().await.is_none() {
+        tracing::error!(handle = self.core.handle, msg = ?next_part, "REP recv: Subsequent message part missing expected SourcePipeReadId metadata!");
+        return Err(ZmqError::Internal(
+          "Missing pipe ID metadata on subsequent message part".into(),
+        ));
       }
-
-      let is_last_part = !part.is_more();
-      request_parts.push(part);
-      if is_last_part {
-        break;
-      }
+      is_last = !next_part.is_more();
+      request_parts.push(next_part);
     }
 
-    let source_pipe_read_id = source_pipe_read_id.unwrap(); // Should be set now
+    // <<< This unwrap should now succeed if metadata is present >>>
+    let source_pipe_read_id = source_pipe_read_id.expect("source_pipe_read_id should be Some if metadata check passed");
 
-    // Separate routing prefix (all but the last part) from payload (last part)
     let payload = request_parts
       .pop()
       .ok_or_else(|| ZmqError::ProtocolViolation("Received empty message".into()))?;
-    let routing_prefix = request_parts; // Remaining parts are prefix
+    let routing_prefix = request_parts;
 
-    // Store peer info and transition state
     let peer_info = PeerInfo {
       source_pipe_read_id,
-      routing_prefix, // Already in reverse order if we push()? No, keep as received.
+      routing_prefix,
     };
     *current_state_guard = RepState::ReceivedRequest(peer_info);
 
@@ -190,18 +188,14 @@ impl ISocket for RepSocket {
       pipe_id = source_pipe_read_id,
       "REP received request, ready to send reply"
     );
-    Ok(payload) // Return only the actual payload to the user
+    Ok(payload)
   } // end recv
 
   async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
     let mut current_state_guard = self.state.lock().await;
     let peer_info = match &*current_state_guard {
       RepState::ReceivedRequest(info) => info.clone(), // Clone needed info
-      _ => {
-        return Err(ZmqError::InvalidState(
-          "REP socket must call recv() before sending",
-        ))
-      }
+      _ => return Err(ZmqError::InvalidState("REP socket must call recv() before sending")),
     };
     // Important: Transition state *before* async operations below to prevent races
     *current_state_guard = RepState::ReadyToReceive;
@@ -213,7 +207,11 @@ impl ISocket for RepSocket {
       match map_guard.get(&peer_info.source_pipe_read_id).copied() {
         Some(id) => id,
         None => {
-          tracing::error!(handle=self.core.handle, pipe_read_id=peer_info.source_pipe_read_id, "REP send failed: Write pipe ID not found for source read pipe (peer likely disconnected)");
+          tracing::error!(
+            handle = self.core.handle,
+            pipe_read_id = peer_info.source_pipe_read_id,
+            "REP send failed: Write pipe ID not found for source read pipe (peer likely disconnected)"
+          );
           // Peer disconnected after we received request but before sending reply.
           // State was already reset, just return error.
           return Err(ZmqError::ConnectionClosed); // Or a different error?
@@ -240,13 +238,15 @@ impl ISocket for RepSocket {
 
     // 3. Prepend routing prefix frames (if any)
     let mut frames_to_send: VecDeque<Msg> = VecDeque::new();
-    // Ensure LAST part sent has MORE flag unset
-    msg.set_flags(MsgFlags::MORE); // Need mutable flags access
-    frames_to_send.push_back(msg); // Payload goes last
 
-    // Prepend routing prefix in reverse order they were received
+    // Add payload (last frame)
+    msg.set_flags(msg.flags() & !MsgFlags::MORE); // Ensure MORE is unset on payload
+    frames_to_send.push_back(msg);
+
+    // Prepend stored prefix frames (already in correct order)
     for mut prefix_msg in peer_info.routing_prefix.into_iter().rev() {
-      prefix_msg.set_flags(MsgFlags::MORE); // Ensure MORE flag is set on prefix parts
+      // Iterate stored prefix in reverse to prepend
+      prefix_msg.set_flags(prefix_msg.flags() | MsgFlags::MORE); // Ensure MORE is set
       frames_to_send.push_front(prefix_msg);
     }
 
@@ -263,11 +263,7 @@ impl ISocket for RepSocket {
       }
     }
 
-    tracing::trace!(
-      handle = self.core.handle,
-      pipe_id = pipe_write_id,
-      "REP sent reply"
-    );
+    tracing::trace!(handle = self.core.handle, pipe_id = pipe_write_id, "REP sent reply");
     Ok(())
   } // end send
 
@@ -287,12 +283,9 @@ impl ISocket for RepSocket {
   async fn handle_pipe_event(&self, pipe_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { mut msg, .. } => {
+        tracing::debug!(handle=self.core.handle, pipe_id=pipe_id, "REQ handle_pipe_event called for PipeMessageReceived");
         // Need to add source pipe ID metadata BEFORE pushing to queue
-        // Ensure ISocket trait has method to get core handle? Yes, core().
-        // let core_handle = self.core.handle; // Need handle access
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        struct PipeReadId(usize);
-        msg.metadata_mut().insert_typed(PipeReadId(pipe_id)).await; // Add metadata
+        msg.metadata_mut().insert_typed(SourcePipeReadId(pipe_id)).await; // Add metadata
 
         // Push message part into the queue for recv() to pick up
         // recv() will loop until MORE flag is unset.
@@ -309,12 +302,7 @@ impl ISocket for RepSocket {
     Ok(())
   }
 
-  async fn pipe_attached(
-    &self,
-    pipe_read_id: usize,
-    pipe_write_id: usize,
-    _peer_identity: Option<&[u8]>,
-  ) {
+  async fn pipe_attached(&self, pipe_read_id: usize, pipe_write_id: usize, _peer_identity: Option<&[u8]>) {
     tracing::debug!(
       handle = self.core.handle,
       pipe_read_id = pipe_read_id,
@@ -338,11 +326,7 @@ impl ISocket for RepSocket {
       "REP detaching pipe"
     );
     // Remove from map
-    self
-      .pipe_read_to_write_id
-      .lock()
-      .await
-      .remove(&pipe_read_id);
+    self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
     // Notify FairQueue
     self.incoming_request_queue.pipe_detached(pipe_read_id);
 
