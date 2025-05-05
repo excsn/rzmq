@@ -1,6 +1,7 @@
 // tests/common.rs
 #![allow(dead_code)] // Allow unused helpers for now
 
+use rzmq::socket::{MonitorReceiver, SocketEvent};
 use rzmq::{Context, Socket, SocketType, ZmqError};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -99,5 +100,39 @@ pub async fn bind_socket_resolve(socket: &Socket, base_endpoint: &str) -> Result
      // Ok("tcp://127.0.0.1:5555".to_string()) // Example
   } else {
      Ok(base_endpoint.to_string())
+  }
+}
+
+// --- Helper function to wait for specific monitor event ---
+pub async fn wait_for_monitor_event(
+  monitor_rx: &MonitorReceiver,
+  timeout: Duration,
+  short_recv_timeout: Duration,
+  check_event: impl Fn(&SocketEvent) -> bool, // Closure to check if event matches
+) -> Result<SocketEvent, String>
+{
+  let start_time = tokio::time::Instant::now();
+  loop {
+      // Check elapsed time first
+      if start_time.elapsed() > timeout {
+          return Err(format!("Timeout waiting for specific monitor event after {:?}", timeout));
+      }
+
+      // Try receiving with a short interval timeout
+      match tokio::time::timeout(short_recv_timeout, monitor_rx.recv()).await {
+          Ok(Ok(event)) => { // Received an event
+               println!("Monitor received: {:?}", event); // Log received event
+               if check_event(&event) {
+                   return Ok(event); // Found the event we want
+               }
+               // Event received, but not the one we're looking for, continue loop
+          }
+          Ok(Err(_recv_err)) => { // Channel closed
+              return Err("Monitor channel closed unexpectedly".to_string());
+          }
+          Err(_elapsed) => { // Timeout for this recv attempt
+              // Continue loop to check overall timeout
+          }
+      }
   }
 }

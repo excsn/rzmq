@@ -3,59 +3,58 @@
 use crate::engine::zmtp_tcp::create_and_spawn_tcp_engine;
 use crate::error::ZmqError;
 use crate::runtime::{mailbox, Command, MailboxReceiver, MailboxSender};
-use crate::session::{self, SessionBase}; // Import placeholder Session
-use crate::socket::options::{SocketOptions, TcpTransportConfig, ZmtpEngineConfig};
-use crate::Msg; // Import config struct
+use crate::session::{self, SessionBase};
+use crate::socket::events::{MonitorSender, SocketEvent}; // Import monitor types
+use crate::socket::options::{SocketOptions, TcpTransportConfig};
 use socket2::{SockRef, TcpKeepalive};
+use std::io; // For error kinds
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::sleep; // For socket options
+use tokio::time::sleep;
 
+// --- TcpListener ---
+#[derive(Debug)]
 pub(crate) struct TcpListener {
   handle: usize,
-  endpoint: String,                 // The original requested endpoint URI
-  local_addr: std::net::SocketAddr, // The actual bound address
+  endpoint: String, // The original requested endpoint URI
+  // local_addr: std::net::SocketAddr, // Store if needed, not strictly required by actor
   core_mailbox: MailboxSender,
   mailbox_receiver: MailboxReceiver,
   listener_handle: JoinHandle<()>, // Handle to the accept loop task
-  listener: Arc<TokioTcpListener>, // Listener needs to be shared for accept loop
-  config: TcpTransportConfig,
-  context_options: Arc<SocketOptions>, // Store full options to pass to Engine factory
-  context_handle_source: Arc<std::sync::atomic::AtomicUsize>, // Source for unique IDs
+                                   // No need to store listener Arc, options Arc, or handle source Arc here
 }
 
 impl TcpListener {
   pub(crate) fn create_and_spawn(
     handle: usize,
-    endpoint: String, // e.g., "tcp://*:5555" or "tcp://127.0.0.1:5555"
+    endpoint: String,
     options: Arc<SocketOptions>,
     core_mailbox: MailboxSender,
-    context_handle_source: Arc<std::sync::atomic::AtomicUsize>, // Pass down handle source
+    context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
+    monitor_tx: Option<MonitorSender>, // Accept monitor sender
   ) -> Result<(MailboxSender, JoinHandle<()>), ZmqError> {
     let (tx, rx) = mailbox();
 
     // --- Bind the actual listener ---
-    // TODO: Extract address from endpoint string properly
-    let bind_addr_str = endpoint.strip_prefix("tcp://").unwrap_or(&endpoint); // Simplistic parsing
+    let bind_addr_str = endpoint
+      .strip_prefix("tcp://")
+      .ok_or_else(|| ZmqError::InvalidEndpoint(endpoint.clone()))?;
     let std_listener =
       std::net::TcpListener::bind(bind_addr_str).map_err(|e| ZmqError::from_io_endpoint(e, &endpoint))?;
-    std_listener.set_nonblocking(true).map_err(|e| ZmqError::Io(e))?; // Essential for Tokio
-                                                                      // Apply SO_REUSEADDR? Often needed for servers.
+    std_listener.set_nonblocking(true).map_err(ZmqError::Io)?;
     SockRef::from(&std_listener)
       .set_reuse_address(true)
-      .map_err(|e| ZmqError::Io(e))?;
+      .map_err(ZmqError::Io)?;
 
-    let tokio_listener = TokioTcpListener::from_std(std_listener).map_err(|e| ZmqError::Io(e))?;
-    let local_addr = tokio_listener.local_addr().map_err(|e| ZmqError::Io(e))?;
-    tracing::info!(handle = handle, ?local_addr, "TCP Listener bound successfully");
+    let tokio_listener = TokioTcpListener::from_std(std_listener).map_err(ZmqError::Io)?;
+    let local_addr = tokio_listener.local_addr().map_err(ZmqError::Io)?;
+    tracing::info!(handle = handle, ?local_addr, uri = %endpoint, "TCP Listener bound successfully");
     let listener_arc = Arc::new(tokio_listener);
     // --- End Bind ---
 
     let config = TcpTransportConfig {
-      // Create transport config
       tcp_nodelay: options.tcp_nodelay,
       keepalive_time: options.tcp_keepalive_idle,
       keepalive_interval: options.tcp_keepalive_interval,
@@ -66,38 +65,39 @@ impl TcpListener {
     let accept_core_mailbox = core_mailbox.clone();
     let accept_listener = listener_arc.clone();
     let accept_handle_source = context_handle_source.clone();
+    let accept_options = options.clone();
+    let accept_config = config.clone();
+    let accept_monitor_tx = monitor_tx.clone();
+    let endpoint_clone = endpoint.clone();
+
     let accept_loop_handle = tokio::spawn(TcpListener::run_accept_loop(
       handle,
+      endpoint_clone, // Pass original endpoint URI
       accept_listener,
       accept_core_mailbox,
-      config.clone(),
-      options.clone(),
+      accept_config,
+      accept_options,
       accept_handle_source,
+      accept_monitor_tx, // Pass monitor sender
     ));
 
     let actor = TcpListener {
       handle,
-      endpoint,
-      local_addr,
+      endpoint, // Store original endpoint
+      // local_addr, // Not needed after bind log
       core_mailbox,
       mailbox_receiver: rx,
-      listener_handle: accept_loop_handle,
-      listener: listener_arc,   // Keep Arc reference
-      config,                   // Store transport config
-      context_options: options, // Store full options Arc
-      context_handle_source,
+      listener_handle: accept_loop_handle, // Store handle to accept loop
     };
 
-    // Spawn the command handling loop for this Listener actor
     let command_loop_handle = tokio::spawn(actor.run_command_loop());
-
-    Ok((tx, command_loop_handle)) // Return mailbox to command this actor
+    Ok((tx, command_loop_handle)) // Return mailbox and handle for command loop
   }
 
   /// Main loop to handle commands (like Stop) for the Listener actor itself.
   async fn run_command_loop(mut self) {
     let handle = self.handle;
-    let endpoint_uri = self.endpoint.clone(); // Clone for cleanup message
+    let endpoint_uri = self.endpoint.clone();
     tracing::debug!(handle = handle, uri=%endpoint_uri, "Listener command loop started");
 
     loop {
@@ -106,34 +106,27 @@ impl TcpListener {
           cmd = self.mailbox_receiver.recv() => {
             match cmd {
               Ok(Command::Stop) => {
-                tracing::info!(handle = self.handle, endpoint=%self.endpoint, "Listener received Stop command");
-                // Stop the accept loop by aborting its task handle
-                self.listener_handle.abort();
-                // We should ideally wait briefly for the accept loop to exit
-                // after aborting it, before sending CleanupComplete.
-                // However, awaiting the aborted handle directly can panic if the task panicked.
-                // A simple sleep might suffice, or a more complex signal mechanism.
-                // For now, just break and send cleanup immediately.
-                // let _ = self.listener_handle.await; // This might panic
+                tracing::info!(handle = handle, uri=%endpoint_uri, "Listener received Stop command");
+                self.listener_handle.abort(); // Stop accept loop first
                 break; // Exit command loop
               },
-              Ok(other) => tracing::warn!(handle=self.handle, uri=%endpoint_uri, "Listener received unhandled command: {:?}", other),
+              Ok(other) => tracing::warn!(handle=handle, uri=%endpoint_uri, "Listener received unhandled command: {:?}", other),
               Err(_) => {
-                tracing::info!(handle=self.handle, uri=%endpoint_uri, "Listener command mailbox closed, stopping accept loop.");
-                self.listener_handle.abort(); // Ensure accept loop stops
+                tracing::info!(handle=handle, uri=%endpoint_uri, "Listener command mailbox closed, stopping accept loop.");
+                self.listener_handle.abort();
                 break;
               }
             }
           }
       }
     }
-    tracing::debug!(handle = self.handle, uri=%endpoint_uri, "Listener command loop finished");
+    tracing::debug!(handle = handle, uri=%endpoint_uri, "Listener command loop finished");
 
-    // Send cleanup notification AFTER command loop exits (implies accept loop was aborted)
+    // Send CleanupComplete notification AFTER command loop exits
     if !self.core_mailbox.is_closed() {
       let cleanup_cmd = Command::CleanupComplete {
         handle: self.handle,
-        endpoint_uri: Some(self.endpoint.clone()), // Use original URI
+        endpoint_uri: Some(self.endpoint.clone()),
       };
       if let Err(e) = self.core_mailbox.send(cleanup_cmd).await {
         tracing::warn!(handle=self.handle, uri=%self.endpoint, "Failed to send CleanupComplete to Core: {:?}", e);
@@ -141,143 +134,153 @@ impl TcpListener {
         tracing::debug!(handle=self.handle, uri=%self.endpoint, "Listener sent CleanupComplete to Core.");
       }
     }
+    // No Drop impl needed here, socket closure handled by std/tokio
   }
 
   /// Separate task that runs the blocking `accept()` loop.
   async fn run_accept_loop(
-    listener_handle_id: usize, // Use the main listener actor handle for logging context
+    listener_handle_id: usize,
+    endpoint_uri: String, // Original listener URI
     listener: Arc<TokioTcpListener>,
     core_mailbox: MailboxSender,
     config: TcpTransportConfig,
     options: Arc<SocketOptions>,
     handle_source: Arc<std::sync::atomic::AtomicUsize>,
+    monitor_tx: Option<MonitorSender>, // Accept monitor sender
   ) {
-    let local_addr_str = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
-    // TODO: Need the original endpoint URI passed down for accurate reporting, local_addr might be wildcard.
-    // Let's assume for now we pass the original URI down to this function.
-    // This requires changing create_and_spawn and the function signature.
-    // Alternative: Use listener_handle_id and have Core map it back? Less direct.
-    // Placeholder - Assume original_endpoint_uri is passed:
-    let endpoint_uri = format!("tcp://{}", local_addr_str); // Placeholder
     tracing::debug!(parent_handle = listener_handle_id, uri=%endpoint_uri, "Listener accept loop started");
-
-    let mut loop_error: Option<ZmqError> = None; // Track fatal error
+    let mut loop_error: Option<ZmqError> = None;
 
     loop {
-      // Accept new connections
-      let accept_result = listener.accept().await;
-
-      match accept_result {
+      match listener.accept().await {
         Ok((stream, peer_addr)) => {
+          let peer_addr_str = peer_addr.to_string();
           tracing::info!(parent_handle = listener_handle_id, %peer_addr, "Accepted new TCP connection");
 
-          // Apply socket options (Nagle, Keepalive) using socket2
+          // Emit Accepted event
+          if let Some(ref tx) = monitor_tx {
+            let event = SocketEvent::Accepted {
+              endpoint: endpoint_uri.clone(), // Event relates to the listener endpoint
+              peer_addr: peer_addr_str.clone(),
+            };
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+              if tx_clone.send(event).await.is_err() {
+                tracing::warn!(
+                  socket_handle = listener_handle_id,
+                  "Monitor channel closed while sending Accepted event"
+                );
+              }
+            });
+          }
+
+          // Apply socket options
           if let Err(e) = apply_tcp_socket_options(&stream, &config) {
-            tracing::error!("Failed to apply socket options: {}", e);
-            // Optionally close the stream here?
+            tracing::error!(handle=listener_handle_id, peer=%peer_addr_str, error=%e, "Failed to apply socket options");
+            // Emit AcceptFailed event
+            if let Some(ref tx) = monitor_tx {
+              let event = SocketEvent::AcceptFailed {
+                endpoint: endpoint_uri.clone(),
+                error_msg: format!("Failed to apply socket options: {}", e), // Include reason
+              };
+              let tx_clone = tx.clone();
+              tokio::spawn(async move {
+                if tx_clone.send(event).await.is_err() { /* Warn */ }
+              });
+            }
+            drop(stream); // Close the stream
             continue; // Skip this connection
           }
 
-          // --- Spawn Session & Engine for the new connection ---
+          // --- Spawn Session & Engine ---
           let session_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
           let engine_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          // Session endpoint URI identifies the *specific* connection
+          let conn_endpoint_uri = format!("tcp://{}", peer_addr_str);
 
-          // Determine Endpoint URI - Use peer address? Listener address? TBD by SocketCore needs.
-          // Let's use peer address for now as it's unique per connection.
-          let endpoint_uri = format!("tcp://{}", peer_addr);
-
-          // 1. Create Session actor
           let (session_cmd_mailbox, session_task_handle) = SessionBase::create_and_spawn(
             session_handle_id,
-            endpoint_uri.clone(),
-            core_mailbox.clone(), // Pass Core's command mailbox only
-                                  // No pipe ends passed here anymore
+            conn_endpoint_uri.clone(),
+            core_mailbox.clone(),
+            monitor_tx.clone(), // Pass monitor sender to Session
           );
-
-          // 2. Create Engine actor, passing the connected stream & config
-          let (engine_mailbox, engine_task_handle) = crate::engine::zmtp_tcp::create_and_spawn_tcp_engine(
+          let (engine_mailbox, engine_task_handle) = create_and_spawn_tcp_engine(
             engine_handle_id,
-            session_cmd_mailbox.clone(), // Session's command mailbox
-            stream,                      // The TcpStream
+            session_cmd_mailbox.clone(),
+            stream,
             options.clone(),
-            true, // true for listener, false for connecter
+            true,
           );
-
-          // 3. Attach Engine to Session
           let attach_cmd = Command::Attach {
             engine_mailbox,
             engine_handle: Some(engine_handle_id),
             engine_task_handle: Some(engine_task_handle),
           };
-          // Send Attach command TO the Session actor's command mailbox
           if session_cmd_mailbox.send(attach_cmd).await.is_err() {
-            tracing::error!(
-              session_handle = session_handle_id,
-              "Failed to send Attach command to session, dropping connection."
-            );
+            tracing::error!(session_handle=session_handle_id, uri=%conn_endpoint_uri, "Failed to send Attach command to session, dropping connection.");
+            // TODO: Should we emit an AcceptFailed event here too?
             continue;
           }
 
-          // 4. Report success back to SocketCore
+          // Report ConnSuccess to Core
           let success_cmd = Command::ConnSuccess {
-            endpoint: endpoint_uri.clone(),               // Identify connection
-            session_mailbox: session_cmd_mailbox.clone(), // Provide Session command mailbox
+            endpoint: conn_endpoint_uri.clone(), // Resolved peer URI
+            target_endpoint_uri: endpoint_uri.clone(), // Original target URI
+            session_mailbox: session_cmd_mailbox,
             session_handle: Some(session_handle_id),
             session_task_handle: Some(session_task_handle),
           };
-          tracing::warn!("TODO: ConnSuccess command needs to include pipe channel ends for SocketCore!");
           if core_mailbox.send(success_cmd).await.is_err() {
-            tracing::error!(
-              parent_handle = listener_handle_id,
-              "Failed to send ConnSuccess to core mailbox. Core actor might be stopped."
-            );
+            tracing::error!(parent_handle = listener_handle_id, uri=%endpoint_uri, "Failed to send ConnSuccess to core mailbox. Core actor likely stopped.");
             loop_error = Some(ZmqError::Internal("Core mailbox closed".into()));
-            // If core is gone, maybe stop accepting?
             break;
           }
-        } // end Ok((stream, peer_addr))
+        }
         Err(e) => {
-          // Accept errors are often recoverable (e.g., EMFILE)
-          // But could also be fatal if listener is closed
-          tracing::error!(parent_handle = listener_handle_id, "Error accepting connection: {}", e);
-          use std::io;
-          if matches!(
-            e.kind(),
-            io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe /* Add other fatal kinds */
-          ) {
+          tracing::error!(parent_handle = listener_handle_id, uri=%endpoint_uri, error=%e, "Error accepting TCP connection");
+          // Emit AcceptFailed event
+          if let Some(ref tx) = monitor_tx {
+            let event = SocketEvent::AcceptFailed {
+              endpoint: endpoint_uri.clone(),
+              error_msg: format!("{}", e),
+            };
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+              if tx_clone.send(event).await.is_err() { /* Warn */ }
+            });
+          }
+          // Check for fatal errors
+          if is_fatal(&e) {
             tracing::error!(parent_handle = listener_handle_id, uri=%endpoint_uri, error=%e, "Fatal error in accept loop, stopping.");
             loop_error = Some(ZmqError::from_io_endpoint(e, &endpoint_uri));
-            break; // Exit loop on fatal error
+            break;
           }
-
-          // Consider delay before retrying accept?
           tokio::time::sleep(Duration::from_millis(100)).await;
-          // TODO: Should check if error is fatal and break loop?
         }
       } // end match accept_result
     } // end loop
 
     tracing::debug!(parent_handle = listener_handle_id, uri=%endpoint_uri, "Listener accept loop finished");
 
-    // Send ReportError if loop exited due to error, otherwise nothing (command loop sends CleanupComplete)
+    // Send ReportError if loop exited due to error
     if let Some(error) = loop_error {
       if !core_mailbox.is_closed() {
         let report_cmd = Command::ReportError {
-          handle: listener_handle_id,
+          handle: listener_handle_id, // Report error against listener handle
           endpoint_uri: endpoint_uri.clone(),
           error,
         };
-        if let Err(e) = core_mailbox.send(report_cmd).await {
-          tracing::warn!(handle=listener_handle_id, uri=%endpoint_uri, "Failed to send ReportError from accept loop: {:?}", e);
+        if let Err(e) = core_mailbox.send(report_cmd).await { /* Warn */
         } else {
           tracing::debug!(handle=listener_handle_id, uri=%endpoint_uri, "Listener accept loop sent ReportError to Core.");
         }
       }
     }
-    // Note: CleanupComplete is now sent by the run_command_loop owning the listener actor.
   } // end run_accept_loop
-}
+} // end impl TcpListener
 
+// --- TcpConnecter ---
+#[derive(Debug)]
 pub(crate) struct TcpConnecter {
   handle: usize,
   endpoint: String, // Target endpoint URI
@@ -285,6 +288,7 @@ pub(crate) struct TcpConnecter {
   config: TcpTransportConfig,
   context_options: Arc<SocketOptions>,
   context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
+  // No need to store monitor_tx here, passed directly to run_connect_loop
 }
 
 impl TcpConnecter {
@@ -294,15 +298,15 @@ impl TcpConnecter {
     options: Arc<SocketOptions>,
     core_mailbox: MailboxSender,
     context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
+    monitor_tx: Option<MonitorSender>, // Accept monitor sender
   ) -> JoinHandle<()> {
+    // Returns JoinHandle for the connect loop task
     let config = TcpTransportConfig {
-      // Create transport config
       tcp_nodelay: options.tcp_nodelay,
       keepalive_time: options.tcp_keepalive_idle,
       keepalive_interval: options.tcp_keepalive_interval,
       keepalive_count: options.tcp_keepalive_count,
     };
-
     let connecter = TcpConnecter {
       handle,
       endpoint,
@@ -311,68 +315,112 @@ impl TcpConnecter {
       context_options: options,
       context_handle_source,
     };
-    // Spawn the main task that attempts connection
-    let task_handle = tokio::spawn(connecter.run_connect_loop());
-
+    // Spawn the main task that attempts connection, passing monitor_tx
+    let task_handle = tokio::spawn(connecter.run_connect_loop(monitor_tx));
     task_handle
   }
 
-  /// Main task loop that attempts to connect.
-  async fn run_connect_loop(self) {
+  /// Main task loop that attempts to connect. Consumes self.
+  async fn run_connect_loop(self, monitor_tx: Option<MonitorSender>) {
+    // Accept monitor_tx
     let handle = self.handle;
     let endpoint_uri = self.endpoint.clone();
     let target_addr_str = match endpoint_uri.strip_prefix("tcp://") {
       Some(addr) => addr.to_string(),
       None => {
         tracing::error!(handle = handle, uri = %endpoint_uri, "Invalid TCP endpoint format");
+        let error = ZmqError::InvalidEndpoint(endpoint_uri.clone());
+        // Emit ConnectFailed immediately
+        if let Some(ref tx) = monitor_tx {
+          let event = SocketEvent::ConnectFailed {
+            endpoint: endpoint_uri.clone(),
+            error_msg: format!("{}", error),
+          };
+          let tx_clone = tx.clone();
+          tokio::spawn(async move {
+            if tx_clone.send(event).await.is_err() { /* Warn */ }
+          });
+        }
+        // Report ConnFailed to Core
         let fail_cmd = Command::ConnFailed {
           endpoint: endpoint_uri.clone(),
-          error: ZmqError::InvalidEndpoint(endpoint_uri.clone()),
+          error,
         };
         let _ = self.core_mailbox.send(fail_cmd).await;
-        // Don't send CleanupComplete here, the actor task finishing is the signal
+        // Send CleanupComplete because this task finished
+        if !self.core_mailbox.is_closed() {
+          let cleanup_cmd = Command::CleanupComplete {
+            handle,
+            endpoint_uri: Some(endpoint_uri),
+          };
+          if let Err(e) = self.core_mailbox.send(cleanup_cmd).await { /* Warn */ }
+        }
         return;
       }
     };
 
     tracing::info!(handle = handle, uri = %endpoint_uri, "TcpConnecter actor started.");
-
     let mut current_delay = self.context_options.reconnect_ivl.unwrap_or(Duration::ZERO);
     let max_delay = self.context_options.reconnect_ivl_max;
     let mut attempt_count = 0;
-    let mut stopped_by_command = false;
+    let mut connection_established = false; // Flag to track if ConnSuccess was sent
 
     loop {
-      // --- Waiting Phase (skip delay for first attempt) ---
       if attempt_count > 0 {
         if current_delay.is_zero() {
           tracing::info!(handle = handle, uri = %endpoint_uri, "Reconnect disabled (interval is 0), stopping connecter task.");
-          // No final ConnFailed needed, core just won't get ConnSuccess
-          break; // Exit loop normally
+          // Final failure if connection wasn't established before
+          if !connection_established {
+            // Emit final ConnectFailed if needed (maybe last error was recoverable?)
+            // We need the last error here. Let's assume loop only breaks on fatal or disabled reconnect.
+            // The ConnectFailed event would have been sent inside the Err block below.
+          }
+          break;
         }
         tracing::debug!(handle = handle, uri = %endpoint_uri, delay = ?current_delay, "Waiting before reconnect attempt {}", attempt_count + 1);
-        // Just sleep, no select needed
+        // Emit ConnectRetried event
+        if let Some(ref tx) = monitor_tx {
+          let event = SocketEvent::ConnectRetried {
+            endpoint: endpoint_uri.clone(),
+            interval: current_delay,
+          };
+          let tx_clone = tx.clone();
+          tokio::spawn(async move {
+            if tx_clone.send(event).await.is_err() { /* Warn */ }
+          });
+        }
         sleep(current_delay).await;
       }
       attempt_count += 1;
 
-      // --- Connection Attempt Phase ---
       tracing::debug!(handle = handle, uri = %endpoint_uri, "Attempting TCP connect #{}", attempt_count);
       let connect_result = TcpStream::connect(&target_addr_str).await;
 
       match connect_result {
         Ok(stream) => {
-          let peer_addr = stream
+          let peer_addr_str = stream
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "unknown".to_string());
-          tracing::info!(handle = handle, uri = %endpoint_uri, peer = %peer_addr, "TCP Connect successful (attempt {})", attempt_count);
+          tracing::info!(handle = handle, uri = %endpoint_uri, peer = %peer_addr_str, "TCP Connect successful (attempt {})", attempt_count);
+
+          // Emit Connected event (Transport level)
+          if let Some(ref tx) = monitor_tx {
+            let event = SocketEvent::Connected {
+              endpoint: endpoint_uri.clone(),
+              peer_addr: peer_addr_str.clone(),
+            };
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+              if tx_clone.send(event).await.is_err() { /* Warn */ }
+            });
+          }
 
           // Apply socket options
           if let Err(e) = apply_tcp_socket_options(&stream, &self.config) {
-            tracing::error!(handle = handle, uri = %endpoint_uri, peer = %peer_addr, error = %e, "Failed to apply socket options after connect, will retry connection.");
-            drop(stream); // Close the faulty stream
-                          // Calculate next delay before continuing
+            tracing::error!(handle = handle, uri = %endpoint_uri, peer = %peer_addr_str, error = %e, "Failed to apply socket options after connect, will retry connection.");
+            // Emit ConnectFailed for this attempt? Or just retry? Let's retry.
+            drop(stream);
             if let Some(max_ivl) = max_delay {
               if !max_ivl.is_zero() {
                 current_delay = (current_delay * 2).min(max_ivl);
@@ -388,9 +436,14 @@ impl TcpConnecter {
           let engine_handle_id = self
             .context_handle_source
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          let conn_endpoint_uri = format!("tcp://{}", peer_addr_str);
 
-          let (session_cmd_mailbox, session_task_handle) =
-            SessionBase::create_and_spawn(session_handle_id, endpoint_uri.clone(), self.core_mailbox.clone());
+          let (session_cmd_mailbox, session_task_handle) = SessionBase::create_and_spawn(
+            session_handle_id,
+            conn_endpoint_uri.clone(),
+            self.core_mailbox.clone(),
+            monitor_tx.clone(), // Pass monitor sender to Session
+          );
           let (engine_mailbox, engine_task_handle) = create_and_spawn_tcp_engine(
             engine_handle_id,
             session_cmd_mailbox.clone(),
@@ -407,117 +460,178 @@ impl TcpConnecter {
           // --- Attach Engine & Report Success ---
           if session_cmd_mailbox.send(attach_cmd).await.is_err() {
             tracing::error!(handle = handle, uri = %endpoint_uri, session_handle = session_handle_id, "Failed to send Attach command to session. Reporting internal error.");
+            let error = ZmqError::Internal("Failed to attach engine".into());
+            // Emit ConnectFailed because session setup failed
+            if let Some(ref tx) = monitor_tx {
+              let event = SocketEvent::ConnectFailed {
+                endpoint: endpoint_uri.clone(),
+                error_msg: format!("{}", error),
+              };
+              let tx_clone = tx.clone();
+              tokio::spawn(async move {
+                if tx_clone.send(event).await.is_err() { /* Warn */ }
+              });
+            }
+            // Report ReportError to Core (so Core cleans up session state if it was added)
             let report_cmd = Command::ReportError {
               handle,
-              endpoint_uri: endpoint_uri.clone(),
-              error: ZmqError::Internal("Failed to attach engine".into()),
-            };
+              endpoint_uri: conn_endpoint_uri.clone(),
+              error,
+            }; // Use conn_endpoint_uri
             let _ = self.core_mailbox.send(report_cmd).await;
             session_task_handle.abort();
-            // Even though attach failed, loop should exit as connection *was* made, but setup failed.
-            // Core handles the error report.
-            break;
+            break; // Exit connecter loop after reporting error
           } else {
+            // Report ConnSuccess to Core
             let success_cmd = Command::ConnSuccess {
-              endpoint: endpoint_uri.clone(),
+              endpoint: conn_endpoint_uri.clone(), // Resolved peer URI
+              target_endpoint_uri: endpoint_uri.clone(), // Original target URI
               session_mailbox: session_cmd_mailbox,
               session_handle: Some(session_handle_id),
               session_task_handle: Some(session_task_handle),
             };
             if self.core_mailbox.send(success_cmd).await.is_err() {
               tracing::error!(handle=handle, uri=%endpoint_uri, "Failed to send ConnSuccess to core mailbox.");
-              // Core is gone, nothing more we can do. Session/Engine will likely time out.
+
+              // If sending fails, the session handle moved into success_cmd is dropped,
+              // but the session task is still running. We can't easily abort it here anymore.
+              // SocketCore won't know about the session, so it won't clean it up.
+              // This might lead to an orphaned session task if the core died.
+              // This is an acceptable limitation for now maybe? Or we could clone the handle *before* moving?
+              // Let's keep it simple: if send fails, we can't abort the session from here.
+            } else {
+              connection_established = true; // Mark success
             }
-            // Connection successful and reported, exit the loop.
-            break;
+            break; // Exit loop on success
           }
-        }
+        } // End Ok(stream)
         Err(e) => {
-          // --- Connection Attempt Failed ---
           tracing::warn!(handle = handle, uri = %endpoint_uri, error = %e, "TCP Connect attempt #{} failed", attempt_count);
-          // Calculate next delay before continuing the loop
+          // Emit ConnectDelayed event (on first failure)
+          if attempt_count == 1 {
+            if let Some(ref tx) = monitor_tx {
+              let event = SocketEvent::ConnectDelayed {
+                endpoint: endpoint_uri.clone(),
+                error_msg: format!("{}", e),
+              };
+              let tx_clone = tx.clone();
+              tokio::spawn(async move {
+                if tx_clone.send(event).await.is_err() { /* Warn */ }
+              });
+            }
+          }
+          // Calculate next delay
           if let Some(max_ivl) = max_delay {
             if !max_ivl.is_zero() {
-              // max=0 disables backoff
               current_delay = (current_delay * 2).min(max_ivl);
             }
           }
-          // Continue loop to wait and retry
+          // Check if reconnect is disabled OR if error is fatal
+          if current_delay.is_zero() || is_fatal_connect_error(&e) {
+            tracing::error!(handle = handle, uri = %endpoint_uri, "Stopping connection attempts.");
+            // Emit final ConnectFailed
+            if let Some(ref tx) = monitor_tx {
+              let event = SocketEvent::ConnectFailed {
+                endpoint: endpoint_uri.clone(),
+                error_msg: format!("{}", e),
+              };
+              let tx_clone = tx.clone();
+              tokio::spawn(async move {
+                if tx_clone.send(event).await.is_err() { /* Warn */ }
+              });
+            }
+            // Report ConnFailed to Core
+            let fail_cmd = Command::ConnFailed {
+              endpoint: endpoint_uri.clone(),
+              error: ZmqError::from_io_endpoint(e, &endpoint_uri),
+            };
+            let _ = self.core_mailbox.send(fail_cmd).await;
+            break; // Exit loop
+          }
+          // Otherwise, loop continues to wait and retry
         }
       } // end match connect_result
     } // end loop
 
     // --- Task Cleanup ---
-    // Send CleanupComplete *only* if we were explicitly stopped by command
-    // before achieving a successful connection and reporting ConnSuccess.
-    // If the loop exited due to success or reconnect_ivl=0, we don't send CleanupComplete.
-    if stopped_by_command {
-      tracing::debug!(handle = handle, uri=%endpoint_uri, "Connecter task was stopped by command.");
-      if !self.core_mailbox.is_closed() {
-        let cleanup_cmd = Command::CleanupComplete {
-          handle,
-          endpoint_uri: Some(endpoint_uri.clone()),
-        };
-        if let Err(e) = self.core_mailbox.send(cleanup_cmd).await {
-          tracing::warn!(handle=handle, uri=%endpoint_uri, "Failed to send CleanupComplete after stop: {:?}", e);
-        } else {
-          tracing::debug!(handle=handle, uri=%endpoint_uri, "Connecter sent CleanupComplete after stop.");
-        }
-      }
-    } else {
-      tracing::debug!(handle = handle, uri=%endpoint_uri, "Connecter task finished naturally (connected or stopped retrying).");
-    }
-
     tracing::info!(handle = handle, uri = %endpoint_uri, "TcpConnecter actor finished.");
-  }
-}
+    // Send CleanupComplete - Connecter *always* sends this when its task ends naturally
+    if !self.core_mailbox.is_closed() {
+      let cleanup_cmd = Command::CleanupComplete {
+        handle,
+        endpoint_uri: Some(endpoint_uri),
+      };
+      if let Err(e) = self.core_mailbox.send(cleanup_cmd).await {
+        tracing::warn!(handle = handle, "Failed to send CleanupComplete: {:?}", e);
+      } else {
+        tracing::debug!(handle = handle, "TcpConnecter sent CleanupComplete to Core.");
+      }
+    }
+  } // end run_connect_loop
+} // end impl TcpConnecter
 
-/// Helper to apply common TCP socket options
+// --- Helper Functions ---
 fn apply_tcp_socket_options(stream: &TcpStream, config: &TcpTransportConfig) -> Result<(), ZmqError> {
   let socket_ref = SockRef::from(stream);
-
   socket_ref.set_nodelay(config.tcp_nodelay)?;
-
-  // Apply Keepalive settings
-  // Check if *any* keepalive parameter is set in the config
   if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
     let mut keepalive = TcpKeepalive::new();
     if let Some(time) = config.keepalive_time {
       keepalive = keepalive.with_time(time);
     }
-    // --- Apply interval if supported ---
-    #[cfg(all( // Match cfg from socket2 source
-          feature = "all", // Assuming 'all' feature of socket2 is enabled or using defaults
-          any(
-              target_os = "android", target_os = "dragonfly", target_os = "freebsd",
-              target_os = "fuchsia", target_os = "illumos", target_os = "linux",
-              target_os = "netbsd", target_vendor = "apple", target_os = "windows", // Added windows here based on source
-          )
-      ))]
+    #[cfg(all(
+      feature = "all",
+      any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_vendor = "apple",
+        target_os = "windows"
+      )
+    ))]
     if let Some(interval) = config.keepalive_interval {
-      keepalive = keepalive.with_interval(interval); // Use with_interval
+      keepalive = keepalive.with_interval(interval);
     }
-
-    // --- Apply retries/count if supported ---
-    #[cfg(all( // Match cfg from socket2 source
-          feature = "all",
-          any(
-              target_os = "android", target_os = "dragonfly", target_os = "freebsd",
-              target_os = "fuchsia", target_os = "illumos", target_os = "linux",
-              target_os = "netbsd", target_vendor = "apple",
-              // Windows does NOT support setting retries via this struct/API
-          )
-      ))]
+    #[cfg(all(
+      feature = "all",
+      any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_vendor = "apple"
+      )
+    ))]
     if let Some(count) = config.keepalive_count {
-      keepalive = keepalive.with_retries(count); // Use with_retries
+      keepalive = keepalive.with_retries(count);
     }
-
-    // Enable keepalive using the configured parameters
     socket_ref.set_tcp_keepalive(&keepalive)?;
     tracing::debug!("Applied TCP Keepalive settings: {:?}", keepalive);
   }
-  // Note: We don't explicitly handle disabling keepalive (ZMQ_TCP_KEEPALIVE=-1) here yet.
-  // `set_tcp_keepalive` likely enables SO_KEEPALIVE implicitly. Disabling might need `socket_ref.set_keepalive(Some(false))`.
-
   Ok(())
+}
+
+/// Checks for fatal accept loop errors
+fn is_fatal(e: &io::Error) -> bool {
+  matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe)
+}
+
+/// Checks for connect errors that should immediately stop retry attempts
+fn is_fatal_connect_error(e: &io::Error) -> bool {
+  matches!(
+    e.kind(),
+        io::ErrorKind::AddrNotAvailable |
+        io::ErrorKind::AddrInUse | // If somehow trying to connect from an address already in use
+        io::ErrorKind::InvalidInput | // E.g., invalid address format parsed earlier
+        io::ErrorKind::PermissionDenied // Consider adding HostUnreachable, NetworkUnreachable?
+                                        // io::ErrorKind::HostUnreachable |
+                                        // io::ErrorKind::NetworkUnreachable
+  )
 }

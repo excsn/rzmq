@@ -3,7 +3,7 @@
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
-use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
 use crate::socket::patterns::LoadBalancer;
 use crate::socket::ISocket;
 
@@ -12,11 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::lock::Mutex;
-use tokio::sync::{oneshot, MutexGuard};
-use tokio::time::{timeout as tokio_timeout, Instant};
-
-use super::core::send_msg_with_timeout;
+use tokio::sync::{oneshot, Mutex, MutexGuard};
+use tokio::time::timeout as tokio_timeout;
 
 #[derive(Debug)]
 pub(crate) struct PushSocket {
@@ -131,38 +128,72 @@ impl ISocket for PushSocket {
         break id; // Found a peer immediately
       }
 
-      // No peer found, behavior depends on timeout
+      // --- ADD CHECK: If no peer, is the core task likely dead? ---
+      // Try a non-blocking send to the core mailbox. If it fails (closed),
+      // the core actor is gone, and we shouldn't wait for peers.
+      let is_core_mailbox_closed = {
+        // Create a dummy oneshot channel (the receiver is immediately dropped)
+        let (test_tx, _) = oneshot::channel::<Result<Vec<u8>, ZmqError>>();
+        // Use a lightweight command like UserGetOpt with a dummy option ID
+        let test_cmd = Command::UserGetOpt {
+          option: -999,
+          reply_tx: test_tx,
+        }; // Dummy option
+           // try_send is non-blocking and returns Err if channel is closed or full.
+           // After termination, closed is the expected reason for Err.
+        self.core.mailbox_sender().try_send(test_cmd).is_err()
+      };
+
+      if is_core_mailbox_closed {
+        tracing::warn!(
+          handle = self.core.handle,
+          "PUSH send failed: Core mailbox closed (socket likely terminated)."
+        );
+        // Return an error indicating the socket is closed/terminated.
+        // Using InvalidState seems appropriate here, as the socket handle is being used after termination.
+        return Err(ZmqError::InvalidState("Socket terminated".into()));
+      }
+      // --- END CHECK ---
+
+      // No peer found, but core mailbox seems open. Behavior depends on timeout.
       match timeout_opt {
         Some(duration) if duration.is_zero() => {
-          // SNDTIMEO = 0 (Non-blocking) -> Return error immediately
-          tracing::trace!(handle = self.core.handle, "PUSH send failed (non-blocking): No connected peers");
+          tracing::trace!(
+            handle = self.core.handle,
+            "PUSH send failed (non-blocking): No connected peers"
+          );
           return Err(ZmqError::ResourceLimitReached); // EAGAIN
         }
         None => {
-          // SNDTIMEO = -1 (Block Indefinitely) -> Wait for notification
-          tracing::trace!(handle = self.core.handle, "PUSH send blocking: Waiting for available peer...");
-          self.load_balancer.wait_for_pipe().await; // Wait for Notify signal
-          // After waiting, loop back to try get_next_pipe() again
-          continue;
+          tracing::trace!(
+            handle = self.core.handle,
+            "PUSH send blocking: Waiting for available peer..."
+          );
+          self.load_balancer.wait_for_pipe().await;
+          continue; // Loop back after waiting
         }
         Some(duration) => {
-          // SNDTIMEO > 0 (Timed Block) -> Wait with timeout
-          tracing::trace!(handle = self.core.handle, ?duration, "PUSH send timed wait: Waiting for available peer...");
-          // <<< MODIFIED: Use tokio::time::timeout on wait_for_pipe >>>
+          tracing::trace!(
+            handle = self.core.handle,
+            ?duration,
+            "PUSH send timed wait: Waiting for available peer..."
+          );
           match tokio_timeout(duration, self.load_balancer.wait_for_pipe()).await {
-              Ok(()) => {
-                  // Wait succeeded within timeout, loop back to try get_next_pipe()
-                  continue;
-              }
-              Err(_elapsed) => {
-                  // Timeout elapsed while waiting for a peer
-                  tracing::debug!(handle = self.core.handle, ?duration, "PUSH send timed out waiting for peer");
-                  return Err(ZmqError::Timeout); // Return Timeout error
-              }
+            Ok(()) => {
+              continue; // Wait succeeded, loop back
+            }
+            Err(_elapsed) => {
+              tracing::debug!(
+                handle = self.core.handle,
+                ?duration,
+                "PUSH send timed out waiting for peer"
+              );
+              return Err(ZmqError::Timeout);
+            }
           }
         }
       } // end match timeout_opt
-    };
+    }; // end loop getting pipe_write_id
 
     // 3. Peer selected (pipe_write_id is valid), get the sender channel
     let pipe_tx = {
@@ -174,7 +205,8 @@ impl ISocket for PushSocket {
           pipe_id = pipe_write_id,
           "PUSH send failed: Pipe sender disappeared after selection."
         );
-        // TODO: Should we remove this apparently stale pipe_write_id from LoadBalancer here?
+        // Should we remove this apparently stale pipe_write_id from LoadBalancer here?
+        // Core cleanup logic should eventually handle this via pipe_detached.
         ZmqError::Internal("Pipe sender consistency error".into())
       })?
     };
@@ -340,6 +372,12 @@ impl ISocket for PushSocket {
     let maybe_write_id = self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
     if let Some(write_id) = maybe_write_id {
       self.load_balancer.remove_pipe(write_id).await;
+      tracing::trace!(
+        handle = self.core.handle,
+        pipe_read_id = pipe_read_id,
+        pipe_write_id = write_id,
+        "PUSH removed detached pipe from load balancer"
+      );
     } else {
       tracing::warn!(
         handle = self.core.handle,

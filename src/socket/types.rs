@@ -2,9 +2,12 @@
 
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::socket::ISocket; // Import the trait
+use crate::runtime::Command;
+use crate::socket::events::{MonitorReceiver, MonitorSender, SocketEvent, DEFAULT_MONITOR_CAPACITY};
+use crate::socket::ISocket;
 use std::fmt;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 /// Represents the type of a ZeroMQ socket, defining its messaging pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,6 +92,41 @@ impl Socket {
   /// Initiates graceful shutdown of the socket asynchronously.
   pub async fn close(&self) -> Result<(), ZmqError> {
     self.inner.close().await
+  }
+
+  /// Creates a monitoring channel for this socket.
+  ///
+  /// Events detailing the socket's internal state changes (connections,
+  /// disconnections, errors, etc.) will be sent to the returned receiver.
+  ///
+  /// `capacity` defines the buffer size of the monitoring channel. If the
+  /// receiver does not consume events quickly enough and the channel fills up,
+  /// subsequent events might be dropped depending on the channel behavior.
+  pub async fn monitor(&self, capacity: usize) -> Result<MonitorReceiver, ZmqError> {
+    let (monitor_tx, monitor_rx) = async_channel::bounded(capacity.max(1));
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    let cmd = Command::UserMonitor { monitor_tx, reply_tx };
+
+    // Send command to the socket's core actor
+    self
+      .inner
+      .mailbox() // Use ISocket::mailbox() to get sender
+      .send(cmd)
+      .await
+      .map_err(|_| ZmqError::Internal("Mailbox send error during monitor setup".into()))?;
+
+    // Wait for the core actor to acknowledge setup
+    reply_rx
+      .await
+      .map_err(|_| ZmqError::Internal("Reply channel error during monitor setup".into()))??; // Double ?? to propagate inner Result
+
+    Ok(monitor_rx)
+  }
+
+  /// Creates a monitoring channel with a default capacity.
+  pub async fn monitor_default(&self) -> Result<MonitorReceiver, ZmqError> {
+    self.monitor(DEFAULT_MONITOR_CAPACITY).await
   }
 }
 

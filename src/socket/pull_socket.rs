@@ -7,10 +7,10 @@ use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::FairQueue; // Use the fair queue helper
 use crate::socket::ISocket;
 use async_trait::async_trait;
-use tokio::time::timeout;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, MutexGuard};
+use tokio::time::timeout;
 
 use super::options::SocketOptions;
 
@@ -110,6 +110,27 @@ impl ISocket for PullSocket {
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
+    // --- ADD CHECK: Is the core task likely dead? ---
+    // Check if the core mailbox is closed before attempting to wait on the queue.
+    let is_core_mailbox_closed = {
+      let (test_tx, _) = oneshot::channel::<Result<Vec<u8>, ZmqError>>(); // Match expected type
+      let test_cmd = Command::UserGetOpt {
+        option: -999,
+        reply_tx: test_tx,
+      }; // Dummy command
+         // try_send returns Err if the channel is closed or full. Closed is expected after term.
+      self.core.mailbox_sender().try_send(test_cmd).is_err()
+    };
+
+    if is_core_mailbox_closed {
+      tracing::warn!(
+        handle = self.core.handle,
+        "PULL recv failed: Core mailbox closed (socket likely terminated)."
+      );
+      // Return an error indicating the socket is closed/terminated.
+      return Err(ZmqError::InvalidState("Socket terminated".into()));
+    }
+    
     // Pop message from the fair queue (awaits if empty)
     // 1. Get configured timeout from core state
     let rcvtimeo_opt: Option<Duration> = {

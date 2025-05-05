@@ -1,6 +1,7 @@
 // src/socket/mod.rs
 
 pub mod core; // Will contain SocketCore
+pub mod events; 
 pub mod options; // Will contain ZMQ option constants etc.
 pub mod patterns;
 pub mod types; // Will contain SocketType, public Socket handle // Will contain pattern helpers
@@ -13,10 +14,6 @@ pub mod rep_socket;
 pub mod req_socket;
 pub mod router_socket;
 pub mod sub_socket;
-
-pub use crate::{Socket, SocketType};
-// Re-export option constants when defined
-// pub use options::*;
 
 use crate::error::ZmqError;
 use crate::message::Msg;
@@ -134,6 +131,10 @@ pub trait ISocket: Send + Sync + 'static {
   /// Allows the pattern logic to deregister the pipe.
   async fn pipe_detached(&self, pipe_id: usize);
 }
+
+pub use types::{Socket, SocketType};
+pub use events::{SocketEvent, MonitorReceiver, MonitorSender};
+// pub use options::*;
 
 // --- Internal Helper ---
 use crate::context::Context;

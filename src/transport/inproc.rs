@@ -87,12 +87,15 @@ pub(crate) async fn connect_inproc(
   // This is tricky because there's no Session actor mailbox.
   // Maybe store binder's mailbox? Or just the pipe IDs?
   // Let's store pipe IDs for now. EndpointInfo needs adapting or separate map.
+  let endpoint_handle_id = core_arc.context.inner().next_handle(); // Generate unique ID for this entry
   let info = EndpointInfo {
     mailbox: binder_info.binder_command_mailbox.clone(), // Store binder's cmd mailbox
     task_handle: tokio::spawn(async {}),                 // Dummy task handle? No good way to track binder task.
     endpoint_type: EndpointType::Session,                // Treat as Session conceptually?
     endpoint_uri: connector_uri.clone(),
     pipe_ids: Some((pipe_id_connector_write, pipe_id_connector_read)),
+    handle_id: endpoint_handle_id,
+    target_endpoint_uri: Some(connector_uri.clone()), // Target URI is the same for inproc
   };
   connector_state.endpoints.insert(connector_uri.clone(), info);
   // Release connector state lock

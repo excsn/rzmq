@@ -1,12 +1,14 @@
 // src/runtime/command.rs
 
-use crate::{error::ZmqError, Blob};
 use crate::message::Msg;
-
-use std::fmt;
+use crate::socket::MonitorSender;
+use crate::{error::ZmqError, Blob};
 
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use tokio::sync::oneshot; // Using tokio's oneshot for replies
+
+/// Type alias for the mailbox sender used within Commands.
+pub type MailboxSender = async_channel::Sender<Command>;
 
 /// Defines messages exchanged between actors (Sockets, Sessions, Engines, etc.).
 #[derive(Debug)] // Auto-derive Debug for now
@@ -46,6 +48,10 @@ pub enum Command {
     option: i32,
     reply_tx: oneshot::Sender<Result<Vec<u8>, ZmqError>>,
   },
+  UserMonitor {
+    monitor_tx: MonitorSender,                       // Sender end of the monitor channel
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // To confirm setup
+  },
   UserClose {
     // reply_tx confirms shutdown initiated, not completed
     reply_tx: oneshot::Sender<Result<(), ZmqError>>,
@@ -68,7 +74,11 @@ pub enum Command {
 
   // --- Connection Management (Listener/Connecter -> SocketCore) ---
   ConnSuccess {
+    /// The specific endpoint URI representing the established connection (e.g., `tcp://peer_ip:peer_port`).
     endpoint: String, // Identify which bind/connect succeeded
+    /// The original target endpoint URI requested by the user (e.g., `tcp://hostname:port`).
+    /// Needed for automatic reconnection attempts.
+    target_endpoint_uri: String,
     // Send mailbox for the *Session* actor created for this connection
     session_mailbox: MailboxSender,
     // Optional Session handle if needed for tracking
@@ -114,7 +124,9 @@ pub enum Command {
   // Placeholder if Engine needs to request something from Session:
   // SessionPullRequestCmd { reply_tx: oneshot::Sender<Result<SomeData, ZmqError>> },
   /// Sent from Engine -> Session when ZMTP handshake is complete
-    EngineReady { peer_identity: Option<Blob> },
+  EngineReady {
+    peer_identity: Option<Blob>,
+  },
   /// Sent from Engine -> Session upon fatal error
   EngineError {
     error: ZmqError,
@@ -172,8 +184,47 @@ pub enum Command {
   },
 }
 
-/// Type alias for the mailbox sender used within Commands.
-pub type MailboxSender = async_channel::Sender<Command>;
+impl Command {
+  pub fn variant_name(&self) -> &'static str {
+    match self {
+      Command::UserBind { .. } => "UserBind",
+      Command::UserConnect { .. } => "UserConnect",
+      Command::UserDisconnect { .. } => "UserDisconnect",
+      Command::UserUnbind { .. } => "UserUnbind",
+      Command::UserSend { .. } => "UserSend",
+      Command::UserRecv { .. } => "UserRecv",
+      Command::UserSetOpt { .. } => "UserSetOpt",
+      Command::UserGetOpt { .. } => "UserGetOpt",
+      Command::UserMonitor { .. } => "UserMonitor",
+      Command::UserClose { .. } => "UserClose",
+      Command::Stop => "Stop",
+      Command::CleanupComplete { .. } => "CleanupComplete",
+      Command::ReportError { .. } => "ReportError",
+      Command::ConnSuccess { .. } => "ConnSuccess",
+      Command::ConnFailed { .. } => "ConnFailed",
+      Command::ListenerStopped { .. } => "ListenerStopped",
+      Command::ConnecterStopped { .. } => "ConnecterStopped",
+      Command::SessionStopped { .. } => "SessionStopped",
+      Command::Attach { .. } => "Attach",
+      Command::SessionPushCmd { .. } => "SessionPushCmd",
+      Command::EnginePushCmd { .. } => "EnginePushCmd",
+      Command::EngineReady { .. } => "EngineReady",
+      Command::EngineError { .. } => "EngineError",
+      Command::EngineStopped => "EngineStopped",
+      Command::RequestZapAuth { .. } => "RequestZapAuth",
+      Command::ProcessZapReply { .. } => "ProcessZapReply",
+      Command::PipeMessageReceived { .. } => "PipeMessageReceived",
+      Command::PipeClosedByPeer { .. } => "PipeClosedByPeer",
+      Command::AttachPipe { .. } => "AttachPipe",
+      #[cfg(feature = "inproc")]
+      Command::InprocConnectRequest { .. } => "InprocConnectRequest",
+      #[cfg(feature = "inproc")]
+      Command::InprocPipeClosed { .. } => "InprocPipeClosed",
+      // _ => "Unknown/Other", // Keep wildcard or ensure all are listed
+    }
+  }
+}
 
 // Implement Display trait for better logging if needed later
 // impl fmt::Display for Command { ... }
+

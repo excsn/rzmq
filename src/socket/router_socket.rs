@@ -127,34 +127,10 @@ impl ISocket for RouterSocket {
             "ROUTER send failed: Destination identity unknown"
           );
 
-          let router_mandatory = { self.core_state().await.options.router_mandatory };
-          if router_mandatory {
-            tracing::debug!(
-              handle = self.core.handle,
-              ?destination_id,
-              "ROUTER send failed (mandatory=true): Destination identity unknown"
-            );
-            return Err(ZmqError::HostUnreachable("Peer identity not connected".into()));
-          // Return EHOSTUNREACH
-          } else {
-            // Default: Drop message silently
-            tracing::trace!(
-              handle = self.core.handle,
-              ?destination_id,
-              "ROUTER dropping message for unknown identity (mandatory=false)"
-            );
-            // We need to consume the rest of the message parts from the user perspective,
-            // even though we drop them. The `send` call should appear successful.
-            // If the identity frame was the *only* frame (no MORE flag), we just return Ok.
-            // If it had MORE, the state logic needs care.
-
-            // Simplest approach: Return Ok(()) here. The subsequent calls to send()
-            // for payload parts will fail because current_target_guard is None.
-            // This isn't perfect ZMQ fidelity (it silently drops subsequent parts too).
-            // A better way would involve state to track "dropping mode".
-            // Let's return Ok for now for simplicity.
-            return Ok(());
-          }
+          return Err(ZmqError::HostUnreachable(format!(
+            "Peer {:?} not connected or identity unknown",
+            destination_id
+          )));
         }
       };
 
@@ -360,23 +336,41 @@ impl ISocket for RouterSocket {
 
         let is_first_part_for_peer = buffer.is_empty();
         let mut current_msg = msg; // Shadow msg
-
-        if is_first_part_for_peer && current_msg.size() == 0 && current_msg.is_more() {
-          // This looks like the empty delimiter from a DEALER.
-          // We consume it and wait for the next part (the actual identity).
-          tracing::trace!(
-            handle = self.core.handle,
-            pipe_id = pipe_read_id,
-            "ROUTER consumed empty delimiter from DEALER"
-          );
-          // Don't add it to the buffer, just drop it and return Ok(())
-          // The next PipeMessageReceived event will contain the identity.
-          drop(partial_guard); // Release lock
-          return Ok(());
-        }
-
         let is_last_part = !current_msg.is_more();
-        buffer.push(current_msg);
+
+        if is_first_part_for_peer {
+          // Handling the very first frame for this peer connection
+          if current_msg.size() == 0 && current_msg.is_more() {
+            // Consume the optional initial empty delimiter from DEALER
+            tracing::trace!(
+              handle = self.core.handle,
+              pipe_id = pipe_read_id,
+              "ROUTER consumed initial empty delimiter from DEALER"
+            );
+            // Do not add to buffer, do not change state, just return
+            drop(partial_guard);
+            return Ok(());
+          } else {
+            // First frame is actual data (e.g., identity or first payload part if no delimiter)
+            buffer.push(current_msg);
+          }
+        } else {
+          // Handling subsequent frames for this peer
+          if current_msg.size() == 0 && current_msg.is_more() {
+            // Consume subsequent empty delimiters from DEALER
+            tracing::trace!(
+              handle = self.core.handle,
+              pipe_id = pipe_read_id,
+              "ROUTER consumed subsequent empty delimiter from DEALER"
+            );
+            // Do not add to buffer, just return
+            drop(partial_guard);
+            return Ok(());
+          } else {
+            // It's a payload part
+            buffer.push(current_msg);
+          }
+        }
 
         if is_last_part {
           // Message complete, process it
