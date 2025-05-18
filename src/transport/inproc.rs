@@ -139,6 +139,7 @@ pub(crate) async fn connect_inproc(
     pipe_ids: Some((pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder)),
     handle_id: inproc_endpoint_entry_handle_id,
     target_endpoint_uri: Some(connector_uri_str.clone()),
+    is_outbound_connection: true,
   };
   connector_core_state_again
     .endpoints
@@ -353,7 +354,6 @@ pub(crate) async fn disconnect_inproc(
   }
 
   // 6. Emit a "Disconnected" monitor event.
-  println!("DISCONNECTED EVENT");
   if let Some(monitor) = monitor_tx_for_event {
     let event = SocketEvent::Disconnected {
       endpoint: endpoint_uri.to_string(),
@@ -366,7 +366,6 @@ pub(crate) async fn disconnect_inproc(
     }
   } else {
 
-  println!("OOPS DISCONNECTED EVENT");
   }
   tracing::info!(connector_core_handle = connector_core_handle, %endpoint_uri, "Inproc connection disconnected successfully");
   Ok(())

@@ -1,6 +1,5 @@
 // src/socket/sub_socket.rs
 
-use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to SocketCore.
 use crate::error::ZmqError;
 use crate::message::Msg; // For recv method and subscription commands.
 use crate::protocol::zmtp::command::{ZMTP_CMD_CANCEL_NAME, ZMTP_CMD_SUBSCRIBE_NAME}; // ZMTP command names for subscribe/cancel.
@@ -8,7 +7,8 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{CoreState, SocketCore}; // Core components.
 use crate::socket::options::{SocketOptions, SUBSCRIBE, UNSUBSCRIBE}; // Option constants.
 use crate::socket::patterns::{FairQueue, SubscriptionTrie}; // SUB uses SubscriptionTrie and FairQueue.
-use crate::socket::ISocket; // The trait this struct implements.
+use crate::socket::ISocket;
+use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to SocketCore. // The trait this struct implements.
 
 use async_channel::Sender as AsyncSender; // For sending commands over pipes.
 use async_trait::async_trait;
@@ -62,11 +62,18 @@ impl SubSocket {
 
   /// Constructs a ZMTP SUBSCRIBE or CANCEL message.
   /// Note: These are sent as regular data messages, not ZMTP Command frames.
-  fn construct_subscription_message(command_name_bytes: &[u8], topic: &[u8]) -> Msg {
-    let mut command_body = Vec::with_capacity(command_name_bytes.len() + topic.len());
-    command_body.extend_from_slice(command_name_bytes);
-    command_body.extend_from_slice(topic);
-    Msg::from_vec(command_body) // No special flags needed
+  /// For libZMQ compatibility:
+  /// - Subscribe: 0x01 followed by topic
+  /// - Cancel:    0x00 followed by topic
+  fn construct_subscription_message(is_subscribe: bool, topic: &[u8]) -> Msg {
+    let mut msg_body = Vec::with_capacity(1 + topic.len());
+    if is_subscribe {
+      msg_body.push(0x01); // Subscribe prefix byte
+    } else {
+      msg_body.push(0x00); // Cancel prefix byte
+    }
+    msg_body.extend_from_slice(topic);
+    Msg::from_vec(msg_body) // No special flags needed
   }
 
   /// Helper function to send a subscription command message to a *specific* pipe.
@@ -106,8 +113,8 @@ impl SubSocket {
   }
 
   /// Helper function to send a SUBSCRIBE or CANCEL command message upstream to ALL connected PUB peers.
-  async fn send_subscription_command_to_all(&self, command_name_bytes: &[u8], topic: &[u8]) {
-    let msg = Self::construct_subscription_message(command_name_bytes, topic);
+  async fn send_subscription_command_to_all(&self, is_subscribe: bool, topic: &[u8]) {
+    let msg = Self::construct_subscription_message(is_subscribe, topic);
 
     // Collect all target pipe senders to send the command to.
     let mut target_pipe_senders: Vec<(usize, AsyncSender<Msg>)> = Vec::new();
@@ -157,94 +164,11 @@ impl SubSocket {
 
     tracing::debug!(
         handle = self.core.handle,
-        command = ?String::from_utf8_lossy(command_name_bytes),
+        command = if is_subscribe { "SUB" } else { "CANCEL" },
         topic = ?String::from_utf8_lossy(topic),
         num_peers = num_peers,
         "Sent subscription command to all peers."
     );
-  }
-
-  /// Helper function to send a SUBSCRIBE or CANCEL command message upstream to all connected PUB peers.
-  ///
-  /// # Arguments
-  /// * `command_name` - The ZMTP command name (e.g., `ZMTP_CMD_SUBSCRIBE_NAME`).
-  /// * `topic` - The topic byte slice for the command.
-  async fn send_subscription_command(&self, command_name_bytes: &[u8], topic: &[u8]) {
-    // Construct the ZMTP command message body.
-    // For SUBSCRIBE/CANCEL, the body is just <command_name_bytes><topic_bytes>.
-    // Note: ZMTP SUBSCRIBE/CANCEL messages are not "ZMTP Command Frames" in the sense of
-    // having the ZMTP_FLAG_COMMAND set. They are regular data messages whose content
-    // is interpreted by the PUB socket as a subscription control message.
-    let mut command_body = Vec::with_capacity(command_name_bytes.len() + topic.len());
-    command_body.extend_from_slice(command_name_bytes);
-    command_body.extend_from_slice(topic);
-
-    let msg = Msg::from_vec(command_body); // Create the message. No special flags needed.
-
-    // Collect all target pipe senders to send the command to.
-    let mut target_pipe_senders: Vec<(usize, AsyncSender<Msg>)> = Vec::new();
-    {
-      // Scoped lock to minimize contention.
-      let state_guard = self.core_state().await; // Lock CoreState to get pipe senders.
-      let pipe_map_guard = self.pipe_read_to_write_id.lock().await; // Lock local pipe map.
-
-      if pipe_map_guard.is_empty() {
-        tracing::trace!(
-          handle = self.core.handle,
-          "Subscription command: No peer pipes to send to."
-        );
-        return; // No connected peers, nothing to do.
-      }
-      target_pipe_senders.reserve(pipe_map_guard.len());
-
-      for pipe_write_id in pipe_map_guard.values() {
-        // Iterate over stored write IDs.
-        if let Some(sender) = state_guard.get_pipe_sender(*pipe_write_id) {
-          target_pipe_senders.push((*pipe_write_id, sender)); // Store (ID, Sender) pair.
-        } else {
-          tracing::warn!(
-            handle = self.core.handle,
-            pipe_id = *pipe_write_id,
-            "SUB command: Pipe sender not found in core state (consistency issue?). Skipping for this pipe."
-          );
-          // Consider if this inconsistency should trigger removal of the pipe_write_id
-          // from pipe_read_to_write_id map. This might be complex due to lock ordering.
-        }
-      }
-      // Locks on CoreState and pipe_read_to_write_id are released here.
-    }
-
-    if target_pipe_senders.is_empty() {
-      tracing::trace!(
-        handle = self.core.handle,
-        "Subscription command: No valid pipe senders found."
-      );
-      return;
-    }
-
-    // Send the command message to all collected targets concurrently.
-    let mut send_futures = Vec::new();
-    for (pipe_write_id, sender) in target_pipe_senders {
-      let msg_clone = msg.clone(); // Clone message for each send task.
-      send_futures.push(async move {
-        // This is a best-effort send. If it fails (e.g., pipe closed, HWM full),
-        // we log a warning. ZMQ SUB behavior for failed subscription commands
-        // isn't strictly defined to propagate errors back to the user of set_option.
-        if let Err(e) = sender.send(msg_clone).await {
-          tracing::warn!(
-            handle = self.core.handle, // Accessing self.core.handle in async block needs clone or careful passing.
-                                       // For simplicity, if this were a real method, core_handle would be passed.
-                                       // Here, we assume it's available or omitted in trace.
-            pipe_id = pipe_write_id,
-            error = ?e, // Debug format for the send error.
-            "Failed to send subscription/cancel command upstream."
-          );
-          // Optionally, could return the (pipe_write_id, error) for cleanup by caller.
-        }
-      });
-    }
-    futures::future::join_all(send_futures).await; // Wait for all sends to complete or fail.
-    tracing::debug!(handle = self.core.handle, command = ?String::from_utf8_lossy(command_name_bytes), topic = ?String::from_utf8_lossy(topic), "Sent subscription command to all peers.");
   }
 }
 
@@ -342,7 +266,7 @@ impl ISocket for SubSocket {
         self.subscriptions.subscribe(value).await; // Add to local trie.
                                                    // Send SUBSCRIBE command message upstream to all connected PUB peers.
         self
-          .send_subscription_command_to_all(ZMTP_CMD_SUBSCRIBE_NAME, value)
+          .send_subscription_command_to_all(true, value)
           .await;
         Ok(())
       }
@@ -351,7 +275,7 @@ impl ISocket for SubSocket {
         // `unsubscribe` returns true if the topic existed and its count reached zero.
         if self.subscriptions.unsubscribe(value).await {
           // Send CANCEL command message upstream to all connected PUB peers.
-          self.send_subscription_command_to_all(ZMTP_CMD_CANCEL_NAME, value).await;
+          self.send_subscription_command_to_all(false, value).await;
         }
         Ok(())
       }
@@ -456,7 +380,7 @@ impl ISocket for SubSocket {
 
       if let Some(sender) = sender_option {
         for topic in current_topics {
-          let msg = Self::construct_subscription_message(ZMTP_CMD_SUBSCRIBE_NAME, &topic);
+          let msg = Self::construct_subscription_message(true, &topic);
           // Send to the specific pipe using the helper
           self.send_command_to_pipe(pipe_write_id, sender.clone(), &msg).await;
         }
@@ -479,14 +403,14 @@ impl ISocket for SubSocket {
 
   async fn update_peer_identity(&self, pipe_read_id: usize, identity: Option<Blob>) {
     tracing::trace!(
-        handle = self.core.handle,
-        socket_type = "THEIR_SOCKET_TYPE", // e.g., "DEALER"
-        pipe_read_id,
-        ?identity,
-        "update_peer_identity called, but this socket type does not use peer identities. Ignoring."
+      handle = self.core.handle,
+      socket_type = "THEIR_SOCKET_TYPE", // e.g., "DEALER"
+      pipe_read_id,
+      ?identity,
+      "update_peer_identity called, but this socket type does not use peer identities. Ignoring."
     );
   }
-  
+
   /// Called by `SocketCore` when a pipe is detached (PUB peer disconnected or socket closing).
   async fn pipe_detached(&self, pipe_read_id: usize) {
     tracing::debug!(

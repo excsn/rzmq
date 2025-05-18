@@ -65,7 +65,19 @@ tokio-test = "^0.4"
 tracing-subscriber = { version = "^0.3", features = ["env-filter"] } # Optional for easy logging setup
 
 [[bench]]
-name = "throughput"
+name = "pull_throughput"
+harness = false
+
+[[bench]]
+name = "req_rep_throughput"
+harness = false
+
+[[bench]]
+name = "pub_sub_throughput"
+harness = false
+
+[[bench]]
+name = "dealer_router_throughput"
 harness = false
 
 [features]

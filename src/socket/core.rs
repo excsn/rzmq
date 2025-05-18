@@ -66,6 +66,7 @@ pub(crate) struct EndpointInfo {
   pub handle_id: usize,
   /// For connected endpoints (Sessions), this stores the original target URI.
   pub target_endpoint_uri: Option<String>,
+  pub is_outbound_connection: bool,
 }
 
 /// Enum to differentiate between Listener endpoints and active Session (connection) endpoints.
@@ -999,7 +1000,6 @@ impl SocketCore {
     let mut core_state_guard = core_arc.core_state.lock().await;
     let initiated_flag = coordinator.initiate(&mut core_state_guard, core_handle);
 
-    println!("LEN {}", coordinator.inproc_connections_to_close.len());
     if initiated_flag {
       if coordinator.current_phase() == ShutdownPhase::Lingering {
         let linger_opt_val = core_state_guard.options.linger;
@@ -1009,13 +1009,11 @@ impl SocketCore {
           #[cfg(feature = "inproc")]
           let pipes_to_clean_val = coordinator.inproc_connections_to_close.clone();
 
-          println!("LEN {}", pipes_to_clean_val.len());
           #[cfg(not(feature = "inproc"))]
           let pipes_to_clean_val = Vec::new();
           drop(coordinator);
           drop(core_state_guard);
 
-          println!("LEN {}", pipes_to_clean_val.len());
           if let Some(sl_val) = core_arc.get_socket_logic().await {
             Self::perform_pipe_cleanup(core_arc.clone(), &sl_val, pipes_to_clean_val).await;
           } else {
@@ -1235,6 +1233,7 @@ impl SocketCore {
                   pipe_ids: None,
                   handle_id: child_h,
                   target_endpoint_uri: None,
+                  is_outbound_connection: false,
                 },
               );
               state_w
@@ -1280,6 +1279,7 @@ impl SocketCore {
                   pipe_ids: None,
                   handle_id: child_h,
                   target_endpoint_uri: None,
+                  is_outbound_connection: false,
                 },
               );
               state_w
@@ -1555,6 +1555,20 @@ impl SocketCore {
     // session_task_handle_opt is a JoinHandle (possibly dummy if event only has ID)
     let owned_task_h = session_task_handle_opt.unwrap_or_else(|| tokio::spawn(async {}));
 
+    let is_this_an_outbound_connection = {
+    // Check if target_uri_from_event corresponds to one of *this SocketCore's UserConnect targets*
+    // rather than one of its *Listener bind URIs*.
+    // If target_uri_from_event matches one of *our own listeners' URIs*, it's an inbound connection.
+    let mut is_inbound_to_own_listener = false;
+    for (ep_uri_key, ep_info_val) in state_g.endpoints.iter() {
+        if ep_info_val.endpoint_type == EndpointType::Listener && ep_uri_key == &target_endpoint_uri {
+            is_inbound_to_own_listener = true;
+            break;
+        }
+    }
+    !is_inbound_to_own_listener // It's outbound if it's NOT inbound to one of our listeners
+  };
+
     state_g.endpoints.insert(
       endpoint.clone(),
       EndpointInfo {
@@ -1565,6 +1579,7 @@ impl SocketCore {
         pipe_ids: Some((pipe_id_core_w, pipe_id_core_r)),
         handle_id: child_actor_h,
         target_endpoint_uri: Some(target_endpoint_uri),
+        is_outbound_connection: is_this_an_outbound_connection
       },
     );
     drop(state_g);
@@ -1691,6 +1706,7 @@ impl SocketCore {
         pipe_ids: Some((connector_pipe_write_id, connector_pipe_read_id)),
         handle_id: endpoint_entry_handle_id, // Unique ID for this endpoint entry in binder.
         target_endpoint_uri: Some(connector_uri.clone()), // Target URI is the connector's URI.
+        is_outbound_connection: false,
       };
       binder_core_state
         .endpoints
@@ -1810,6 +1826,7 @@ impl SocketCore {
     // <<< MODIFIED END >>>
 
 
+    let mut removed_endpoint_info_for_reconnect: Option<EndpointInfo> = None;
     // --- Perform state cleanup for the stopped child ---
     // This needs to happen regardless of the shutdown phase if the child stopped unexpectedly
     // or if we are shutting down and need to remove its entry.
@@ -1823,7 +1840,11 @@ impl SocketCore {
 
       if needs_clean {
         tracing::debug!(handle=core_h, child_handle=child_handle, uri=%uri_s, "Performing state cleanup for stopped child (URI: {}).", uri_s);
-        Self::cleanup_session_state_by_uri(core_arc.clone(), uri_s, socket_logic_strong, child_handle).await;
+
+        let captured_info = Self::cleanup_session_state_by_uri(core_arc.clone(), uri_s, socket_logic_strong, child_handle).await;
+        if current_phase_val == ShutdownPhase::Running && is_err { // Check if stopped unexpectedly while core is running
+          removed_endpoint_info_for_reconnect = captured_info;
+        }
       } else {
         tracing::trace!(handle=core_h, child_handle=child_handle, uri=%uri_s, "Skipping state cleanup for stopped child (endpoint likely already removed).");
       }
@@ -1835,6 +1856,69 @@ impl SocketCore {
         "Child completion missing endpoint URI, cannot perform URI-based cleanup."
       );
     }
+    // --- Phase 3: Potentially respawn connecter ---
+    let current_core_phase_now = { // Re-check current phase after cleanup and potential shutdown progression
+        let guard = core_arc.shutdown_coordinator.lock().await;
+        guard.current_phase()
+    }; // Guard dropped
+
+    if current_core_phase_now == ShutdownPhase::Running {
+      if let Some(ref removed_info) = removed_endpoint_info_for_reconnect { // Child died unexpectedly while core was running
+        if removed_info.endpoint_type == EndpointType::Session && removed_info.is_outbound_connection { // Check the new flag
+          if let Some(ref target_uri_to_reconnect) = removed_info.target_endpoint_uri {
+            // No reconnect for inproc, already handled by its specific logic
+            if !target_uri_to_reconnect.starts_with("inproc://") {
+                let reconnect_enabled = { 
+                    let cs_guard = core_arc.core_state.lock().await;
+                    cs_guard.options.reconnect_ivl.map_or(false, |d| !d.is_zero()) 
+                };
+
+                if reconnect_enabled {
+                    tracing::info!(
+                        handle = core_h, 
+                        target_uri = %target_uri_to_reconnect, 
+                        child_handle = child_handle,
+                        "Unexpected session stop for an 'is_outbound_connection=true' session. Initiating reconnect."
+                    );
+                    Self::respawn_connecter(core_arc.clone(), target_uri_to_reconnect.clone()).await;
+                } else {
+                    tracing::debug!(
+                        handle = core_h, 
+                        target_uri = %target_uri_to_reconnect, 
+                        child_handle = child_handle,
+                        "Reconnect disabled for unexpectedly stopped outbound session child."
+                    );
+                }
+            }
+          } else {
+            tracing::warn!(
+              handle = core_h,
+              child_handle = child_handle,
+              "Outbound session child died unexpectedly but had no target_endpoint_uri for reconnect."
+            );
+          }
+        } else if removed_info.endpoint_type == EndpointType::Session && !removed_info.is_outbound_connection {
+          tracing::debug!(
+            handle = core_h,
+            child_handle = child_handle,
+            actual_peer_uri = %removed_info.endpoint_uri, // This is the client's URI
+            "Session for an inbound connection (is_outbound_connection=false) stopped. No reconnect attempted by SocketCore."
+          );
+        }
+            // If it was a Listener type, no reconnect attempt is made here.
+      }
+    } else {
+      if removed_endpoint_info_for_reconnect.is_some() { // Log if we *would* have reconnected
+        tracing::debug!(
+          handle = core_h, 
+          child_handle = child_handle,
+          target_uri = ?removed_endpoint_info_for_reconnect.as_ref().and_then(|i| i.target_endpoint_uri.as_ref()), 
+          current_phase = ?current_core_phase_now, 
+          "Skipping potential reconnect for child because SocketCore is no longer in Running phase (current phase: {:?}).",
+          current_core_phase_now
+        );
+      }
+    }
   }
 
   async fn cleanup_session_state_by_uri(
@@ -1842,7 +1926,7 @@ impl SocketCore {
     endpoint_uri: &str,
     socket_logic: &Arc<dyn ISocket>,
     stopping_child_handle_id: usize,
-  ) {
+  ) -> Option<EndpointInfo> {
     let core_h = core_arc.handle;
     tracing::debug!(handle = core_h, uri = %endpoint_uri, stopping_child_id = stopping_child_handle_id, "Attempting cleanup by URI for specific child");
     let mut state_g = core_arc.core_state.lock().await;
@@ -1891,6 +1975,8 @@ impl SocketCore {
         socket_logic.pipe_detached(read_id_val).await;
       }
     }
+
+    actual_removed_ep_info
   }
 
   async fn cleanup_session_state_by_pipe(

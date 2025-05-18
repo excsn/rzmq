@@ -1,3 +1,5 @@
+use tracing::debug;
+
 use crate::runtime::{ActorType, SystemEvent}; // Adjust imports as needed
 use crate::{Context, ZmqError};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,7 +41,7 @@ impl Drop for ActorDropGuard {
     // Only publish stop if the task didn't signal normal completion
     if !self.stopped_normally.load(Ordering::Relaxed) {
       // Log carefully here, as we are in drop context
-      eprintln!(
+      debug!(
         // Use eprintln or tracing::error! if subscriber setup handles panics
         "ActorDropGuard: Actor {} ({:?}) stopping abnormally (likely cancelled/aborted). Publishing stop.",
         self.handle_id, self.actor_type

@@ -100,7 +100,7 @@ impl SessionBase {
     let event_bus = self.context.event_bus();
     let mut system_event_rx = event_bus.subscribe();
 
-    tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "SessionBase actor started main loop");
+    tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "SessionBase actor started main loop. Initial engine_ready={}, pipe_attached={}", self.engine_ready, self.pipe_attached);
 
     let mut _engine_stopped_cleanly = false; // Renamed to avoid warning if not used extensively
     let mut error_to_report_on_stop: Option<ZmqError> = None;
@@ -111,7 +111,7 @@ impl SessionBase {
       loop {
         let should_read_core_pipe = self.pipe_attached && self.engine_ready && self.rx_from_core.is_some();
         let core_pipe_receiver_ref = self.rx_from_core.as_ref();
-
+tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loop iteration. engine_ready={}, pipe_attached={}, shutdown_signal={}", self.engine_ready, self.pipe_attached, received_shutdown_signal);
         tokio::select! {
           biased;
 
@@ -310,6 +310,7 @@ impl SessionBase {
           }
 
           msg_result = async { core_pipe_receiver_ref.unwrap().recv().await }, if should_read_core_pipe && !received_shutdown_signal => {
+            tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session polled rx_from_core branch.");
             match msg_result {
               Ok(msg) => {
                 if let Some(ref engine_mb) = self.engine_mailbox {

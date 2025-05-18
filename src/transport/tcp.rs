@@ -4,7 +4,7 @@ use crate::context::Context;
 use crate::engine::zmtp_tcp::create_and_spawn_tcp_engine as create_engine_task_internal;
 use crate::error::ZmqError;
 use crate::runtime::{
-  self, mailbox, ActorDropGuard, ActorType, Command, EventBus, MailboxReceiver, MailboxSender, SystemEvent
+  self, mailbox, ActorDropGuard, ActorType, Command, EventBus, MailboxReceiver, MailboxSender, SystemEvent,
 };
 use crate::session::{self, SessionBase};
 use crate::socket::events::{MonitorSender, SocketEvent};
@@ -223,7 +223,7 @@ impl TcpListener {
       accept_loop_actor_type,
       Some(endpoint_uri.clone()),
     );
-    
+
     tracing::debug!(handle = accept_loop_handle, parent_handle = listener_cmd_loop_handle, uri = %endpoint_uri, "TCP Listener accept loop started");
     let mut loop_error_to_report: Option<ZmqError> = None; // Store ZmqError
 
@@ -388,24 +388,21 @@ impl TcpConnecter {
       Some(addr) => addr.to_string(),
       None => {
         let err = ZmqError::InvalidEndpoint(endpoint_uri_clone.clone());
-        tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, "{}", err);
-        if let Some(ref tx) = monitor_tx {
-          let event = SocketEvent::ConnectFailed {
-            endpoint: endpoint_uri_clone.clone(),
-            error_msg: format!("{}", err),
-          };
-          let tx_clone = tx.clone();
-          tokio::spawn(async move {
-            if tx_clone.send(event).await.is_err() { /* Warn */ }
-          });
-        }
-        // Publish ConnectionAttemptFailed event
-        let fail_event = SystemEvent::ConnectionAttemptFailed {
+        tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, "Invalid TCP endpoint format: {}", err);
+
+        let fail_event_system = SystemEvent::ConnectionAttemptFailed {
           parent_core_id: self.parent_socket_id,
           target_endpoint_uri: endpoint_uri_clone.clone(),
           error_msg: err.to_string(),
         };
-        let _ = self.context.event_bus().publish(fail_event);
+        if self.context.event_bus().publish(fail_event_system).is_err() {
+          tracing::warn!(
+            handle = connecter_handle,
+            "Failed to publish ConnectionAttemptFailed system event for invalid endpoint {}",
+            endpoint_uri_clone
+          );
+        }
+
         self.context.publish_actor_stopping(
           connecter_handle,
           connecter_actor_type,
@@ -417,152 +414,320 @@ impl TcpConnecter {
     };
 
     tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter actor started connection attempts.");
-    let mut current_delay = self.context_options.reconnect_ivl.unwrap_or(Duration::ZERO);
-    let max_delay = self.context_options.reconnect_ivl_max;
-    let mut attempt_count = 0;
-    let mut final_error_for_actor_stop: Option<ZmqError> = None;
 
+    let initial_reconnect_ivl_opt = self.context_options.reconnect_ivl;
+    let mut current_retry_delay_base = initial_reconnect_ivl_opt.unwrap_or(Duration::from_millis(100)); // Base for next retry
+    if initial_reconnect_ivl_opt == Some(Duration::ZERO) {
+      current_retry_delay_base = Duration::ZERO; // Explicitly no delay if ZMQ_RECONNECT_IVL=0
+    }
+    let max_delay_opt = self.context_options.reconnect_ivl_max;
+
+    let mut attempt_count = 0;
+    let mut last_attempt_error: Option<ZmqError> = None; // Error from the most recent connect/options attempt
     let mut system_event_rx = self.context.event_bus().subscribe();
 
     loop {
-      tokio::select! {
-        biased;
-        event_result = system_event_rx.recv() => {
-          match event_result {
-            Ok(SystemEvent::ContextTerminating) => {
-              tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter received ContextTerminating, stopping attempts.");
-              final_error_for_actor_stop = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating".into()));
-              break; // Exit the connection loop
+      // Outer loop for retries
+      // 1. Handle delay for retries (if not the first attempt)
+      if attempt_count > 0 {
+        // If initial_reconnect_ivl was Some(0), we should have broken after the first failure.
+        if initial_reconnect_ivl_opt == Some(Duration::ZERO) {
+          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Reconnect disabled (RECONNECT_IVL=0) and first attempt failed. Stopping.");
+          break; // Exit loop, final_error_for_actor_stop will be used
+        }
+
+        let delay_for_this_retry = current_retry_delay_base;
+
+        tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, delay = ?delay_for_this_retry, "Waiting before reconnect attempt #{}", attempt_count + 1);
+        if let Some(ref tx) = monitor_tx {
+          let event = SocketEvent::ConnectRetried {
+            endpoint: endpoint_uri_clone.clone(),
+            interval: delay_for_this_retry,
+          };
+          let tx_clone = tx.clone();
+          tokio::spawn(async move {
+            if tx_clone.send(event).await.is_err() { /* Warn */ }
+          });
+        }
+
+        // Sleep, interruptible by shutdown signals
+        tokio::select! {
+            _ = sleep(delay_for_this_retry) => {},
+            event_result = system_event_rx.recv() => {
+                 match event_result {
+                    Ok(SystemEvent::ContextTerminating) => {
+                        tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter received ContextTerminating during retry delay.");
+                        last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating".into()));
+                        break; // Break outer loop
+                    }
+                    Ok(SystemEvent::SocketClosing{ socket_id: sid }) if sid == self.parent_socket_id => {
+                        tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "TCP Connecter received SocketClosing for parent during retry delay.");
+                        last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into()));
+                        break; // Break outer loop
+                    }
+                    Err(_) => { // Lagged or Closed
+                        last_attempt_error = Some(ZmqError::Internal("Connecter event bus error during retry delay".into()));
+                        break; // Break outer loop
+                    }
+                    _ => {} // Other event, ignore
+                }
             }
-            Ok(SystemEvent::SocketClosing{ socket_id }) => {
-              if socket_id == self.parent_socket_id {
-                tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "TCP Connecter received SocketClosing for parent, stopping attempts.");
-                final_error_for_actor_stop = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into()));
-                break; // Exit the connection loop
-              }
-              // If SocketClosing is for a different socket_id, ignore it.
-            }
-            Err(_) => { // Lagged or Closed
-              final_error_for_actor_stop = Some(ZmqError::Internal("Connecter event bus error".into()));
-              break;
-            }
-            Ok(_) => { /* Ignore other events. */ }
+        }
+        if last_attempt_error.is_some()
+          && matches!(last_attempt_error, Some(ZmqError::Internal(ref s)) if s.contains("shutdown") || s.contains("event bus error"))
+        {
+          break; // Break outer loop if shutdown occurred during sleep
+        }
+
+        // Calculate delay for *next* time *after* sleeping for current delay
+        if let Some(md) = max_delay_opt {
+          if md > Duration::ZERO {
+            // Positive max_delay caps the backoff
+            current_retry_delay_base = (current_retry_delay_base * 2).min(md);
+          }
+          // If md is Duration::ZERO, current_retry_delay_base remains fixed (no exponential increase)
+        } else {
+          // No max_delay, plain exponential backoff
+          if current_retry_delay_base > Duration::ZERO {
+            // Avoid making zero * 2 = zero
+            current_retry_delay_base *= 2;
+          } else if initial_reconnect_ivl_opt.is_none() {
+            // If it was zero due to default, kickstart with 100ms based delay.
+            current_retry_delay_base = Duration::from_millis(100) * 2; // So next is 200ms
           }
         }
-        should_break_outer_loop = async {
-          if attempt_count > 0 {
-            if current_delay.is_zero() && self.context_options.reconnect_ivl != Some(Duration::ZERO) {
-                final_error_for_actor_stop = Some(ZmqError::Internal("Reconnect disabled after first attempt".into()));
-                let event = SystemEvent::ConnectionAttemptFailed {
-                    parent_core_id: self.parent_socket_id,
-                    target_endpoint_uri: endpoint_uri_clone.clone(),
-                    error_msg: final_error_for_actor_stop.clone().unwrap_or_else(|| ZmqError::Internal("Unknown reconnect disable error".into())).to_string(),
-                };
-                let _ = self.context.event_bus().publish(event);
-                return true;
-            }
-             if current_delay.is_zero() { // Initial reconnect_ivl was zero.
-                // Error will be set by the failed connect attempt below.
-                // This return true ensures we don't sleep and just try once.
-                return true; // Will attempt once and then break if it fails and reconnect_ivl is zero.
-            }
-            tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, delay = ?current_delay, "Waiting before reconnect attempt #{}", attempt_count + 1);
-            if let Some(ref tx) = monitor_tx {
-              let event = SocketEvent::ConnectRetried { endpoint: endpoint_uri_clone.clone(), interval: current_delay };
-              let tx_clone = tx.clone();
-              tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
-            }
-            sleep(current_delay).await;
+      }
+      attempt_count += 1;
+
+      // 2. Check for shutdown signals (again, right before attempting to connect)
+      // Non-blocking check
+      match system_event_rx.try_recv() {
+        Ok(SystemEvent::ContextTerminating) => {
+          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter received ContextTerminating before connect attempt.");
+          last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating".into()));
+          break;
+        }
+        Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => {
+          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "TCP Connecter received SocketClosing for parent before connect attempt.");
+          last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into()));
+          break;
+        }
+        Err(broadcast::error::TryRecvError::Closed) => {
+          last_attempt_error = Some(ZmqError::Internal("Connecter event bus closed".into()));
+          break;
+        }
+        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+          tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, num_skipped = n, "Connecter event bus lagged before connect attempt.");
+        }
+        _ => {}
+      }
+      if last_attempt_error.is_some()
+        && matches!(last_attempt_error, Some(ZmqError::Internal(ref s)) if s.contains("shutdown") || s.contains("event bus error"))
+      {
+        break;
+      }
+
+      // 3. Attempt TCP connection
+      tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Attempting TCP connect #{}", attempt_count);
+
+      let connect_future = TcpStream::connect(&target_addr_str);
+      let mut established_stream_after_options: Option<TcpStream> = None;
+
+      // Select on connect future vs shutdown event
+      tokio::select! {
+          connect_result = connect_future => {
+              match connect_result {
+                  Ok(stream) => {
+                      tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP connect call successful for attempt #{}", attempt_count);
+                      match apply_tcp_socket_options(&stream, &self.config) {
+                          Ok(()) => {
+                              tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Successfully applied TCP options for attempt #{}", attempt_count);
+                              established_stream_after_options = Some(stream);
+                          }
+                          Err(apply_err) => {
+                              tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %apply_err, "Failed to apply TCP options on attempt #{}. Dropping stream, will retry if configured.", attempt_count);
+                              last_attempt_error = Some(apply_err);
+                              if initial_reconnect_ivl_opt == Some(Duration::ZERO) { /* Loop will break */ }
+                              // continue; // Implicitly done by loop structure if established_stream_after_options is None
+                          }
+                      }
+                  }
+                  Err(connect_err) => {
+                      last_attempt_error = Some(ZmqError::from_io_endpoint(connect_err, &endpoint_uri_clone));
+                      tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %last_attempt_error.as_ref().unwrap(), "TCP Connect attempt #{} failed", attempt_count);
+
+                      if attempt_count == 1 && initial_reconnect_ivl_opt.map_or(true, |ivl| ivl != Duration::ZERO) && !is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
+                          if let Some(ref tx) = monitor_tx {
+                              let event = SocketEvent::ConnectDelayed { endpoint: endpoint_uri_clone.clone(), error_msg: format!("{}", last_attempt_error.as_ref().unwrap()) };
+                              let tx_clone = tx.clone();
+                              tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
+                          }
+                      }
+                      if initial_reconnect_ivl_opt == Some(Duration::ZERO) || is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
+                          // Loop will break due to this error
+                      }
+                      // continue; // Implicitly done by loop structure
+                  }
+              }
           }
-          attempt_count += 1;
-
-          tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Attempting TCP connect #{}", attempt_count);
-          let connect_result = TcpStream::connect(&target_addr_str).await;
-
-          match connect_result {
-            Ok(tcp_stream) => {
-              let peer_addr_str = tcp_stream.peer_addr().map(|a|a.to_string()).unwrap_or_else(|_| "unknown_peer".to_string());
-              tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, peer = %peer_addr_str, "TCP Connect successful (attempt #{})", attempt_count);
-              if let Some(ref tx) = monitor_tx { /* ... emit Connected ... */ }
-
-              if let Err(e) = apply_tcp_socket_options(&tcp_stream, &self.config) {
-                tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %e, "Failed to apply options, will retry.");
-                drop(tcp_stream);
-                if let Some(max_ivl_val) = max_delay { if !max_ivl_val.is_zero() { current_delay = (current_delay * 2).min(max_ivl_val); } }
-                else if self.context_options.reconnect_ivl == Some(Duration::ZERO) {
-                    final_error_for_actor_stop = Some(ZmqError::Internal(format!("Failed to apply options and reconnect disabled: {}", e)));
-                    let event = SystemEvent::ConnectionAttemptFailed {
-                        parent_core_id: self.parent_socket_id, target_endpoint_uri: endpoint_uri_clone.clone(),
-                        error_msg: final_error_for_actor_stop.clone().unwrap_or_else(|| ZmqError::Internal("Unknown option apply error".into())).to_string(),
-                    };
-                    let _ = self.context.event_bus().publish(event);
-                    return true;
-                }
-                return false; // Retry
+          event_result = system_event_rx.recv() => {
+              match event_result {
+                  Ok(SystemEvent::ContextTerminating) => {
+                      tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter received ContextTerminating during connect attempt.");
+                      last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating".into()));
+                  }
+                  Ok(SystemEvent::SocketClosing{ socket_id: sid }) if sid == self.parent_socket_id => {
+                      tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "TCP Connecter received SocketClosing for parent during connect attempt.");
+                      last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into()));
+                  }
+                  Err(_) => {
+                      last_attempt_error = Some(ZmqError::Internal("Connecter event bus error during connect attempt".into()));
+                  }
+                  _ => { /* Other events, potentially allow connect to complete or retry */ }
               }
-
-              let session_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-              let engine_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-              let connection_specific_uri = format!("tcp://{}", peer_addr_str);
-
-              let (session_cmd_mailbox, session_task_join_handle) = SessionBase::create_and_spawn(
-                session_handle_id, connection_specific_uri.clone(), monitor_tx.clone(),
-                self.context.clone(), self.parent_socket_id,
-              );
-              let (engine_mailbox, engine_task_join_handle_inner) = create_and_spawn_tcp_engine(
-                engine_handle_id, session_cmd_mailbox.clone(), tcp_stream, self.context_options.clone(),
-                false, &self.context, session_handle_id,
-              );
-              let attach_cmd = Command::Attach { engine_mailbox, engine_handle: Some(engine_handle_id), engine_task_handle: Some(engine_task_join_handle_inner) };
-
-              if session_cmd_mailbox.send(attach_cmd).await.is_err() {
-                final_error_for_actor_stop = Some(ZmqError::Internal("Failed to attach engine to session".into()));
-                if !session_task_join_handle.is_finished() { session_task_join_handle.abort(); }
-                return true; // Fatal
-              } else {
-                let event = SystemEvent::NewConnectionEstablished {
-                  parent_core_id: self.parent_socket_id, endpoint_uri: connection_specific_uri.clone(),
-                  target_endpoint_uri: endpoint_uri_clone.clone(), session_mailbox: session_cmd_mailbox,
-                  session_handle_id, session_task_id: session_task_join_handle.id(),
-                };
-                if self.context.event_bus().publish(event).is_err() {
-                  final_error_for_actor_stop = Some(ZmqError::Internal("Failed to publish NewConnectionEstablished".into()));
-                  if !session_task_join_handle.is_finished() { session_task_join_handle.abort(); }
-                }
-                return true; // Success or event publish failure, break outer loop
-              }
-            }
-            Err(e) => { // TCP connect failed
-              let current_error = ZmqError::from_io_endpoint(e, &endpoint_uri_clone); // Store ZmqError
-              tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %current_error, "TCP Connect attempt #{} failed", attempt_count);
-              if attempt_count == 1 && self.context_options.reconnect_ivl != Some(Duration::ZERO) && !is_fatal_connect_error(&current_error) {
-                if let Some(ref tx) = monitor_tx { /* emit ConnectDelayed */ }
-              }
-              if let Some(max_ivl_val) = max_delay { if !max_ivl_val.is_zero() { current_delay = (current_delay * 2).min(max_ivl_val); } }
-              else if current_delay > Duration::ZERO { current_delay *= 2; }
-
-              if self.context_options.reconnect_ivl == Some(Duration::ZERO) || is_fatal_connect_error(&current_error) {
-                final_error_for_actor_stop = Some(current_error.clone());
-                let event = SystemEvent::ConnectionAttemptFailed {
-                    parent_core_id: self.parent_socket_id, target_endpoint_uri: endpoint_uri_clone.clone(),
-                    error_msg: current_error.to_string(), // Pass ZmqError
-                };
-                let _ = self.context.event_bus().publish(event);
-                return true; // Break outer loop
-              }
-              return false; // Continue retrying
-            }
           }
-        } => { if should_break_outer_loop { break; } }
-      } // end select!
-    } // end loop
+      } // End of select for connect vs shutdown
+
+      // Check if loop should break based on outcomes of the select
+      if last_attempt_error.is_some() {
+        if matches!(last_attempt_error, Some(ZmqError::Internal(ref s)) if s.contains("shutdown") || s.contains("event bus error"))
+        {
+          break; // Shutdown signal means definite stop
+        }
+        if initial_reconnect_ivl_opt == Some(Duration::ZERO) {
+          // ZMQ_RECONNECT_IVL=0
+          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "RECONNECT_IVL=0 and connect attempt failed. Stopping.");
+          break;
+        }
+        if is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
+          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Fatal connect error. Stopping attempts.");
+          break;
+        }
+        // If not shutdown, not ZMQ_RECONNECT_IVL=0, and not fatal, loop will continue for retry.
+      }
+
+      // 4. If stream established and configured, create Session/Engine
+      if let Some(fully_configured_stream) = established_stream_after_options {
+        let peer_addr_str = fully_configured_stream
+          .peer_addr()
+          .map(|a| a.to_string())
+          .unwrap_or_else(|_| "unknown_peer".to_string());
+        tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, peer = %peer_addr_str, "TCP Connect and option application successful (attempt #{})", attempt_count);
+
+        if let Some(ref tx) = monitor_tx {
+          let event = SocketEvent::Connected {
+            endpoint: endpoint_uri_clone.clone(),
+            peer_addr: peer_addr_str.clone(),
+          };
+          let tx_clone = tx.clone();
+          let ep_clone = endpoint_uri_clone.clone();
+          tokio::spawn(async move {
+            if tx_clone.send(event).await.is_err() {
+              tracing::warn!("Failed to send Connected monitor event from connecter {}", ep_clone);
+            }
+          });
+        }
+
+        let session_handle_id = self
+          .context_handle_source
+          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let engine_handle_id = self
+          .context_handle_source
+          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let connection_specific_uri = format!("tcp://{}", peer_addr_str);
+
+        let (session_cmd_mailbox, session_task_join_handle) = SessionBase::create_and_spawn(
+          session_handle_id,
+          connection_specific_uri.clone(),
+          monitor_tx.clone(),
+          self.context.clone(),
+          self.parent_socket_id,
+        );
+        let (engine_mailbox, engine_task_join_handle_inner) = create_and_spawn_tcp_engine(
+          engine_handle_id,
+          session_cmd_mailbox.clone(),
+          fully_configured_stream,
+          self.context_options.clone(),
+          false,
+          &self.context,
+          session_handle_id,
+        );
+        let attach_cmd = Command::Attach {
+          engine_mailbox,
+          engine_handle: Some(engine_handle_id),
+          engine_task_handle: Some(engine_task_join_handle_inner),
+        };
+
+        if session_cmd_mailbox.send(attach_cmd).await.is_err() {
+          tracing::error!("Failed to attach engine to new session for {}", endpoint_uri_clone);
+          last_attempt_error = Some(ZmqError::Internal("Failed to attach engine to session".into()));
+          if !session_task_join_handle.is_finished() {
+            session_task_join_handle.abort();
+          }
+        } else {
+          let event = SystemEvent::NewConnectionEstablished {
+            parent_core_id: self.parent_socket_id,
+            endpoint_uri: connection_specific_uri.clone(),
+            target_endpoint_uri: endpoint_uri_clone.clone(),
+            session_mailbox: session_cmd_mailbox,
+            session_handle_id,
+            session_task_id: session_task_join_handle.id(),
+          };
+          if self.context.event_bus().publish(event).is_err() {
+            tracing::error!("Failed to publish NewConnectionEstablished for {}", endpoint_uri_clone);
+            last_attempt_error = Some(ZmqError::Internal("Failed to publish NewConnectionEstablished".into()));
+            if !session_task_join_handle.is_finished() {
+              session_task_join_handle.abort();
+            }
+          } else {
+            last_attempt_error = None; // Clear previous attempt's error, successfully connected.
+          }
+        }
+        break; // Connection successful or critical setup error post-connect, exit loop.
+      }
+      // If established_stream_after_options is None, means connect or option apply failed,
+      // and loop will continue if not fatal/shutdown/reconnect_ivl=0.
+    } // End of loop for retries
 
     tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter actor finished connection loop.");
+
+    // If loop exited due to an error (last_attempt_error is Some),
+    // publish ConnectionAttemptFailed. If it's None, it means success.
+    if let Some(ref err) = last_attempt_error {
+      // Only publish ConnectionAttemptFailed system event if the error isn't an internal shutdown signal
+      if !matches!(err, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus closed")) {
+        let event_system = SystemEvent::ConnectionAttemptFailed {
+          parent_core_id: self.parent_socket_id,
+          target_endpoint_uri: endpoint_uri_clone.clone(),
+          error_msg: err.to_string(),
+        };
+        if self.context.event_bus().publish(event_system).is_err() {
+          tracing::warn!(
+            handle = connecter_handle,
+            "Failed to publish final ConnectionAttemptFailed system event for {}",
+            endpoint_uri_clone
+          );
+        }
+
+        // Also send to monitor if it was a connection failure (not just internal shutdown)
+        if let Some(ref tx) = monitor_tx {
+          let event_monitor = SocketEvent::ConnectFailed {
+            endpoint: endpoint_uri_clone.clone(),
+            error_msg: err.to_string(),
+          };
+          let tx_clone = tx.clone();
+          tokio::spawn(async move {
+            if tx_clone.send(event_monitor).await.is_err() { /* Warn */ }
+          });
+        }
+      }
+    }
+
     self.context.publish_actor_stopping(
       connecter_handle,
       connecter_actor_type,
       Some(endpoint_uri_clone),
-      final_error_for_actor_stop, // This is Option<ZmqError>
+      last_attempt_error, // Use the error from the last failed attempt or None if successful
     );
     tracing::info!(handle = connecter_handle, uri = %self.endpoint, "TCP Connecter actor fully stopped.");
   }

@@ -87,10 +87,20 @@ impl ISocket for PubSocket {
   /// PUB sockets do not report send errors like `ResourceLimitReached` or `Timeout`
   /// to the user; they either succeed in queuing or drop (for SNDTIMEO=0).
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
+    let payload_preview_str = msg.data()
+        .map(|d| String::from_utf8_lossy(&d.iter().take(20).copied().collect::<Vec<_>>()).into_owned())
+        .unwrap_or_else(|| "<empty_payload>".to_string());
+
+    tracing::debug!(
+        handle = self.core.handle,
+        msg_size = msg.size(),
+        msg_payload_preview = %payload_preview_str, // Use the owned String
+        "PubSocket::send preparing to distribute message"
+    );
     // Use the distributor to send the message to all connected peer pipes.
     // `send_to_all` internally handles HWM and timeouts for each pipe.
     // It collects fatal errors (like ConnectionClosed) for pipes that need cleanup.
-    match self.distributor.send_to_all(&msg, &self.core.core_state).await {
+    match self.distributor.send_to_all(&msg, self.core.handle, &self.core.core_state).await {
       Ok(()) => Ok(()), // Succeeded for all reachable peers (or message was dropped due to HWM for some).
       Err(errors) => {
         // Some peers disconnected or had fatal errors during the send attempt.
