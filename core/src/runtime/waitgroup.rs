@@ -111,7 +111,7 @@ mod tests {
   use std::time::Duration;
   use tokio::time::timeout;
 
-  #[tokio::test]
+  #[rzmq::main]
   async fn test_waitgroup_add_done_wait() {
     let wg = WaitGroup::new();
     assert_eq!(wg.get_count(), 0);
@@ -172,7 +172,7 @@ mod tests {
     assert_eq!(wait_res.unwrap().unwrap(), "Wait Finished");
   }
 
-  #[tokio::test]
+  #[rzmq::main]
   async fn test_waitgroup_wait_on_zero() {
     let wg = WaitGroup::new();
     let start = tokio::time::Instant::now();
@@ -181,7 +181,7 @@ mod tests {
     assert_eq!(wg.get_count(), 0);
   }
 
-  #[tokio::test]
+  #[rzmq::main]
   async fn test_waitgroup_add_after_wait_starts() {
     let wg = WaitGroup::new();
     wg.add(1); // Count is 1
@@ -217,7 +217,7 @@ mod tests {
     );
   }
 
-  #[tokio::test]
+  #[rzmq::main]
   #[should_panic]
   async fn test_waitgroup_done_panic_on_zero() {
     let wg = WaitGroup::new();

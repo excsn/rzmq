@@ -43,6 +43,12 @@ pub const CURVE_SERVERKEY: i32 = 50;
 // Key Length Constants (from libsodium)
 #[cfg(feature = "curve")]
 pub const CURVE_KEY_LEN: usize = 32;
+
+#[cfg(feature = "io-uring")]
+pub const IO_URING_SNDZEROCOPY: i32 = 1170;
+#[cfg(feature = "io-uring")]
+pub const IO_URING_RCVMULTISHOT: i32 = 1171;
+
 // Add more constants as needed...
 
 /// Holds parsed and validated socket options.
@@ -95,6 +101,8 @@ pub(crate) struct SocketOptions {
   #[cfg(feature = "curve")]
   pub curve_server_key: Option<[u8; CURVE_KEY_LEN]>, // Client uses this
   // pub heartbeat_ttl: Option<Duration>, // TTL often derived from timeout
+  pub io_uring_send_zerocopy: bool,
+  pub io_uring_recv_multishot: bool,
 }
 
 impl Default for SocketOptions {
@@ -130,6 +138,8 @@ impl Default for SocketOptions {
       curve_secret_key: None,
       #[cfg(feature = "curve")]
       curve_server_key: None,
+      io_uring_send_zerocopy: false,
+      io_uring_recv_multishot: false,
     }
   }
 }
@@ -157,9 +167,7 @@ pub(crate) struct ZmtpEngineConfig {
   // pub security_mechanism: PlannedMechanismEnum,
 
   // io-uring specific options
-  #[cfg(feature = "io-uring")]
   pub use_send_zerocopy: bool, // TODO: Get from SocketOptions
-  #[cfg(feature = "io-uring")]
   pub use_recv_multishot: bool, // TODO: Get from SocketOptions
   #[cfg(feature = "io-uring")]
   pub use_cork: bool, // Example io-uring related option

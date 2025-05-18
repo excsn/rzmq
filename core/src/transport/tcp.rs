@@ -9,14 +9,56 @@ use crate::runtime::{
 use crate::session::{self, SessionBase};
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::socket::options::{SocketOptions, TcpTransportConfig};
-use socket2::{SockRef, TcpKeepalive}; // For setting TCP options like NODELAY, KEEPALIVE
+
 use std::io;
+use std::net::SocketAddr as StdSocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
+
+use socket2::{SockRef, TcpKeepalive}; // For setting TCP options like NODELAY, KEEPALIVE
 use tokio::sync::broadcast; // For receiving system events
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+
+#[cfg(not(feature = "io-uring"))]
+mod underlying_net {
+  use std::io::Result as IoResult;
+  pub use tokio::net::TcpListener;
+  pub use tokio::net::TcpStream;
+  use tokio::net::ToSocketAddrs; // Keep this for standard tokio
+
+  // Helper to match tokio_uring's bind/connect signature if needed, or just use directly
+  // For standard Tokio, TcpListener::bind is async and takes ToSocketAddrs
+  pub async fn bind_listener<A: ToSocketAddrs>(addr: A) -> IoResult<TcpListener> {
+    TcpListener::bind(addr).await
+  }
+  // For standard Tokio, TcpStream::connect is async and takes ToSocketAddrs
+  pub async fn connect_stream<A: ToSocketAddrs>(addr: A) -> IoResult<TcpStream> {
+    TcpStream::connect(addr).await
+  }
+}
+
+#[cfg(feature = "io-uring")]
+mod underlying_net {
+  use std::io::Result as IoResult;
+  use std::net::SocketAddr;
+  pub use tokio_uring::net::TcpListener;
+  pub use tokio_uring::net::TcpStream;
+
+  // tokio_uring bind/connect often take SocketAddr.
+  // `TcpListener::bind` is NOT async.
+  pub fn bind_listener_uring(addr: SocketAddr) -> IoResult<TcpListener> {
+    TcpListener::bind(addr)
+  }
+  // `TcpStream::connect` IS async.
+  pub async fn connect_stream_uring(addr: SocketAddr) -> IoResult<TcpStream> {
+    TcpStream::connect(addr).await
+  }
+}
+
+// Aliases to use throughout this file
+use underlying_net::TcpListener as CurrentTcpListener;
+use underlying_net::TcpStream as CurrentTcpStream;
 
 // --- TcpListener Actor ---
 /// Manages a listening TCP socket, accepts incoming connections, and spawns Session/Engine pairs.
@@ -47,17 +89,49 @@ impl TcpListener {
     let bind_addr_str = endpoint
       .strip_prefix("tcp://")
       .ok_or_else(|| ZmqError::InvalidEndpoint(endpoint.clone()))?;
-    let std_listener =
-      std::net::TcpListener::bind(bind_addr_str).map_err(|e| ZmqError::from_io_endpoint(e, &endpoint))?;
-    std_listener.set_nonblocking(true).map_err(ZmqError::from)?;
-    SockRef::from(&std_listener)
-      .set_reuse_address(true)
+
+    let tokio_listener_arc: Arc<CurrentTcpListener> = {
+      let std_listener_socket = socket2::Socket::new(
+        if bind_addr_str.contains(':') && bind_addr_str.matches('[').count() > 0 {
+          socket2::Domain::IPV6 // Basic check for IPv6 literal
+        } else {
+          socket2::Domain::IPV4
+        },
+        socket2::Type::STREAM,
+        None,
+      )
       .map_err(ZmqError::from)?;
 
-    let tokio_listener = TokioTcpListener::from_std(std_listener).map_err(ZmqError::from)?;
-    let local_addr = tokio_listener.local_addr().map_err(ZmqError::from)?;
+      std_listener_socket.set_reuse_address(true).map_err(ZmqError::from)?;
+      // std_listener_socket.set_reuse_port(true).map_err(ZmqError::from)?; // Optional
+
+      let socket_addr: StdSocketAddr = bind_addr_str
+        .parse()
+        .map_err(|e| ZmqError::InvalidEndpoint(format!("Failed to parse bind address '{}': {}", bind_addr_str, e)))?;
+      std_listener_socket
+        .bind(&socket_addr.into())
+        .map_err(|e| ZmqError::from_io_endpoint(e, &endpoint))?;
+      std_listener_socket.listen(128).map_err(ZmqError::from)?; // Standard backlog
+
+      let std_listener: std::net::TcpListener = std_listener_socket.into();
+      std_listener.set_nonblocking(true).map_err(ZmqError::from)?;
+
+      #[cfg(not(feature = "io-uring"))]
+      let current_listener = CurrentTcpListener::from_std(std_listener).map_err(ZmqError::from)?;
+
+      #[cfg(feature = "io-uring")]
+      let current_listener = CurrentTcpListener::from_std(std_listener).map_err(|e| {
+        // tokio_uring::from_std can return std::io::Error
+        ZmqError::IoError {
+          kind: e.kind(),
+          message: e.to_string(),
+        }
+      })?;
+      Arc::new(current_listener)
+    };
+
+    let local_addr = tokio_listener_arc.local_addr().map_err(ZmqError::from)?;
     tracing::info!(listener_handle = handle, ?local_addr, uri = %endpoint, "TCP Listener bound successfully");
-    let listener_arc = Arc::new(tokio_listener);
 
     // Prepare TCP configuration for accepted streams.
     let transport_config = TcpTransportConfig {
@@ -68,7 +142,7 @@ impl TcpListener {
     };
 
     // Spawn the accept loop task.
-    let accept_listener_arc = listener_arc.clone();
+    let accept_listener_arc = tokio_listener_arc.clone();
     let accept_handle_source_clone = context_handle_source.clone();
     let accept_options_clone = options.clone();
     let accept_config_clone = transport_config.clone();
@@ -208,7 +282,7 @@ impl TcpListener {
     accept_loop_handle: usize,
     listener_cmd_loop_handle: usize,
     endpoint_uri: String,
-    listener: Arc<TokioTcpListener>,
+    listener: Arc<CurrentTcpListener>,
     transport_config: TcpTransportConfig,
     socket_options: Arc<SocketOptions>,
     handle_source: Arc<std::sync::atomic::AtomicUsize>,
@@ -239,15 +313,40 @@ impl TcpListener {
               if let Some(ref tx) = monitor_tx {
                 let event = SocketEvent::Accepted { endpoint: endpoint_uri.clone(), peer_addr: peer_addr_str.clone() };
                 let tx_clone = tx.clone();
-                tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
+                let endpoint_uri_clone_for_log = endpoint_uri.clone();
+                let peer_addr_str = peer_addr_str.clone();
+                tokio::spawn(async move {
+
+                 if let Err(e) = tx_clone.send(event).await {
+                    tracing::warn!(
+                      endpoint = %endpoint_uri_clone_for_log,
+                      peer = %peer_addr_str,
+                      error = ?e,
+                      "Failed to send Accepted monitor event"
+                    );
+                  }
+                });
               }
 
               if let Err(e) = apply_tcp_socket_options(&tcp_stream, &transport_config) {
                 tracing::error!(accept_loop_handle = accept_loop_handle, peer = %peer_addr_str, error = %e, "Failed to apply TCP options. Dropping.");
+
                 if let Some(ref tx) = monitor_tx {
                   let event = SocketEvent::AcceptFailed { endpoint: endpoint_uri.clone(), error_msg: format!("Apply options failed: {}", e) };
                   let tx_clone = tx.clone();
-                  tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
+                  let endpoint_uri_clone_for_log = endpoint_uri.clone();
+
+                  tokio::spawn(async move {
+                    if let Err(e_send) = tx_clone.send(event).await {
+                      tracing::warn!(
+                        endpoint = %endpoint_uri_clone_for_log,
+                        peer = %peer_addr_str,
+                        original_error = %e,
+                        send_error = ?e_send,
+                        "Failed to send AcceptFailed (options) monitor event"
+                      );
+                    }
+                  });
                 }
                 drop(tcp_stream);
                 continue;
@@ -306,7 +405,19 @@ impl TcpListener {
               if let Some(ref tx) = monitor_tx {
                 let event = SocketEvent::AcceptFailed { endpoint: endpoint_uri.clone(), error_msg: format!("{}", e) };
                 let tx_clone = tx.clone();
-                tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
+                let endpoint_uri_clone_for_log = endpoint_uri.clone();
+
+                let e = e.to_string();
+                tokio::spawn(async move {
+                  if let Err(e_send) = tx_clone.send(event).await {
+                    tracing::warn!(
+                      endpoint = %endpoint_uri_clone_for_log,
+                      original_error = %e,
+                      send_error = ?e_send,
+                      "Failed to send AcceptFailed (general) monitor event"
+                    );
+                  }
+                });
               }
               if is_fatal_accept_error(&e) {
                 tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, error = %e, "Fatal error in TCP accept loop, stopping.");
@@ -379,7 +490,7 @@ impl TcpConnecter {
     task_join_handle
   }
 
-  async fn run_connect_loop(mut self, monitor_tx: Option<MonitorSender>) {
+  async fn run_connect_loop(self, monitor_tx: Option<MonitorSender>) {
     let connecter_handle = self.handle;
     let connecter_actor_type = ActorType::Connecter;
     let endpoint_uri_clone = self.endpoint.clone();
@@ -444,9 +555,19 @@ impl TcpConnecter {
             endpoint: endpoint_uri_clone.clone(),
             interval: delay_for_this_retry,
           };
+
           let tx_clone = tx.clone();
+          let endpoint_uri_log_clone_retry = endpoint_uri_clone.clone();
+
           tokio::spawn(async move {
-            if tx_clone.send(event).await.is_err() { /* Warn */ }
+            if let Err(e_send) = tx_clone.send(event).await {
+              tracing::warn!(
+                endpoint = %endpoint_uri_log_clone_retry,
+                delay = ?delay_for_this_retry,
+                error = ?e_send,
+                "Failed to send ConnectRetried monitor event"
+              );
+            }
           });
         }
 
@@ -528,47 +649,106 @@ impl TcpConnecter {
       }
 
       // 3. Attempt TCP connection
-      tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Attempting TCP connect #{}", attempt_count);
 
-      let connect_future = TcpStream::connect(&target_addr_str);
-      let mut established_stream_after_options: Option<TcpStream> = None;
+      tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Attempting TCP connect #{}", attempt_count);
+      let mut established_stream_after_options: Option<CurrentTcpStream> = None;
+
+      #[cfg(not(feature = "io-uring"))]
+      let connect_future = underlying_net::connect_stream(&target_addr_str);
+      #[cfg(feature = "io-uring")]
+      let connect_future = {
+        // For io-uring, create std socket, configure, connect, then convert
+        async {
+          let domain = if target_socket_addr.is_ipv4() {
+            socket2::Domain::IPV4
+          } else {
+            socket2::Domain::IPV6
+          };
+          let socket = Socket2Socket::new(domain, socket2::Type::STREAM, None)?;
+
+          // Apply options from self.config (TcpTransportConfig) to socket2::Socket
+          socket.set_nodelay(self.config.tcp_nodelay)?;
+          if self.config.keepalive_time.is_some()
+            || self.config.keepalive_interval.is_some()
+            || self.config.keepalive_count.is_some()
+          {
+            let mut keepalive = TcpKeepalive::new();
+            if let Some(time) = self.config.keepalive_time {
+              keepalive = keepalive.with_time(time);
+            }
+            #[cfg(any(unix, target_os = "windows"))]
+            if let Some(interval) = self.config.keepalive_interval {
+              keepalive = keepalive.with_interval(interval);
+            }
+            #[cfg(unix)]
+            if let Some(count) = self.config.keepalive_count {
+              keepalive = keepalive.with_retries(count);
+            }
+            socket.set_tcp_keepalive(&keepalive)?;
+          }
+          // socket2::Socket::connect is blocking, so wrap in spawn_blocking for async context
+          let std_socket_addr = target_socket_addr.into();
+          let std_stream: std::net::TcpStream = tokio::task::spawn_blocking(move || {
+            socket.connect(&std_socket_addr)?;
+            socket.try_into() // Converts socket2::Socket to std::net::TcpStream
+          })
+          .await
+          .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??; // Handle JoinError and inner Result
+
+          std_stream.set_nonblocking(true)?;
+          CurrentTcpStream::from_std(std_stream) // Convert to tokio_uring::net::TcpStream
+        }
+      };
 
       // Select on connect future vs shutdown event
       tokio::select! {
           connect_result = connect_future => {
-              match connect_result {
-                  Ok(stream) => {
-                      tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP connect call successful for attempt #{}", attempt_count);
-                      match apply_tcp_socket_options(&stream, &self.config) {
-                          Ok(()) => {
-                              tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Successfully applied TCP options for attempt #{}", attempt_count);
-                              established_stream_after_options = Some(stream);
-                          }
-                          Err(apply_err) => {
-                              tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %apply_err, "Failed to apply TCP options on attempt #{}. Dropping stream, will retry if configured.", attempt_count);
-                              last_attempt_error = Some(apply_err);
-                              if initial_reconnect_ivl_opt == Some(Duration::ZERO) { /* Loop will break */ }
-                              // continue; // Implicitly done by loop structure if established_stream_after_options is None
-                          }
-                      }
+            match connect_result {
+              Ok(stream) => {
+                tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP connect call successful for attempt #{}", attempt_count);
+                match apply_tcp_socket_options(&stream, &self.config) {
+                  Ok(()) => {
+                    tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Successfully applied TCP options for attempt #{}", attempt_count);
+                    established_stream_after_options = Some(stream);
                   }
-                  Err(connect_err) => {
-                      last_attempt_error = Some(ZmqError::from_io_endpoint(connect_err, &endpoint_uri_clone));
-                      tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %last_attempt_error.as_ref().unwrap(), "TCP Connect attempt #{} failed", attempt_count);
-
-                      if attempt_count == 1 && initial_reconnect_ivl_opt.map_or(true, |ivl| ivl != Duration::ZERO) && !is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
-                          if let Some(ref tx) = monitor_tx {
-                              let event = SocketEvent::ConnectDelayed { endpoint: endpoint_uri_clone.clone(), error_msg: format!("{}", last_attempt_error.as_ref().unwrap()) };
-                              let tx_clone = tx.clone();
-                              tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
-                          }
-                      }
-                      if initial_reconnect_ivl_opt == Some(Duration::ZERO) || is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
-                          // Loop will break due to this error
-                      }
-                      // continue; // Implicitly done by loop structure
+                  Err(apply_err) => {
+                    tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %apply_err, "Failed to apply TCP options on attempt #{}. Dropping stream, will retry if configured.", attempt_count);
+                    last_attempt_error = Some(apply_err);
+                    // if initial_reconnect_ivl_opt == Some(Duration::ZERO) { /* Loop will break */ }
+                    // continue; // Implicitly done by loop structure if established_stream_after_options is None
                   }
+                }
               }
+              Err(connect_err) => {
+                last_attempt_error = Some(ZmqError::from_io_endpoint(connect_err, &endpoint_uri_clone));
+                tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %last_attempt_error.as_ref().unwrap(), "TCP Connect attempt #{} failed", attempt_count);
+
+                if attempt_count == 1 && initial_reconnect_ivl_opt.map_or(true, |ivl| ivl != Duration::ZERO) && !is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
+                  if let Some(ref tx) = monitor_tx {
+
+                    let event = SocketEvent::ConnectDelayed { endpoint: endpoint_uri_clone.clone(), error_msg: format!("{}", last_attempt_error.as_ref().unwrap()) };
+                    let tx_clone = tx.clone();
+                    let endpoint_uri_log_clone_delay = endpoint_uri_clone.clone();
+                    let error_msg_clone_delay = last_attempt_error.as_ref().unwrap().to_string();
+
+                    tokio::spawn(async move {
+                      if let Err(e_send) = tx_clone.send(event).await {
+                        tracing::warn!(
+                          endpoint = %endpoint_uri_log_clone_delay,
+                          original_error = %error_msg_clone_delay,
+                          error = ?e_send,
+                          "Failed to send ConnectDelayed monitor event"
+                        );
+                      }
+                    });
+                  }
+                }
+                if initial_reconnect_ivl_opt == Some(Duration::ZERO) || is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
+                  // Loop will break due to this error
+                }
+                // continue; // Implicitly done by loop structure
+              }
+            }
           }
           event_result = system_event_rx.recv() => {
               match event_result {
@@ -716,8 +896,18 @@ impl TcpConnecter {
             error_msg: err.to_string(),
           };
           let tx_clone = tx.clone();
+          let endpoint_uri_log_clone_final_fail = endpoint_uri_clone.clone();
+          let error_msg_clone_final_fail = err.to_string();
+
           tokio::spawn(async move {
-            if tx_clone.send(event_monitor).await.is_err() { /* Warn */ }
+            if let Err(e_send) = tx_clone.send(event_monitor).await {
+              tracing::warn!(
+                endpoint = %endpoint_uri_log_clone_final_fail,
+                original_error = %error_msg_clone_final_fail,
+                error = ?e_send,
+                "Failed to send final ConnectFailed monitor event"
+              );
+            }
           });
         }
       }
@@ -733,36 +923,84 @@ impl TcpConnecter {
   }
 }
 
-fn apply_tcp_socket_options(stream: &TcpStream, config: &TcpTransportConfig) -> Result<(), ZmqError> {
-  let socket_ref = SockRef::from(stream);
-  socket_ref.set_nodelay(config.tcp_nodelay)?;
-  tracing::trace!(nodelay = config.tcp_nodelay, "Applied TCP_NODELAY");
+// This helper needs to handle both tokio::net::TcpStream and tokio_uring::net::TcpStream
+fn apply_tcp_socket_options(stream: &CurrentTcpStream, config: &TcpTransportConfig) -> Result<(), ZmqError> {
+  #[cfg(not(feature = "io-uring"))]
+  {
+    // Standard Tokio stream
+    let socket_ref = SockRef::from(stream);
+    socket_ref.set_nodelay(config.tcp_nodelay)?;
+    tracing::trace!(nodelay = config.tcp_nodelay, "Applied TCP_NODELAY (std tokio)");
 
-  if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
-    let mut keepalive = TcpKeepalive::new();
-    if let Some(time) = config.keepalive_time {
-      keepalive = keepalive.with_time(time);
+    if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
+      let mut keepalive = TcpKeepalive::new();
+      if let Some(time) = config.keepalive_time {
+        keepalive = keepalive.with_time(time);
+      }
+      #[cfg(any(unix, target_os = "windows"))]
+      if let Some(interval) = config.keepalive_interval {
+        keepalive = keepalive.with_interval(interval);
+      }
+      #[cfg(not(any(unix, target_os = "windows")))]
+      if config.keepalive_interval.is_some() {
+        tracing::warn!("TCP Keepalive Interval not supported on this platform for std tokio stream post-connect.");
+      }
+      #[cfg(unix)]
+      if let Some(count) = config.keepalive_count {
+        keepalive = keepalive.with_retries(count);
+      }
+      #[cfg(not(unix))]
+      if config.keepalive_count.is_some() {
+        tracing::warn!("TCP Keepalive Count not supported on this platform for std tokio stream post-connect.");
+      }
+      socket_ref.set_tcp_keepalive(&keepalive)?;
+      tracing::debug!("Applied TCP Keepalive settings (std tokio): {:?}", keepalive);
+    } else {
+      tracing::trace!("TCP Keepalive settings not configured (std tokio), using system defaults.");
     }
-    #[cfg(any(unix, target_os = "windows"))]
-    if let Some(interval) = config.keepalive_interval {
-      keepalive = keepalive.with_interval(interval);
+  }
+  #[cfg(feature = "io-uring")]
+  {
+    // tokio-uring stream (stream is &tokio_uring::net::TcpStream)
+    // If TcpConnecter configured socket2::Socket before connecting and converting to_std,
+    // then most options are already set. This function might become a no-op for
+    // client-side uring streams, or only verify/log.
+    // For accepted streams (listener side), we might need to set NODELAY here if not inherited.
+    // Let's assume NODELAY also needs to be set if possible.
+    use std::os::fd::AsRawFd; // Or AsFd for more modern socket2
+                              // This block is inherently unsafe if not careful with fd lifetime.
+                              // However, stream is alive for the duration of this call.
+    let fd = stream.as_raw_fd();
+    match unsafe { SockRef::from_fd(fd) } {
+      Ok(socket_ref) => {
+        socket_ref.set_nodelay(config.tcp_nodelay)?;
+        tracing::trace!(nodelay = config.tcp_nodelay, "Applied TCP_NODELAY (io_uring via fd)");
+
+        if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
+          // Keepalive logic is identical once SockRef is obtained
+          let mut keepalive = TcpKeepalive::new();
+          if let Some(time) = config.keepalive_time {
+            keepalive = keepalive.with_time(time);
+          }
+          #[cfg(any(unix, target_os = "windows"))]
+          if let Some(interval) = config.keepalive_interval {
+            keepalive = keepalive.with_interval(interval);
+          }
+          #[cfg(unix)]
+          if let Some(count) = config.keepalive_count {
+            keepalive = keepalive.with_retries(count);
+          }
+          socket_ref.set_tcp_keepalive(&keepalive)?;
+          tracing::debug!("Applied TCP Keepalive settings (io_uring via fd): {:?}", keepalive);
+        } else {
+          tracing::trace!("TCP Keepalive settings not configured (io_uring), using system defaults post-connect.");
+        }
+      }
+      Err(e) => {
+        tracing::error!(error = %e, "Failed to get SockRef from io_uring stream's FD. Cannot set post-connect options.");
+        // Not returning error here, as connect might have succeeded with defaults
+      }
     }
-    #[cfg(not(any(unix, target_os = "windows")))]
-    if config.keepalive_interval.is_some() {
-      tracing::warn!("TCP Keepalive Interval not supported on this platform.");
-    }
-    #[cfg(unix)]
-    if let Some(count) = config.keepalive_count {
-      keepalive = keepalive.with_retries(count);
-    }
-    #[cfg(not(unix))]
-    if config.keepalive_count.is_some() {
-      tracing::warn!("TCP Keepalive Count not supported on this platform.");
-    }
-    socket_ref.set_tcp_keepalive(&keepalive)?;
-    tracing::debug!("Applied TCP Keepalive settings: {:?}", keepalive);
-  } else {
-    tracing::trace!("TCP Keepalive settings not configured, using system defaults.");
   }
   Ok(())
 }
@@ -794,7 +1032,7 @@ fn is_fatal_connect_error(e: &ZmqError) -> bool {
 pub(crate) fn create_and_spawn_tcp_engine(
   engine_handle_id: usize,
   session_cmd_mailbox: MailboxSender,
-  tcp_stream: TcpStream,
+  tcp_stream: CurrentTcpStream,
   socket_options: Arc<SocketOptions>,
   is_server_role: bool,
   context: &Context,

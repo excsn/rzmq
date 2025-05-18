@@ -12,7 +12,7 @@ const SHORT_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECT_RETRY_WAIT: Duration = Duration::from_millis(300); // Time for connect attempts
 
 // --- Test: Connect to TCP address with no listener ---
-#[tokio::test]
+#[rzmq::main]
 async fn test_tcp_connect_fail_no_listener() -> Result<(), ZmqError> {
   println!("Starting test_tcp_connect_fail_no_listener...");
   let ctx = common::test_context();
@@ -52,7 +52,7 @@ async fn test_tcp_connect_fail_no_listener() -> Result<(), ZmqError> {
 }
 
 // --- Test: Connect to IPC path with no listener ---
-#[tokio::test]
+#[rzmq::main]
 #[cfg(feature = "ipc")]
 async fn test_ipc_connect_fail_no_listener() -> Result<(), ZmqError> {
   println!("Starting test_ipc_connect_fail_no_listener...");
@@ -99,7 +99,7 @@ async fn test_ipc_connect_fail_no_listener() -> Result<(), ZmqError> {
 }
 
 // --- Test: Bind IPC fails if path is an existing directory ---
-#[tokio::test]
+#[rzmq::main]
 #[cfg(feature = "ipc")]
 async fn test_ipc_bind_fail_directory_exists() -> Result<(), ZmqError> {
   println!("Starting test_ipc_bind_fail_directory_exists...");
@@ -142,7 +142,7 @@ async fn test_ipc_bind_fail_directory_exists() -> Result<(), ZmqError> {
 }
 
 // --- Test: Bind IPC succeeds if path is an existing file (non-socket) ---
-#[tokio::test]
+#[rzmq::main]
 #[cfg(feature = "ipc")]
 async fn test_ipc_bind_succeeds_over_existing_file() -> Result<(), ZmqError> {
   println!("Starting test_ipc_bind_succeeds_over_existing_file...");

@@ -29,6 +29,25 @@ pub mod socket;
 /// Deals with network transport layers (TCP, IPC, Inproc).
 pub mod transport;
 
+/// A conditional main macro.
+///
+/// If the `io-uring` feature is enabled and the target is Linux,
+/// this expands to `#[tokio_uring::main]`.
+/// Otherwise, it expands to `#[tokio::main]`.
+///
+/// Apply this to your async main function instead of `#[tokio::main]`
+/// when using the `io-uring` feature of `rzmq`.
+///
+/// # Example
+/// ```ignore
+/// #[rzmq::main]
+/// async fn main() {
+///   // Your application code
+/// }
+/// ```
+#[cfg(feature = "io-uring")]
+pub use rzmq_macros::main;
+
 // Re-export core types for user convenience, making them accessible directly
 // from the crate root (e.g., `rzmq::ZmqError`, `rzmq::Socket`).
 pub use error::ZmqError;

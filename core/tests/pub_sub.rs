@@ -14,7 +14,7 @@ const MONITOR_EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 // --- TCP Tests ---
 
-#[tokio::test]
+#[rzmq::main]
 #[serial]
 async fn test_pub_sub_tcp_basic() -> Result<(), ZmqError> {
   let ctx = common::test_context();
@@ -45,7 +45,7 @@ async fn test_pub_sub_tcp_basic() -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[tokio::test]
+#[rzmq::main]
 #[serial]
 async fn test_pub_sub_tcp_topic_filter() -> Result<(), ZmqError> {
   let ctx = common::test_context();
@@ -81,7 +81,7 @@ async fn test_pub_sub_tcp_topic_filter() -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[tokio::test]
+#[rzmq::main]
 #[serial]
 async fn test_pub_sub_tcp_multiple_subs() -> Result<(), ZmqError> {
   let ctx = common::test_context();
@@ -152,7 +152,7 @@ async fn test_pub_sub_tcp_multiple_subs() -> Result<(), ZmqError> {
 
 // --- IPC Tests ---
 
-#[tokio::test]
+#[rzmq::main]
 #[serial]
 #[cfg(feature = "ipc")]
 async fn test_pub_sub_ipc_basic() -> Result<(), ZmqError> {
@@ -179,7 +179,7 @@ async fn test_pub_sub_ipc_basic() -> Result<(), ZmqError> {
 
 // --- Inproc Tests ---
 
-#[tokio::test]
+#[rzmq::main]
 #[serial]
 #[cfg(feature = "inproc")]
 async fn test_pub_sub_inproc_basic() -> Result<(), ZmqError> {
@@ -203,7 +203,7 @@ async fn test_pub_sub_inproc_basic() -> Result<(), ZmqError> {
 }
 
 // --- Test: Unsubscribe ---
-#[tokio::test]
+#[rzmq::main]
 #[serial]
 async fn test_pub_sub_unsubscribe() -> Result<(), ZmqError> {
   println!("Starting test_pub_sub_unsubscribe...");
@@ -260,7 +260,7 @@ async fn test_pub_sub_unsubscribe() -> Result<(), ZmqError> {
 }
 
 // --- Test: Late Subscriber ---
-#[tokio::test]
+#[rzmq::main]
 #[serial]
 async fn test_pub_sub_late_subscriber() -> Result<(), ZmqError> {
   println!("Starting test_pub_sub_late_subscriber...");
@@ -319,7 +319,7 @@ async fn test_pub_sub_late_subscriber() -> Result<(), ZmqError> {
 }
 
 // --- Test: Subscriber Disconnects ---
-#[tokio::test]
+#[rzmq::main]
 #[serial]
 async fn test_pub_sub_subscriber_disconnects() -> Result<(), ZmqError> {
   println!("Starting test_pub_sub_subscriber_disconnects...");

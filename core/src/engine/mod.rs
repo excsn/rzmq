@@ -41,3 +41,10 @@ pub(crate) trait ZmtpStream: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::D
 impl ZmtpStream for tokio::net::TcpStream {}
 #[cfg(feature = "ipc")]
 impl ZmtpStream for tokio::net::UnixStream {}
+
+#[cfg(feature = "io-uring")]
+impl ZmtpStream for tokio_uring::net::TcpStream {}
+
+// Optional: if you want io_uring for IPC as well (deferred for now)
+// #[cfg(all(feature = "ipc", feature = "io-uring"))]
+// impl ZmtpStream for tokio_uring::net::UnixStream {}

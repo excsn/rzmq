@@ -19,6 +19,11 @@ use crate::socket::options::{
   RECONNECT_IVL_MAX, ROUTER_MANDATORY, ROUTING_ID, SNDHWM, SNDTIMEO, SUBSCRIBE, TCP_KEEPALIVE, TCP_KEEPALIVE_CNT,
   TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTVL, UNSUBSCRIBE, ZAP_DOMAIN,
 };
+#[cfg(feature = "io-uring")]
+use crate::socket::options::{
+  IO_URING_RCVMULTISHOT,
+  IO_URING_SNDZEROCOPY,
+};
 #[cfg(feature = "curve")]
 use crate::socket::options::{
   parse_key_option, CURVE_KEY_LEN, CURVE_PUBLICKEY, CURVE_SECRETKEY, CURVE_SERVER, CURVE_SERVERKEY,
@@ -2154,12 +2159,29 @@ impl SocketCore {
       value_len = value.len(),
       "Setting option"
     );
+    
     match socket_logic.set_pattern_option(option, value).await {
       Ok(()) => return Ok(()),
       Err(ZmqError::UnsupportedOption(_)) => {}
       Err(e) => return Err(e),
     }
+
     let mut state_g = core_arc.core_state.lock().await;
+
+     #[cfg(feature = "io-uring")]
+    {
+        if option == IO_URING_SNDZEROCOPY {
+            state_g.options.io_uring_send_zerocopy = options::parse_bool_option(value)?;
+            // Note: This typically affects new engines. Existing engines won't change behavior.
+            tracing::debug!(handle = core_arc.handle, "IO_URING_SNDZEROCOPY set to {}", state_g.options.io_uring_send_zerocopy);
+            return Ok(());
+        } else if option == IO_URING_RCVMULTISHOT {
+            state_g.options.io_uring_recv_multishot = options::parse_bool_option(value)?;
+            tracing::debug!(handle = core_arc.handle, "IO_URING_RCVMULTISHOT set to {}", state_g.options.io_uring_recv_multishot);
+            return Ok(());
+        }
+    }
+
     match option {
       SNDHWM => {
         state_g.options.sndhwm = parse_i32_option(value)?.max(0) as usize;
@@ -2253,12 +2275,24 @@ impl SocketCore {
     option: i32,
   ) -> Result<Vec<u8>, ZmqError> {
     tracing::debug!(handle = core_arc.handle, option = option, "Getting option");
+    
     match socket_logic.get_pattern_option(option).await {
       Ok(v_val) => return Ok(v_val),
       Err(ZmqError::UnsupportedOption(_)) => {}
       Err(e_val) => return Err(e_val),
     }
+
     let state_g = core_arc.core_state.lock().await;
+
+     #[cfg(feature = "io-uring")]
+    {
+        if option == options::IO_URING_SNDZEROCOPY {
+            return Ok((state_g.options.io_uring_send_zerocopy as i32).to_ne_bytes().to_vec());
+        } else if option == options::IO_URING_RCVMULTISHOT {
+            return Ok((state_g.options.io_uring_recv_multishot as i32).to_ne_bytes().to_vec());
+        }
+    }
+    
     match option {
       SNDHWM => Ok((state_g.options.sndhwm as i32).to_ne_bytes().to_vec()),
       RCVHWM => Ok((state_g.options.rcvhwm as i32).to_ne_bytes().to_vec()),
