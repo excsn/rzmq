@@ -9,7 +9,7 @@ const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
 const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 
 // --- Test: REQ sending twice ---
-#[rzmq::main]
+#[rzmq_macros::test]
 async fn test_req_rep_req_send_without_recv() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_req_send_without_recv...");
   let ctx = common::test_context();
@@ -82,7 +82,7 @@ async fn test_req_rep_req_send_without_recv() -> Result<(), ZmqError> {
 }
 
 // --- Test: REP receiving before request ---
-#[rzmq::main]
+#[rzmq_macros::test]
 async fn test_req_rep_rep_recv_without_request() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_rep_recv_without_request...");
   let ctx = common::test_context();
@@ -135,7 +135,7 @@ async fn test_req_rep_rep_recv_without_request() -> Result<(), ZmqError> {
 }
 
 // --- Test: REP sending before request ---
-#[rzmq::main]
+#[rzmq_macros::test]
 async fn test_req_rep_rep_send_without_request() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_rep_send_without_request...");
   let ctx = common::test_context();
@@ -173,7 +173,7 @@ async fn test_req_rep_rep_send_without_request() -> Result<(), ZmqError> {
 }
 
 // --- Test: REP disconnects while REQ is waiting for reply ---
-#[rzmq::main]
+#[rzmq_macros::test]
 async fn test_req_rep_rep_disconnects_while_req_waiting() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_rep_disconnects_while_req_waiting...");
   let ctx = common::test_context();
@@ -260,7 +260,7 @@ async fn test_req_rep_rep_disconnects_while_req_waiting() -> Result<(), ZmqError
 }
 
 // --- Test: REQ disconnects before REP sends reply ---
-#[rzmq::main]
+#[rzmq_macros::test]
 async fn test_req_rep_req_disconnects_before_reply() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_req_disconnects_before_reply...");
   let ctx = common::test_context();
@@ -305,10 +305,7 @@ async fn test_req_rep_req_disconnects_before_reply() -> Result<(), ZmqError> {
   // SendError to ConnectionClosed. The REP send might return this or
   // potentially HostUnreachable if the core handles detachment that way.
   assert!(
-    matches!(
-      send_result,
-      Err(ZmqError::InvalidState(_)) 
-    ),
+    matches!(send_result, Err(ZmqError::InvalidState(_))),
     "Expected InvalidState error, got {:?}",
     send_result
   );

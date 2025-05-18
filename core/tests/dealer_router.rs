@@ -10,7 +10,7 @@ const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 
 // --- TCP Tests ---
 
-#[rzmq::main]
+#[rzmq_macros::test]
 async fn test_dealer_router_tcp_basic() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   {
@@ -76,7 +76,7 @@ async fn test_dealer_router_tcp_basic() -> Result<(), ZmqError> {
 
 // --- IPC Tests ---
 
-#[rzmq::main]
+#[rzmq_macros::test]
 #[cfg(feature = "ipc")]
 async fn test_dealer_router_ipc_basic() -> Result<(), ZmqError> {
   let ctx = common::test_context();
@@ -121,7 +121,7 @@ async fn test_dealer_router_ipc_basic() -> Result<(), ZmqError> {
 
 // --- Inproc Tests ---
 
-#[rzmq::main]
+#[rzmq_macros::test]
 #[cfg(feature = "inproc")]
 async fn test_dealer_router_inproc_basic() -> Result<(), ZmqError> {
   let ctx = common::test_context();

@@ -45,7 +45,6 @@ pub mod transport;
 ///   // Your application code
 /// }
 /// ```
-#[cfg(feature = "io-uring")]
 pub use rzmq_macros::main;
 
 // Re-export core types for user convenience, making them accessible directly

@@ -1,12 +1,15 @@
 use rzmq::{
-  socket::{options::{RCVHWM, SNDHWM, SNDTIMEO}, MonitorReceiver, SocketEvent},
+  socket::{
+    options::{RCVHWM, SNDHWM, SNDTIMEO},
+    MonitorReceiver, SocketEvent,
+  },
   Context, Msg, SocketType, ZmqError,
 };
-use std::{sync::Arc, time::Instant};
 use std::time::Duration;
-use tokio::{sync::Notify, task};
+use std::{sync::Arc, time::Instant};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
+use tokio::{sync::Notify, task};
 
 mod common;
 
@@ -218,7 +221,7 @@ async fn run_single_pair(ctx: Arc<Context>, endpoint: String) -> Result<(), Stri
   Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[rzmq_macros::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_push_pull_concurrent_shutdown_race() {
   println!("\n--- Starting test_push_pull_concurrent_shutdown_race ---");
   let ctx = Arc::new(common::test_context());
@@ -273,165 +276,191 @@ const NUM_PUSHERS: usize = 2;
 const NUM_PULLERS: usize = 2;
 const FINAL_TERM_TIMEOUT: Duration = Duration::from_secs(5); // Timeout for ctx.term() itself
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[rzmq_macros::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_chaotic_shutdown() -> Result<(), ZmqError> {
-    println!("\n--- Starting test_chaotic_shutdown (Inproc N-PUSH -> 1-PULL) ---");
-    let ctx = common::test_context(); // Owned context
+  println!("\n--- Starting test_chaotic_shutdown (Inproc N-PUSH -> 1-PULL) ---");
+  let ctx = common::test_context(); // Owned context
 
-    let mut push_sockets = Vec::new();
-    let mut pull_sockets = Vec::new();
-    let mut task_handles: Vec<JoinHandle<_>> = Vec::new();
+  let mut push_sockets = Vec::new();
+  let mut pull_sockets = Vec::new();
+  let mut task_handles: Vec<JoinHandle<_>> = Vec::new();
 
-    // --- Setup PULL Socket (The single receiver) ---
-    println!("Creating 1 PULL socket, binding to {}...", CHAOS_ENDPOINT);
-    let pull = ctx.socket(SocketType::Pull)?;
-    pull.set_option(RCVHWM, &CHAOS_HWM.to_ne_bytes()).await?;
-    pull.bind(CHAOS_ENDPOINT)
-        .await
-        .expect("Failed to bind PULL socket");
-    let pull_socket = Arc::new(pull);
-    pull_sockets.push(pull_socket.clone());
-    println!("[Setup] PULL bound.");
+  // --- Setup PULL Socket (The single receiver) ---
+  println!("Creating 1 PULL socket, binding to {}...", CHAOS_ENDPOINT);
+  let pull = ctx.socket(SocketType::Pull)?;
+  pull.set_option(RCVHWM, &CHAOS_HWM.to_ne_bytes()).await?;
+  pull.bind(CHAOS_ENDPOINT).await.expect("Failed to bind PULL socket");
+  let pull_socket = Arc::new(pull);
+  pull_sockets.push(pull_socket.clone());
+  println!("[Setup] PULL bound.");
 
-    // --- Setup PUSH Sockets (Multiple Connectors) ---
-    println!(
-        "Creating {} PUSH sockets, connecting to {}...",
-        NUM_PUSHERS, CHAOS_ENDPOINT
-    );
-    for i in 0..NUM_PUSHERS {
-        let push = ctx.socket(SocketType::Push)?;
-        push.set_option(SNDHWM, &CHAOS_HWM.to_ne_bytes()).await?;
-        push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?; // Non-blocking send
+  // --- Setup PUSH Sockets (Multiple Connectors) ---
+  println!(
+    "Creating {} PUSH sockets, connecting to {}...",
+    NUM_PUSHERS, CHAOS_ENDPOINT
+  );
+  for i in 0..NUM_PUSHERS {
+    let push = ctx.socket(SocketType::Push)?;
+    push.set_option(SNDHWM, &CHAOS_HWM.to_ne_bytes()).await?;
+    push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?; // Non-blocking send
 
-        // Connect directly - for inproc, connect() awaits confirmation
-        match push.connect(CHAOS_ENDPOINT).await {
-             Ok(()) => {
-                 println!("[Setup] PUSH socket {} connected successfully.", i);
-                 push_sockets.push(Arc::new(push)); // Store Arc<Socket>
-             }
-             Err(e) => panic!("[Setup] PUSH socket {} failed to connect: {}", i, e),
-         }
+    // Connect directly - for inproc, connect() awaits confirmation
+    match push.connect(CHAOS_ENDPOINT).await {
+      Ok(()) => {
+        println!("[Setup] PUSH socket {} connected successfully.", i);
+        push_sockets.push(Arc::new(push)); // Store Arc<Socket>
+      }
+      Err(e) => panic!("[Setup] PUSH socket {} failed to connect: {}", i, e),
     }
-    // Short sleep *after* all connections complete might help ensure pipe attachment messages are processed
-    sleep(Duration::from_millis(50)).await;
-    println!("All sockets created and connected/bound.");
+  }
+  // Short sleep *after* all connections complete might help ensure pipe attachment messages are processed
+  sleep(Duration::from_millis(50)).await;
+  println!("All sockets created and connected/bound.");
 
-
-    // --- Spawn Pusher Tasks ---
-    println!("Spawning {} pusher tasks...", NUM_PUSHERS);
-    for i in 0..NUM_PUSHERS {
-        let push_socket_clone = push_sockets[i].clone();
-        let handle = task::spawn(async move {
-            let mut count = 0u64;
-            let start = Instant::now();
-            while start.elapsed() < CHAOS_DURATION {
-                let msg = Msg::from_vec(format!("PUSH[{}]-{}", i, count).into_bytes());
-                match push_socket_clone.send(msg).await {
-                    Ok(()) => count += 1,
-                    Err(ZmqError::ResourceLimitReached) => { task::yield_now().await; }
-                    // Check specifically for InvalidState("Socket terminated")
-                    Err(ZmqError::InvalidState(ref s)) if s == &"Socket terminated" => {
-                         println!("[Pusher {}] Got 'Socket terminated'. Stopping.", i);
-                         break;
-                    }
-                    Err(e) => { println!("[Pusher {}] Send error: {}", i, e); break; }
-                }
-                 // Optional yield
-                 // if count % 100 == 0 { task::yield_now().await; }
-            }
-             println!("[Pusher {}] Finished loop after {:?}, sent ~{} messages.", i, start.elapsed(), count);
-            count
-        });
-        task_handles.push(handle);
-    }
-
-    // --- Spawn Puller Task (Only one) ---
-    println!("Spawning 1 puller task...");
-    let pull_socket_clone = pull_sockets[0].clone(); // The single puller
+  // --- Spawn Pusher Tasks ---
+  println!("Spawning {} pusher tasks...", NUM_PUSHERS);
+  for i in 0..NUM_PUSHERS {
+    let push_socket_clone = push_sockets[i].clone();
     let handle = task::spawn(async move {
-        let mut count = 0u64;
-        let start = Instant::now();
-        loop {
-             // Use a slightly longer timeout for recv
-            match timeout(CHAOS_DURATION + Duration::from_secs(2), pull_socket_clone.recv()).await {
-                Ok(Ok(_msg)) => { count += 1; }
-                Ok(Err(ZmqError::InvalidState(ref s))) if s == &"Socket terminated" => {
-                    println!("[Puller 0] Got 'Socket terminated' after {} msgs.", count); break;
-                }
-                 Ok(Err(ZmqError::Timeout)) => { // This might happen if pushers finish early
-                      println!("[Puller 0] Timed out waiting after {} msgs.", count); break;
-                  }
-                Ok(Err(e)) => { println!("[Puller 0] Recv error: {}", e); break; }
-                Err(_) => { // Outer timeout
-                    println!("[Puller 0] Recv loop timed out after {:?}, received {} messages.", start.elapsed(), count);
-                    break;
-                }
-            }
-            if start.elapsed() >= CHAOS_DURATION {
-                 // Don't break immediately, allow recv timeout to catch remaining messages
-                 // println!("[Puller 0] Chaos duration ended after {:?}, received {} messages.", start.elapsed(), count);
-                 // break;
-             }
-             // Optional yield
-             // if count % 100 == 0 { task::yield_now().await; }
+      let mut count = 0u64;
+      let start = Instant::now();
+      while start.elapsed() < CHAOS_DURATION {
+        let msg = Msg::from_vec(format!("PUSH[{}]-{}", i, count).into_bytes());
+        match push_socket_clone.send(msg).await {
+          Ok(()) => count += 1,
+          Err(ZmqError::ResourceLimitReached) => {
+            task::yield_now().await;
+          }
+          // Check specifically for InvalidState("Socket terminated")
+          Err(ZmqError::InvalidState(ref s)) if s == &"Socket terminated" => {
+            println!("[Pusher {}] Got 'Socket terminated'. Stopping.", i);
+            break;
+          }
+          Err(e) => {
+            println!("[Pusher {}] Send error: {}", i, e);
+            break;
+          }
         }
-        println!("[Puller 0] Finished loop, received total {}.", count);
+        // Optional yield
+        // if count % 100 == 0 { task::yield_now().await; }
+      }
+      println!(
+        "[Pusher {}] Finished loop after {:?}, sent ~{} messages.",
+        i,
+        start.elapsed(),
         count
+      );
+      count
     });
     task_handles.push(handle);
+  }
 
-    // Let the chaos run
-    println!("Letting chaos run for {:?}...", CHAOS_DURATION);
-    sleep(CHAOS_DURATION).await;
-    println!("Chaos duration finished. Initiating context termination.");
-
-    pull_socket.close().await;
-    for sck in push_sockets {
-      sck.close().await;
-    }
-    // --- Initiate Context Termination ---
-    let term_result = timeout(FINAL_TERM_TIMEOUT, ctx.term()).await;
-
-    println!("Context termination initiated. Waiting for tasks...");
-
-    // --- Wait for all tasks to complete ---
-    let mut total_sent: u64 = 0;
-    let mut total_recv: u64 = 0;
-    let mut puller_count = 0;
-    for (i, handle) in task_handles.into_iter().enumerate() {
-        match handle.await {
-            Ok(count) => {
-                 if i < NUM_PUSHERS {
-                     println!("[Main] Pusher {} finished, sent ~{}.", i, count);
-                     total_sent += count;
-                 } else {
-                     println!("[Main] Puller {} finished, received {}.", puller_count, count);
-                     total_recv += count;
-                     puller_count += 1;
-                 }
-            },
-            Err(e) => {
-                 println!("[Main] Task {} panicked: {:?}", i, e);
-            }
+  // --- Spawn Puller Task (Only one) ---
+  println!("Spawning 1 puller task...");
+  let pull_socket_clone = pull_sockets[0].clone(); // The single puller
+  let handle = task::spawn(async move {
+    let mut count = 0u64;
+    let start = Instant::now();
+    loop {
+      // Use a slightly longer timeout for recv
+      match timeout(CHAOS_DURATION + Duration::from_secs(2), pull_socket_clone.recv()).await {
+        Ok(Ok(_msg)) => {
+          count += 1;
         }
+        Ok(Err(ZmqError::InvalidState(ref s))) if s == &"Socket terminated" => {
+          println!("[Puller 0] Got 'Socket terminated' after {} msgs.", count);
+          break;
+        }
+        Ok(Err(ZmqError::Timeout)) => {
+          // This might happen if pushers finish early
+          println!("[Puller 0] Timed out waiting after {} msgs.", count);
+          break;
+        }
+        Ok(Err(e)) => {
+          println!("[Puller 0] Recv error: {}", e);
+          break;
+        }
+        Err(_) => {
+          // Outer timeout
+          println!(
+            "[Puller 0] Recv loop timed out after {:?}, received {} messages.",
+            start.elapsed(),
+            count
+          );
+          break;
+        }
+      }
+      if start.elapsed() >= CHAOS_DURATION {
+        // Don't break immediately, allow recv timeout to catch remaining messages
+        // println!("[Puller 0] Chaos duration ended after {:?}, received {} messages.", start.elapsed(), count);
+        // break;
+      }
+      // Optional yield
+      // if count % 100 == 0 { task::yield_now().await; }
     }
-    println!("All tasks joined. Total Sent ~{}, Total Recv {}", total_sent, total_recv);
+    println!("[Puller 0] Finished loop, received total {}.", count);
+    count
+  });
+  task_handles.push(handle);
 
-    // --- Assertions ---
-    match term_result {
-         Ok(Ok(())) => {
-             println!("[Main] Context terminated successfully.");
-         }
-         Ok(Err(e)) => {
-              panic!("Context termination failed with ZmqError: {}", e);
-         }
-         Err(_) => {
-              panic!("Context termination timed out after {:?}! Potential deadlock.", FINAL_TERM_TIMEOUT);
-         }
+  // Let the chaos run
+  println!("Letting chaos run for {:?}...", CHAOS_DURATION);
+  sleep(CHAOS_DURATION).await;
+  println!("Chaos duration finished. Initiating context termination.");
+
+  pull_socket.close().await;
+  for sck in push_sockets {
+    sck.close().await;
+  }
+  // --- Initiate Context Termination ---
+  let term_result = timeout(FINAL_TERM_TIMEOUT, ctx.term()).await;
+
+  println!("Context termination initiated. Waiting for tasks...");
+
+  // --- Wait for all tasks to complete ---
+  let mut total_sent: u64 = 0;
+  let mut total_recv: u64 = 0;
+  let mut puller_count = 0;
+  for (i, handle) in task_handles.into_iter().enumerate() {
+    match handle.await {
+      Ok(count) => {
+        if i < NUM_PUSHERS {
+          println!("[Main] Pusher {} finished, sent ~{}.", i, count);
+          total_sent += count;
+        } else {
+          println!("[Main] Puller {} finished, received {}.", puller_count, count);
+          total_recv += count;
+          puller_count += 1;
+        }
+      }
+      Err(e) => {
+        println!("[Main] Task {} panicked: {:?}", i, e);
+      }
     }
+  }
+  println!(
+    "All tasks joined. Total Sent ~{}, Total Recv {}",
+    total_sent, total_recv
+  );
 
-    println!("--- Test test_chaotic_shutdown (Inproc N-PUSH -> 1-PULL) Finished ---");
-    Ok(())
+  // --- Assertions ---
+  match term_result {
+    Ok(Ok(())) => {
+      println!("[Main] Context terminated successfully.");
+    }
+    Ok(Err(e)) => {
+      panic!("Context termination failed with ZmqError: {}", e);
+    }
+    Err(_) => {
+      panic!(
+        "Context termination timed out after {:?}! Potential deadlock.",
+        FINAL_TERM_TIMEOUT
+      );
+    }
+  }
+
+  println!("--- Test test_chaotic_shutdown (Inproc N-PUSH -> 1-PULL) Finished ---");
+  Ok(())
 }
 
 // Constants specific to this TCP test
@@ -445,30 +474,30 @@ const TCP_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_EVENT_RECV_TIMEOUT: Duration = Duration::from_secs(4);
 
 // --- Helper function copied/adapted from benchmark setup ---
-async fn wait_for_event_tcp( // Renamed slightly for clarity
+async fn wait_for_event_tcp(
+  // Renamed slightly for clarity
   monitor_rx: &MonitorReceiver,
   check_event: impl Fn(&SocketEvent) -> bool,
 ) -> Result<SocketEvent, String> {
   let start_time = Instant::now();
   loop {
-      if start_time.elapsed() > TCP_EVENT_RECV_TIMEOUT {
-          return Err(format!("Timeout after {:?}", TCP_EVENT_RECV_TIMEOUT));
+    if start_time.elapsed() > TCP_EVENT_RECV_TIMEOUT {
+      return Err(format!("Timeout after {:?}", TCP_EVENT_RECV_TIMEOUT));
+    }
+    match timeout(Duration::from_millis(50), monitor_rx.recv()).await {
+      Ok(Ok(event)) => {
+        // println!("[Monitor]: {:?}", event); // Optional detailed logging
+        if check_event(&event) {
+          return Ok(event);
+        }
       }
-      match timeout(Duration::from_millis(50), monitor_rx.recv()).await {
-          Ok(Ok(event)) => {
-              // println!("[Monitor]: {:?}", event); // Optional detailed logging
-              if check_event(&event) {
-                  return Ok(event);
-              }
-          }
-          Ok(Err(_)) => return Err("Monitor channel closed".to_string()),
-          Err(_) => {} // Timeout poll
-      }
+      Ok(Err(_)) => return Err("Monitor channel closed".to_string()),
+      Err(_) => {} // Timeout poll
+    }
   }
 }
 
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[rzmq_macros::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
   println!("\n--- Starting test_chaotic_shutdown_tcp (TCP N-PUSH -> 1-PULL) ---");
   let ctx = common::test_context(); // Owned context
@@ -478,10 +507,7 @@ async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
   let mut task_handles: Vec<JoinHandle<_>> = Vec::new();
 
   // --- Setup PULL Socket (The single receiver) ---
-  println!(
-      "Creating 1 PULL socket, binding to {}...",
-      TCP_CHAOS_ENDPOINT
-  );
+  println!("Creating 1 PULL socket, binding to {}...", TCP_CHAOS_ENDPOINT);
   let pull = ctx.socket(SocketType::Pull)?;
   pull.set_option(RCVHWM, &TCP_CHAOS_HWM.to_ne_bytes()).await?;
 
@@ -491,9 +517,10 @@ async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
 
   pull.bind(TCP_CHAOS_ENDPOINT).await?;
   println!("[Setup] PULL bound.");
-  wait_for_event_tcp(&pull_monitor, |e| {
-      matches!(e, SocketEvent::Listening { endpoint: ep } if ep == TCP_CHAOS_ENDPOINT)
-  })
+  wait_for_event_tcp(
+    &pull_monitor,
+    |e| matches!(e, SocketEvent::Listening { endpoint: ep } if ep == TCP_CHAOS_ENDPOINT),
+  )
   .await
   .map_err(|e| ZmqError::Internal(format!("PULL Listening event error: {}", e)))?;
   println!("[Setup] PULL Listening event confirmed.");
@@ -502,122 +529,153 @@ async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
 
   // --- Setup PUSH Sockets (Multiple Connectors) ---
   println!(
-      "Creating {} PUSH sockets, connecting to {}...",
-      TCP_NUM_PUSHERS, TCP_CHAOS_ENDPOINT
+    "Creating {} PUSH sockets, connecting to {}...",
+    TCP_NUM_PUSHERS, TCP_CHAOS_ENDPOINT
   );
   let mut push_connection_futures = vec![];
   let expected_connections = Arc::new(tokio::sync::Semaphore::new(TCP_NUM_PUSHERS)); // To count connections
 
   for i in 0..TCP_NUM_PUSHERS {
-      let push = ctx.socket(SocketType::Push)?;
-      push.set_option(SNDHWM, &TCP_CHAOS_HWM.to_ne_bytes()).await?;
-      push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?; // Non-blocking send
+    let push = ctx.socket(SocketType::Push)?;
+    push.set_option(SNDHWM, &TCP_CHAOS_HWM.to_ne_bytes()).await?;
+    push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?; // Non-blocking send
 
-      // Spawn a task to connect
-      let connect_endpoint = TCP_CHAOS_ENDPOINT.to_string();
-      let connect_task = tokio::spawn(async move {
-           // Connect doesn't wait for confirmation for TCP
-          push.connect(&connect_endpoint).await?;
-           println!("[Setup PUSH {}] Connect call returned Ok.", i);
-          // The confirmation will happen via the PULL monitor below
-          Ok::<_, ZmqError>(push) // Return the socket handle
-      });
-      push_connection_futures.push(connect_task);
+    // Spawn a task to connect
+    let connect_endpoint = TCP_CHAOS_ENDPOINT.to_string();
+    let connect_task = tokio::spawn(async move {
+      // Connect doesn't wait for confirmation for TCP
+      push.connect(&connect_endpoint).await?;
+      println!("[Setup PUSH {}] Connect call returned Ok.", i);
+      // The confirmation will happen via the PULL monitor below
+      Ok::<_, ZmqError>(push) // Return the socket handle
+    });
+    push_connection_futures.push(connect_task);
   }
 
   // Wait for all PUSH sockets connect calls to complete (doesn't mean connected yet)
   println!("[Setup] Waiting for all PUSH connect calls to return...");
   let push_results = futures::future::join_all(push_connection_futures).await;
-   for (i, result) in push_results.into_iter().enumerate() {
-       match result {
-           Ok(Ok(push_sock)) => {
-                push_sockets.push(Arc::new(push_sock)); // Store Arc<Socket>
-                println!("[Setup] PUSH socket {} connect call finished.", i);
-           }
-           Ok(Err(e)) => panic!("[Setup] PUSH socket {} failed connect call: {}", i, e),
-           Err(e) => panic!("[Setup] PUSH socket {} connect task panicked: {:?}", i, e),
-       }
-   }
+  for (i, result) in push_results.into_iter().enumerate() {
+    match result {
+      Ok(Ok(push_sock)) => {
+        push_sockets.push(Arc::new(push_sock)); // Store Arc<Socket>
+        println!("[Setup] PUSH socket {} connect call finished.", i);
+      }
+      Ok(Err(e)) => panic!("[Setup] PUSH socket {} failed connect call: {}", i, e),
+      Err(e) => panic!("[Setup] PUSH socket {} connect task panicked: {:?}", i, e),
+    }
+  }
 
-   // Wait for the PULL monitor to see all PUSH connections
-   println!("[Setup] Waiting for PULL monitor to confirm {} connections...", TCP_NUM_PUSHERS);
-   let mut confirmed_connections = 0;
-   let confirmation_timeout = TCP_SETUP_TIMEOUT + Duration::from_secs(2); // Extra time for connections
-   let start_confirm = Instant::now();
-   while confirmed_connections < TCP_NUM_PUSHERS {
-       if start_confirm.elapsed() > confirmation_timeout {
-            panic!("[Setup] Timed out waiting for all {} PUSH connections to be confirmed by PULL monitor (only saw {}).", TCP_NUM_PUSHERS, confirmed_connections);
-       }
-       // Wait for the next connection event
-       match wait_for_event_tcp(&pull_monitor, |e| {
-            matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
-       }).await {
-           Ok(_) => {
-               confirmed_connections += 1;
-               println!("[Setup] PULL Monitor confirmed connection {}/{}.", confirmed_connections, TCP_NUM_PUSHERS);
-           }
-           Err(e) => {
-                panic!("[Setup] Error waiting for PULL monitor connection event: {}", e);
-           }
-       }
-   }
-   println!("All sockets created and connections confirmed.");
-
+  // Wait for the PULL monitor to see all PUSH connections
+  println!(
+    "[Setup] Waiting for PULL monitor to confirm {} connections...",
+    TCP_NUM_PUSHERS
+  );
+  let mut confirmed_connections = 0;
+  let confirmation_timeout = TCP_SETUP_TIMEOUT + Duration::from_secs(2); // Extra time for connections
+  let start_confirm = Instant::now();
+  while confirmed_connections < TCP_NUM_PUSHERS {
+    if start_confirm.elapsed() > confirmation_timeout {
+      panic!(
+        "[Setup] Timed out waiting for all {} PUSH connections to be confirmed by PULL monitor (only saw {}).",
+        TCP_NUM_PUSHERS, confirmed_connections
+      );
+    }
+    // Wait for the next connection event
+    match wait_for_event_tcp(&pull_monitor, |e| {
+      matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+    })
+    .await
+    {
+      Ok(_) => {
+        confirmed_connections += 1;
+        println!(
+          "[Setup] PULL Monitor confirmed connection {}/{}.",
+          confirmed_connections, TCP_NUM_PUSHERS
+        );
+      }
+      Err(e) => {
+        panic!("[Setup] Error waiting for PULL monitor connection event: {}", e);
+      }
+    }
+  }
+  println!("All sockets created and connections confirmed.");
 
   // --- Spawn Pusher Tasks ---
   println!("Spawning {} pusher tasks...", TCP_NUM_PUSHERS);
   for i in 0..TCP_NUM_PUSHERS {
-      let push_socket_clone = push_sockets[i].clone();
-      let handle = task::spawn(async move {
-          let mut count = 0u64;
-          let start = Instant::now();
-          while start.elapsed() < TCP_CHAOS_DURATION {
-              let msg = Msg::from_vec(format!("PUSH[{}]-{}", i, count).into_bytes());
-              match push_socket_clone.send(msg).await {
-                  Ok(()) => count += 1,
-                  Err(ZmqError::ResourceLimitReached) => { task::yield_now().await; }
-                  Err(ZmqError::InvalidState(ref s)) if s == &"Socket terminated" => {
-                       println!("[Pusher {}] Got 'Socket terminated'. Stopping.", i); break;
-                  }
-                  Err(e) => { println!("[Pusher {}] Send error: {}", i, e); break; }
-              }
+    let push_socket_clone = push_sockets[i].clone();
+    let handle = task::spawn(async move {
+      let mut count = 0u64;
+      let start = Instant::now();
+      while start.elapsed() < TCP_CHAOS_DURATION {
+        let msg = Msg::from_vec(format!("PUSH[{}]-{}", i, count).into_bytes());
+        match push_socket_clone.send(msg).await {
+          Ok(()) => count += 1,
+          Err(ZmqError::ResourceLimitReached) => {
+            task::yield_now().await;
           }
-           println!("[Pusher {}] Finished loop after {:?}, sent ~{} messages.", i, start.elapsed(), count);
-          count
-      });
-      task_handles.push(handle);
+          Err(ZmqError::InvalidState(ref s)) if s == &"Socket terminated" => {
+            println!("[Pusher {}] Got 'Socket terminated'. Stopping.", i);
+            break;
+          }
+          Err(e) => {
+            println!("[Pusher {}] Send error: {}", i, e);
+            break;
+          }
+        }
+      }
+      println!(
+        "[Pusher {}] Finished loop after {:?}, sent ~{} messages.",
+        i,
+        start.elapsed(),
+        count
+      );
+      count
+    });
+    task_handles.push(handle);
   }
 
   // --- Spawn Puller Task (Only one) ---
   println!("Spawning 1 puller task...");
   let pull_socket_clone = pull_sockets[0].clone(); // The single puller
   let handle = task::spawn(async move {
-      let mut count = 0u64;
-      let start = Instant::now();
-      loop {
-          match timeout(TCP_CHAOS_DURATION + Duration::from_secs(2), pull_socket_clone.recv()).await {
-              Ok(Ok(_msg)) => { count += 1; }
-              Ok(Err(ZmqError::InvalidState(ref s))) if s == &"Socket terminated" => {
-                  println!("[Puller 0] Got 'Socket terminated' after {} msgs.", count); break;
-              }
-               Ok(Err(ZmqError::Timeout)) => {
-                    println!("[Puller 0] Timed out waiting after {} msgs.", count); break;
-                }
-              Ok(Err(e)) => { println!("[Puller 0] Recv error: {}", e); break; }
-              Err(_) => {
-                  println!("[Puller 0] Recv loop timed out after {:?}, received {} messages.", start.elapsed(), count);
-                  break;
-              }
-          }
-          if start.elapsed() >= TCP_CHAOS_DURATION {
-                // Let recv timeout handle the end
-            }
+    let mut count = 0u64;
+    let start = Instant::now();
+    loop {
+      match timeout(TCP_CHAOS_DURATION + Duration::from_secs(2), pull_socket_clone.recv()).await {
+        Ok(Ok(_msg)) => {
+          count += 1;
+        }
+        Ok(Err(ZmqError::InvalidState(ref s))) if s == &"Socket terminated" => {
+          println!("[Puller 0] Got 'Socket terminated' after {} msgs.", count);
+          break;
+        }
+        Ok(Err(ZmqError::Timeout)) => {
+          println!("[Puller 0] Timed out waiting after {} msgs.", count);
+          break;
+        }
+        Ok(Err(e)) => {
+          println!("[Puller 0] Recv error: {}", e);
+          break;
+        }
+        Err(_) => {
+          println!(
+            "[Puller 0] Recv loop timed out after {:?}, received {} messages.",
+            start.elapsed(),
+            count
+          );
+          break;
+        }
       }
-      println!("[Puller 0] Finished loop, received total {}.", count);
-      count
+      if start.elapsed() >= TCP_CHAOS_DURATION {
+        // Let recv timeout handle the end
+      }
+    }
+    println!("[Puller 0] Finished loop, received total {}.", count);
+    count
   });
   task_handles.push(handle);
-
 
   // Let the chaos run
   println!("Letting chaos run for {:?}...", TCP_CHAOS_DURATION);
@@ -634,35 +692,41 @@ async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
   let mut total_recv: u64 = 0;
   let mut puller_count = 0;
   for (i, handle) in task_handles.into_iter().enumerate() {
-      match handle.await {
-          Ok(count) => {
-               if i < TCP_NUM_PUSHERS {
-                   println!("[Main] Pusher {} finished, sent ~{}.", i, count);
-                   total_sent += count;
-               } else {
-                   println!("[Main] Puller {} finished, received {}.", puller_count, count);
-                   total_recv += count;
-                   puller_count += 1;
-               }
-          },
-          Err(e) => {
-               println!("[Main] Task {} panicked: {:?}", i, e);
-          }
+    match handle.await {
+      Ok(count) => {
+        if i < TCP_NUM_PUSHERS {
+          println!("[Main] Pusher {} finished, sent ~{}.", i, count);
+          total_sent += count;
+        } else {
+          println!("[Main] Puller {} finished, received {}.", puller_count, count);
+          total_recv += count;
+          puller_count += 1;
+        }
       }
+      Err(e) => {
+        println!("[Main] Task {} panicked: {:?}", i, e);
+      }
+    }
   }
-  println!("All tasks joined. Total Sent ~{}, Total Recv {}", total_sent, total_recv);
+  println!(
+    "All tasks joined. Total Sent ~{}, Total Recv {}",
+    total_sent, total_recv
+  );
 
   // --- Assertions ---
   match term_result {
-       Ok(Ok(())) => {
-           println!("[Main] Context terminated successfully.");
-       }
-       Ok(Err(e)) => {
-            panic!("Context termination failed with ZmqError: {}", e);
-       }
-       Err(_) => {
-            panic!("Context termination timed out after {:?}! Potential deadlock.", TCP_FINAL_TERM_TIMEOUT);
-       }
+    Ok(Ok(())) => {
+      println!("[Main] Context terminated successfully.");
+    }
+    Ok(Err(e)) => {
+      panic!("Context termination failed with ZmqError: {}", e);
+    }
+    Err(_) => {
+      panic!(
+        "Context termination timed out after {:?}! Potential deadlock.",
+        TCP_FINAL_TERM_TIMEOUT
+      );
+    }
   }
 
   println!("--- Test test_chaotic_shutdown_tcp (TCP N-PUSH -> 1-PULL) Finished ---");

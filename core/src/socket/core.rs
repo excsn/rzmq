@@ -17,7 +17,7 @@ use crate::socket::options::{
   parse_secs_duration_option, parse_timeout_option, parse_u32_option, SocketOptions, ZmtpEngineConfig, HEARTBEAT_IVL,
   HEARTBEAT_TIMEOUT, LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME, RCVHWM, RCVTIMEO, RECONNECT_IVL,
   RECONNECT_IVL_MAX, ROUTER_MANDATORY, ROUTING_ID, SNDHWM, SNDTIMEO, SUBSCRIBE, TCP_KEEPALIVE, TCP_KEEPALIVE_CNT,
-  TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTVL, UNSUBSCRIBE, ZAP_DOMAIN,
+  TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTVL, UNSUBSCRIBE, ZAP_DOMAIN, TCP_CORK_OPT,
 };
 #[cfg(feature = "io-uring")]
 use crate::socket::options::{
@@ -2170,16 +2170,23 @@ impl SocketCore {
 
      #[cfg(feature = "io-uring")]
     {
-        if option == IO_URING_SNDZEROCOPY {
-            state_g.options.io_uring_send_zerocopy = options::parse_bool_option(value)?;
-            // Note: This typically affects new engines. Existing engines won't change behavior.
-            tracing::debug!(handle = core_arc.handle, "IO_URING_SNDZEROCOPY set to {}", state_g.options.io_uring_send_zerocopy);
-            return Ok(());
-        } else if option == IO_URING_RCVMULTISHOT {
-            state_g.options.io_uring_recv_multishot = options::parse_bool_option(value)?;
-            tracing::debug!(handle = core_arc.handle, "IO_URING_RCVMULTISHOT set to {}", state_g.options.io_uring_recv_multishot);
-            return Ok(());
-        }
+      if option == IO_URING_SNDZEROCOPY {
+        state_g.options.io_uring_send_zerocopy = options::parse_bool_option(value)?;
+        // Note: This typically affects new engines. Existing engines won't change behavior.
+        tracing::debug!(handle = core_arc.handle, "IO_URING_SNDZEROCOPY set to {}", state_g.options.io_uring_send_zerocopy);
+        return Ok(());
+      } else if option == IO_URING_RCVMULTISHOT {
+        state_g.options.io_uring_recv_multishot = options::parse_bool_option(value)?;
+        tracing::debug!(handle = core_arc.handle, "IO_URING_RCVMULTISHOT set to {}", state_g.options.io_uring_recv_multishot);
+        return Ok(());
+      }
+    }
+
+
+    if option == TCP_CORK_OPT {
+      state_g.options.tcp_cork = options::parse_bool_option(value)?;
+      tracing::debug!(handle = core_arc.handle, "TCP_CORK_OPT set to {}", state_g.options.tcp_cork);
+      return Ok(());
     }
 
     match option {
@@ -2291,6 +2298,10 @@ impl SocketCore {
         } else if option == options::IO_URING_RCVMULTISHOT {
             return Ok((state_g.options.io_uring_recv_multishot as i32).to_ne_bytes().to_vec());
         }
+    }
+
+    if option == TCP_CORK_OPT {
+      return Ok((state_g.options.tcp_cork as i32).to_ne_bytes().to_vec());
     }
     
     match option {

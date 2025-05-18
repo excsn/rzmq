@@ -10,7 +10,7 @@ const SHORT_TIMEOUT: Duration = Duration::from_millis(250);
 const LONG_TIMEOUT: Duration = Duration::from_secs(3); // Slightly longer for debugging
 const NUM_MESSAGES: usize = 5; // Smaller number for faster test
 
-#[rzmq::main]
+#[rzmq_macros::test]
 async fn test_push_pull_explicit_close_then_term() -> Result<(), ZmqError> {
   println!("\n--- Starting test_push_pull_explicit_close_then_term ---");
   let ctx = common::test_context(); // Ensure tracing is set up via common

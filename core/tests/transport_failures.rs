@@ -12,7 +12,7 @@ const SHORT_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECT_RETRY_WAIT: Duration = Duration::from_millis(300); // Time for connect attempts
 
 // --- Test: Connect to TCP address with no listener ---
-#[rzmq::main]
+#[rzmq_macros::test]
 async fn test_tcp_connect_fail_no_listener() -> Result<(), ZmqError> {
   println!("Starting test_tcp_connect_fail_no_listener...");
   let ctx = common::test_context();
@@ -52,7 +52,7 @@ async fn test_tcp_connect_fail_no_listener() -> Result<(), ZmqError> {
 }
 
 // --- Test: Connect to IPC path with no listener ---
-#[rzmq::main]
+#[rzmq_macros::test]
 #[cfg(feature = "ipc")]
 async fn test_ipc_connect_fail_no_listener() -> Result<(), ZmqError> {
   println!("Starting test_ipc_connect_fail_no_listener...");
@@ -99,7 +99,7 @@ async fn test_ipc_connect_fail_no_listener() -> Result<(), ZmqError> {
 }
 
 // --- Test: Bind IPC fails if path is an existing directory ---
-#[rzmq::main]
+#[rzmq_macros::test]
 #[cfg(feature = "ipc")]
 async fn test_ipc_bind_fail_directory_exists() -> Result<(), ZmqError> {
   println!("Starting test_ipc_bind_fail_directory_exists...");
@@ -127,7 +127,7 @@ async fn test_ipc_bind_fail_directory_exists() -> Result<(), ZmqError> {
   // Binding to a directory usually results in AddrInUse or a specific Io error
   // Let's check for AddrInUse primarily, or a generic IO error.
   assert!(
-    matches!(bind_result, Err(ZmqError::AddrInUse(_)) | Err(ZmqError::IoError{ .. })),
+    matches!(bind_result, Err(ZmqError::AddrInUse(_)) | Err(ZmqError::IoError { .. })),
     "Expected AddrInUse or Io error, got {:?}",
     bind_result
   );
@@ -142,7 +142,7 @@ async fn test_ipc_bind_fail_directory_exists() -> Result<(), ZmqError> {
 }
 
 // --- Test: Bind IPC succeeds if path is an existing file (non-socket) ---
-#[rzmq::main]
+#[rzmq_macros::test]
 #[cfg(feature = "ipc")]
 async fn test_ipc_bind_succeeds_over_existing_file() -> Result<(), ZmqError> {
   println!("Starting test_ipc_bind_succeeds_over_existing_file...");

@@ -37,6 +37,7 @@ pub(crate) fn create_and_spawn_tcp_engine(
     // io_uring options need checking based on feature flag
     use_send_zerocopy: options.io_uring_send_zerocopy,
     use_recv_multishot: options.io_uring_recv_multishot,
+    use_cork: options.tcp_cork,
   };
 
   // Create the generic core state with TcpStream as the type

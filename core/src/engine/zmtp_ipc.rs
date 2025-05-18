@@ -1,21 +1,18 @@
 // src/engine/zmtp_ipc.rs
 
-// <<< MODIFIED START [Feature gate and Imports for Event Bus integration] >>>
 #![cfg(feature = "ipc")] // Only compile this file if ipc feature is enabled
 
-use crate::runtime::{mailbox, ActorType, Command, MailboxSender}; // Added Context, ActorType
+use crate::runtime::{mailbox, MailboxSender}; 
 use crate::socket::options::{SocketOptions, ZmtpEngineConfig};
 use crate::Context;
 use std::sync::Arc;
-use tokio::net::UnixStream; // Use UnixStream
+use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
 use super::core::ZmtpEngineCore;
-// <<< MODIFIED END >>>
 
 /// Creates and spawns the ZMTP Engine actor task for an IPC stream.
 /// Returns the MailboxSender for the spawned engine task and its JoinHandle.
-// <<< MODIFIED START [Signature accepts Context and parent_id] >>>
 pub(crate) fn create_and_spawn_ipc_engine(
   handle: usize, // Engine's own handle ID
   session_mailbox: MailboxSender,
@@ -23,9 +20,8 @@ pub(crate) fn create_and_spawn_ipc_engine(
   options: Arc<SocketOptions>,
   is_server: bool,
   context: &Context, // Accept Context reference
-  parent_id: usize,  // ID of the parent Session actor
+  _parent_id: usize,  // ID of the parent Session actor
 ) -> (MailboxSender, JoinHandle<()>) {
-  // <<< MODIFIED END >>>
 
   let (tx, rx) = mailbox(); // Mailbox for the engine actor
 
@@ -34,12 +30,11 @@ pub(crate) fn create_and_spawn_ipc_engine(
     socket_type_name: options.socket_type_name.clone(),
     heartbeat_ivl: options.heartbeat_ivl,
     heartbeat_timeout: options.heartbeat_timeout,
-    // io_uring specific options - usually less relevant for IPC
-    use_send_zerocopy: false, // N/A for UnixStream? Check tokio-uring docs if needed
-    use_recv_multishot: false, // N/A for UnixStream? Check tokio-uring docs if needed
+    use_send_zerocopy: false,
+    use_recv_multishot: false,
+    use_cork: false,
   };
 
-  // <<< MODIFIED START [Pass Context to ZmtpEngineCore::new] >>>
   eprintln!("[DEBUG ENGINE {} PRE-NEW] Creating ZmtpEngineCore, is_server={}", handle, is_server);
   let core = ZmtpEngineCore::<UnixStream>::new(
     handle,
@@ -50,7 +45,7 @@ pub(crate) fn create_and_spawn_ipc_engine(
     is_server,
     context.clone(), // Pass context clone to the engine core
   );
-  // <<< MODIFIED END >>>
+  
   eprintln!("[DEBUG ENGINE {} POST-NEW] ZmtpEngineCore created. Spawning run_loop...", handle);
 
   // Spawn the generic core loop task
