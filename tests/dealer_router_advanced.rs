@@ -5,6 +5,7 @@ use rzmq::socket::options::ROUTER_MANDATORY;
 use rzmq::socket::SocketEvent;
 // <<< Added Import >>>
 use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
+use serial_test::serial;
 use std::collections::{HashMap, HashSet}; // <<< Added HashMap >>>
 use std::sync::Arc; // <<< Added Arc >>>
 use std::time::Duration;
@@ -19,6 +20,7 @@ const MONITOR_EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 // --- Test: Multiple Dealers ---
 #[tokio::test]
+#[serial]
 async fn test_dealer_router_multiple_dealers() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_multiple_dealers...");
   let ctx = common::test_context();
@@ -153,6 +155,7 @@ async fn test_dealer_router_multiple_dealers() -> Result<(), ZmqError> {
 
 // --- Test: ROUTER_MANDATORY = false (Default) ---
 #[tokio::test]
+#[serial]
 async fn test_dealer_router_router_sends_to_unknown_mandatory_false() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_router_sends_to_unknown_mandatory_false...");
   let ctx = common::test_context();
@@ -175,24 +178,47 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_false() -> Result<
   println!("ROUTER received initial ping from ID: {:?}", ping_id.data().unwrap());
 
   // ROUTER attempts to send to an unknown identity
-  let unknown_id = Msg::from_static(b"NoSuchDealer");
-  let mut id_msg = unknown_id.clone();
+  let unknown_id_data = b"NoSuchDealer";
+  let mut id_msg = Msg::from_static(unknown_id_data);
   id_msg.set_flags(MsgFlags::MORE);
-  let payload_msg = Msg::from_static(b"PayloadToNowhere");
+  let payload_msg_data = b"PayloadToNowhere";
 
   println!(
-    "ROUTER sending to unknown ID {:?} (mandatory=false)...",
-    unknown_id.data().unwrap()
+    "ROUTER sending to unknown ID {:?} (mandatory=false, identity frame)...",
+    unknown_id_data
   );
+  // <<< MODIFIED START [Assertion for ROUTER_MANDATORY=false] >>>
   let send_id_res = router.send(id_msg).await;
   assert!(
-    matches!(send_id_res, Err(ZmqError::HostUnreachable(_))),
-    "Expected HostUnreachable error sending to unknown ID (mandatory=false), got {:?}", // Adjusted expectation
+    send_id_res.is_ok(),
+    "Expected Ok(()) (silent drop) sending identity to unknown ID (mandatory=false), got {:?}",
     send_id_res
   );
-  println!("ROUTER correctly failed with HostUnreachable (mandatory=false).");
 
-  println!("ROUTER send calls completed (message likely dropped).");
+  println!("ROUTER correctly returned Ok (identity frame dropped).");
+
+  // Attempt to send payload. Since current_target_guard is None, this will be treated
+  // as an attempt to send an identity. If it's not MORE, it's an error.
+  // If it IS MORE, it will be treated as another identity send and also dropped.
+  // To be robust, let's assume the user *would* follow protocol and send payload after identity.
+  // After the previous send_id_res was Ok(()), current_send_target in RouterSocket is still None.
+  // So, trying to send a non-MORE payload frame now would be an InvalidMessage error.
+  // If the user tries to send another MORE frame (as if it's a new identity), that will also be Ok(())/dropped.
+  // Let's test the scenario where the payload *would* have been sent if the ID was known.
+  // The first send attempt for the identity has already returned Ok(()).
+  // If the user then tries to send the payload part:
+  let payload_to_send = Msg::from_static(payload_msg_data);
+  println!(
+    "ROUTER sending payload to (still) unknown ID (mandatory=false, payload frame)..."
+  );
+  let send_payload_res = router.send(payload_to_send).await;
+   
+  assert!(
+    matches!(send_payload_res, Err(ZmqError::InvalidMessage(_))),
+    "Expected InvalidMessage sending payload without MORE after identity was dropped (mandatory=false), got {:?}",
+    send_payload_res
+  );
+  println!("ROUTER correctly returned InvalidMessage for subsequent payload part.");
 
   // DEALER attempts recv - should timeout as message was dropped
   println!("DEALER attempting recv (should timeout)...");
@@ -212,6 +238,7 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_false() -> Result<
 
 // --- Test: ROUTER_MANDATORY = true ---
 #[tokio::test]
+#[serial]
 async fn test_dealer_router_router_sends_to_unknown_mandatory_true() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_router_sends_to_unknown_mandatory_true...");
   let ctx = common::test_context();
@@ -265,9 +292,9 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_true() -> Result<(
   Ok(())
 }
 
-// --- Test: Dealer disconnects, Router tries to send ---
 // --- Test: Dealer disconnects, Router tries to send (Using Monitor) ---
 #[tokio::test]
+#[serial]
 async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_dealer_disconnects_router_sends (Monitor)...");
   let ctx = common::test_context();
@@ -360,13 +387,13 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
   let send_id_res = router.send(id_msg).await;
   println!("ROUTER send ID result: {:?}", send_id_res);
 
-  // Sending the ID should fail with HostUnreachable now that disconnect is processed
+  // Default router_mandatory is false. After disconnect, identity is unknown.
   assert!(
-    matches!(send_id_res, Err(ZmqError::HostUnreachable(_))),
-    "Expected HostUnreachable error when sending ID after disconnect event, got {:?}",
+    send_id_res.is_ok(),
+    "Expected Ok(()) (silent drop) sending ID after disconnect (mandatory=false), got {:?}",
     send_id_res
   );
-  println!("ROUTER correctly failed to send to disconnected DEALER.");
+  println!("ROUTER correctly returned Ok (message to disconnected DEALER dropped).");
 
   println!("Terminating context...");
   ctx.term().await?;
@@ -376,6 +403,7 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
 
 // --- Test: Multi-part message from Dealer -> Router ---
 #[tokio::test]
+#[serial]
 async fn test_dealer_router_multi_part_dealer_to_router() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_multi_part_dealer_to_router...");
   let ctx = common::test_context();
@@ -436,6 +464,7 @@ async fn test_dealer_router_multi_part_dealer_to_router() -> Result<(), ZmqError
 
 // --- Test: Multi-part message from Router -> Dealer ---
 #[tokio::test]
+#[serial]
 async fn test_dealer_router_multi_part_router_to_dealer() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_multi_part_router_to_dealer...");
   let ctx = common::test_context();

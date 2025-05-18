@@ -7,14 +7,13 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::convert::TryInto;
 use tokio_util::codec::{Decoder, Encoder};
 
-// <<< ADDED ZmtpCodec STRUCT AND IMPLS >>>
-
 /// Codec for ZMTP/3.1 message framing.
 #[derive(Debug, Default)]
 pub struct ZmtpCodec {
   // State needed for decoding potentially fragmented frames
   // TODO: Add state if needed, e.g., expected size of next frame body
   decoding_state: DecodingState,
+  prefix_bytes: Option<BytesMut>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -32,7 +31,17 @@ struct FrameHeader {
 
 impl ZmtpCodec {
   pub fn new() -> Self {
-    Self::default()
+    Self {
+      decoding_state: DecodingState::default(),
+      prefix_bytes: None,
+    }
+  }
+
+  pub fn prime_with_prefix(&mut self, prefix: BytesMut) {
+    if !prefix.is_empty() {
+      tracing::trace!(prefix_len = prefix.len(), "ZmtpCodec primed with prefix bytes");
+      self.prefix_bytes = Some(prefix);
+    }
   }
 }
 
@@ -63,14 +72,9 @@ impl Encoder<Msg> for ZmtpCodec {
     } else {
       // Long frame: flags(1) + 0xFF indicator(1) + size(8) + body
       zmtp_flags |= ZMTP_FLAG_LONG; // Set LONG flag
-      dst.reserve(10 + size);
+      dst.reserve(9 + size);
       dst.put_u8(zmtp_flags);
-      dst.put_u8(0xFF); // Per spec, length is 8 bytes (although spec diagram is confusing)
-                        // Re-checking spec 3.1 / 4.2 Framing: Flag octet has LONG flag. Length is 1 or 8 octets.
-                        // Let's use FLAG_LONG bit in first octet, then 8-byte length.
-                        // This seems simpler than the 0xFF marker from older drafts?
-                        // Correcting: ZMTP 3.1 uses FLAG_LONG in first octet, followed by 8-byte length.
-      dst.put_u64(size as u64); // Network byte order (Big Endian)
+      dst.put_u64(size as u64);
     }
 
     // Put message body
@@ -86,6 +90,26 @@ impl Decoder for ZmtpCodec {
   type Error = ZmqError;
 
   fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+    if let Some(mut prefix) = self.prefix_bytes.take() {
+      if !prefix.is_empty() {
+        tracing::trace!(
+          prefix_len = prefix.len(),
+          src_len_before = src.len(),
+          "ZmtpCodec::decode: Prepending stored prefix bytes to src buffer"
+        );
+        // Ensure src has enough capacity. This might reallocate.
+        src.reserve(prefix.len());
+        // Efficiently prepend: copy current src content to after prefix, then put prefix at start
+        let original_src_content = src.split(); // Empties src, returns its content
+        src.put(prefix); // Put prefix first
+        src.put(original_src_content); // Append original content
+        tracing::trace!(
+          src_len_after = src.len(),
+          "ZmtpCodec::decode: Finished prepending prefix."
+        );
+      }
+    }
+
     loop {
       match self.decoding_state {
         DecodingState::ReadHeader => {

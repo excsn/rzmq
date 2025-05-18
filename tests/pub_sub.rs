@@ -99,7 +99,9 @@ async fn test_pub_sub_tcp_multiple_subs() -> Result<(), ZmqError> {
     println!("PUB sent broadcast");
 
     // Both subscribers should receive it
+    println!("sub 1 recv");
     let rec1 = common::recv_timeout(&sub1, LONG_TIMEOUT).await?;
+    println!("sub 2 recv");
     let rec2 = common::recv_timeout(&sub2, LONG_TIMEOUT).await?;
     assert_eq!(rec1.data().unwrap(), msg_data);
     assert_eq!(rec2.data().unwrap(), msg_data);

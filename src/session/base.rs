@@ -1,48 +1,52 @@
 // src/session/base.rs
 
+use crate::context::Context;
 use crate::error::ZmqError;
-use crate::runtime::{mailbox, Command, MailboxReceiver, MailboxSender};
+use crate::runtime::{self, mailbox, ActorType, Command, EventBus, MailboxReceiver, MailboxSender, SystemEvent};
 use crate::session::ISession;
-use crate::socket::events::{MonitorSender, SocketEvent}; // Monitor imports
+use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::{Blob, Msg};
 
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::time::Duration; // Added for timeout join
+use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub(crate) struct SessionBase {
   handle: usize,
-  endpoint_uri: String,                       // Store the URI for reporting/events
-  socket_mailbox: MailboxSender,              // Mailbox TO SocketCore
-  engine_mailbox: Option<MailboxSender>,      // Mailbox TO Engine
-  engine_task_handle: Option<JoinHandle<()>>, // Handle TO Engine Task
-  mailbox_receiver: MailboxReceiver,          // Mailbox FROM SocketCore/Engine
-  rx_from_core: Option<AsyncReceiver<Msg>>,   // READ messages FROM SocketCore
-  tx_to_core: Option<AsyncSender<Msg>>,       // WRITE messages TO SocketCore
-  pipe_read_id: Option<usize>,                // ID Core uses to write TO session
-  pipe_write_id: Option<usize>,               // ID Core uses to read FROM session
-  monitor_tx: Option<MonitorSender>,          // Store optional monitor sender
-  // --- State Flags ---
+  endpoint_uri: String,
+  engine_mailbox: Option<MailboxSender>,
+  engine_task_handle: Option<JoinHandle<()>>,
+  mailbox_receiver: MailboxReceiver,
+  rx_from_core: Option<AsyncReceiver<Msg>>,
+  tx_to_core: Option<AsyncSender<Msg>>,
+  pipe_read_id: Option<usize>,
+  pipe_write_id: Option<usize>,
+  monitor_tx: Option<MonitorSender>,
   pipe_attached: bool,
-  engine_ready: bool, // Set true only after EngineReady received
+  engine_ready: bool,
+  context: Context,
+  parent_socket_id: usize,
 }
 
 impl SessionBase {
-  /// Creates and spawns the SessionBase actor task.
   pub(crate) fn create_and_spawn(
     handle: usize,
     endpoint_uri: String,
-    socket_mailbox: MailboxSender,
-    monitor_tx: Option<MonitorSender>, // Accept monitor sender
+    monitor_tx: Option<MonitorSender>,
+    context: Context,
+    parent_socket_id: usize,
   ) -> (MailboxSender, JoinHandle<()>) {
+    let actor_type = ActorType::Session;
     let (tx, rx) = mailbox();
     let session = SessionBase {
       handle,
-      endpoint_uri,
-      socket_mailbox,
+      // <<< MODIFIED START [Clone endpoint_uri for logging before move] >>>
+      endpoint_uri: endpoint_uri.clone(), // Clone here if original endpoint_uri is needed later
+      // <<< MODIFIED END >>>
       engine_mailbox: None,
       engine_task_handle: None,
       mailbox_receiver: rx,
@@ -50,285 +54,338 @@ impl SessionBase {
       tx_to_core: None,
       pipe_read_id: None,
       pipe_write_id: None,
-      monitor_tx, // Store monitor_tx
+      monitor_tx,
       pipe_attached: false,
       engine_ready: false,
+      context: context.clone(),
+      parent_socket_id,
     };
+
+    // <<< MODIFIED START [Access session.endpoint_uri before it's moved] >>>
+    // If you need endpoint_uri for logging here, use the one passed in or clone from session
+    // For the tracing macro, we can use the `endpoint_uri` argument directly,
+    // or clone `session.endpoint_uri` before the move if we specifically want the one from the struct.
+    // Let's use the `endpoint_uri` argument for clarity here.
+    let endpoint_uri_for_log = endpoint_uri; // Use the argument passed to the function
+
+    tracing::debug!(session_handle = handle, uri = %endpoint_uri_for_log, "Spawning SessionBase task");
+    // `session` is moved into `run_loop` here.
     let task_handle = tokio::spawn(session.run_loop());
+
+    // Log after spawning, using the cloned/argument value.
+    tracing::debug!(session_handle = handle, uri = %endpoint_uri_for_log, "SessionBase task spawned. Publishing ActorStarted event.");
+    // <<< MODIFIED END >>>
+
+    context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
+
     (tx, task_handle)
   }
 
-  /// Helper to emit monitor events if monitoring is enabled.
   async fn send_monitor_event(&self, event: SocketEvent) {
     if let Some(ref tx) = self.monitor_tx {
       if tx.send(event).await.is_err() {
-        tracing::warn!(session_handle = self.handle, uri = %self.endpoint_uri,
-                           "Monitor channel closed while sending session event");
+        tracing::warn!(
+          session_handle = self.handle,
+          uri = %self.endpoint_uri,
+          "Monitor channel closed while sending session event (likely dropped by user)"
+        );
       }
     }
   }
 
-  /// Main actor loop for the session.
   async fn run_loop(mut self) {
     let session_handle = self.handle;
-    let endpoint_uri_clone = self.endpoint_uri.clone();
-    tracing::info!(handle = session_handle, uri=%endpoint_uri_clone, "SessionBase actor started");
+    let actor_type = ActorType::Session;
+    let endpoint_uri_clone = self.endpoint_uri.clone(); // Clone for logging and event publishing.
+    let event_bus = self.context.event_bus();
+    let mut system_event_rx = event_bus.subscribe();
 
-    let mut engine_stopped_cleanly = false;
-    let mut error_reported_to_core = false;
-    let mut peer_identity: Option<Blob> = None;
+    tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "SessionBase actor started main loop");
 
-    loop {
-      let should_read_core_pipe = self.pipe_attached && self.engine_ready && self.rx_from_core.is_some();
-      let core_pipe_receiver_ref = self.rx_from_core.as_ref();
+    let mut _engine_stopped_cleanly = false; // Renamed to avoid warning if not used extensively
+    let mut error_to_report_on_stop: Option<ZmqError> = None;
+    let mut received_shutdown_signal = false;
+    let mut peer_identity_from_engine: Option<Blob> = None;
 
-      tokio::select! {
-           biased; // Prioritize commands
+    let _loop_result: Result<(), ()> = async {
+      loop {
+        let should_read_core_pipe = self.pipe_attached && self.engine_ready && self.rx_from_core.is_some();
+        let core_pipe_receiver_ref = self.rx_from_core.as_ref();
 
-           // --- Receive Commands from Core/Engine Mailbox ---
-           cmd_result = self.mailbox_receiver.recv() => {
-                 let command = match cmd_result {
-                     Ok(cmd) => cmd,
-                     Err(_) => {
-                         tracing::info!(handle = session_handle, uri=%endpoint_uri_clone, "Session mailbox closed, stopping.");
-                         if let Some(engine_mb) = self.engine_mailbox.take() {
-                             let _ = engine_mb.send(Command::Stop).await;
-                         }
-                         break; // Exit loop
-                     }
-                 };
+        tokio::select! {
+          biased;
 
-                 tracing::trace!(handle=session_handle, uri=%endpoint_uri_clone, ?command, "Session received command");
-
-                 match command {
-                    // Engine attached by Listener/Connecter
-                    Command::Attach { engine_mailbox, engine_task_handle: handle_opt, .. } => {
-                        tracing::debug!(handle = session_handle, uri=%endpoint_uri_clone, "Session received Attach (Engine)");
-                        if self.engine_mailbox.is_some() {
-                            tracing::warn!(handle=session_handle, uri=%endpoint_uri_clone, "Session received Attach but engine already attached!");
-                            continue;
-                        }
-                        self.engine_mailbox = Some(engine_mailbox);
-                        self.engine_task_handle = handle_opt;
-                    }
-                    // Pipe attached by SocketCore after ConnSuccess
-                    Command::AttachPipe { rx_from_core, tx_to_core, pipe_read_id, pipe_write_id } => {
-                        tracing::debug!(handle=session_handle, uri=%endpoint_uri_clone, pipe_read_id, pipe_write_id, "Session received AttachPipe");
-                        if self.pipe_attached {
-                            tracing::warn!(handle=session_handle, uri=%endpoint_uri_clone, "Session received AttachPipe but pipe already attached!");
-                            continue;
-                        }
-                        self.rx_from_core = Some(rx_from_core);
-                        self.tx_to_core = Some(tx_to_core);
-                        self.pipe_read_id = Some(pipe_read_id);
-                        self.pipe_write_id = Some(pipe_write_id);
-                        self.pipe_attached = true;
-                    }
-                    // Stop command from SocketCore
-                    Command::Stop => {
-                        tracing::info!(handle = session_handle, uri=%endpoint_uri_clone, "Session received Stop command");
-                        if let Some(engine_mb) = self.engine_mailbox.take() {
-                            tracing::debug!(handle = session_handle, uri=%endpoint_uri_clone, "Session sending Stop to Engine");
-                            let _ = engine_mb.send(Command::Stop).await;
-                        }
-                        if let Some(engine_handle) = self.engine_task_handle.take() {
-                            tracing::debug!(handle = session_handle, uri=%endpoint_uri_clone, "Session awaiting Engine task completion");
-                             match engine_handle.await {
-                                 Ok(()) => tracing::debug!(handle=session_handle, uri=%endpoint_uri_clone, "Engine task joined successfully"),
-                                 Err(e) => tracing::error!(handle=session_handle, uri=%endpoint_uri_clone, "Error joining engine task: {:?}", e),
-                             }
-                        }
-                        break;
-                    }
-                    // Message FROM Engine -> TO SocketCore Pipe
-                    Command::EnginePushCmd { msg } => {
-                        if self.engine_ready {
-                            tracing::trace!(handle = session_handle, uri=%endpoint_uri_clone, msg_size=msg.size(), "Session forwarding push from Engine to Core Pipe");
-                            if let Some(ref tx) = self.tx_to_core {
-                                if let Err(e) = tx.send(msg).await {
-                                    tracing::error!(handle=session_handle, uri=%endpoint_uri_clone, "Error sending message to core pipe: {:?}. Stopping session.", e);
-                                    if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
-                                    break;
-                                }
-                            } else {
-                                 tracing::error!(handle=session_handle, uri=%endpoint_uri_clone, "Core pipe sender (tx_to_core) is None when receiving EnginePushCmd!");
-                                 if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
-                                 break;
-                            }
-                        } else {
-                            tracing::warn!(handle=session_handle, uri=%endpoint_uri_clone, "Session received EnginePushCmd before EngineReady, dropping message.");
-                        }
-                    }
-                    // Engine Status Reports
-                    Command::EngineReady { peer_identity: received_identity } => {
-                        tracing::debug!(handle = session_handle, uri=%endpoint_uri_clone, peer_id=?received_identity, "Session received EngineReady");
-                        self.engine_ready = true;
-                        peer_identity = received_identity;
-
-                        // Emit HandshakeSucceeded event
-                        self.send_monitor_event(SocketEvent::HandshakeSucceeded {
-                            endpoint: endpoint_uri_clone.clone()
-                        }).await;
-                    }
-                    Command::EngineStopped => {
-                        tracing::debug!(handle = session_handle, uri=%endpoint_uri_clone, "Session received EngineStopped signal");
-                        engine_stopped_cleanly = true;
-                        self.engine_ready = false;
-                        self.engine_mailbox = None;
-
-                        tracing::info!(handle = session_handle, uri=%endpoint_uri_clone, "Engine stopped cleanly, stopping session.");
-                        // Optionally await engine handle briefly if needed, though it should be stopped.
-                        if let Some(engine_handle) = self.engine_task_handle.take() {
-                          match engine_handle.await {
-                            Ok(()) => tracing::debug!(handle=session_handle, uri=%endpoint_uri_clone, "Engine task joined successfully after EngineStopped signal."),
-                            Err(e) => tracing::error!(handle=session_handle, uri=%endpoint_uri_clone, "Error joining engine task after EngineStopped signal: {:?}", e),
-                          }
-                        }
-                        break;
-                    }
-                    Command::EngineError{ error } => {
-                        tracing::error!(handle = session_handle, uri=%endpoint_uri_clone, error=%error, "Session received EngineError");
-                        self.engine_ready = false;
-                        let error_msg = format!("{}", error);
-
-                        // Emit HandshakeFailed event
-                        self.send_monitor_event(SocketEvent::HandshakeFailed {
-                            endpoint: endpoint_uri_clone.clone(),
-                            error_msg,
-                        }).await;
-
-                        // Report error up to SocketCore
-                        let report_cmd = Command::ReportError {
-                            handle: session_handle,
-                            endpoint_uri: endpoint_uri_clone.clone(),
-                            error,
-                        };
-                        if self.socket_mailbox.send(report_cmd).await.is_err() {
-                            tracing::warn!(handle=session_handle, uri=%endpoint_uri_clone, "Failed to send ReportError to SocketCore (mailbox closed).");
-                        }
-                        error_reported_to_core = true;
-
-                        if let Some(engine_handle) = self.engine_task_handle.take() { engine_handle.abort(); }
-                        self.engine_mailbox = None;
-                        break; // Exit loop
-                    }
-                    // Commands *from* SocketCore should arrive via Pipe read
-                    Command::SessionPushCmd { .. } => {
-                        tracing::error!(handle=session_handle, uri=%endpoint_uri_clone, "Session received SessionPushCmd via Mailbox - Should arrive via Pipe read!");
-                    }
-                    // ZAP/Other Commands
-                    Command::RequestZapAuth { .. } => {
-                        tracing::warn!(handle = session_handle, uri=%endpoint_uri_clone, "ZAP authentication requested but not yet implemented in SessionBase.");
-                        // TODO: Implement ZAP client logic here or delegate
-                    }
-                     Command::ProcessZapReply { .. } => {
-                         tracing::warn!(handle = session_handle, uri=%endpoint_uri_clone, "Session received ProcessZapReply but ZAP not implemented.");
-                    }
-                    _ => tracing::warn!(handle = session_handle, uri=%endpoint_uri_clone, "Session received unhandled command via Mailbox: {:?}", command),
-                 } // end match command
-           } // end cmd_result = mailbox_receiver.recv() arm
-
-
-            // --- Receive Messages From SocketCore (via Pipe) ---
-             msg_result = async { core_pipe_receiver_ref.unwrap().recv().await }, if should_read_core_pipe => {
-               match msg_result {
-                  Ok(msg) => {
-                    tracing::trace!(handle = session_handle, uri=%endpoint_uri_clone, msg_size=msg.size(), "Session received push from Core Pipe");
-                    if self.engine_ready {
-                      if let Some(ref engine_mb) = self.engine_mailbox {
-                        if let Err(e) = engine_mb.send(Command::SessionPushCmd { msg }).await {
-                            tracing::error!(handle=session_handle, uri=%endpoint_uri_clone, "Failed to send msg to engine: {:?}, stopping.", e);
-                            let report_cmd = Command::ReportError {
-                                handle: session_handle, endpoint_uri: endpoint_uri_clone.clone(),
-                                error: ZmqError::Internal(format!("Engine send failed: {:?}", e)),
-                            };
-                            if self.socket_mailbox.send(report_cmd).await.is_err() { /* Warn */ }
-                            error_reported_to_core = true;
-                            self.engine_mailbox = None;
-                            if let Some(h) = self.engine_task_handle.take() { h.abort(); }
-                            break; // Stop session
-                        }
-                      } else {
-                           tracing::warn!(handle=session_handle, uri=%endpoint_uri_clone, "Engine mailbox gone when message received from core pipe, dropping message.");
-                      }
-                    } else {
-                      tracing::warn!(handle=session_handle, uri=%endpoint_uri_clone, "Engine not ready when message received from core pipe, dropping message.");
-                    }
-                  } // end Ok(msg)
-                  Err(_) => { // Assuming RecvError means closed channel
-                    tracing::info!(handle=session_handle, uri=%endpoint_uri_clone, "Pipe from SocketCore closed, stopping session.");
-                     if let Some(engine_mb) = self.engine_mailbox.take() {
-                        let _ = engine_mb.send(Command::Stop).await;
-                     }
-                    break; // Exit loop
+          event_result = system_event_rx.recv(), if !received_shutdown_signal => {
+            match event_result {
+              Ok(SystemEvent::ContextTerminating) => {
+                tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Session received ContextTerminating event, stopping engine.");
+                if !received_shutdown_signal {
+                  if let Some(engine_mb) = self.engine_mailbox.take() {
+                    let _ = engine_mb.send(Command::Stop).await;
                   }
-              } // end match msg_result
-           } // end msg_result = core_pipe_receiver.recv() arm
+                  self.engine_task_handle = None;
+                  received_shutdown_signal = true;
+                }
+              }
+              Ok(SystemEvent::SocketClosing{ socket_id }) if socket_id == self.parent_socket_id => {
+                tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "Session received SocketClosing for parent, stopping engine.");
+                if !received_shutdown_signal {
+                  if let Some(engine_mb) = self.engine_mailbox.take() {
+                    let _ = engine_mb.send(Command::Stop).await;
+                  }
+                  self.engine_task_handle = None;
+                  received_shutdown_signal = true;
+                }
+              }
+              Ok(_) => { /* Ignore other system events. */ }
+              Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, skipped = n, "System event bus lagged for Session!");
+                if !received_shutdown_signal {
+                  if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                  self.engine_task_handle = None;
+                  received_shutdown_signal = true;
+                  error_to_report_on_stop = Some(ZmqError::Internal("Session event bus lagged".into()));
+                }
+                break;
+              }
+              Err(broadcast::error::RecvError::Closed) => {
+                tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "System event bus closed unexpectedly for Session!");
+                if !received_shutdown_signal {
+                  if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                  self.engine_task_handle = None;
+                  received_shutdown_signal = true;
+                  error_to_report_on_stop = Some(ZmqError::Internal("Session event bus closed".into()));
+                }
+                break;
+              }
+            }
+          }
 
-      } // end select!
-    } // end loop <--- END loop
+          cmd_result = self.mailbox_receiver.recv() => {
+            let command = match cmd_result {
+              Ok(cmd) => cmd,
+              Err(_) => {
+                tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Session command mailbox closed, initiating shutdown.");
+                if !received_shutdown_signal {
+                  if let Some(engine_mb) = self.engine_mailbox.take() {
+                    let _ = engine_mb.send(Command::Stop).await;
+                  }
+                  self.engine_task_handle = None;
+                  received_shutdown_signal = true;
+                  if error_to_report_on_stop.is_none() {
+                    error_to_report_on_stop = Some(ZmqError::Internal("Session command mailbox closed by peer".into()));
+                  }
+                }
+                break;
+              }
+            };
 
-    // --- Cleanup ---
-    tracing::info!(handle = session_handle, uri=%endpoint_uri_clone, "SessionBase actor stopping");
+            tracing::trace!(handle = session_handle, uri = %endpoint_uri_clone, command = ?command.variant_name(), "Session received command");
 
-    // Notify SocketCore that this session has stopped.
-    if !self.socket_mailbox.is_closed() {
-      // Use SessionStopped command
-      let stopped_cmd = Command::SessionStopped {
-        handle: session_handle,
-        endpoint_uri: endpoint_uri_clone.clone(),
-      };
-      if let Err(e) = self.socket_mailbox.send(stopped_cmd).await {
-        tracing::warn!(handle = session_handle, uri=%endpoint_uri_clone, "Failed to send SessionStopped to SocketCore: {:?}", e);
-      } else {
-        tracing::debug!(handle=session_handle, uri=%endpoint_uri_clone, "Sent SessionStopped to SocketCore.");
-      }
-    } else {
-      tracing::debug!(handle=session_handle, uri=%endpoint_uri_clone, "Skipping SessionStopped notification as socket core mailbox is closed.");
-    }
+            match command {
+              Command::Attach { engine_mailbox, engine_handle: _, engine_task_handle } => {
+                tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session received Attach (Engine)");
+                if self.engine_mailbox.is_some() {
+                  tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Session received Attach but engine already attached! Aborting new engine.");
+                  if let Some(h) = engine_task_handle { h.abort(); }
+                  continue;
+                }
+                self.engine_mailbox = Some(engine_mailbox);
+                self.engine_task_handle = engine_task_handle;
+              }
+              Command::AttachPipe { rx_from_core, tx_to_core, pipe_read_id, pipe_write_id } => {
+                tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, pipe_read_id, pipe_write_id, "Session received AttachPipe");
+                if self.pipe_attached {
+                  tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Session received AttachPipe but pipe already attached!");
+                  continue;
+                }
+                self.rx_from_core = Some(rx_from_core);
+                self.tx_to_core = Some(tx_to_core);
+                self.pipe_read_id = Some(pipe_read_id);
+                self.pipe_write_id = Some(pipe_write_id);
+                self.pipe_attached = true;
+              }
+              Command::Stop => {
+                tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Session received Stop command");
+                if !received_shutdown_signal {
+                  if let Some(engine_mb) = self.engine_mailbox.take() {
+                    tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session sending Stop to Engine");
+                    let _ = engine_mb.send(Command::Stop).await;
+                  }
+                  self.engine_task_handle = None;
+                  received_shutdown_signal = true;
+                }
+              }
+              Command::EnginePushCmd { msg } => {
+                if self.engine_ready {
+                  tracing::trace!(handle = session_handle, uri = %endpoint_uri_clone, msg_size = msg.size(), "Session forwarding push from Engine to Core Pipe");
+                  if let Some(ref tx) = self.tx_to_core {
+                    if tx.send(msg).await.is_err() {
+                      tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Error sending message to core pipe. Stopping session.");
+                      if !received_shutdown_signal {
+                        if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                        self.engine_task_handle = None;
+                        received_shutdown_signal = true;
+                        error_to_report_on_stop = Some(ZmqError::Internal("Session failed to send to core pipe".into()));
+                      }
+                      break;
+                    }
+                  } else {
+                    tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Core pipe sender (tx_to_core) is None when receiving EnginePushCmd! State inconsistency.");
+                    if !received_shutdown_signal {
+                      if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                      self.engine_task_handle = None;
+                      received_shutdown_signal = true;
+                      error_to_report_on_stop = Some(ZmqError::Internal("Session missing core pipe sender".into()));
+                    }
+                    break;
+                  }
+                } else {
+                  tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Session received EnginePushCmd before EngineReady, dropping message.");
+                }
+              }
+              Command::EngineReady { peer_identity: received_identity } => {
+                tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, peer_id = ?received_identity, "Session received EngineReady");
+                self.engine_ready = true;
+                peer_identity_from_engine = received_identity.clone();
 
-    // Ensure engine task is joined if handle still exists
+                if let Some(core_reads_from_this_pipe_id) = self.pipe_write_id { // Session's write_id is Core's read_id
+                  let identity_event = SystemEvent::PeerIdentityEstablished {
+                    parent_core_id: self.parent_socket_id,
+                    core_pipe_read_id: core_reads_from_this_pipe_id,
+                    peer_identity: received_identity, // This is Option<Blob>
+                    session_handle_id: session_handle,
+                  };
+                  if let Err(e) = self.context.event_bus().publish(identity_event) {
+                    tracing::warn!(
+                      handle = session_handle,
+                      uri = %endpoint_uri_clone,
+                      "Failed to publish PeerIdentityEstablished event: {}", e
+                    );
+                  } else {
+                     tracing::trace!(handle = session_handle, uri = %endpoint_uri_clone, "Published PeerIdentityEstablished event.");
+                  }
+                } else {
+                  tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Cannot publish PeerIdentityEstablished: Session's pipe_write_id is None.");
+                }
+
+                self.send_monitor_event(SocketEvent::HandshakeSucceeded { endpoint: endpoint_uri_clone.clone() }).await;
+              }
+              Command::EngineStopped => {
+                tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session received EngineStopped signal");
+                _engine_stopped_cleanly = true;
+                self.engine_ready = false;
+                self.engine_mailbox = None;
+                if received_shutdown_signal {
+                  tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Engine stopped cleanly after session shutdown signal. Session will now stop.");
+                  break;
+                } else {
+                  tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Engine stopped unexpectedly. Stopping session.");
+                  if error_to_report_on_stop.is_none() {
+                    error_to_report_on_stop = Some(ZmqError::Internal("Engine stopped unexpectedly".into()));
+                  }
+                  received_shutdown_signal = true;
+                  break;
+                }
+              }
+              Command::EngineError{ error } => {
+                tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, error = %error, "Session received EngineError");
+                self.engine_ready = false;
+                let error_msg_for_monitor = format!("{}", error);
+                self.send_monitor_event(SocketEvent::HandshakeFailed {
+                  endpoint: endpoint_uri_clone.clone(), error_msg: error_msg_for_monitor,
+                }).await;
+                if error_to_report_on_stop.is_none() {
+                  error_to_report_on_stop = Some(error);
+                }
+                if !received_shutdown_signal {
+                  if let Some(engine_handle) = self.engine_task_handle.take() { engine_handle.abort(); }
+                  self.engine_mailbox = None;
+                  received_shutdown_signal = true;
+                }
+                break;
+              }
+              cmd => tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Session received unhandled command via Mailbox: {:?}", cmd.variant_name()),
+            }
+          }
+
+          msg_result = async { core_pipe_receiver_ref.unwrap().recv().await }, if should_read_core_pipe && !received_shutdown_signal => {
+            match msg_result {
+              Ok(msg) => {
+                if let Some(ref engine_mb) = self.engine_mailbox {
+                  if engine_mb.send(Command::SessionPushCmd { msg }).await.is_err() {
+                    tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Failed to send message to engine, stopping session.");
+                    if !received_shutdown_signal {
+                      self.engine_mailbox = None;
+                      if let Some(h) = self.engine_task_handle.take() { h.abort(); }
+                      received_shutdown_signal = true;
+                      if error_to_report_on_stop.is_none() {
+                        error_to_report_on_stop = Some(ZmqError::Internal("Session failed to send to engine".into()));
+                      }
+                    }
+                    break;
+                  }
+                } else {
+                  tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Engine mailbox gone when message received from core pipe, dropping message. Initiating shutdown.");
+                  if !received_shutdown_signal {
+                    self.engine_task_handle = None;
+                    received_shutdown_signal = true;
+                    if error_to_report_on_stop.is_none() {
+                        error_to_report_on_stop = Some(ZmqError::Internal("Engine mailbox missing during core pipe read".into()));
+                    }
+                  }
+                  break;
+                }
+              }
+              Err(_) => {
+                tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Pipe from SocketCore closed, stopping session.");
+                if !received_shutdown_signal {
+                  if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                  self.engine_task_handle = None;
+                  received_shutdown_signal = true;
+                  if error_to_report_on_stop.is_none() {
+                    error_to_report_on_stop = Some(ZmqError::ConnectionClosed);
+                  }
+                }
+                break;
+              }
+            }
+          }
+        } // end select!
+      } // end loop
+      Ok(())
+    }.await;
+
+    tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "SessionBase actor stopping, performing cleanup");
+
     if let Some(engine_handle) = self.engine_task_handle.take() {
-      tracing::debug!(handle=session_handle, uri=%endpoint_uri_clone, "Session ensuring Engine task cleanup...");
-      match tokio::time::timeout(Duration::from_millis(100), engine_handle).await {
-        // Short timeout
+      tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session ensuring Engine task cleanup...");
+      match tokio::time::timeout(Duration::from_millis(200), engine_handle).await {
+        // Increased timeout
         Ok(Ok(())) => {
-          tracing::debug!(handle=session_handle, uri=%endpoint_uri_clone, "Engine task joined cleanly during session cleanup.")
+          tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Engine task joined cleanly during session cleanup.")
         }
         Ok(Err(e)) => {
-          tracing::error!(handle=session_handle, uri=%endpoint_uri_clone, "Error joining engine task during session cleanup: {:?}", e)
+          tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Error joining engine task (it panicked): {:?}", e);
+          if error_to_report_on_stop.is_none() {
+            error_to_report_on_stop = Some(ZmqError::Internal(format!("Engine task panicked: {:?}", e)));
+          }
         }
         Err(_) => {
-          tracing::warn!(handle=session_handle, uri=%endpoint_uri_clone, "Timeout joining engine task during session cleanup.")
+          tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Timeout joining engine task during session cleanup. Engine might be stuck.");
+          if error_to_report_on_stop.is_none() {
+            error_to_report_on_stop = Some(ZmqError::Internal("Timeout joining engine task".into()));
+          }
         }
       }
     }
-  } // end run_loop
-}
 
-// --- Dummy ISession Trait Implementation ---
-#[async_trait]
-impl ISession for SessionBase {
-  async fn attach_engine(
-    &self,
-    _engine_mailbox: MailboxSender,
-    _engine_task_handle: Option<JoinHandle<()>>,
-  ) -> Result<(), ZmqError> {
-    unimplemented!("Dummy ISession method called")
-  }
-  async fn push_msg_to_engine(&self, _msg: crate::message::Msg) -> Result<(), ZmqError> {
-    unimplemented!("Dummy ISession method called")
-  }
-  async fn handle_zap_request(&self, _request_frames: Vec<Vec<u8>>) -> Result<(), ZmqError> {
-    unimplemented!("Dummy ISession method called")
-  }
-  fn engine_ready(&self) {
-    unimplemented!("Dummy ISession method called")
-  }
-  fn engine_error(&self, _error: ZmqError) {
-    unimplemented!("Dummy ISession method called")
-  }
-  fn engine_stopped(&self) {
-    unimplemented!("Dummy ISession method called")
+    self.context.publish_actor_stopping(
+      session_handle,
+      actor_type,
+      Some(endpoint_uri_clone),
+      error_to_report_on_stop,
+    );
+    tracing::info!(handle = session_handle, uri = %self.endpoint_uri, "SessionBase actor fully stopped.");
   }
 }

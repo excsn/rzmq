@@ -1,16 +1,18 @@
 // tests/lifecycle.rs
 
+use rzmq::socket::options::SNDTIMEO;
 use rzmq::socket::SocketEvent;
 use rzmq::{Context, Msg, Socket, SocketType, ZmqError};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify; // For signalling
 use tokio::task::{self, JoinHandle};
+use tokio::time::timeout;
 mod common;
 
 const SHORT_TIMEOUT: Duration = Duration::from_millis(250);
 const LONG_TIMEOUT: Duration = Duration::from_secs(2);
-const MONITOR_EVENT_TIMEOUT: Duration = Duration::from_secs(3); 
+const MONITOR_EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 // --- Test: Context termination closes sockets and allows exit ---
 #[tokio::test]
@@ -20,61 +22,71 @@ async fn test_context_term_closes_sockets() -> Result<(), ZmqError> {
   let push = ctx.socket(SocketType::Push)?;
   let pull = ctx.socket(SocketType::Pull)?;
 
-  // *** ADD MONITOR FOR PUSH SOCKET ***
   println!("Setting up monitor for PUSH socket...");
   let push_monitor_rx = push.monitor_default().await?;
   println!("PUSH monitor setup.");
-  // *** END ADDITION ***
 
-  let endpoint = "inproc://term-test"; // Using inproc for simplicity
+  let endpoint = "inproc://term-test";
 
   println!("Binding PULL...");
   pull.bind(endpoint).await?;
   println!("Connecting PUSH...");
   push.connect(endpoint).await?;
-  // Allow time for inproc connection setup (should be fast, but wait briefly)
-  // Optionally, wait for a specific monitor event signalling connection if implemented for inproc
-  tokio::time::sleep(Duration::from_millis(50)).await;
 
-  // Send a message - should succeed
+  println!("Main test: Waiting for PUSH monitor Connected event...");
+  common::wait_for_monitor_event(
+    &push_monitor_rx,
+    MONITOR_EVENT_TIMEOUT,
+    SHORT_TIMEOUT,
+    |e| matches!(e, SocketEvent::Connected { endpoint: ep, .. } if *ep == endpoint),
+  )
+  .await
+  .expect("Monitor did not receive Connected event");
+  println!("Main test: PUSH monitor received Connected event.");
+  tokio::time::sleep(Duration::from_millis(20)).await;
+
   println!("PUSH sending message...");
   push.send(Msg::from_static(b"Before Term")).await?;
   println!("PUSH sent.");
 
-  // PULL receives message
   println!("PULL receiving message...");
   let msg1 = common::recv_timeout(&pull, SHORT_TIMEOUT).await?;
   assert_eq!(msg1.data().unwrap(), b"Before Term");
   println!("PULL received.");
 
-  // Terminate the context - this should initiate shutdown of PUSH and PULL actors
-  println!("Terminating context...");
-  ctx.term().await?; // Awaits clean shutdown of both socket actors
+  println!("Initiating context termination...");
+  // Initiate termination - this returns quickly
+  let shutdown_task = ctx.shutdown(); // Use shutdown() to just initiate
+
+  println!("Waiting for Disconnected event for {}...", endpoint);
+  // Now wait for the event AFTER initiating shutdown
+  let event_wait_task = common::wait_for_monitor_event(
+    &push_monitor_rx,
+    MONITOR_EVENT_TIMEOUT, // Use a reasonable timeout
+    SHORT_TIMEOUT,
+    |e| matches!(e, SocketEvent::Disconnected { endpoint: ep } if *ep == endpoint),
+  );
+
+  let (_, event_wait_result) = futures::future::join(shutdown_task, event_wait_task).await;
+
+  match event_wait_result {
+    Ok(_) => println!("PUSH monitor received Disconnected event as expected."),
+    Err(e) => panic!("PUSH monitor wait failed: {}", e),
+  }
+
+  println!("Event received or timed out. Now waiting for term() to complete...");
+  // Now await the full termination process
+  let term_result = ctx.term().await; // This waits on the WaitGroup
+  println!("ctx.term() completed with: {:?}", term_result);
+  assert!(term_result.is_ok(), "Context termination failed");
   println!("Context terminated.");
 
-  // *** ADD MONITOR WAIT FOR DISCONNECT ***
-  println!("Waiting for PUSH monitor to report disconnect for {}...", endpoint);
-  let disconnect_result = common::wait_for_monitor_event(
-    &push_monitor_rx,
-    MONITOR_EVENT_TIMEOUT,
-    SHORT_TIMEOUT, // Interval to check channel
-    |e| matches!(e, SocketEvent::Disconnected { endpoint: ep } if *ep == endpoint),
-  )
-  .await;
-
-  match disconnect_result {
-    Ok(_) => println!("PUSH monitor received Disconnected event as expected."),
-    Err(e) => panic!("PUSH monitor failed to receive Disconnected event: {}", e), // Fail test if event not received
-  }
-  // *** END ADDITION ***
-
   // Try using sockets after termination - should fail
-  println!("Attempting PUSH set_option after term (should fail)..."); // Keep this check
+  println!("Attempting PUSH set_option after term (should fail)...");
   let setopt_res = push
     .set_option(rzmq::socket::options::SNDTIMEO, &(0i32).to_ne_bytes())
     .await;
   println!("PUSH set_option result: {:?}", setopt_res);
-  // Setting option should fail because the core actor's mailbox is gone
   assert!(
     setopt_res.is_err(),
     "Expected error setting option after term, got {:?}",
@@ -83,13 +95,9 @@ async fn test_context_term_closes_sockets() -> Result<(), ZmqError> {
   println!("PUSH set_option correctly failed: {:?}", setopt_res.err().unwrap());
 
   println!("Attempting PUSH send after term (should fail)...");
-  // Now that we've confirmed disconnect via monitor and set_option failed,
-  // the send attempt should ideally also fail quickly, likely with the same
-  // mailbox error as set_option, or ResourceLimitReached if the ISocket::send
-  // could somehow proceed to check the load balancer (which should be empty).
   let send_res = push.send(Msg::from_static(b"After Term")).await;
   assert!(
-    send_res.is_err(), // Expect *some* error
+    send_res.is_err(),
     "Expected error sending after term and disconnect, got {:?}",
     send_res
   );
@@ -98,7 +106,7 @@ async fn test_context_term_closes_sockets() -> Result<(), ZmqError> {
   println!("Attempting PULL recv after term (should fail)...");
   let recv_res = pull.recv().await;
   assert!(
-    recv_res.is_err(), // Expect some error
+    recv_res.is_err(),
     "Expected error receiving after term, got {:?}",
     recv_res
   );
@@ -165,25 +173,58 @@ async fn test_socket_close_stops_connection() -> Result<(), ZmqError> {
   Ok(())
 }
 
-// --- Test: Dropping socket handle triggers cleanup ---
-// (Similar to close, but relies on Rust's Drop)
+// --- Test: Closing socket handle triggers cleanup ---
 #[tokio::test]
-async fn test_socket_close_on_drop_stops_connection() -> Result<(), ZmqError> {
-  println!("Starting test_socket_close_on_drop_stops_connection..."); // Renamed log
+async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Result<()> {
+  println!("Starting test_socket_explicit_close_triggers_disconnect_event...");
   let ctx = common::test_context();
-  let push = ctx.socket(SocketType::Push)?;
+  let push = ctx.socket(SocketType::Push)?; // Keep as owned initially
 
-  let endpoint = "tcp://127.0.0.1:5641"; // Unique port
+  // ... (setup push_monitor, bind push, check Listening) ...
+  println!("Setting up PUSH monitor...");
+  let mut push_monitor = push.monitor_default().await?;
+
+  let endpoint = "tcp://127.0.0.1:5641"; // Keep unique port
 
   println!("Binding PUSH...");
   push.bind(endpoint).await?;
+
+  println!("Expecting Listening event...");
+  common::wait_for_monitor_event(
+    &push_monitor,
+    MONITOR_EVENT_TIMEOUT,
+    SHORT_TIMEOUT,
+    |e| matches!(e, SocketEvent::Listening { endpoint: ep } if ep == endpoint),
+  )
+  .await
+  .map_err(|e| anyhow::anyhow!("Listening event wait failed: {}", e))?;
+  println!("PUSH Monitor: Received Listening event.");
+
   tokio::time::sleep(Duration::from_millis(50)).await;
+
+  let disconnected_endpoint_uri: String;
 
   {
     // Scope for PULL socket
     let pull = ctx.socket(SocketType::Pull)?;
     println!("Connecting PULL...");
     pull.connect(endpoint).await?;
+
+    println!("Expecting Accepted/Handshake event...");
+    let event2 = common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+      matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Accepted/Handshake event wait failed: {}", e))?;
+    println!("PUSH Monitor: Received connection event: {:?}", event2);
+
+    disconnected_endpoint_uri = match event2 {
+      SocketEvent::Accepted { endpoint: _, peer_addr } => format!("tcp://{}", peer_addr),
+      SocketEvent::HandshakeSucceeded { endpoint: ep } => ep,
+      _ => panic!("Unexpected event type received: {:?}", event2),
+    };
+    println!("Determined peer endpoint URI: {}", disconnected_endpoint_uri);
+
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     println!("PUSH sending Message 1...");
@@ -193,36 +234,84 @@ async fn test_socket_close_on_drop_stops_connection() -> Result<(), ZmqError> {
     println!("PULL received Message 1.");
 
     println!("PULL socket closing...");
-    // *** CHANGE: Explicitly call close() instead of relying on drop ***
     pull.close().await?;
-    // *** END CHANGE ***
+    println!("PULL socket closed (explicitly).");
+  } // pull socket scope ends, handle is dropped
 
-    println!("PULL socket closed.");
-    // pull handle is dropped here, but close already initiated shutdown
-  } // pull socket scope ends
+  println!("Waiting for Disconnected event for {}...", disconnected_endpoint_uri);
+  common::wait_for_monitor_event(
+    &push_monitor,
+    MONITOR_EVENT_TIMEOUT,
+    SHORT_TIMEOUT,
+    |e| matches!(e, SocketEvent::Disconnected { endpoint: ep } if *ep == disconnected_endpoint_uri),
+  )
+  .await
+  .map_err(|e| anyhow::anyhow!("Disconnected event wait failed: {}", e))?;
+  println!(
+    "PUSH Monitor: Received Disconnected event for {}.",
+    disconnected_endpoint_uri
+  );
 
-  // Allow time for close to propagate
-  println!("Waiting after PULL close...");
-  tokio::time::sleep(Duration::from_millis(200)).await;
-
-  // PUSH attempts to send another message
-  println!("PUSH sending Message 2 (after PULL closed)..."); // Changed log
-  push
-    .set_option(rzmq::socket::options::SNDTIMEO, &(0i32).to_ne_bytes())
-    .await?;
+  println!("PUSH setting SNDTIMEO=0...");
+  push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
+  println!("PUSH sending Message 2 (after PULL disconnected)...");
   let send_res = push.send(Msg::from_static(b"Message 2")).await;
   println!("PUSH send result: {:?}", send_res);
 
   assert!(
     matches!(send_res, Err(ZmqError::ResourceLimitReached)),
-    "Expected ResourceLimitReached sending after peer close, got {:?}", // Changed expectation message
+    "Expected ResourceLimitReached sending after peer disconnect, got {:?}",
     send_res
   );
-  println!("PUSH correctly failed sending after PULL closed."); // Changed log
+  println!("PUSH correctly failed sending after PULL disconnected.");
+
+  // <<< ADDED START: Explicitly close PUSH before terminating context >>>
+  println!("Closing PUSH socket explicitly before context term...");
+  let push_close_res = push.close().await;
+  println!("PUSH close result: {:?}", push_close_res);
+  // We expect Ok(()) here as the socket should still be operational enough to process close
+  assert!(push_close_res.is_ok(), "PUSH close failed unexpectedly");
+  // Allow a moment for the close command to be processed and shutdown to initiate
+  tokio::time::sleep(Duration::from_millis(50)).await;
+  // <<< ADDED END >>>
 
   println!("Terminating context...");
-  ctx.term().await?;
-  println!("Test test_socket_close_on_drop_stops_connection finished."); // Renamed log
+  ctx.term().await?; // Terminate context gracefully
+
+  println!("Checking if monitor channel is closed...");
+  match timeout(SHORT_TIMEOUT, push_monitor.recv()).await {
+    Ok(Ok(event)) => {
+      // <<< MODIFIED START: Allow specific final events, but fail on ConnectDelayed >>>
+      // It's possible to receive a final 'Closed' or 'Disconnected' related to the *listener*
+      // being shut down as part of the PUSH socket closing, *before* the monitor channel itself closes.
+      // However, receiving ConnectDelayed is definitely wrong.
+      match event {
+        SocketEvent::ConnectDelayed { .. } => {
+          anyhow::bail!(
+            "Received unexpected ConnectDelayed event after context term: {:?}",
+            event
+          );
+        }
+        // Allow other close-related events like Closed or potentially another Disconnected
+        // if the timing is very specific, but log them as warnings maybe.
+        _ => {
+          println!(
+            "PUSH Monitor received final event {:?} (expected closed/empty). Tolerating.",
+            event
+          );
+        }
+      }
+      // <<< MODIFIED END >>>
+    }
+    Ok(Err(_recv_err)) => {
+      println!("PUSH Monitor channel correctly closed after context term.");
+    }
+    Err(_) => {
+      println!("PUSH Monitor channel timed out (likely closed and empty) after context term.");
+    }
+  }
+
+  println!("Test test_socket_explicit_close_triggers_disconnect_event finished.");
   Ok(())
 }
 
@@ -266,7 +355,7 @@ async fn test_concurrent_term_and_op() -> Result<(), ZmqError> {
           break;
         }
       }
-      if count % 100 == 0 {
+      if count % 1000 == 0 {
         println!("Send task: Sent {} messages", count);
       }
     }

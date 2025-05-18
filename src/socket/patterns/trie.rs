@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use async_recursion::async_recursion;
 use tokio::sync::RwLock; // Use RwLock for concurrent read access, blocking write
 
 /// A node in the subscription trie.
@@ -22,6 +23,17 @@ pub(crate) struct SubscriptionTrie {
 impl SubscriptionTrie {
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Retrieves all currently active subscription topics.
+  /// Returns a Vec where each inner Vec<u8> is a subscribed topic prefix.
+  pub async fn get_all_topics(&self) -> Vec<Vec<u8>> {
+    let mut topics = Vec::new();
+    // Start recursive traversal from the root.
+    self
+      .collect_topics_recursive(self.root.clone(), Vec::new(), &mut topics)
+      .await;
+    topics
   }
 
   /// Adds a subscription topic (prefix).
@@ -132,5 +144,41 @@ impl SubscriptionTrie {
     let final_node_r = current_node_arc.read().await;
     final_node_r.count.load(Ordering::Relaxed) > 0
   }
+
+  /// Recursive helper function to collect topics.
+  #[async_recursion]
+  async fn collect_topics_recursive(
+    &self,
+    node_arc: Arc<RwLock<TrieNode>>,
+    current_prefix: Vec<u8>,
+    all_topics: &mut Vec<Vec<u8>>,
+  ) {
+    let node_read_guard = node_arc.read().await; // Lock current node for reading
+
+    // If this node marks the end of a subscription (count > 0), add its prefix.
+    if node_read_guard.count.load(Ordering::Relaxed) > 0 {
+      all_topics.push(current_prefix.clone());
+    }
+
+    // Create a list of children to visit *after* releasing the read lock.
+    // Cloning the Arc<RwLock<TrieNode>> is cheap.
+    let children_to_visit: Vec<(u8, Arc<RwLock<TrieNode>>)> = node_read_guard
+      .children
+      .iter()
+      .map(|(byte, child_arc)| (*byte, child_arc.clone()))
+      .collect();
+
+    // Drop the read lock before recursing to avoid potential deadlocks if the
+    // recursion somehow tried to acquire a write lock later (unlikely here, but good practice).
+    drop(node_read_guard);
+
+    // Recurse into children
+    for (byte, child_node_arc) in children_to_visit {
+      let mut next_prefix = current_prefix.clone();
+      next_prefix.push(byte);
+      self
+        .collect_topics_recursive(child_node_arc, next_prefix, all_topics)
+        .await;
+    }
+  }
 }
-// <<< ADDED SubscriptionTrie END >>>

@@ -1,0 +1,124 @@
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 1 test
+Starting test_concurrent_term_and_op...
+Tracing subscriber initialized.
+[2m2025-05-06T19:03:40.356185Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m351:[0m Creating new rzmq Context
+[2m2025-05-06T19:03:40.356213Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m76:[0m Libsodium initialized successfully.
+[2m2025-05-06T19:03:40.356437Z[0m [34mDEBUG[0m [2mrzmq::runtime::event_bus[0m[2m:[0m [2m22:[0m Created new EventBus [3mcapacity[0m[2m=[0m256
+[2m2025-05-06T19:03:40.356651Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m360:[0m Creating socket [3msocket_type[0m[2m=[0mPush [3mhandle[0m[2m=[0m1
+[2m2025-05-06T19:03:40.357023Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m360:[0m Creating socket [3msocket_type[0m[2m=[0mPull [3mhandle[0m[2m=[0m2
+Binding PULL...
+[2m2025-05-06T19:03:40.357297Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m126:[0m Context event listener task started. [3mhandle[0m[2m=[0m0 [3mactor_type[0m[2m=[0mContextListener
+[2m2025-05-06T19:03:40.357474Z[0m [32m INFO[0m [2mrzmq::socket::core[0m[2m:[0m [2m481:[0m SocketCore run_command_loop starting task. [3mhandle[0m[2m=[0m1 [3msocket_type[0m[2m=[0mOk(Push)
+[2m2025-05-06T19:03:40.357681Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m194:[0m Socket mailboxes registered [3msocket_handle[0m[2m=[0m1
+[2m2025-05-06T19:03:40.357811Z[0m [32m INFO[0m [2mrzmq::socket::core[0m[2m:[0m [2m481:[0m SocketCore run_command_loop starting task. [3mhandle[0m[2m=[0m2 [3msocket_type[0m[2m=[0mOk(Pull)
+[2m2025-05-06T19:03:40.357845Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m890:[0m Handling UserBind (helper) [3mhandle[0m[2m=[0m2 [3mendpoint[0m[2m=[0minproc://concurrent-term
+[2m2025-05-06T19:03:40.357856Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m312:[0m Registering inproc binding [3minproc_name[0m[2m=[0mconcurrent-term
+[2m2025-05-06T19:03:40.357886Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m194:[0m Socket mailboxes registered [3msocket_handle[0m[2m=[0m2
+Connecting PUSH...
+[2m2025-05-06T19:03:40.357947Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m1035:[0m Handling UserConnect (helper) [3mhandle[0m[2m=[0m1 [3mendpoint[0m[2m=[0minproc://concurrent-term
+[2m2025-05-06T19:03:40.358003Z[0m [34mDEBUG[0m [2mrzmq::transport::inproc[0m[2m:[0m [2m47:[0m Attempting inproc connect [3mhandle[0m[2m=[0m1 [3mname[0m[2m=[0mconcurrent-term
+[2m2025-05-06T19:03:40.358094Z[0m [34mDEBUG[0m [2mrzmq::transport::inproc[0m[2m:[0m [2m125:[0m Sending InprocConnectRequest to binder's system mailbox [3mhandle[0m[2m=[0m1 [3mname[0m[2m=[0mconcurrent-term
+[2m2025-05-06T19:03:40.358119Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m426:[0m Pipe reader task started [3mcore_handle[0m[2m=[0m1 [3mpipe_id[0m[2m=[0m4 [3mreader_handle[0m[2m=[0m5
+[2m2025-05-06T19:03:40.358205Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m1321:[0m Handling InprocConnectRequest (helper) [3mbinder_handle[0m[2m=[0m2 [3mconnector_uri[0m[2m=[0minproc://concurrent-term
+[2m2025-05-06T19:03:40.358232Z[0m [34mDEBUG[0m [2mrzmq::socket::pull_socket[0m[2m:[0m [2m271:[0m PULL attaching pipe [3mhandle[0m[2m=[0m2 [3mpipe_read_id[0m[2m=[0m3
+[2m2025-05-06T19:03:40.358239Z[0m [32m INFO[0m [2mrzmq::socket::core[0m[2m:[0m [2m1368:[0m Inproc connection accepted [3mbinder_handle[0m[2m=[0m2 [3mconnector_uri[0m[2m=[0minproc://concurrent-term
+[2m2025-05-06T19:03:40.358258Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m426:[0m Pipe reader task started [3mcore_handle[0m[2m=[0m2 [3mpipe_id[0m[2m=[0m3 [3mreader_handle[0m[2m=[0m7
+[2m2025-05-06T19:03:40.358284Z[0m [32m INFO[0m [2mrzmq::transport::inproc[0m[2m:[0m [2m151:[0m Inproc connection established [3mhandle[0m[2m=[0m1 [3mname[0m[2m=[0mconcurrent-term
+[2m2025-05-06T19:03:40.358306Z[0m [34mDEBUG[0m [2mrzmq::socket::push_socket[0m[2m:[0m [2m348:[0m PUSH attaching pipe [3mhandle[0m[2m=[0m1 [3mpipe_write_id[0m[2m=[0m3
+Main task receiving first message...
+Main task received one message.
+Main task initiating context termination...
+[2m2025-05-06T19:03:40.421475Z[0m [32m INFO[0m [2mrzmq::context[0m[2m:[0m [2m221:[0m Context shutdown initiated.
+[2m2025-05-06T19:03:40.421524Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m230:[0m Published ContextTerminating event via bus.
+[2m2025-05-06T19:03:40.421542Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m247:[0m Sent Stop command to all registered sockets (via system mailbox).
+[2m2025-05-06T19:03:40.421550Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m262:[0m Context wait_for_termination starting wait on WG (includes listener task)... [3mcount[0m[2m=[0m3
+[2m2025-05-06T19:03:40.421579Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m151:[0m Event listener saw ContextTerminating, stopping listener task. [3mhandle[0m[2m=[0m0 [3mactor_type[0m[2m=[0mContextListener
+[2m2025-05-06T19:03:40.421592Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m174:[0m Context event listener task stopping, decrementing own WG count. [3mhandle[0m[2m=[0m0 [3mactor_type[0m[2m=[0mContextListener [3mwg_prev[0m[2m=[0m3
+[2m2025-05-06T19:03:40.421603Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m179:[0m Context event listener task finished. [3mhandle[0m[2m=[0m0 [3mactor_type[0m[2m=[0mContextListener
+[2m2025-05-06T19:03:40.421643Z[0m [32m INFO[0m [2mrzmq::socket::core[0m[2m:[0m [2m501:[0m SocketCore received ContextTerminating event. [3mhandle[0m[2m=[0m1
+[2m2025-05-06T19:03:40.421655Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m411:[0m Published SocketClosing event. [3mhandle[0m[2m=[0m1
+[2m2025-05-06T19:03:40.421663Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m181:[0m ShutdownCoordinator: Initiating state. [3mhandle[0m[2m=[0m1
+[2m2025-05-06T19:03:40.421715Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m217:[0m ShutdownCoordinator: Waiting for children, moving to StoppingChildren state. [3mhandle[0m[2m=[0m1 [3mnum_children[0m[2m=[0m1
+[2m2025-05-06T19:03:40.421724Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m510:[0m SocketCore received its own SocketClosing event. [3mhandle[0m[2m=[0m1
+[2m2025-05-06T19:03:40.421736Z[0m [32m INFO[0m [2mrzmq::socket::core[0m[2m:[0m [2m501:[0m SocketCore received ContextTerminating event. [3mhandle[0m[2m=[0m2
+[2m2025-05-06T19:03:40.421744Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m411:[0m Published SocketClosing event. [3mhandle[0m[2m=[0m2
+[2m2025-05-06T19:03:40.421751Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m181:[0m ShutdownCoordinator: Initiating state. [3mhandle[0m[2m=[0m2
+[2m2025-05-06T19:03:40.421799Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m217:[0m ShutdownCoordinator: Waiting for children, moving to StoppingChildren state. [3mhandle[0m[2m=[0m2 [3mnum_children[0m[2m=[0m1
+[2m2025-05-06T19:03:40.421820Z[0m [34mDEBUG[0m [2mrzmq::socket::core[0m[2m:[0m [2m510:[0m SocketCore received its own SocketClosing event. [3mhandle[0m[2m=[0m2
+[2m2025-05-06T19:03:40.421872Z[0m [33m WARN[0m [2mrzmq::socket::push_socket[0m[2m:[0m [2m130:[0m PUSH send failed: Socket is not in Running state. [3mhandle[0m[2m=[0m1
+Send task: Send failed: Resource limit reached (e.g., HWM)
+Send task finished.
+Send task finished notification received first.
+Awaiting final termination signal after send task finished...
+[2m2025-05-06T19:03:50.423894Z[0m [31mERROR[0m [2mrzmq::context[0m[2m:[0m [2m279:[0m Context wait_for_termination timed out! 2 actors may not have stopped correctly. [3minitial_count[0m[2m=[0m3 [3mfinal_count[0m[2m=[0m2 [3mtimeout[0m[2m=[0m10s
+[2m2025-05-06T19:03:50.424121Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m294:[0m Waiting for context event listener task to join...
+[2m2025-05-06T19:03:50.424574Z[0m [34mDEBUG[0m [2mrzmq::context[0m[2m:[0m [2m296:[0m Context event listener task joined successfully.
+Termination task: ctx.term() finished with result: Ok(())
+Final termination signal received after send task finished.
+Termination task joined successfully.
+Test test_concurrent_term_and_op finished.
+test test_concurrent_term_and_op ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 10.08s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+

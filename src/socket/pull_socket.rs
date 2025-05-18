@@ -4,33 +4,48 @@ use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{CoreState, SocketCore};
-use crate::socket::patterns::FairQueue; // Use the fair queue helper
+use crate::socket::options::SocketOptions;
+use crate::socket::patterns::FairQueue; // PULL uses a FairQueue to collect messages.
 use crate::socket::ISocket;
+
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, MutexGuard};
-use tokio::time::timeout;
+use tokio::sync::{oneshot, MutexGuard}; // oneshot for API replies.
+use tokio::time::timeout; // For recv timeout.
 
-use super::options::SocketOptions;
+// Import the delegate_to_core macro.
+use crate::{delegate_to_core, Blob};
 
+/// Implements the PULL socket pattern.
+/// PULL sockets are used to collect messages distributed by PUSH sockets.
+/// They receive messages in a fair-queued manner from all connected PUSH peers.
+/// PULL sockets do not send messages.
 #[derive(Debug)]
 pub(crate) struct PullSocket {
+  /// Arc to the shared `SocketCore` actor that manages common socket state and transport.
   core: Arc<SocketCore>,
-  fair_queue: FairQueue, // Buffers incoming messages
+  /// `FairQueue` to buffer incoming messages from all connected PUSH peers.
+  /// `recv()` calls will pop messages from this queue.
+  fair_queue: FairQueue,
 }
 
 impl PullSocket {
-  /// Creates a new PullSocket.
+  /// Creates a new `PullSocket`.
+  ///
+  /// # Arguments
+  /// * `core` - An `Arc` to the `SocketCore` managing this socket.
+  /// * `options` - Initial socket options, used here to determine queue capacity (RCVHWM).
   pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
-    let queue_capacity = options.rcvhwm.max(1);
+    // Capacity for the incoming message queue, based on RCVHWM.
+    let queue_capacity = options.rcvhwm.max(1); // Ensure capacity is at least 1.
     Self {
       core,
       fair_queue: FairQueue::new(queue_capacity),
     }
   }
 
-  /// Helper to access core state safely.
+  /// Helper to get a locked guard for the `CoreState` within `SocketCore`.
   async fn core_state(&self) -> MutexGuard<'_, CoreState> {
     self.core.core_state.lock().await
   }
@@ -38,136 +53,95 @@ impl PullSocket {
 
 #[async_trait]
 impl ISocket for PullSocket {
+  /// Returns a reference to the `SocketCore`.
   fn core(&self) -> &Arc<SocketCore> {
     &self.core
   }
 
-  fn mailbox(&self) -> &MailboxSender {
-    self.core.mailbox_sender()
+  /// Returns a clone of the `SocketCore`'s command mailbox sender.
+  fn mailbox(&self) -> MailboxSender {
+    self.core.command_sender()
   }
 
-  // --- Methods mirroring public API ---
-
+  // --- API Method Implementations (mostly delegated to SocketCore) ---
   async fn bind(&self, endpoint: &str) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    self
-      .core
-      .mailbox_sender()
-      .send(Command::UserBind {
-        endpoint: endpoint.to_string(),
-        reply_tx,
-      })
-      .await
-      .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
+    delegate_to_core!(self, UserBind, endpoint: endpoint.to_string())
   }
-
   async fn connect(&self, endpoint: &str) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    self
-      .core
-      .mailbox_sender()
-      .send(Command::UserConnect {
-        endpoint: endpoint.to_string(),
-        reply_tx,
-      })
-      .await
-      .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
+    delegate_to_core!(self, UserConnect, endpoint: endpoint.to_string())
   }
-
   async fn disconnect(&self, endpoint: &str) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    self
-      .core
-      .mailbox_sender()
-      .send(Command::UserDisconnect {
-        endpoint: endpoint.to_string(),
-        reply_tx,
-      })
-      .await
-      .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
+    delegate_to_core!(self, UserDisconnect, endpoint: endpoint.to_string())
   }
-
   async fn unbind(&self, endpoint: &str) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    self
-      .core
-      .mailbox_sender()
-      .send(Command::UserUnbind {
-        endpoint: endpoint.to_string(),
-        reply_tx,
-      })
-      .await
-      .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
+    delegate_to_core!(self, UserUnbind, endpoint: endpoint.to_string())
   }
 
+  /// PULL sockets cannot send messages. This method will always return an error.
   async fn send(&self, _msg: Msg) -> Result<(), ZmqError> {
-    // PULL sockets cannot send messages
     Err(ZmqError::InvalidState("PULL sockets cannot send messages"))
   }
 
+  /// Receives a message using the PULL pattern.
+  /// Messages are taken from an internal fair queue populated by all connected PUSH peers.
+  /// This call will block (asynchronously) if no messages are currently available,
+  /// unless a `RCVTIMEO` is set.
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    // --- ADD CHECK: Is the core task likely dead? ---
-    // Check if the core mailbox is closed before attempting to wait on the queue.
-    let is_core_mailbox_closed = {
-      let (test_tx, _) = oneshot::channel::<Result<Vec<u8>, ZmqError>>(); // Match expected type
-      let test_cmd = Command::UserGetOpt {
-        option: -999,
-        reply_tx: test_tx,
-      }; // Dummy command
-         // try_send returns Err if the channel is closed or full. Closed is expected after term.
-      self.core.mailbox_sender().try_send(test_cmd).is_err()
-    };
-
-    if is_core_mailbox_closed {
+    // Check if the socket (and its core actor) is still considered running.
+    // This check uses the command_sender's status as a proxy for the core actor's liveness.
+    // If the mailbox is closed, the core actor is likely terminated.
+    if self.core.command_sender().is_closed() {
       tracing::warn!(
         handle = self.core.handle,
-        "PULL recv failed: Core mailbox closed (socket likely terminated)."
+        "PULL recv failed: Core command mailbox detected as closed (socket terminated)."
       );
-      // Return an error indicating the socket is closed/terminated.
       return Err(ZmqError::InvalidState("Socket terminated".into()));
     }
-    
-    // Pop message from the fair queue (awaits if empty)
-    // 1. Get configured timeout from core state
-    let rcvtimeo_opt: Option<Duration> = {
-      // Limit lock scope
-      self.core_state().await.options.rcvtimeo
-    };
 
-    // 2. Pop message from the fair queue, applying timeout if set
+    // Get RCVTIMEO from options.
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
+
+    // Attempt to pop a message from the fair queue.
     let pop_future = self.fair_queue.pop_message();
 
     let result = match rcvtimeo_opt {
       Some(duration) if !duration.is_zero() => {
-        // Timeout > 0
-        tracing::trace!(handle = self.core.handle, ?duration, "Applying RCVTIMEO to recv");
+        // Apply timeout if RCVTIMEO is set to a positive value.
+        tracing::trace!(handle = self.core.handle, ?duration, "Applying RCVTIMEO to PULL recv");
         match timeout(duration, pop_future).await {
-          Ok(Ok(Some(msg))) => Ok(msg), // Message received within timeout
+          Ok(Ok(Some(msg))) => Ok(msg), // Message received within timeout.
           Ok(Ok(None)) => {
-            // Queue closed while waiting (unexpected)
-            tracing::error!(handle = self.core.handle, "PULL recv failed: FairQueue closed");
-            Err(ZmqError::Internal("Receive queue closed".into()))
+            // FairQueue::pop_message returning None usually means the internal channel was closed.
+            tracing::error!(
+              handle = self.core.handle,
+              "PULL recv failed: FairQueue's internal channel closed."
+            );
+            Err(ZmqError::Internal("Receive queue closed unexpectedly".into()))
           }
-          Ok(Err(e)) => Err(e), // Internal error from pop_message
+          Ok(Err(e)) => Err(e), // Propagate internal errors from pop_message.
           Err(_timeout_elapsed) => {
-            tracing::trace!(handle = self.core.handle, "PULL recv timed out");
-            Err(ZmqError::Timeout) // Timeout occurred
+            tracing::trace!(handle = self.core.handle, "PULL recv timed out due to RCVTIMEO.");
+            Err(ZmqError::Timeout) // Timeout occurred.
           }
         }
       }
       _ => {
-        // No timeout (None) or zero timeout (immediate check - though pop_message awaits)
-        // Await indefinitely (or until queue closes)
+        // No timeout (RCVTIMEO is None, meaning infinite wait) or RCVTIMEO = 0.
+        // Note: RCVTIMEO=0 usually implies non-blocking, but FairQueue::pop_message is inherently blocking
+        // if the queue is empty. To achieve true non-blocking, `try_pop_message` would be used,
+        // but the ZMQ API for recv with RCVTIMEO=0 is typically mapped to ResourceLimitReached if no message.
+        // Here, we assume RCVTIMEO=0 still means "wait indefinitely if no message" for simplicity with pop_message.
+        // A more precise RCVTIMEO=0 handling might involve `try_pop_message` and returning `ResourceLimitReached`.
+        // For now, it blocks until a message or queue closure.
         match pop_future.await? {
-          // Use ? to propagate internal errors
+          // Use ? to propagate errors from pop_message (e.g., queue closed).
           Some(msg) => Ok(msg),
           None => {
-            tracing::error!(handle = self.core.handle, "PULL recv failed: FairQueue closed");
-            Err(ZmqError::Internal("Receive queue closed".into()))
+            tracing::error!(
+              handle = self.core.handle,
+              "PULL recv failed: FairQueue's internal channel closed (infinite wait)."
+            );
+            Err(ZmqError::Internal("Receive queue closed unexpectedly".into()))
           }
         }
       }
@@ -176,45 +150,21 @@ impl ISocket for PullSocket {
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
-    // TODO: Handle RCVHWM by recreating/resizing the FairQueue? Complex.
-    // For now, delegate all to core.
-    let (reply_tx, reply_rx) = oneshot::channel();
-    self
-      .core
-      .mailbox_sender()
-      .send(Command::UserSetOpt {
-        option,
-        value: value.to_vec(),
-        reply_tx,
-      })
-      .await
-      .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
+    // Most options are handled by SocketCore. RCVHWM might affect FairQueue capacity,
+    // but changing HWM on an active queue is complex and often not supported directly
+    // without recreating the queue. For now, delegate all to core.
+    delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec())
   }
-
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
-    // TODO: Handle RCVHWM by reading FairQueue capacity?
-    let (reply_tx, reply_rx) = oneshot::channel();
-    self
-      .core
-      .mailbox_sender()
-      .send(Command::UserGetOpt { option, reply_tx })
-      .await
-      .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
+    // Delegate all option gets to SocketCore.
+    // If RCVHWM needs to reflect FairQueue.capacity(), SocketCore's handler would need to query it.
+    delegate_to_core!(self, UserGetOpt, option: option)
   }
-
   async fn close(&self) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    self
-      .core
-      .mailbox_sender()
-      .send(Command::UserClose { reply_tx })
-      .await
-      .map_err(|_| ZmqError::Internal("Mailbox error".into()))?;
-    reply_rx.await.map_err(|_| ZmqError::Internal("Reply error".into()))?
+    delegate_to_core!(self, UserClose,)
   }
 
+  // --- Pattern-Specific Option Handling ---
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
     tracing::debug!(
       handle = self.core.handle,
@@ -222,10 +172,9 @@ impl ISocket for PullSocket {
       option = option,
       "set_pattern_option called"
     );
-    // PULL socket has no specific pattern options
+    // PULL sockets do not have specific pattern options like SUBSCRIBE.
     Err(ZmqError::UnsupportedOption(option))
   }
-
   async fn get_pattern_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     tracing::debug!(
       handle = self.core.handle,
@@ -233,17 +182,19 @@ impl ISocket for PullSocket {
       option = option,
       "get_pattern_option called"
     );
-    // PULL socket has no specific readable pattern options
+    // PULL sockets do not have readable pattern-specific options.
     Err(ZmqError::UnsupportedOption(option))
   }
 
-  // --- Internal Methods ---
-
+  // --- Internal Hooks called by SocketCore ---
   async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
-    // PULL doesn't have specific commands
-    Ok(false)
+    // PULL sockets do not have special commands to process beyond user API calls.
+    Ok(false) // Indicate command was not handled here.
   }
 
+  /// Handles messages received from a pipe by the `SocketCore`.
+  /// For PULL sockets, any `PipeMessageReceived` contains a message from a PUSH peer.
+  /// This message is pushed into the internal `fair_queue`.
   async fn handle_pipe_event(&self, pipe_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
@@ -251,46 +202,62 @@ impl ISocket for PullSocket {
           handle = self.core.handle,
           pipe_id = pipe_id,
           msg_size = msg.size(),
-          "PULL pushing message to FairQueue"
+          "PULL handle_pipe_event: Received message from pipe, pushing to FairQueue."
         );
-        // Push message into the internal queue
+        // Push the received message into the internal fair queue.
+        // `recv()` will then pick it up from this queue.
         self.fair_queue.push_message(msg).await?;
       }
-      // Ignore other pipe events for now? Or log them?
+      // PULL sockets typically ignore other pipe events like PipeClosedByPeer at this ISocket level,
+      // as the pipe detachment is handled by SocketCore calling pipe_detached.
       _ => {
         tracing::trace!(
           handle = self.core.handle,
           pipe_id = pipe_id,
           "PULL received unhandled pipe event: {:?}",
-          event
+          event.variant_name() // Log variant name for brevity.
         );
       }
     }
     Ok(())
   }
 
+  /// Called by `SocketCore` when a new pipe (connection to a PUSH peer) is attached.
   async fn pipe_attached(
     &self,
-    pipe_read_id: usize, // PULL cares about the read pipe ID
-    _pipe_write_id: usize,
-    _peer_identity: Option<&[u8]>,
+    pipe_read_id: usize,           // PULL uses the read ID to associate with the FairQueue.
+    _pipe_write_id: usize,         // PULL does not send, so write ID is not directly used here.
+    _peer_identity: Option<&[u8]>, // Peer identity is not typically used by PULL.
   ) {
     tracing::debug!(
       handle = self.core.handle,
       pipe_read_id = pipe_read_id,
       "PULL attaching pipe"
     );
-    // Notify FairQueue helper (might be used for tracking later)
+    // Notify the FairQueue that a new pipe is contributing messages.
+    // This might be used for internal tracking or debugging within FairQueue.
     self.fair_queue.pipe_attached(pipe_read_id);
   }
 
+  async fn update_peer_identity(&self, pipe_read_id: usize, identity: Option<Blob>) {
+    tracing::trace!(
+      handle = self.core.handle,
+      socket_type = "THEIR_SOCKET_TYPE", // e.g., "DEALER"
+      pipe_read_id,
+      ?identity,
+      "update_peer_identity called, but this socket type does not use peer identities. Ignoring."
+    );
+  }
+
+  /// Called by `SocketCore` when a pipe is detached (PUSH peer disconnected or socket closing).
   async fn pipe_detached(&self, pipe_read_id: usize) {
     tracing::debug!(
       handle = self.core.handle,
       pipe_read_id = pipe_read_id,
       "PULL detaching pipe"
     );
-    // Notify FairQueue helper
+    // Notify the FairQueue that a pipe is no longer contributing.
+    // FairQueue might use this for cleanup or internal state adjustment if necessary.
     self.fair_queue.pipe_detached(pipe_read_id);
   }
 }

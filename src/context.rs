@@ -1,182 +1,201 @@
 // src/context.rs
 
 use crate::error::ZmqError;
-use crate::runtime::{mailbox, Command, MailboxReceiver, MailboxSender}; // Use mailbox fn
-use crate::socket::{self, ISocket, Socket, SocketType};
+use crate::runtime::{
+  mailbox, // For creating mailboxes
+  ActorType,
+  Command, // MailboxSender sends Commands
+  EventBus,
+  MailboxReceiver, // Not directly used in Context, but MailboxSender implies it
+  MailboxSender,   // Stored for sockets
+  SystemEvent,
+  WaitGroup,
+};
+use crate::socket::{self, ISocket, Socket, SocketType}; // For creating and managing Sockets
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid clash
 use std::sync::Arc;
 
 #[cfg(feature = "curve")]
-use libsodium_rs as libsodium;
-use tokio::sync::{Notify, RwLock}; // Use Tokio's RwLock for async access
+use libsodium_rs as libsodium; // For CURVE security initialization
+
+use std::time::Duration;
+use tokio::sync::{broadcast, Mutex, RwLock}; // broadcast for EventBus, Mutex/RwLock for shared state
 
 /// Information stored in the inproc registry for a bound endpoint.
+/// This is used by in-process connectors to find the binder.
 #[derive(Debug, Clone)]
 #[cfg(feature = "inproc")]
 pub(crate) struct InprocBinding {
-  /// The mailbox of the SocketCore actor that bound to this name.
-  /// The connector sends an `InprocConnectRequest` command here.
-  pub(crate) binder_command_mailbox: MailboxSender,
-  // Store socket type? Optional, for validation.
-  // socket_type: crate::socket::SocketType,
+  /// The unique handle ID of the `SocketCore` actor that bound to this inproc name.
+  /// Connectors will use this ID to target events or filter responses if needed,
+  /// though primary communication is via `SystemEvent::InprocBindingRequest`.
+  pub(crate) binder_core_id: usize,
 }
 
-/// Holds the internal state shared by multiple Context handles.
-#[derive(Debug)] // Basic Debug for now
+/// Holds the internal state shared by multiple `Context` handles.
+/// This struct is Arc'd to allow shared ownership.
+#[derive(Debug)]
 pub(crate) struct ContextInner {
-  /// Next available unique handle ID for sockets, pipes, etc.
-  pub(crate) next_handle: Arc<AtomicUsize>, // Use Atomic for simple counter
-
-  /// Map of active socket handles to their command mailboxes.
-  pub(crate) sockets: RwLock<HashMap<usize, MailboxSender>>, // Async RwLock
-
-  /// Registry for in-process bindings. Key is the inproc address name.
+  /// Source for generating the next available unique handle ID for sockets, pipes, etc.
+  pub(crate) next_handle: Arc<std::sync::atomic::AtomicUsize>,
+  /// Map of active socket handles to their command mailboxes (single command mailbox per socket).
+  /// This allows the context (or other authorized entities) to potentially interact
+  /// directly with a socket's command processing loop if absolutely necessary,
+  /// though most inter-socket coordination is now event-driven.
+  pub(crate) sockets: RwLock<HashMap<usize, MailboxSender>>,
+  /// Registry for in-process bindings. Key is the inproc address name (e.g., "my-service").
   #[cfg(feature = "inproc")]
-  pub(crate) inproc_registry: RwLock<HashMap<String, InprocBinding>>, // Feature-gated
+  pub(crate) inproc_registry: RwLock<HashMap<String, InprocBinding>>,
 
   // --- Shutdown Coordination ---
-  /// Used to notify tasks waiting in `Context::term()` when shutdown might be complete.
-  pub(crate) shutdown_notify: Notify,
-  /// Count of currently active sockets associated with this context.
-  pub(crate) active_sockets: AtomicUsize,
-  /// Flag indicating if shutdown has been initiated.
+  /// Central event bus for broadcasting system-wide notifications (e.g., termination, actor lifecycle).
+  event_bus: Arc<EventBus>,
+  /// WaitGroup tracking all active actors spawned under this context.
+  /// This is used by `Context::term()` to wait for all actors to complete shutdown.
+  actor_wait_group: WaitGroup,
+  /// Flag indicating if context-wide shutdown has been initiated.
+  /// Used to prevent redundant shutdown operations and to signal actors.
   pub(crate) shutdown_initiated: AtomicBool,
 }
 
 impl ContextInner {
-  /// Creates new shared context state.
+  /// Creates new shared context state, including initializing libsodium (if CURVE enabled)
+  /// and spawning the event listener task.
   fn new() -> Self {
     #[cfg(feature = "curve")]
     {
-      // libsodium::init() returns Result, handle potential error
       if let Err(_) = libsodium::ensure_init() {
-        // Log error, decide if this should be fatal for the context/app
         tracing::error!("Failed to initialize libsodium! CURVE security will not work.");
-        // Consider returning an error:
-        // return Err(ZmqError::Internal("Libsodium initialization failed".to_string()));
       } else {
         tracing::debug!("Libsodium initialized successfully.");
       }
     }
+
+    let event_bus = Arc::new(EventBus::new());
+    let actor_wait_group = WaitGroup::new();
+
     Self {
-      next_handle: Arc::new(AtomicUsize::new(1)),
+      next_handle: Arc::new(std::sync::atomic::AtomicUsize::new(1)), // Start handle IDs from 1.
       sockets: RwLock::new(HashMap::new()),
       #[cfg(feature = "inproc")]
       inproc_registry: RwLock::new(HashMap::new()),
-      shutdown_notify: Notify::new(),
-      active_sockets: AtomicUsize::new(0),
+      event_bus,
+      actor_wait_group,
       shutdown_initiated: AtomicBool::new(false),
     }
   }
 
-  /// Generates the next unique handle ID.
+  /// Generates the next unique handle ID using an atomic counter.
   pub(crate) fn next_handle(&self) -> usize {
-    // Relaxed ordering is sufficient for a simple counter
-    self.next_handle.fetch_add(1, Ordering::Relaxed)
+    self.next_handle.fetch_add(1, AtomicOrdering::Relaxed)
   }
 
-  /// Registers a newly created socket actor.
-  pub(crate) async fn register_socket(&self, handle: usize, mailbox: MailboxSender) {
+  /// Registers a newly created socket actor's command mailbox.
+  /// The WaitGroup increment for the socket actor happens *after* its task is spawned,
+  /// via an `ActorStarted` event published by the spawner.
+  pub(crate) async fn register_socket(&self, handle: usize, command_sender: MailboxSender) {
     let mut sockets_w = self.sockets.write().await;
-    sockets_w.insert(handle, mailbox);
-    self.active_sockets.fetch_add(1, Ordering::AcqRel);
-    tracing::debug!(socket_handle = handle, "Socket registered");
+    sockets_w.insert(handle, command_sender);
+    tracing::debug!(socket_handle = handle, "Socket command mailbox registered");
   }
 
-  /// Unregisters a socket actor, typically when it stops cleanly.
+  /// Unregisters a socket actor's command mailbox.
+  /// The WaitGroup decrement for the socket actor happens when it publishes an
+  /// `ActorStopping` event just before its task terminates.
   pub(crate) async fn unregister_socket(&self, handle: usize) {
     let mut sockets_w = self.sockets.write().await;
     if sockets_w.remove(&handle).is_some() {
-      let prev_count = self.active_sockets.fetch_sub(1, Ordering::AcqRel);
-      tracing::debug!(socket_handle = handle, "Socket unregistered");
-      // If this was the last socket AND shutdown was initiated, notify waiters.
-      if prev_count == 1 && self.shutdown_initiated.load(Ordering::Acquire) {
-        tracing::debug!("Last socket unregistered during shutdown, notifying term waiters.");
-        self.shutdown_notify.notify_waiters();
-      }
+      tracing::debug!(socket_handle = handle, "Socket command mailbox unregistered");
     } else {
-      tracing::warn!(socket_handle = handle, "Attempted to unregister non-existent socket");
+      tracing::warn!(
+        socket_handle = handle,
+        "Attempted to unregister non-existent socket handle"
+      );
     }
   }
 
-  /// Initiates shutdown for all registered sockets.
+  /// Initiates shutdown for all actors managed by this context.
+  /// This is done by publishing a `SystemEvent::ContextTerminating` event.
+  /// Individual socket actors are responsible for reacting to this event and shutting down.
   pub(crate) async fn shutdown(&self) {
     if self
       .shutdown_initiated
-      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+      .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
       .is_ok()
     {
       tracing::info!("Context shutdown initiated.");
-      let sockets_r = self.sockets.read().await;
-      if sockets_r.is_empty() {
-        tracing::debug!("No active sockets during shutdown initiation.");
-        // If already empty when shutdown starts, notify immediately
-        self.shutdown_notify.notify_waiters();
-        return;
+      // Publish the global termination event. All actors should listen for this.
+      if let Err(e) = self.event_bus.publish(SystemEvent::ContextTerminating) {
+        tracing::warn!(
+          "Publishing ContextTerminating event failed (receivers={}): {}",
+          self.event_bus.subscriber_count(),
+          e
+        );
+      } else {
+        tracing::debug!("Published ContextTerminating event via bus.");
       }
-
-      // Create a list of mailboxes to avoid holding read lock while sending
-      let mailboxes_to_stop: Vec<_> = sockets_r.values().cloned().collect();
-      drop(sockets_r); // Release read lock
-
-      // Send Stop command to all sockets concurrently
-      let stop_futures = mailboxes_to_stop.into_iter().map(|mb| async move {
-        // Ignore send errors - socket might have already terminated
-        let _ = mb.send(Command::Stop).await;
-      });
-      futures::future::join_all(stop_futures).await;
-      tracing::debug!("Sent Stop command to all registered sockets.");
+      // Direct Stop commands to individual sockets are removed.
+      // Actors now rely on the ContextTerminating event or SocketClosing events from their parents.
     } else {
       tracing::debug!("Context shutdown already initiated.");
     }
   }
 
-  /// Waits until all sockets are unregistered after shutdown is initiated.
+  /// Waits until all actors associated with the context have terminated.
+  /// This relies on the `actor_wait_group` which is managed by the `event_listener_task`.
   pub(crate) async fn wait_for_termination(&self) {
-    if !self.shutdown_initiated.load(Ordering::Acquire) {
-      tracing::warn!("Context::term called before shutdown initiated. Call shutdown() first or just use term().");
-      // If we didn't initiate shutdown, there's nothing to wait for in this logic.
-      // Alternatively, call self.shutdown().await here? Decided against it for clarity.
-      return;
+    if !self.shutdown_initiated.load(AtomicOrdering::Acquire) {
+      tracing::warn!("Context::term waiting but shutdown not initiated? Proceeding anyway.");
+      // Consider initiating shutdown here if it's a valid recovery path: self.shutdown().await;
     }
+    let initial_count = self.actor_wait_group.get_count();
+    tracing::debug!(
+      count = initial_count,
+      "Context wait_for_termination starting wait on WG (includes listener task)..."
+    );
 
-    loop {
-      let count = self.active_sockets.load(Ordering::Acquire);
-      if count == 0 {
-        tracing::info!("Context termination complete (all sockets stopped).");
-        break;
+    // Add a timeout to prevent indefinite blocking if an actor fails to stop correctly.
+    let wait_timeout = Duration::from_secs(10); // Example: 10 second timeout.
+    match tokio::time::timeout(wait_timeout, self.actor_wait_group.wait()).await {
+      Ok(()) => {
+        tracing::info!(
+          initial_count,
+          final_count = self.actor_wait_group.get_count(),
+          "Context termination complete (WaitGroup reached zero)."
+        );
       }
-      tracing::debug!(active_sockets = count, "Waiting for sockets to terminate...");
-      // Wait for a notification OR a timeout to avoid infinite loop if something goes wrong
-      tokio::select! {
-          _ = self.shutdown_notify.notified() => {
-              tracing::debug!("Received termination notification signal.");
-              // Re-check count immediately after notification
-              continue;
-          }
-          _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-               tracing::warn!(active_sockets = count, "Timeout while waiting for context termination, still checking...");
-               // Log timeout and continue loop - allows recovery if notification was missed
-          }
+      Err(_) => {
+        let final_count = self.actor_wait_group.get_count();
+        tracing::error!(
+            initial_count,
+            final_count,
+            timeout=?wait_timeout,
+            "Context wait_for_termination timed out! {} actors may not have stopped correctly.",
+            final_count // This count still includes the listener if it hasn't exited.
+        );
+        // Consider returning an error or panicking here for critical applications.
       }
     }
   }
 
+  /// Registers an in-process binding. The `binder_core_id` identifies the `SocketCore`
+  /// that is binding to this name, allowing it to filter `InprocBindingRequest` events.
   #[cfg(feature = "inproc")]
-  pub(crate) async fn register_inproc(&self, name: String, binding_info: InprocBinding) -> Result<(), ZmqError> {
+  pub(crate) async fn register_inproc(&self, name: String, binder_core_id: usize) -> Result<(), ZmqError> {
     let mut registry = self.inproc_registry.write().await;
     if registry.contains_key(&name) {
-      Err(ZmqError::AddrInUse(format!("inproc://{}", name))) // Address already bound
+      Err(ZmqError::AddrInUse(format!("inproc://{}", name)))
     } else {
-      tracing::debug!(inproc_name = %name, "Registering inproc binding");
-      registry.insert(name, binding_info);
+      tracing::debug!(inproc_name = %name, binder_core_id = binder_core_id, "Registering inproc binding");
+      registry.insert(name, InprocBinding { binder_core_id });
       Ok(())
     }
   }
 
+  /// Unregisters an in-process binding.
   #[cfg(feature = "inproc")]
   pub(crate) async fn unregister_inproc(&self, name: &str) {
     let mut registry = self.inproc_registry.write().await;
@@ -185,32 +204,33 @@ impl ContextInner {
     }
   }
 
+  /// Looks up an in-process binding by name.
   #[cfg(feature = "inproc")]
   pub(crate) async fn lookup_inproc(&self, name: &str) -> Option<InprocBinding> {
     self.inproc_registry.read().await.get(name).cloned()
   }
-  
-  /// Gets the mailbox for a specific registered socket.
-  pub(crate) async fn get_socket_mailbox(&self, handle: usize) -> Option<MailboxSender> {
+
+  /// Gets the command mailbox sender for a specific registered socket.
+  pub(crate) async fn get_socket_command_sender(&self, handle: usize) -> Option<MailboxSender> {
     self.sockets.read().await.get(&handle).cloned()
+  }
+
+  /// Provides access to the shared `EventBus` instance Arc.
+  pub(crate) fn event_bus(&self) -> Arc<EventBus> {
+    self.event_bus.clone()
   }
 }
 
 /// A handle to an rzmq context, managing sockets and shared resources.
-/// Contexts are cloneable and thread-safe.
-#[derive(Clone)] // Clone is cheap due to Arc
+/// `Context` handles are cloneable (`Arc`-based).
+#[derive(Clone)]
 pub struct Context {
   inner: Arc<ContextInner>,
 }
-// <<< ADDED PUBLIC CONTEXT STRUCT END >>>
 
-// <<< ADDED PUBLIC CONTEXT IMPL >>>
 impl Context {
   /// Creates a new, independent context.
   pub fn new() -> Result<Self, ZmqError> {
-    // Initialize tracing subscriber (optional, good practice)
-    // setup_tracing(); // Define this helper function somewhere
-
     tracing::debug!("Creating new rzmq Context");
     Ok(Self {
       inner: Arc::new(ContextInner::new()),
@@ -222,70 +242,142 @@ impl Context {
     let handle = self.inner.next_handle();
     tracing::debug!(socket_type = ?socket_type, handle = handle, "Creating socket");
 
-    // --- Socket Actor Creation ---
-    // This is complex: involves Arc::new_cyclic, creating SocketCore,
-    // creating the specific ISocket impl (e.g., PubSocket), spawning the
-    // SocketCore's run_loop task, and registering with ContextInner.
-    // We'll defer the full implementation to SocketCore::create_and_spawn.
+    // `create_socket_actor` now returns the ISocket logic and the single command_sender.
+    let (socket_logic, command_sender) = crate::socket::create_socket_actor(handle, self.clone(), socket_type)?;
 
-    // Placeholder for the actual socket creation logic:
-    let (socket_handle, socket_mailbox) = crate::socket::create_socket_actor(handle, self.clone(), socket_type)?;
-    // `create_socket_actor` needs to:
-    // 1. Create SocketCore + ISocket impl (e.g., PubSocket) via Arc::new_cyclic
-    // 2. Spawn SocketCore::run_command_loop task
-    // 3. Return Arc<dyn ISocket> handle and the SocketCore's MailboxSender
-
-    // Register the socket *after* it's successfully created and spawned
-    let inner = self.inner.clone(); // Clone Arc for async block
-    let mailbox = socket_mailbox.clone(); // Clone mailbox for async block
+    // Register the socket's command mailbox with the context.
+    // WG increment for the socket actor happens via an ActorStarted event published by create_socket_actor.
+    let inner_clone = self.inner.clone();
+    let cmd_sender_clone = command_sender.clone();
     tokio::spawn(async move {
-      inner.register_socket(handle, mailbox).await;
+      inner_clone.register_socket(handle, cmd_sender_clone).await;
     });
 
-    // Wrap the ISocket Arc in the public Socket handle
-    Ok(Socket::new(socket_handle))
+    // The public `Socket` handle now needs the command_sender to interact with its `SocketCore`.
+    Ok(Socket::new(socket_logic, command_sender))
   }
 
-  /// Initiates background shutdown of all sockets created by this context.
-  /// Returns immediately. Sockets will close gracefully.
+  /// Initiates background shutdown of all sockets and actors created by this context.
+  /// This publishes `ContextTerminating` on the event bus.
   pub async fn shutdown(&self) -> Result<(), ZmqError> {
     self.inner.shutdown().await;
     Ok(())
   }
 
   /// Shuts down all sockets and waits for their clean termination.
-  /// Consumes the Context handle. Use for final cleanup.
-  /// Note: This awaits, so it should be called from an async context.
-  pub async fn term(self) -> Result<(), ZmqError> {
-    self.inner.shutdown().await;
-    self.inner.wait_for_termination().await;
+  /// This involves publishing `ContextTerminating` and then waiting on the context's `WaitGroup`.
+  pub async fn term(&self) -> Result<(), ZmqError> {
+    self.inner.shutdown().await; // Ensure shutdown is initiated.
+    self.inner.wait_for_termination().await; // Wait using the WG.
     Ok(())
   }
 
-  // --- Internal Methods ---
-
-  /// Internal helper to get the inner Arc. Used by SocketCore etc.
+  /// Internal helper to get the `Arc<ContextInner>`.
+  /// Used by `SocketCore` and other internal components to access shared context state.
   pub(crate) fn inner(&self) -> &Arc<ContextInner> {
     &self.inner
   }
-}
-// <<< ADDED PUBLIC CONTEXT IMPL END >>>
 
-// <<< ADDED DEBUG IMPL FOR CONTEXT >>>
-impl fmt::Debug for Context {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    // Avoid trying to display the full inner state, just identify it
-    f.debug_struct("Context")
-      // Optionally include a unique ID or pointer address if helpful
-      // .field("inner_ptr", &Arc::as_ptr(&self.inner))
-      .finish_non_exhaustive()
+  // Helper for actors to get the event bus Arc easily from a Context handle.
+  pub(crate) fn event_bus(&self) -> Arc<EventBus> {
+    self.inner.event_bus() // Delegate to inner.
+  }
+
+  /// Publishes an `ActorStarted` event. This is typically called by the code
+  /// that spawns a new actor task, immediately after successful spawning.
+  pub(crate) fn publish_actor_started(&self, handle_id: usize, actor_type: ActorType, parent_id: Option<usize>) {
+    let event = SystemEvent::ActorStarted {
+      handle_id,
+      actor_type,
+      parent_id,
+    };
+    if let Err(e) = self.inner.event_bus().publish(event) {
+      tracing::warn!(
+        actor_handle = handle_id,
+        ?actor_type,
+        "Failed to publish ActorStarted event: {}",
+        e
+      );
+    }
+
+    let wg = &self.inner.actor_wait_group; // Borrow the WaitGroup
+    wg.add(1); // Increment WaitGroup for the newly started actor.
+  }
+
+  /// Publishes an `ActorStopping` event. This is typically called by an actor task
+  /// itself, just before it exits, to signal its termination.
+  pub(crate) fn publish_actor_stopping(
+    &self,
+    handle_id: usize,
+    actor_type: ActorType,
+    endpoint_uri: Option<String>,
+    error: Option<ZmqError>,
+  ) {
+    let error_msg_opt = error.map(|e| format!("{}", e));
+    let event = SystemEvent::ActorStopping {
+      handle_id,
+      actor_type,
+      endpoint_uri,
+      error_msg: error_msg_opt,
+    };
+
+    // --- Attempt to publish the event (best effort) ---
+    if let Err(e) = self.inner.event_bus().publish(event) {
+      // Log failure, especially if during active shutdown phase.
+      // Use eprintln for higher chance of visibility during shutdown/panic.
+      // Check if already panicking to avoid making things worse.
+      if !std::thread::panicking() {
+        eprintln!(
+          "WARN: Failed to publish ActorStopping event for handle {}: {} (receivers={})",
+          handle_id,
+          e,
+          self.inner.event_bus().subscriber_count()
+        );
+      }
+      // Note: Even if publish fails, we MUST decrement the WaitGroup below.
+    } else {
+      // Optional: Trace successful publish if needed, but can be noisy.
+      // tracing::trace!(actor_handle = handle_id, ?actor_type, "Published ActorStopping event");
+    }
+
+    // --- Unconditionally decrement the WaitGroup ---
+    // This is the crucial part to ensure termination completes even if the
+    // event listener is gone or event publishing fails.
+    let wg = &self.inner.actor_wait_group; // Borrow the WaitGroup
+                                           // Ensure count doesn't go below zero before decrementing.
+    if wg.get_count() > 0 {
+      tracing::trace!(
+        actor_handle = handle_id,
+        ?actor_type,
+        wg_prev = wg.get_count(),
+        "Decrementing WaitGroup for stopping actor."
+      );
+      wg.done(); // Directly decrement the counter
+    } else {
+      // Log a warning if done() is called when count is already zero.
+      // This indicates a potential logic error (e.g., double stop).
+      if !std::thread::panicking() {
+        eprintln!(
+          "WARN: Attempted WaitGroup done() for handle {} ({:?}) but count was already zero!",
+          handle_id, actor_type
+        );
+      }
+      // Consider if panicking here is appropriate, maybe only in debug builds.
+      // panic!("WaitGroup done() called with count zero for handle {} ({:?})", handle_id, actor_type);
+    }
   }
 }
-// <<< ADDED DEBUG IMPL FOR CONTEXT END >>>
 
-// <<< MODIFIED LIB.RS CONTEXT FUNCTION >>>
-/// Creates a new library context.
-pub fn context() -> Result<Context, ZmqError> {
-  Context::new() // Now calls the actual implementation
+impl fmt::Debug for Context {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    // Provide a more informative Debug representation if useful,
+    // e.g., number of active sockets, shutdown status.
+    // For now, keep it simple.
+    f.debug_struct("Context").finish_non_exhaustive()
+  }
 }
-// <<< MODIFIED LIB.RS CONTEXT FUNCTION END >>>
+
+/// Creates a new library context. This is the main entry point for using rzmq.
+pub fn context() -> Result<Context, ZmqError> {
+  Context::new()
+}

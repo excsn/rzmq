@@ -1,291 +1,381 @@
 // src/transport/ipc.rs
 
-#![cfg(feature = "ipc")]
+#![cfg(feature = "ipc")] // Only compile this file if ipc feature is enabled
 
-use crate::engine; // Engine factory functions
+use crate::context::Context;
+use crate::engine; // For engine::zmtp_ipc
 use crate::error::ZmqError;
-use crate::runtime::{mailbox, Command, MailboxReceiver, MailboxSender};
-use crate::session::SessionBase;
-use crate::socket::events::{MonitorSender, SocketEvent}; // Import monitor types
-use crate::socket::options::SocketOptions;
+use crate::runtime::{
+  self,
+  mailbox,
+  ActorDropGuard,
+  ActorType,
+  Command,
+  EventBus,
+  MailboxReceiver,
+  MailboxSender,
+  SystemEvent, // System events for lifecycle management
+};
+use crate::session::SessionBase; // For spawning Session actors
+use crate::socket::events::{MonitorSender, SocketEvent}; // For emitting monitor events
+use crate::socket::options::SocketOptions; // Configuration types
 use std::io;
-use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::os::fd::AsRawFd; // For creating a synthetic peer address from file descriptor
+use std::path::PathBuf; // For IPC path manipulation
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::fs; // For removing socket file
-use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
-use tokio::task::JoinHandle;
-use tokio::time::sleep; // For delay
+use tokio::fs; // For asynchronous file system operations (removing socket file) - though Drop uses std::fs
+use tokio::net::{UnixListener as TokioUnixListener, UnixStream}; // Tokio's Unix domain socket types
+use tokio::sync::broadcast; // For EventBus subscription
+use tokio::task::JoinHandle; // For managing spawned tasks
+use tokio::time::{sleep, timeout}; // For delays and timeouts
 
-// --- IpcListener ---
+// --- IpcListener Actor ---
+/// Manages a listening Unix Domain Socket, accepts incoming connections,
+/// and spawns Session/Engine pairs for them.
 #[derive(Debug)]
 pub(crate) struct IpcListener {
-  handle: usize,
-  endpoint: String, // Original URI (e.g., "ipc:///tmp/rzmq.sock")
-  path: PathBuf,    // Parsed Path - needed for Drop cleanup
-  core_mailbox: MailboxSender,
-  mailbox_receiver: MailboxReceiver,
-  listener_handle: JoinHandle<()>, // Accept loop handle - needed for Stop/Drop
+  handle: usize,                           // Handle of the Listener's command loop actor.
+  endpoint: String,                        // The URI this listener is bound to.
+  path: PathBuf,                           // The file system path of the socket, for cleanup in Drop.
+  mailbox_receiver: MailboxReceiver,       // For receiving Stop commands.
+  listener_handle: Option<JoinHandle<()>>, // JoinHandle for the accept loop task.
+  context: Context,                        // The rzmq Context.
+  parent_socket_id: usize,                 // Handle ID of the parent SocketCore.
 }
 
 impl IpcListener {
   pub(crate) fn create_and_spawn(
     handle: usize,
     endpoint_uri: String,
-    path: PathBuf,               // Pass parsed path
-    options: Arc<SocketOptions>, // Options needed for accept loop
-    core_mailbox: MailboxSender,
-    context_handle_source: Arc<std::sync::atomic::AtomicUsize>, // Handle source needed for accept loop
-    monitor_tx: Option<MonitorSender>,                          // Accept monitor sender
+    path: PathBuf,
+    options: Arc<SocketOptions>,
+    context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
+    monitor_tx: Option<MonitorSender>,
+    context: Context,
+    parent_socket_id: usize,
   ) -> Result<(MailboxSender, JoinHandle<()>), ZmqError> {
+    let actor_type = ActorType::Listener;
     let (tx, rx) = mailbox();
 
-    // --- Bind the actual listener ---
+    // Attempt to remove an existing socket file before binding.
     match std::fs::remove_file(&path) {
-      Ok(_) => tracing::debug!(handle=handle, path=?path, "Removed existing IPC socket file before binding."),
+      Ok(_) => {
+        tracing::debug!(listener_handle = handle, path = ?path, "Removed existing IPC socket file before binding.")
+      }
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
       Err(e) => {
-        tracing::warn!(handle=handle, path=?path, error=%e, "Failed to remove existing IPC socket file before binding.")
+        tracing::warn!(listener_handle = handle, path = ?path, error = %e, "Failed to remove existing IPC socket file before binding. Bind may fail.");
       }
     }
 
     let listener = TokioUnixListener::bind(&path).map_err(|e| ZmqError::from_io_endpoint(e, &endpoint_uri))?;
-    tracing::info!(handle=handle, path=?path, uri=%endpoint_uri, "IPC Listener bound successfully");
+    tracing::info!(listener_handle = handle, path = ?path, uri = %endpoint_uri, "IPC Listener bound successfully");
     let listener_arc = Arc::new(listener);
-    // --- End Bind ---
 
-    // Spawn the accept loop task separately
-    let accept_core_mailbox = core_mailbox.clone();
-    let accept_listener = listener_arc.clone();
-    let accept_handle_source = context_handle_source.clone();
-    let accept_options = options.clone();
-    let accept_monitor_tx = monitor_tx.clone();
-    let endpoint_clone = endpoint_uri.clone();
-    let path_clone = path.clone(); // For logging inside accept loop
+    // Prepare arguments for the accept loop task.
+    let accept_listener_arc = listener_arc.clone();
+    let accept_handle_source_clone = context_handle_source.clone();
+    let accept_options_clone = options.clone();
+    let accept_monitor_tx_clone = monitor_tx.clone();
+    let endpoint_uri_for_accept_loop = endpoint_uri.clone();
+    let path_for_accept_loop = path.clone();
+    let context_for_accept_loop = context.clone();
+    let parent_socket_id_for_accept_loop = parent_socket_id;
+    let accept_loop_parent_handle = handle;
 
-    let accept_loop_handle = tokio::spawn(IpcListener::run_accept_loop(
-      handle,
-      endpoint_clone, // Pass original endpoint URI
-      path_clone,     // Pass path for logging
-      accept_listener,
-      accept_core_mailbox,
-      accept_options,
-      accept_handle_source,
-      accept_monitor_tx, // Pass monitor sender
+    let accept_loop_handle_id = context_for_accept_loop.inner().next_handle();
+    let accept_loop_actor_type = ActorType::AcceptLoop;
+
+    let accept_loop_task_join_handle = tokio::spawn(IpcListener::run_accept_loop(
+      accept_loop_handle_id,
+      accept_loop_parent_handle,
+      endpoint_uri_for_accept_loop,
+      path_for_accept_loop,
+      accept_listener_arc,
+      accept_options_clone,
+      accept_handle_source_clone,
+      accept_monitor_tx_clone,
+      context_for_accept_loop.clone(),
+      parent_socket_id_for_accept_loop,
     ));
+    context.publish_actor_started(
+      accept_loop_handle_id,
+      accept_loop_actor_type,
+      Some(accept_loop_parent_handle),
+    );
 
-    let actor = IpcListener {
+    let listener_actor = IpcListener {
       handle,
       endpoint: endpoint_uri,
-      path, // Keep path for Drop impl
-      core_mailbox,
+      path, // Store path for Drop.
       mailbox_receiver: rx,
-      listener_handle: accept_loop_handle, // Store handle to abort loop
+      listener_handle: Some(accept_loop_task_join_handle),
+      context: context.clone(),
+      parent_socket_id,
     };
 
-    let command_loop_handle = tokio::spawn(actor.run_command_loop());
-    Ok((tx, command_loop_handle)) // Return mailbox and handle for command loop
+    let command_loop_join_handle = tokio::spawn(listener_actor.run_command_loop());
+    context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
+
+    Ok((tx, command_loop_join_handle))
   }
 
-  /// Main loop to handle commands (like Stop) for the Listener actor itself.
   async fn run_command_loop(mut self) {
-    let handle = self.handle;
-    let endpoint_uri = self.endpoint.clone();
-    tracing::debug!(handle = handle, uri=%endpoint_uri, "IPC Listener command loop started");
+    let listener_cmd_loop_handle = self.handle;
+    let listener_cmd_loop_actor_type = ActorType::Listener;
+    let endpoint_uri_clone_log = self.endpoint.clone();
+    let path_clone_log = self.path.clone();
+    let event_bus = self.context.event_bus();
+    let mut system_event_rx = event_bus.subscribe();
+    let mut listener_abort_handle = self.listener_handle.take();
 
-    loop {
-      tokio::select! {
+    tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, path = ?path_clone_log, "IPC Listener command loop started");
+
+    let mut final_error_for_actor_stopping: Option<ZmqError> = None;
+
+    let _loop_result: Result<(), ()> = async {
+      loop {
+        tokio::select! {
           biased;
-          cmd = self.mailbox_receiver.recv() => {
-            match cmd {
-              Ok(Command::Stop) => {
-                tracing::info!(handle = handle, uri=%endpoint_uri, "IPC Listener received Stop command");
-                self.listener_handle.abort();
+          event_result = system_event_rx.recv() => {
+            match event_result {
+              Ok(SystemEvent::ContextTerminating) => {
+                tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener received ContextTerminating, stopping accept loop.");
+                if let Some(h) = &listener_abort_handle { h.abort(); }
                 break;
-              },
-              Ok(other) => tracing::warn!(handle=handle, uri=%endpoint_uri, "IPC Listener received unhandled command: {:?}", other),
-              Err(_) => {
-                tracing::info!(handle=handle, uri=%endpoint_uri, "IPC Listener command mailbox closed, stopping accept loop.");
-                self.listener_handle.abort();
+              }
+              Ok(SystemEvent::SocketClosing{ socket_id }) if socket_id == self.parent_socket_id => {
+                tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, parent_id = self.parent_socket_id, "IPC Listener received SocketClosing for parent, stopping accept loop.");
+                if let Some(h) = &listener_abort_handle { h.abort(); }
+                break;
+              }
+              Ok(_) => { /* Ignore other events. */ }
+              Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, skipped = n, "System event bus lagged for IPC Listener command loop!");
+                if let Some(h) = &listener_abort_handle { h.abort(); }
+                final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus lagged (IPC)".into()));
+                break;
+              }
+              Err(broadcast::error::RecvError::Closed) => {
+                tracing::error!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "System event bus closed unexpectedly for IPC Listener command loop!");
+                if let Some(h) = &listener_abort_handle { h.abort(); }
+                final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus closed (IPC)".into()));
                 break;
               }
             }
           }
+          cmd_result = self.mailbox_receiver.recv() => {
+            match cmd_result {
+              Ok(Command::Stop) => {
+                tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener received Stop command");
+                if let Some(h) = &listener_abort_handle { h.abort(); }
+                break;
+              }
+              Ok(other_cmd) => {
+                tracing::warn!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener received unhandled command: {:?}", other_cmd.variant_name());
+              }
+              Err(_) => {
+                tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener command mailbox closed, stopping accept loop.");
+                if let Some(h) = &listener_abort_handle { h.abort(); }
+                if final_error_for_actor_stopping.is_none() {
+                    final_error_for_actor_stopping = Some(ZmqError::Internal("Listener command mailbox closed by peer (IPC)".into()));
+                }
+                break;
+              }
+            }
+          }
+        }
       }
-    }
-    tracing::debug!(handle = handle, uri=%endpoint_uri, "IPC Listener command loop finished");
+      Ok(())
+    }.await;
 
-    // Send CleanupComplete notification AFTER command loop exits
-    if !self.core_mailbox.is_closed() {
-      let cleanup_cmd = Command::CleanupComplete {
-        handle: self.handle,
-        endpoint_uri: Some(self.endpoint.clone()),
-      };
-      if let Err(e) = self.core_mailbox.send(cleanup_cmd).await {
-        tracing::warn!(handle=self.handle, uri=%self.endpoint, "Failed to send CleanupComplete to Core: {:?}", e);
+    tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener command loop finished, awaiting accept loop task.");
+    if let Some(listener_handle) = self.listener_handle.take() {
+      if let Err(e) = listener_handle.await {
+        if !e.is_cancelled() {
+          tracing::error!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener accept loop task panicked: {:?}", e);
+          if final_error_for_actor_stopping.is_none() {
+            final_error_for_actor_stopping = Some(ZmqError::Internal(format!(
+              "Listener accept loop panicked (IPC): {:?}",
+              e
+            )));
+          }
+        } else {
+          tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener accept loop task was cancelled as expected.");
+        }
       } else {
-        tracing::debug!(handle=self.handle, uri=%self.endpoint, "IPC Listener sent CleanupComplete to Core.");
+        tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener accept loop task joined cleanly.");
       }
     }
-    // Drop impl handles socket file removal
+
+    self.context.publish_actor_stopping(
+      listener_cmd_loop_handle,
+      listener_cmd_loop_actor_type,
+      Some(self.endpoint.clone()), // Pass owned endpoint URI from struct.
+      final_error_for_actor_stopping,
+    );
+    tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener command loop actor fully stopped.");
+    // Drop impl for IpcListener handles socket file removal.
   }
 
-  /// Separate task that runs the blocking `accept()` loop.
   async fn run_accept_loop(
-    listener_handle_id: usize,
-    endpoint_uri: String, // Original listener URI
-    path: PathBuf,        // Listener path for logging
+    accept_loop_handle: usize,
+    listener_cmd_loop_handle: usize,
+    endpoint_uri: String,
+    path: PathBuf, // Path for logging.
     listener: Arc<TokioUnixListener>,
-    core_mailbox: MailboxSender,
-    options: Arc<SocketOptions>,
+    socket_options: Arc<SocketOptions>,
     handle_source: Arc<std::sync::atomic::AtomicUsize>,
-    monitor_tx: Option<MonitorSender>, // Accept monitor sender
+    monitor_tx: Option<MonitorSender>,
+    context: Context,
+    parent_socket_core_id: usize,
   ) {
-    tracing::debug!(parent_handle = listener_handle_id, uri=%endpoint_uri, path=?path, "IPC Listener accept loop started");
-    let mut loop_error: Option<ZmqError> = None;
+    let accept_loop_actor_type = ActorType::AcceptLoop;
+    let actor_drop_guard = ActorDropGuard::new(
+      context.clone(),
+      accept_loop_handle,
+      accept_loop_actor_type,
+      Some(endpoint_uri.clone()),
+    );
+
+    tracing::debug!(handle = accept_loop_handle, parent_handle = listener_cmd_loop_handle, uri = %endpoint_uri, path = ?path, "IPC Listener accept loop started");
+    let mut loop_error_to_report: Option<ZmqError> = None;
 
     loop {
-      match listener.accept().await {
-        Ok((stream, _peer_addr)) => {
-          // Peer addr is often meaningless for UnixStream
-          let peer_addr_str = format!("ipc-peer-fd-{}", stream.as_raw_fd()); // Use FD as identifier?
-          tracing::info!(parent_handle = listener_handle_id, path=?path, peer=?peer_addr_str, "Accepted new IPC connection");
+      tokio::select! {
+        biased;
+        accept_result = listener.accept() => {
+          match accept_result {
+            Ok((unix_stream, _peer_addr_os_specific)) => {
+              let peer_addr_str = format!("ipc-peer-fd-{}", unix_stream.as_raw_fd());
+              tracing::info!(listener_accept_loop_handle = accept_loop_handle, path = ?path, peer = %peer_addr_str, "Accepted new IPC connection");
 
-          // Emit Accepted event
-          if let Some(ref tx) = monitor_tx {
-            let event = SocketEvent::Accepted {
-              endpoint: endpoint_uri.clone(),
-              peer_addr: peer_addr_str.clone(), // Use synthetic peer addr
-            };
-            let tx_clone = tx.clone();
-            tokio::spawn(async move {
-              if tx_clone.send(event).await.is_err() { /* Warn */ }
-            });
-          }
+              if let Some(ref tx) = monitor_tx {
+                let event = SocketEvent::Accepted { endpoint: endpoint_uri.clone(), peer_addr: peer_addr_str.clone() };
+                let tx_clone = tx.clone();
+                tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
+              }
 
-          // --- Spawn Session & Engine ---
-          let session_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-          let engine_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-          // Session endpoint URI identifies the specific connection
-          let conn_endpoint_uri = format!("ipc://{}", peer_addr_str); // Use unique identifier
+              // UnixStream does not have options like NODELAY or KEEPALIVE.
 
-          let (session_cmd_mailbox, session_task_handle) = SessionBase::create_and_spawn(
-            session_handle_id,
-            conn_endpoint_uri.clone(),
-            core_mailbox.clone(),
-            monitor_tx.clone(), // Pass monitor sender to Session
-          );
-          let (engine_mailbox, engine_task_handle) = engine::zmtp_ipc::create_and_spawn_ipc_engine(
-            engine_handle_id,
-            session_cmd_mailbox.clone(),
-            stream,
-            options.clone(),
-            true,
-          );
-          let attach_cmd = Command::Attach {
-            engine_mailbox,
-            engine_handle: Some(engine_handle_id),
-            engine_task_handle: Some(engine_task_handle),
-          };
-          if session_cmd_mailbox.send(attach_cmd).await.is_err() {
-            tracing::error!(session_handle=session_handle_id, uri=%conn_endpoint_uri, "Failed to send Attach command to session, dropping connection.");
-            // Emit AcceptFailed because session setup failed?
-            if let Some(ref tx) = monitor_tx {
-              let event = SocketEvent::AcceptFailed {
-                endpoint: endpoint_uri.clone(),
-                error_msg: "Failed to attach engine to session".to_string(),
+              let session_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              let engine_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              let connection_specific_uri = format!("ipc://{}", peer_addr_str);
+
+              let (session_cmd_mailbox, session_task_join_handle) = SessionBase::create_and_spawn(
+                session_handle_id,
+                connection_specific_uri.clone(),
+                monitor_tx.clone(),
+                context.clone(),
+                parent_socket_core_id,
+              );
+
+              let (engine_mailbox, engine_task_join_handle_inner) = create_and_spawn_ipc_engine(
+                engine_handle_id,
+                session_cmd_mailbox.clone(),
+                unix_stream,
+                socket_options.clone(),
+                true, // Server-side engine.
+                &context,
+                session_handle_id, // Engine's parent is Session.
+              );
+
+              let attach_cmd = Command::Attach {
+                engine_mailbox,
+                engine_handle: Some(engine_handle_id),
+                engine_task_handle: Some(engine_task_join_handle_inner),
               };
-              let tx_clone = tx.clone();
-              tokio::spawn(async move {
-                if tx_clone.send(event).await.is_err() { /* Warn */ }
-              });
-            }
-            continue;
-          }
+              if session_cmd_mailbox.send(attach_cmd).await.is_err() {
+                tracing::error!(session_handle = session_handle_id, uri = %connection_specific_uri, "Failed to send Attach to new IPC Session.");
+                // If attach fails, Session will stop, Engine might too. Accept loop continues.
+                continue;
+              }
 
-          // Report ConnSuccess to Core
-          let success_cmd = Command::ConnSuccess {
-            endpoint: conn_endpoint_uri.clone(), // Resolved peer URI
-            target_endpoint_uri: endpoint_uri.clone(), // Original target URI
-            session_mailbox: session_cmd_mailbox,
-            session_handle: Some(session_handle_id),
-            session_task_handle: Some(session_task_handle),
-          };
-          if core_mailbox.send(success_cmd).await.is_err() {
-            tracing::error!(parent_handle = listener_handle_id, uri=%endpoint_uri, "Failed to send ConnSuccess to core mailbox. Core actor likely stopped.");
-            loop_error = Some(ZmqError::Internal("Core mailbox closed".into()));
-            break;
+              let event = SystemEvent::NewConnectionEstablished {
+                parent_core_id: parent_socket_core_id,
+                endpoint_uri: connection_specific_uri.clone(),
+                target_endpoint_uri: endpoint_uri.clone(),
+                session_mailbox: session_cmd_mailbox,
+                session_handle_id,
+                session_task_id: session_task_join_handle.id(),
+              };
+              if context.event_bus().publish(event).is_err() {
+                tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, "Failed to publish NewConnectionEstablished for IPC.");
+                loop_error_to_report = Some(ZmqError::Internal("Event bus publish failed for IPC NewConnectionEstablished".into()));
+                break;
+              }
+            }
+            Err(e) => {
+              tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, error = %e, "Error accepting new IPC connection");
+              if let Some(ref tx) = monitor_tx {
+                let event = SocketEvent::AcceptFailed { endpoint: endpoint_uri.clone(), error_msg: format!("{}", e) };
+                let tx_clone = tx.clone();
+                tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
+              }
+              if is_fatal_ipc_accept_error(&e) {
+                tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, error = %e, "Fatal error in IPC accept loop, stopping.");
+                loop_error_to_report = Some(ZmqError::from_io_endpoint(e, &endpoint_uri));
+                break;
+              }
+              sleep(Duration::from_millis(100)).await;
+            }
           }
         }
-        Err(e) => {
-          tracing::error!(parent_handle = listener_handle_id, uri=%endpoint_uri, error=%e, "Error accepting IPC connection");
-          // Emit AcceptFailed event
-          if let Some(ref tx) = monitor_tx {
-            let event = SocketEvent::AcceptFailed {
-              endpoint: endpoint_uri.clone(),
-              error_msg: format!("{}", e),
-            };
-            let tx_clone = tx.clone();
-            tokio::spawn(async move {
-              if tx_clone.send(event).await.is_err() { /* Warn */ }
-            });
-          }
-          // Check for fatal errors
-          if is_fatal(&e) {
-            tracing::error!(parent_handle = listener_handle_id, uri=%endpoint_uri, error=%e, "Fatal error in IPC accept loop, stopping.");
-            loop_error = Some(ZmqError::from_io_endpoint(e, &endpoint_uri));
-            break;
-          }
-          sleep(Duration::from_millis(100)).await;
+        _ = tokio::time::sleep(Duration::from_secs(60 * 5)) => {
+          tracing::warn!(handle = accept_loop_handle, uri = %endpoint_uri, "IPC Listener accept loop timed out (safety break).");
+          loop_error_to_report = Some(ZmqError::Internal("IPC Accept loop safety timeout".into()));
+          break;
         }
-      } // end match accept_result
+      } // end select!
     } // end loop
 
-    tracing::debug!(parent_handle = listener_handle_id, uri=%endpoint_uri, "IPC Listener accept loop finished");
+    tracing::debug!(handle = accept_loop_handle, parent_handle = listener_cmd_loop_handle, uri = %endpoint_uri, "IPC Listener accept loop finished");
+    actor_drop_guard.waive();
+    context.publish_actor_stopping(
+      accept_loop_handle,
+      accept_loop_actor_type,
+      Some(endpoint_uri),
+      loop_error_to_report,
+    );
+  }
+}
 
-    // Send ReportError if loop exited due to error
-    if let Some(error) = loop_error {
-      if !core_mailbox.is_closed() {
-        let report_cmd = Command::ReportError {
-          handle: listener_handle_id,
-          endpoint_uri: endpoint_uri.clone(),
-          error,
-        };
-        if let Err(e) = core_mailbox.send(report_cmd).await { /* Warn */
-        } else {
-          tracing::debug!(handle=listener_handle_id, uri=%endpoint_uri, "IPC Listener accept loop sent ReportError to Core.");
-        }
-      }
-    }
-  } // end run_accept_loop
-} // end impl IpcListener
-
-// Implement Drop to clean up the socket file path
 impl Drop for IpcListener {
   fn drop(&mut self) {
-    tracing::debug!(handle = self.handle, path=?self.path, "Dropping IpcListener, cleaning up socket file");
+    tracing::debug!(listener_handle = self.handle, path = ?self.path, "Dropping IpcListener, attempting to clean up IPC socket file");
     match std::fs::remove_file(&self.path) {
-      Ok(_) => tracing::debug!(path=?self.path, "Removed IPC socket file."),
-      Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-      Err(e) => tracing::warn!(path=?self.path, error=%e, "Failed to remove IPC socket file during drop."),
+      Ok(_) => {
+        tracing::debug!(listener_handle = self.handle, path = ?self.path, "Removed IPC socket file successfully.")
+      }
+      Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        tracing::trace!(listener_handle = self.handle, path = ?self.path, "IPC socket file not found during drop.");
+      }
+      Err(e) => {
+        tracing::warn!(listener_handle = self.handle, path = ?self.path, error = %e, "Failed to remove IPC socket file during drop.");
+      }
     }
-    self.listener_handle.abort();
+
+    if let Some(listener_handle) = self.listener_handle.take() {
+      if !listener_handle.is_finished() {
+        listener_handle.abort();
+        tracing::debug!(listener_handle = self.handle, path = ?self.path, "Aborted accept loop task in IpcListener Drop.");
+      }
+    }
   }
 }
 // --- End IpcListener ---
 
-// --- IpcConnecter ---
+// --- IpcConnecter Actor ---
 #[derive(Debug)]
 pub(crate) struct IpcConnecter {
   handle: usize,
-  endpoint_uri: String, // Original URI
-  path: PathBuf,        // Parsed path
-  core_mailbox: MailboxSender,
-  // No need for receiver mailbox if it only runs once
+  endpoint_uri: String,
+  path: PathBuf,
   context_options: Arc<SocketOptions>,
   context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
-  // No need to store monitor_tx, passed directly to run_connect_attempt
+  context: Context,
+  parent_socket_id: usize,
 }
 
 impl IpcConnecter {
@@ -294,169 +384,160 @@ impl IpcConnecter {
     endpoint_uri: String,
     path: PathBuf,
     options: Arc<SocketOptions>,
-    core_mailbox: MailboxSender,
     context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
-    monitor_tx: Option<MonitorSender>, // Accept monitor sender
+    monitor_tx: Option<MonitorSender>,
+    context: Context,
+    parent_socket_id: usize,
   ) -> (MailboxSender, JoinHandle<()>) {
-    // Return mailbox for consistency, even if unused
-    let (tx, _rx) = mailbox(); // Create mailbox pair
-    let connecter = IpcConnecter {
+    let actor_type = ActorType::Connecter;
+    let (tx, _rx) = mailbox(); // Mailbox for connecter (receiver currently unused).
+
+    let connecter_actor = IpcConnecter {
       handle,
-      endpoint_uri,
+      endpoint_uri: endpoint_uri.clone(),
       path,
-      core_mailbox,
       context_options: options,
       context_handle_source,
+      context: context.clone(),
+      parent_socket_id,
     };
-    // Spawn the main task that attempts connection
-    let task_handle = tokio::spawn(connecter.run_connect_attempt(monitor_tx)); // Pass monitor_tx
-    (tx, task_handle) // Return mailbox and handle
+
+    let task_join_handle = tokio::spawn(connecter_actor.run_connect_attempt(monitor_tx));
+    context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
+
+    (tx, task_join_handle)
   }
 
-  /// Main task loop that attempts to connect. Consumes self.
-  async fn run_connect_attempt(self, monitor_tx: Option<MonitorSender>) {
-    // Accept monitor_tx
-    let handle = self.handle;
-    let endpoint_uri = self.endpoint_uri.clone();
-    let path = self.path.clone(); // Clone path for logging/use
+  async fn run_connect_attempt(mut self, monitor_tx: Option<MonitorSender>) {
+    let connecter_handle = self.handle;
+    let connecter_actor_type = ActorType::Connecter;
+    let endpoint_uri_clone = self.endpoint_uri.clone();
+    let path_clone_log = self.path.clone();
+    let mut final_error_for_actor_stop: Option<ZmqError> = None;
 
-    tracing::info!(handle = handle, uri = %endpoint_uri, path=?path, "IpcConnecter actor started connection attempt");
+    tracing::info!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, path = ?path_clone_log, "IPC Connecter actor started connection attempt");
 
-    // Simplified: Attempt connect once for IPC (reconnect logic less common)
-    // Could add retry logic similar to TCP if desired.
-    let connect_result = UnixStream::connect(&path).await;
+    let mut system_event_rx = self.context.event_bus().subscribe();
+    let mut should_abort_attempt_due_to_event = false;
 
-    match connect_result {
-      Ok(stream) => {
-        let peer_addr_str = format!("ipc-peer-fd-{}", stream.as_raw_fd()); // Synthetic peer addr
-        tracing::info!(handle = handle, uri = %endpoint_uri, path=?path, peer=?peer_addr_str, "IPC Connect successful");
-
-        // Emit Connected event
-        if let Some(ref tx) = monitor_tx {
-          let event = SocketEvent::Connected {
-            endpoint: endpoint_uri.clone(),
-            peer_addr: peer_addr_str.clone(),
-          };
-          let tx_clone = tx.clone();
-          tokio::spawn(async move {
-            if tx_clone.send(event).await.is_err() { /* Warn */ }
-          });
-        }
-
-        // --- Spawn Session & Engine ---
-        let session_handle_id = self
-          .context_handle_source
-          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let engine_handle_id = self
-          .context_handle_source
-          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let conn_endpoint_uri = format!("ipc://{}", peer_addr_str); // Unique connection identifier
-
-        let (session_cmd_mailbox, session_task_handle) = SessionBase::create_and_spawn(
-          session_handle_id,
-          conn_endpoint_uri.clone(),
-          self.core_mailbox.clone(),
-          monitor_tx.clone(), // Pass monitor sender to Session
-        );
-        let (engine_mailbox, engine_task_handle) = engine::zmtp_ipc::create_and_spawn_ipc_engine(
-          engine_handle_id,
-          session_cmd_mailbox.clone(),
-          stream,
-          self.context_options.clone(),
-          false,
-        );
-        let attach_cmd = Command::Attach {
-          engine_mailbox,
-          engine_handle: Some(engine_handle_id),
-          engine_task_handle: Some(engine_task_handle),
-        };
-
-        // --- Attach Engine & Report Success ---
-        if session_cmd_mailbox.send(attach_cmd).await.is_err() {
-          tracing::error!(handle = handle, uri = %endpoint_uri, session_handle = session_handle_id, "Failed to send Attach command to session. Reporting internal error.");
-          let error = ZmqError::Internal("Failed to attach engine".into());
-          // Emit ConnectFailed
-          if let Some(ref tx) = monitor_tx {
-            let event = SocketEvent::ConnectFailed {
-              endpoint: endpoint_uri.clone(),
-              error_msg: format!("{}", error),
-            };
-            let tx_clone = tx.clone();
-            tokio::spawn(async move {
-              if tx_clone.send(event).await.is_err() { /* Warn */ }
-            });
+    tokio::select! {
+      biased;
+      _ = async {
+        loop {
+          match system_event_rx.recv().await {
+            Ok(SystemEvent::ContextTerminating) => {
+              tracing::info!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, "IPC Connecter received ContextTerminating, flagging for abort.");
+              should_abort_attempt_due_to_event = true; break;
+            }
+            Ok(SystemEvent::SocketClosing{ socket_id }) if socket_id == self.parent_socket_id => {
+              tracing::info!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "IPC Connecter received SocketClosing for parent, flagging for abort.");
+              should_abort_attempt_due_to_event = true; break;
+            }
+            Ok(_) => { /* Ignore other events. */ }
+            Err(_) => { // Lagged or Closed
+              tracing::warn!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, "IPC Connecter: Error receiving from system event bus. Flagging for abort.");
+              should_abort_attempt_due_to_event = true; break;
+            }
           }
-          // Report ReportError to Core
-          let report_cmd = Command::ReportError {
-            handle,
-            endpoint_uri: conn_endpoint_uri.clone(),
-            error,
-          };
-          let _ = self.core_mailbox.send(report_cmd).await;
-          session_task_handle.abort();
+        }
+      } => { /* Event monitoring loop completed or broke. */ }
+
+      connect_result_fut = UnixStream::connect(&self.path) => {
+        if should_abort_attempt_due_to_event {
+          tracing::info!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, "IPC connection attempt completed but abort was flagged by event. Ignoring result.");
+          final_error_for_actor_stop = Some(ZmqError::Internal("IPC Connecter aborted by system event".into()));
         } else {
-          // Report ConnSuccess to Core
-          let success_cmd = Command::ConnSuccess {
-            endpoint: conn_endpoint_uri.clone(), // Resolved peer URI
-            target_endpoint_uri: endpoint_uri.clone(), // Original target URI
-            session_mailbox: session_cmd_mailbox,
-            session_handle: Some(session_handle_id),
-            session_task_handle: Some(session_task_handle),
-          };
-          if self.core_mailbox.send(success_cmd).await.is_err() {
-            tracing::error!(handle=handle, uri=%endpoint_uri, "Failed to send ConnSuccess to core mailbox.");
+          match connect_result_fut {
+            Ok(unix_stream) => {
+              let peer_addr_str = format!("ipc-peer-fd-{}", unix_stream.as_raw_fd());
+              tracing::info!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, path = ?path_clone_log, peer = %peer_addr_str, "IPC Connect successful");
 
-            // If sending fails, the session handle moved into success_cmd is dropped,
-            // but the session task is still running. We can't easily abort it here anymore.
-            // SocketCore won't know about the session, so it won't clean it up.
-            // This might lead to an orphaned session task if the core died.
-            // This is an acceptable limitation for now maybe? Or we could clone the handle *before* moving?
-            // Let's keep it simple: if send fails, we can't abort the session from here.
+              if let Some(ref tx) = monitor_tx { /* ... emit Connected ... */ }
+
+              let session_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              let engine_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              let connection_specific_uri = format!("ipc://{}", peer_addr_str);
+
+              let (session_cmd_mailbox, session_task_join_handle) = SessionBase::create_and_spawn(
+                session_handle_id, connection_specific_uri.clone(), monitor_tx.clone(),
+                self.context.clone(), self.parent_socket_id,
+              );
+              let (engine_mailbox, engine_task_join_handle_inner) = create_and_spawn_ipc_engine(
+                engine_handle_id, session_cmd_mailbox.clone(), unix_stream, self.context_options.clone(),
+                false, &self.context, session_handle_id,
+              );
+              let attach_cmd = Command::Attach {
+                engine_mailbox, engine_handle: Some(engine_handle_id), engine_task_handle: Some(engine_task_join_handle_inner)
+              };
+
+              if session_cmd_mailbox.send(attach_cmd).await.is_err() {
+                final_error_for_actor_stop = Some(ZmqError::Internal("Failed to attach engine to session (IPC)".into()));
+                if !session_task_join_handle.is_finished() { session_task_join_handle.abort(); }
+              } else {
+                let event = SystemEvent::NewConnectionEstablished {
+                  parent_core_id: self.parent_socket_id, endpoint_uri: connection_specific_uri.clone(),
+                  target_endpoint_uri: endpoint_uri_clone.clone(), session_mailbox: session_cmd_mailbox,
+                  session_handle_id, session_task_id: session_task_join_handle.id(),
+                };
+                if self.context.event_bus().publish(event).is_err() {
+                  final_error_for_actor_stop = Some(ZmqError::Internal("Failed to publish NewConnectionEstablished (IPC)".into()));
+                  if !session_task_join_handle.is_finished() { session_task_join_handle.abort(); }
+                }
+              }
+            }
+            Err(e) => {
+              let current_error = ZmqError::from_io_endpoint(e, &endpoint_uri_clone);
+              final_error_for_actor_stop = Some(current_error.clone());
+              tracing::error!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, error = %current_error, "IPC Connect failed");
+              if let Some(ref tx) = monitor_tx { /* ... emit ConnectFailed ... */ }
+              let event = SystemEvent::ConnectionAttemptFailed {
+                parent_core_id: self.parent_socket_id, target_endpoint_uri: endpoint_uri_clone.clone(),
+                error_msg: current_error.to_string(), // Pass ZmqError
+              };
+              let _ = self.context.event_bus().publish(event);
+            }
           }
         }
-      } // end Ok(stream)
+      } // end connect_result_fut arm
+    } // end select!
 
-      Err(e) => {
-        tracing::error!(handle = handle, uri = %endpoint_uri, path=?path, error = %e, "IPC Connect failed");
-        let error = ZmqError::from_io_endpoint(e, &endpoint_uri);
-        // Emit ConnectFailed immediately (no retry logic for IPC currently)
-        if let Some(ref tx) = monitor_tx {
-          let event = SocketEvent::ConnectFailed {
-            endpoint: endpoint_uri.clone(),
-            error_msg: format!("{}", error),
-          };
-          let tx_clone = tx.clone();
-          tokio::spawn(async move {
-            if tx_clone.send(event).await.is_err() { /* Warn */ }
-          });
-        }
-        // Report ConnFailed to Core
-        let fail_cmd = Command::ConnFailed {
-          endpoint: endpoint_uri.clone(),
-          error,
-        };
-        let _ = self.core_mailbox.send(fail_cmd).await;
-      }
-    } // end match connect_result
-
-    // --- Task Cleanup ---
-    tracing::info!(handle = handle, uri = %endpoint_uri, "IpcConnecter actor finished connection attempt");
-    // Send CleanupComplete - Connecter always sends this when its task ends
-    if !self.core_mailbox.is_closed() {
-      let cleanup_cmd = Command::CleanupComplete {
-        handle,
-        endpoint_uri: Some(endpoint_uri),
-      };
-      if let Err(e) = self.core_mailbox.send(cleanup_cmd).await { /* Warn */
-      } else {
-        tracing::debug!(handle = handle, "IPC Connecter sent CleanupComplete to Core.");
-      }
-    }
-  } // end run_connect_attempt
+    tracing::info!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, "IPC Connecter actor finished connection attempt");
+    self.context.publish_actor_stopping(
+      connecter_handle,
+      connecter_actor_type,
+      Some(endpoint_uri_clone),
+      final_error_for_actor_stop, // This is Option<ZmqError>
+    );
+    tracing::info!(connecter_handle = connecter_handle, uri = %self.endpoint_uri, "IPC Connecter actor fully stopped.");
+  }
 }
 // --- End IpcConnecter ---
 
-// Helper function (same as TCP version)
-fn is_fatal(e: &io::Error) -> bool {
+fn is_fatal_ipc_accept_error(e: &io::Error) -> bool {
   matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe)
+}
+
+/// Helper to create and spawn a ZMTP Engine task for an IPC stream.
+/// This function also publishes the `ActorStarted` event for the spawned engine.
+pub(crate) fn create_and_spawn_ipc_engine(
+  engine_handle_id: usize,
+  session_cmd_mailbox: MailboxSender,
+  unix_stream: UnixStream,
+  socket_options: Arc<SocketOptions>,
+  is_server_role: bool,
+  context: &Context,
+  session_handle_id: usize,
+) -> (MailboxSender, JoinHandle<()>) {
+  let engine_actor_type = ActorType::Engine;
+  let (engine_command_mailbox, engine_task_join_handle) = engine::zmtp_ipc::create_and_spawn_ipc_engine(
+    engine_handle_id,
+    session_cmd_mailbox,
+    unix_stream,
+    socket_options,
+    is_server_role,
+    context,
+    session_handle_id,
+  );
+  context.publish_actor_started(engine_handle_id, engine_actor_type, Some(session_handle_id));
+  (engine_command_mailbox, engine_task_join_handle)
 }

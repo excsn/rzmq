@@ -1,190 +1,159 @@
 // src/runtime/command.rs
 
 use crate::message::Msg;
-use crate::socket::MonitorSender;
-use crate::{error::ZmqError, Blob};
+use crate::socket::MonitorSender; // For UserMonitor command
+use crate::{error::ZmqError, Blob}; // Blob for EngineReady, ZmqError for replies
 
+// Using tokio's oneshot for replies within commands.
+// async_channel is used for the mailboxes themselves and for inter-actor pipes.
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
-use tokio::sync::oneshot; // Using tokio's oneshot for replies
-
-/// Type alias for the mailbox sender used within Commands.
-pub type MailboxSender = async_channel::Sender<Command>;
+use tokio::sync::oneshot;
 
 /// Defines messages exchanged between actors (Sockets, Sessions, Engines, etc.).
-#[derive(Debug)] // Auto-derive Debug for now
-#[allow(dead_code)] // Allow unused variants during development
+/// These are primarily for direct, targeted communication, often expecting a reply,
+/// or for high-frequency data flow (like pipe messages).
+/// Broader system notifications and lifecycle events are handled by `SystemEvent` on the `EventBus`.
+#[derive(Debug)] // Auto-derive Debug for now, custom impl if needed for sensitive fields.
+#[allow(dead_code)] // Allow unused variants during development stages.
 pub enum Command {
-  // --- User Requests (from API Handle -> SocketCore) ---
+  // --- User Requests (from API Handle -> SocketCore's single command mailbox) ---
+  /// Command to bind the socket to a local endpoint.
   UserBind {
-    endpoint: String,
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
+    endpoint: String,                                // The endpoint string to bind to.
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the bind result back.
   },
+  /// Command to connect the socket to a remote endpoint.
   UserConnect {
-    endpoint: String,
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
+    endpoint: String,                                // The endpoint string to connect to.
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the connect result back.
   },
+  /// Command to disconnect from a specific endpoint.
   UserDisconnect {
-    endpoint: String,
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
+    endpoint: String,                                // The endpoint string to disconnect from.
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the disconnect result back.
   },
+  /// Command to unbind from a specific endpoint.
   UserUnbind {
-    endpoint: String,
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
+    endpoint: String,                                // The endpoint string to unbind from.
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the unbind result back.
   },
+  /// Command to send a message.
   UserSend {
-    msg: Msg,
-    // Reply might be needed for backpressure / errors? TBD
-    // reply_tx: oneshot::Sender<Result<(), ZmqError>>,
+    msg: Msg, // The message to send.
+              // No reply_tx here for PUSH/PUB simplicity; errors handled by options (SNDTIMEO) or pattern.
   },
+  /// Command to receive a message.
   UserRecv {
-    reply_tx: oneshot::Sender<Result<Msg, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<Msg, ZmqError>>, // Channel to send the received message or error back.
   },
+  /// Command to set a socket option.
   UserSetOpt {
-    option: i32,
-    value: Vec<u8>, // Pass owned value
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
+    option: i32,                                     // The integer ID of the option to set.
+    value: Vec<u8>,                                  // The new value for the option, as raw bytes.
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the set option result back.
   },
+  /// Command to get a socket option's value.
   UserGetOpt {
-    option: i32,
-    reply_tx: oneshot::Sender<Result<Vec<u8>, ZmqError>>,
+    option: i32,                                          // The integer ID of the option to get.
+    reply_tx: oneshot::Sender<Result<Vec<u8>, ZmqError>>, // Channel to send the option value or error back.
   },
+  /// Command to register a monitor channel for socket events.
   UserMonitor {
-    monitor_tx: MonitorSender,                       // Sender end of the monitor channel
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // To confirm setup
+    monitor_tx: MonitorSender, // The sender end of the channel where monitor events will be sent.
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Confirms registration.
   },
+  /// Command to initiate the closing sequence for the socket.
   UserClose {
-    // reply_tx confirms shutdown initiated, not completed
+    // Reply confirms that the close process has been initiated, not necessarily completed.
     reply_tx: oneshot::Sender<Result<(), ZmqError>>,
   },
 
   // --- Lifecycle ---
   /// Universal signal to gracefully shut down an actor task.
+  /// Can be sent directly to an actor's mailbox if needed, bypassing the event bus
+  /// for very targeted shutdown scenarios (though event bus is preferred for general lifecycle).
   Stop,
-  /// Sent from child to parent confirming clean shutdown.
-  CleanupComplete {
-    handle: usize,
-    endpoint_uri: Option<String>,
-  }, // Identify child by handle
-  /// Sent from child to parent reporting a fatal error.
-  ReportError {
-    handle: usize,
-    endpoint_uri: String, // Make URI mandatory for error reporting
-    error: ZmqError,
-  },
 
-  // --- Connection Management (Listener/Connecter -> SocketCore) ---
-  ConnSuccess {
-    /// The specific endpoint URI representing the established connection (e.g., `tcp://peer_ip:peer_port`).
-    endpoint: String, // Identify which bind/connect succeeded
-    /// The original target endpoint URI requested by the user (e.g., `tcp://hostname:port`).
-    /// Needed for automatic reconnection attempts.
-    target_endpoint_uri: String,
-    // Send mailbox for the *Session* actor created for this connection
-    session_mailbox: MailboxSender,
-    // Optional Session handle if needed for tracking
-    session_handle: Option<usize>,
-    // Optional Session task handle if needed
-    session_task_handle: Option<tokio::task::JoinHandle<()>>,
-  },
-  ConnFailed {
-    endpoint: String,
-    error: ZmqError,
-  },
-  ListenerStopped {
-    handle: usize,
-    endpoint_uri: String,
-  },
-  ConnecterStopped {
-    handle: usize,
-    endpoint_uri: String,
-  },
-
-  /// Sent from Session -> SocketCore upon clean stop
-  SessionStopped {
-    handle: usize,
-    // Include URI to identify which session stopped
-    endpoint_uri: String,
-  },
-  // --- Session <-> Engine Interaction ---
-  /// Sent from Listener/Connecter/Socket -> Session to provide Engine details
+  // --- Session <-> Engine Interaction (Direct commands, not via event bus) ---
+  /// Sent from Listener/Connecter (via SocketCore) -> Session to provide Engine details.
   Attach {
-    engine_mailbox: MailboxSender,
-    // Optional handle/task_handle for the Engine itself
-    engine_handle: Option<usize>,
-    engine_task_handle: Option<tokio::task::JoinHandle<()>>,
+    engine_mailbox: MailboxSender, // The command mailbox for the ZMTP Engine actor.
+    engine_handle: Option<usize>,  // Optional unique handle ID of the Engine actor.
+    engine_task_handle: Option<tokio::task::JoinHandle<()>>, // Optional JoinHandle for the Engine's task.
   },
-  /// Sent from Session/Pipe -> Engine to send a message
+  /// Sent from Session/Pipe -> Engine to send a message over the transport.
   SessionPushCmd {
-    msg: Msg,
+    msg: Msg, // The message to be pushed to the Engine for sending.
   },
-  /// Sent from Engine -> Session carrying a received message
+  /// Sent from Engine -> Session carrying a received message from the transport.
   EnginePushCmd {
-    msg: Msg,
-  }, // Distinguish direction? Maybe reuse SessionPushCmd? TBD
-  // Placeholder if Engine needs to request something from Session:
-  // SessionPullRequestCmd { reply_tx: oneshot::Sender<Result<SomeData, ZmqError>> },
-  /// Sent from Engine -> Session when ZMTP handshake is complete
+    msg: Msg, // The message received by the Engine.
+  },
+  /// Sent from Engine -> Session when ZMTP handshake is complete and ready for data.
   EngineReady {
-    peer_identity: Option<Blob>,
+    peer_identity: Option<Blob>, // Optional identity of the peer, established during handshake.
   },
-  /// Sent from Engine -> Session upon fatal error
+  /// Sent from Engine -> Session upon a fatal error within the Engine.
   EngineError {
-    error: ZmqError,
+    error: ZmqError, // The error that occurred in the Engine.
   },
-  /// Sent from Engine -> Session upon clean stop
+  /// Sent from Engine -> Session upon clean shutdown of the Engine.
   EngineStopped,
-  // --- ZAP Related (Examples) ---
-  /// Sent from Engine -> Session to initiate ZAP check
+
+  // --- ZAP Related (Examples, for direct Session <-> Engine interaction if ZAP is handled there) ---
+  /// Sent from Engine -> Session to initiate ZAP authentication check.
   RequestZapAuth {
-    // ZAP Request Frames (Mechanism, Credentials, etc.)
-    // TBD based on ZAP implementation details
+    // Payload would include ZAP request frames (Mechanism, Credentials, etc.)
+    // Details TBD based on ZAP implementation.
   },
-  /// Sent from Session -> Engine with ZAP reply from authenticator
+  /// Sent from Session -> Engine with ZAP reply from an authenticator.
   ProcessZapReply {
-    // ZAP Reply Frames (Status Code, UserID, Metadata)
-    // TBD
+    // Payload would include ZAP reply frames (Status Code, UserID, Metadata, etc.)
+    // Details TBD.
   },
 
-  // --- Pipe Management (Pipe -> Owner) ---
-  /// Sent from PipeReaderTask -> SocketCore when a message arrives from a session pipe.
+  // --- Pipe Management (PipeReaderTask -> SocketCore, direct commands for performance) ---
+  /// Sent from PipeReaderTask -> SocketCore when a message arrives from a session's data pipe.
   PipeMessageReceived {
+    /// The ID of the pipe (from SocketCore's perspective, its read pipe ID) that received the message.
     pipe_id: usize,
-    msg: Msg,
+    msg: Msg, // The message received from the pipe.
   },
-  /// Sent from PipeReaderTask -> SocketCore when the session closes its *sending* end.
+  /// Sent from PipeReaderTask -> SocketCore when the session closes its *sending* end of the data pipe.
   PipeClosedByPeer {
+    /// The ID of the pipe (from SocketCore's perspective, its read pipe ID) that was closed.
     pipe_id: usize,
   },
 
-  /// Sent from SocketCore -> Session to provide its pipe channel ends.
+  // --- SocketCore -> Session (Direct command for initial pipe setup) ---
+  /// Sent from SocketCore -> Session to provide its ends of the inter-actor data pipe.
   AttachPipe {
-    // Session needs receiver FROM Core and sender TO Core
+    /// The channel receiver for the Session to read messages from the SocketCore.
     rx_from_core: AsyncReceiver<Msg>,
+    /// The channel sender for the Session to send messages to the SocketCore.
     tx_to_core: AsyncSender<Msg>,
-    // Pass IDs for potential future use/logging in Session
-    pipe_read_id: usize,  // ID Session uses to read (Core writes to this)
-    pipe_write_id: usize, // ID Session uses to write (Core reads from this)
-  },
-  /// Sent from Connector's SocketCore -> Binder's SocketCore via Context registry.
-  #[cfg(feature = "inproc")]
-  InprocConnectRequest {
-    connector_uri: String,                           // Identify the connector
-    connector_pipe_tx: AsyncSender<Msg>,             // Connector's SENDING end (Binder writes here)
-    connector_pipe_rx: AsyncReceiver<Msg>,           // Connector's RECEIVING end (Binder reads from here)
-    connector_pipe_write_id: usize,                  // ID Binder uses to write to connector
-    connector_pipe_read_id: usize,                   // ID Binder uses to read from connector
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Confirm connection accepted/rejected
-  },
-  /// Sent from Connector's SocketCore -> Binder's SocketCore when connector closes pipe.
-  /// Needed because Binder holds the other ends of the channels directly.
-  #[cfg(feature = "inproc")]
-  InprocPipeClosed {
-    // Identify which pipe closed (e.g., the ID Binder uses to read from connector)
+    /// The ID the Session uses to read from its pipe (SocketCore writes to this ID).
     pipe_read_id: usize,
+    /// The ID the Session uses to write to its pipe (SocketCore reads from this ID).
+    pipe_write_id: usize,
   },
+  // Note: InprocConnectRequest and InprocPipeClosed were moved to SystemEvents.
+  // Commands like CleanupComplete, ReportError, ConnSuccess, ConnFailed, *Stopped
+  // were also replaced by ActorStopping or other SystemEvents.
+  // The following commands are REMOVED as their functionality is now handled by SystemEvents:
+  // - CleanupComplete
+  // - ReportError
+  // - ConnSuccess
+  // - ConnFailed
+  // - ListenerStopped
+  // - ConnecterStopped
+  // - SessionStopped
+  // - InprocConnectRequest (functionality moved to SystemEvent::InprocBindingRequest)
+  // - InprocPipeClosed (functionality moved to SystemEvent::InprocPipePeerClosed)
 }
 
 impl Command {
+  /// Returns a string representation of the command variant's name. Useful for logging.
   pub fn variant_name(&self) -> &'static str {
     match self {
       Command::UserBind { .. } => "UserBind",
@@ -198,13 +167,6 @@ impl Command {
       Command::UserMonitor { .. } => "UserMonitor",
       Command::UserClose { .. } => "UserClose",
       Command::Stop => "Stop",
-      Command::CleanupComplete { .. } => "CleanupComplete",
-      Command::ReportError { .. } => "ReportError",
-      Command::ConnSuccess { .. } => "ConnSuccess",
-      Command::ConnFailed { .. } => "ConnFailed",
-      Command::ListenerStopped { .. } => "ListenerStopped",
-      Command::ConnecterStopped { .. } => "ConnecterStopped",
-      Command::SessionStopped { .. } => "SessionStopped",
       Command::Attach { .. } => "Attach",
       Command::SessionPushCmd { .. } => "SessionPushCmd",
       Command::EnginePushCmd { .. } => "EnginePushCmd",
@@ -216,15 +178,13 @@ impl Command {
       Command::PipeMessageReceived { .. } => "PipeMessageReceived",
       Command::PipeClosedByPeer { .. } => "PipeClosedByPeer",
       Command::AttachPipe { .. } => "AttachPipe",
-      #[cfg(feature = "inproc")]
-      Command::InprocConnectRequest { .. } => "InprocConnectRequest",
-      #[cfg(feature = "inproc")]
-      Command::InprocPipeClosed { .. } => "InprocPipeClosed",
-      // _ => "Unknown/Other", // Keep wildcard or ensure all are listed
+      // Removed variants are no longer listed here.
+      // Consider adding a catch-all if new temporary commands are added during dev.
+      // For now, this covers all defined variants.
     }
   }
 }
 
-// Implement Display trait for better logging if needed later
-// impl fmt::Display for Command { ... }
-
+/// Type alias for the mailbox sender used by actors to send `Command`s.
+/// This is typically cloned and passed around.
+pub type MailboxSender = async_channel::Sender<Command>;

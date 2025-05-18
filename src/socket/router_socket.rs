@@ -5,6 +5,7 @@ use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
+use crate::socket::options::{SocketOptions, ROUTER_MANDATORY};
 use crate::socket::patterns::{FairQueue, RouterMap}; // Use RouterMap and FairQueue
 use crate::socket::ISocket;
 
@@ -15,8 +16,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::timeout;
-
-use super::options::SocketOptions;
 
 #[derive(Debug)]
 pub(crate) struct RouterSocket {
@@ -63,8 +62,9 @@ impl ISocket for RouterSocket {
   fn core(&self) -> &Arc<SocketCore> {
     &self.core
   }
-  fn mailbox(&self) -> &MailboxSender {
-    self.core.mailbox_sender()
+
+  fn mailbox(&self) -> MailboxSender {
+    self.core.command_sender()
   }
 
   // --- API Method Implementations (Delegate to Core) ---
@@ -92,15 +92,10 @@ impl ISocket for RouterSocket {
 
   // --- Pattern-Specific Logic ---
   async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
-    // ROUTER send expects Identity frame first, then payload frame(s).
-    // We implement stateful send based on current_send_target.
-
-    // Lock the target state for the whole operation if possible,
-    // or carefully manage its setting/clearing around awaits.
     let mut current_target_guard = self.current_send_target.lock().await;
-
-    // 1. Get SNDTIMEO setting (needed for potentially sending first frame)
-    let timeout_opt: Option<Duration> = { self.core_state().await.options.sndtimeo };
+    let core_opts = self.core_state().await.options.clone(); // Clone options for use
+    let timeout_opt: Option<Duration> = core_opts.sndtimeo;
+    let router_mandatory_opt: bool = core_opts.router_mandatory;
 
     if current_target_guard.is_none() {
       // --- First Frame: Must be the Destination Identity ---
@@ -120,46 +115,54 @@ impl ISocket for RouterSocket {
       let pipe_write_id = match self.router_map.get_pipe(&destination_id).await {
         Some(id) => id,
         None => {
-          // Identity not found
-          tracing::debug!(
-            handle = self.core.handle,
-            ?destination_id,
-            "ROUTER send failed: Destination identity unknown"
-          );
-
-          return Err(ZmqError::HostUnreachable(format!(
-            "Peer {:?} not connected or identity unknown",
-            destination_id
-          )));
+          // Identity not found. Behavior depends on ROUTER_MANDATORY.
+          if router_mandatory_opt {
+            tracing::debug!(
+              handle = self.core.handle,
+              ?destination_id,
+              "ROUTER send failed (mandatory=true): Destination identity unknown. Returning EHOSTUNREACH."
+            );
+            return Err(ZmqError::HostUnreachable(format!(
+              "Peer {:?} not connected or identity unknown (ROUTER_MANDATORY=true)",
+              destination_id
+            )));
+          } else {
+            tracing::debug!(
+              handle = self.core.handle,
+              ?destination_id,
+              "ROUTER send (mandatory=false): Destination identity unknown. Silently dropping message."
+            );
+            // current_target_guard remains None, message effectively dropped.
+            return Ok(()); // Silently drop
+          }
         }
       };
 
       // Get sender channel
       let pipe_tx = {
+        // Re-lock core_state briefly if needed, or ensure it's still valid
+        // If we already cloned options, maybe we don't need to lock again just for sender if it's cached
+        // But get_pipe_sender typically needs the lock.
         let core_state_guard = self.core_state().await;
         match core_state_guard.get_pipe_sender(pipe_write_id) {
           Some(tx) => tx,
           None => {
-            // Peer likely disconnected between router_map lookup and getting sender
             tracing::error!(
               handle = self.core.handle,
               pipe_id = pipe_write_id,
               ?destination_id,
-              "ROUTER send failed: Pipe sender disappeared after lookup."
+              "ROUTER send failed: Pipe sender disappeared after lookup (peer likely disconnected)."
             );
-            // TODO: Cleanup RouterMap? Needs coordination.
-            return Err(ZmqError::HostUnreachable("Peer disconnected".into())); // EHOSTUNREACH
+            // Even if mandatory is false, if we found an ID then a pipe, but pipe is gone, this is an error.
+            return Err(ZmqError::HostUnreachable("Peer disconnected".into()));
           }
         }
       };
 
-      // Ensure MORE flag IS set on the identity frame being sent
       msg.set_flags(msg.flags() | MsgFlags::MORE);
 
-      // Send the identity frame using the timeout helper
       match send_msg_with_timeout(&pipe_tx, msg, timeout_opt, self.core.handle, pipe_write_id).await {
         Ok(()) => {
-          // Store target for subsequent payload frames
           *current_target_guard = Some(pipe_write_id);
           tracing::trace!(
             handle = self.core.handle,
@@ -167,7 +170,7 @@ impl ISocket for RouterSocket {
             pipe_id = pipe_write_id,
             "ROUTER send target locked"
           );
-          Ok(()) // Ready for payload frame(s)
+          Ok(())
         }
         Err(e @ ZmqError::ConnectionClosed) => {
           tracing::warn!(
@@ -176,16 +179,13 @@ impl ISocket for RouterSocket {
             "ROUTER send (identity) failed: {}",
             e
           );
-          // TODO: Remove peer from RouterMap? Needs read ID. Complex cleanup.
           Err(ZmqError::HostUnreachable("Peer disconnected during send".into()))
-          // Return EHOSTUNREACH
         }
         Err(e @ ZmqError::Internal(_)) => {
-          // Treat internal errors as fatal for this attempt
           tracing::warn!(
             handle = self.core.handle,
             pipe_id = pipe_write_id,
-            "ROUTER send (identity) failed: {}",
+            "ROUTER send (identity) internal error: {}",
             e
           );
           Err(e)
@@ -197,48 +197,39 @@ impl ISocket for RouterSocket {
             "ROUTER send (identity) failed HWM/Timeout: {}",
             e
           );
-          Err(e) // Return EAGAIN or Timeout
+          Err(e)
         }
-        Err(e) => Err(e), // Other errors
+        Err(e) => Err(e),
       }
-      // Note: current_target_guard lock is held until this branch returns
     } else {
       // --- Subsequent Frame(s): Payload ---
-      let target_pipe_id = current_target_guard.unwrap(); // We know it's Some
+      let target_pipe_id = current_target_guard.unwrap();
 
-      // Get sender (potentially locking CoreState again)
       let pipe_tx = {
         let core_state_guard = self.core_state().await;
         match core_state_guard.get_pipe_sender(target_pipe_id) {
           Some(tx) => tx,
           None => {
-            // Target pipe disappeared while we were holding the lock! Should be rare.
             tracing::error!(
               handle = self.core.handle,
               pipe_id = target_pipe_id,
               "ROUTER send (payload): Target pipe disappeared!"
             );
-            *current_target_guard = None; // Clear target state
-            return Err(ZmqError::HostUnreachable("Peer disconnected mid-message".into()));
-            // EHOSTUNREACH
+            *current_target_guard = None;
+            // If router_mandatory is false, we should still silently drop here.
+            // If router_mandatory is true, EHOSTUNREACH is appropriate.
+            return if router_mandatory_opt {
+              Err(ZmqError::HostUnreachable("Peer disconnected mid-message".into()))
+            } else {
+              Ok(()) // Silently drop
+            };
           }
         }
       };
 
-      // Determine if this is the last part *intended by the user* for this message
       let is_last_user_part = !msg.is_more();
+      let send_result = send_msg_with_timeout(&pipe_tx, msg, timeout_opt, self.core.handle, target_pipe_id).await;
 
-      // Send payload frame using the *same timeout setting* as the identity frame
-      let send_result = send_msg_with_timeout(
-        &pipe_tx,
-        msg,         // msg already has correct MORE flag from user perspective
-        timeout_opt, // Reuse timeout setting
-        self.core.handle,
-        target_pipe_id,
-      )
-      .await;
-
-      // If this was the last part intended by the user, clear the target state
       if is_last_user_part {
         *current_target_guard = None;
         tracing::trace!(
@@ -248,7 +239,6 @@ impl ISocket for RouterSocket {
         );
       }
 
-      // Process send result
       match send_result {
         Ok(()) => Ok(()),
         Err(e @ ZmqError::ConnectionClosed) => {
@@ -257,33 +247,38 @@ impl ISocket for RouterSocket {
             pipe_id = target_pipe_id,
             "ROUTER send (payload) failed: Pipe channel closed"
           );
-          *current_target_guard = None; // Ensure target is cleared on error too
-                                        // TODO: Remove peer from RouterMap?
-          Err(ZmqError::HostUnreachable("Peer disconnected during send".into()))
-          // Return EHOSTUNREACH
+          *current_target_guard = None;
+          // If router_mandatory is false, this should be a silent drop.
+          // If router_mandatory is true, EHOSTUNREACH.
+          if router_mandatory_opt {
+            Err(ZmqError::HostUnreachable("Peer disconnected during send".into()))
+          } else {
+            Ok(()) // Silently drop
+          }
         }
         Err(e @ ZmqError::Internal(_)) => {
-          *current_target_guard = None; // Clear target
-          Err(e)
+          *current_target_guard = None;
+          Err(e) // Internal errors are usually propagated
         }
         Err(e @ ZmqError::ResourceLimitReached) | Err(e @ ZmqError::Timeout) => {
-          // Don't clear target state here, user might retry the *same* payload part
+          // These errors should be propagated regardless of router_mandatory.
+          // The send attempt was made but blocked/timed out.
           tracing::debug!(
             handle = self.core.handle,
             pipe_id = target_pipe_id,
             "ROUTER send (payload) failed HWM/Timeout: {}",
             e
           );
-          Err(e) // Return EAGAIN or Timeout
+          Err(e)
         }
         Err(e) => {
-          *current_target_guard = None; // Clear target on unknown errors
+          // Other unexpected errors
+          *current_target_guard = None;
           Err(e)
         }
       }
-      // Note: current_target_guard lock is held until this branch returns
-    } // end else (payload frame)
-  } // end send
+    }
+  }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
     let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
@@ -315,12 +310,23 @@ impl ISocket for RouterSocket {
   }
 
   // --- Pattern Specific Options ---
-  async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
-    // TODO: Handle ROUTER specific options like ZMQ_ROUTER_MANDATORY, ZMQ_ROUTER_HANDOVER?
-    Err(ZmqError::UnsupportedOption(option))
+  async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
+    if option == ROUTER_MANDATORY {
+      let val = crate::socket::options::parse_bool_option(value)?;
+      self.core_state().await.options.router_mandatory = val;
+      tracing::debug!(handle = self.core.handle, "ROUTER_MANDATORY set to {}", val);
+      Ok(())
+    } else {
+      Err(ZmqError::UnsupportedOption(option))
+    }
   }
   async fn get_pattern_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
-    Err(ZmqError::UnsupportedOption(option))
+    if option == ROUTER_MANDATORY {
+      let val = self.core_state().await.options.router_mandatory;
+      Ok((val as i32).to_ne_bytes().to_vec())
+    } else {
+      Err(ZmqError::UnsupportedOption(option))
+    }
   }
 
   // --- Internal Hooks ---
@@ -467,26 +473,23 @@ impl ISocket for RouterSocket {
   }
 
   async fn pipe_attached(&self, pipe_read_id: usize, pipe_write_id: usize, peer_identity_opt: Option<&[u8]>) {
-    // Determine identity: Use provided identity, or generate placeholder
-    let identity = match peer_identity_opt {
-      // Use provided ID if available and non-empty
+    let placeholder_identity = Self::pipe_id_to_placeholder_identity(pipe_read_id);
+    let initial_identity_to_use = match peer_identity_opt {
       Some(id_bytes) if !id_bytes.is_empty() => {
         tracing::debug!(
           handle = self.core.handle,
-          pipe_read_id = pipe_read_id,
-          "ROUTER using ZMTP peer identity from handshake"
+          pipe_read_id,
+          "ROUTER pipe_attached using provided ZMTP identity"
         );
         Blob::from(id_bytes.to_vec())
       }
       _ => {
-        // Fallback if no ZMTP ID provided or it's empty
         tracing::debug!(
-          // Changed level to debug, this is expected if peer has no ID set
           handle = self.core.handle,
-          pipe_read_id = pipe_read_id,
-          "ROUTER Peer did not provide ZMTP identity, generating placeholder based on pipe ID."
+          pipe_read_id,
+          "ROUTER pipe_attached using placeholder identity, awaiting true identity"
         );
-        Self::pipe_id_to_placeholder_identity(pipe_read_id)
+        placeholder_identity.clone() // Use placeholder if no valid ZMTP ID yet
       }
     };
 
@@ -494,17 +497,111 @@ impl ISocket for RouterSocket {
       handle = self.core.handle,
       pipe_read_id = pipe_read_id,
       pipe_write_id = pipe_write_id,
-      ?identity,
+      initial_identity = ?initial_identity_to_use,
       "ROUTER attaching pipe"
     );
-    // Add peer to router map AND local reverse map
+
     self
       .router_map
-      .add_peer(identity.clone(), pipe_read_id, pipe_write_id)
+      .add_peer(initial_identity_to_use.clone(), pipe_read_id, pipe_write_id)
       .await;
-    self.pipe_to_identity.lock().await.insert(pipe_read_id, identity); // Store the chosen identity
-                                                                       // Notify FairQueue
+    self
+      .pipe_to_identity
+      .lock()
+      .await
+      .insert(pipe_read_id, initial_identity_to_use);
     self.incoming_queue.pipe_attached(pipe_read_id);
+  }
+
+  async fn update_peer_identity(&self, pipe_read_id: usize, new_identity_opt: Option<Blob>) {
+    let new_identity = match new_identity_opt {
+      Some(id) if !id.is_empty() => id,
+      _ => {
+        tracing::warn!(
+          handle = self.core.handle,
+          pipe_read_id,
+          "update_peer_identity called with None or empty identity, using placeholder."
+        );
+        Self::pipe_id_to_placeholder_identity(pipe_read_id)
+      }
+    };
+
+    tracing::debug!(
+        handle = self.core.handle,
+        pipe_read_id = pipe_read_id,
+        new_identity = ?new_identity,
+        "ROUTER updating peer identity"
+    );
+
+    let mut p_to_id_guard = self.pipe_to_identity.lock().await;
+    let old_identity_opt = p_to_id_guard.get(&pipe_read_id).cloned(); // Get current/old identity
+
+    if old_identity_opt.as_ref() == Some(&new_identity) {
+      tracing::trace!(handle = self.core.handle, pipe_read_id, "Identity already up-to-date.");
+      return;
+    }
+
+    // Get the write_id associated with this pipe_read_id
+    // This requires looking up the old_identity in router_map
+    let pipe_write_id_opt = if let Some(ref old_id) = old_identity_opt {
+      self.router_map.get_pipe(old_id).await
+    } else {
+      // If there was no old identity, it means this pipe was not fully in router_map yet
+      // or pipe_to_identity was somehow inconsistent.
+      // We need a write_id to update router_map. If we don't have one, we can't update router_map correctly.
+      // This implies pipe_attached might not have found a write_id, which is problematic.
+      // For now, we'll try to find it via a reverse lookup in core_state if this is a real issue.
+      // However, pipe_attached *should* have received a valid pipe_write_id.
+      // Let's assume pipe_attached always sets a valid write_id for the initial placeholder.
+      tracing::warn!(
+        handle = self.core.handle,
+        pipe_read_id,
+        "No old identity found in pipe_to_identity map for update. Cannot find write_id via old identity."
+      );
+      None
+    };
+
+    if let Some(pipe_write_id) = pipe_write_id_opt {
+      // If there was an old identity, remove its mapping from router_map
+      if let Some(old_id) = old_identity_opt {
+        // We can't directly call remove_peer_by_read_pipe as it also removes from pipe_to_identity
+        // which we are currently holding a lock on (implicitly).
+        // Let's refine this: RouterMap should probably handle updates more gracefully.
+        // For now:
+        let mut id_to_pipe_guard = self.router_map.identity_to_pipe.lock().await;
+        id_to_pipe_guard.remove(&old_id);
+        drop(id_to_pipe_guard);
+        tracing::trace!(
+          handle = self.core.handle,
+          pipe_read_id,
+          ?old_id,
+          "Removed old identity from router_map."
+        );
+      }
+
+      // Add the new identity to router_map, pointing to the same pipe_write_id
+      let mut id_to_pipe_guard = self.router_map.identity_to_pipe.lock().await;
+      id_to_pipe_guard.insert(new_identity.clone(), pipe_write_id);
+      drop(id_to_pipe_guard);
+      tracing::trace!(
+        handle = self.core.handle,
+        pipe_read_id,
+        ?new_identity,
+        pipe_write_id,
+        "Added new identity to router_map."
+      );
+    } else {
+      tracing::error!(
+        handle = self.core.handle,
+        pipe_read_id,
+        "Could not find pipe_write_id for update_peer_identity. RouterMap may be inconsistent."
+      );
+      // If we don't have pipe_write_id, we cannot update router_map.
+      // This is a significant issue.
+    }
+
+    // Update the pipe_to_identity map last
+    p_to_id_guard.insert(pipe_read_id, new_identity);
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {

@@ -127,7 +127,7 @@ async fn test_ipc_bind_fail_directory_exists() -> Result<(), ZmqError> {
   // Binding to a directory usually results in AddrInUse or a specific Io error
   // Let's check for AddrInUse primarily, or a generic IO error.
   assert!(
-    matches!(bind_result, Err(ZmqError::AddrInUse(_)) | Err(ZmqError::Io(_))),
+    matches!(bind_result, Err(ZmqError::AddrInUse(_)) | Err(ZmqError::IoError{ .. })),
     "Expected AddrInUse or Io error, got {:?}",
     bind_result
   );
