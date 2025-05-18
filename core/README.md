@@ -1,11 +1,9 @@
-# RZMQ - Async, Pure Rust ZeroMQ
+# rzmq - Async, Pure Rust ZeroMQ
 
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-<!-- Add other badges as appropriate: CI status, crates.io version, etc. -->
-<!-- [![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq) -->
-<!-- [![Build Status](...)]() -->
+[![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
 
-`rzmq` is an asynchronous, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, built on top of the [Tokio](https://tokio.rs/) runtime. It aims to provide a familiar ZeroMQ-style API within the Rust async ecosystem.
+`rzmq` is an asynchronous, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, built on top of the [Tokio](https://tokio.rs/) runtime. It aims to provide a familiar ZeroMQ-style API within the Rust async ecosystem, allowing developers to build distributed and concurrent applications without a dependency on the C `libzmq` library.
 
 ## Project Status: Experimental ⚠️
 
@@ -18,164 +16,152 @@
 
 Use with caution and expect potential bugs or missing features. Contributions are welcome!
 
-## Features
+## Key Features
 
-*   **Asynchronous:** Built entirely on Tokio for non-blocking I/O.
-*   **Pure Rust:** No dependency on the C `libzmq` library.
-*   **Core API:**
-    *   `Context` for managing sockets.
-    *   `Socket` handle with async methods (`bind`, `connect`, `send`, `recv`, `set_option`, `get_option`, `close`).
-*   **Socket Types:**
-    *   Request-Reply: `REQ`, `REP`
-    *   Publish-Subscribe: `PUB`, `SUB`
-    *   Pipeline: `PUSH`, `PULL`
-    *   Asynchronous Req-Rep: `DEALER`, `ROUTER`
-*   **Transports:**
-    *   `tcp`: TCP transport.
-    *   `ipc`: Inter-Process Communication via Unix Domain Sockets (requires `ipc` feature).
-    *   `inproc`: In-process communication between threads (requires `inproc` feature).
-*   **Basic ZMTP 3.1:** Implements core protocol aspects (Greeting, Framing, READY, PING/PONG).
-*   **Basic Socket Options:** Supports common options like `SNDHWM`, `RCVHWM`, `LINGER`, `SNDTIMEO`, `RCVTIMEO`, `SUBSCRIBE`, `UNSUBSCRIBE`, `ROUTING_ID`, reconnection intervals, TCP keepalives, ZMTP heartbeats.
-*   **Socket Monitoring:** Provides an event channel similar to `zmq_socket_monitor`.
-*   **Graceful Shutdown:** `Context::term()` allows for coordinated shutdown.
-*   **Basic Security:** Infrastructure for NULL, PLAIN, and CURVE security mechanisms (implementations are placeholders or basic).
+### Asynchronous & Pure Rust
+Built entirely on Tokio for non-blocking I/O, with no dependency on the C `libzmq` library.
 
-## Missing Features / Limitations (Known)
+### Core API
+Provides a `Context` for managing sockets and a `Socket` handle with async methods (`bind`, `connect`, `send`, `recv`, `set_option`, `get_option`, `close`).
 
-*   **Full ZMQ Option Parity:** Many `libzmq` options are not yet implemented (e.g., `ZMQ_LAST_ENDPOINT`, buffer sizes, `ZMQ_IMMEDIATE`).
-*   **Complete Security:** CURVE crypto and ZAP authentication are not fully implemented.
-*   **`zmq_poll` Equivalent:** No built-in mechanism for polling multiple sockets simultaneously.
-*   **`zmq_proxy` Equivalent:** No high-level proxy function.
-*   **Advanced Pattern Options:** Options like `ZMQ_ROUTER_MANDATORY`, `ZMQ_ROUTER_HANDOVER` behavior needs full verification/implementation.
-*   **Performance:** Performance has not been heavily optimized or benchmarked against `libzmq`. Zero-copy operations are limited.
-*   **Error Handling Parity:** Mapping of internal errors to specific `ZmqError` variants corresponding to `zmq_errno()` may not be exhaustive.
-*   **Robustness:** Edge cases, high-concurrency scenarios, and complex failure conditions need more testing.
+### Supported Socket Types
+*   Request-Reply: `REQ`, `REP`
+*   Publish-Subscribe: `PUB`, `SUB`
+*   Pipeline: `PUSH`, `PULL`
+*   Asynchronous Req-Rep: `DEALER`, `ROUTER`
+
+### Multiple Transports
+*   **`tcp`**: Reliable TCP transport for network communication.
+*   **`ipc`**: Inter-Process Communication via Unix Domain Sockets (requires `ipc` feature, Unix-like systems only).
+*   **`inproc`**: In-process communication between threads within the same application (requires `inproc` feature).
+*   **`io-uring` (Optional, Linux-only)**: Enables an `io_uring`-based backend for TCP transport via `tokio-uring` for potentially higher performance. Requires using the `#[rzmq::main]` attribute. (Requires `io-uring` feature).
+
+### ZMTP 3.1 Protocol Basics
+Implements core aspects of the ZeroMQ Message Transport Protocol version 3.1, including Greeting, Framing, READY command, and PING/PONG keepalives.
+
+### Common Socket Options
+Supports a range of common socket options for fine-tuning behavior, such as:
+*   High-Water Marks: `SNDHWM`, `RCVHWM`
+*   Timeouts: `SNDTIMEO`, `RCVTIMEO`, `LINGER`
+*   Connection: `RECONNECT_IVL`, `RECONNECT_IVL_MAX`, `TCP_KEEPALIVE`
+*   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE` (for SUB), `ROUTING_ID` (for DEALER/ROUTER), `ROUTER_MANDATORY`
+*   Keepalives: ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
+
+### Socket Monitoring
+Offers an event channel via `Socket::monitor()` to observe socket lifecycle events (e.g., connected, disconnected, bind failed), similar to `zmq_socket_monitor`.
+
+### Graceful Shutdown
+Facilitates coordinated shutdown of the context and all associated sockets using `Context::term()`.
+
+### Basic Security Placeholders
+Includes infrastructure for NULL, PLAIN, and CURVE security mechanisms, though full implementations (especially for CURVE and ZAP) are still under development. (CURVE support requires `curve` feature).
 
 ## Installation
 
-Add `rzmq` to your `Cargo.toml`. You likely also need `tokio`.
+Add `rzmq` to your `Cargo.toml` dependencies. You will also need `tokio`.
 
 ```toml
 [dependencies]
-# If using git:
-# rzmq = { git = "repository-url", branch = "main" }
-# Once published:
-# rzmq = "0.1.0" # Replace with actual version
+# Replace "..." with the desired version or Git source
+# rzmq = "0.1.0" # Example for a published version
+# rzmq = { git = "https://github.com/your-username/rzmq.git", branch = "main" } # Example for Git
 
-# Enable transport features as needed:
-# rzmq = { version = "...", features = ["ipc", "inproc"] }
+# To enable specific features:
+rzmq = { version = "...", features = ["ipc", "inproc", "curve", "io-uring"] }
 
-tokio = { version = "1", features = ["full"] } # "full" recommended for ease
-tracing = "0.1" # Optional: for logging
-tracing-subscriber = { version = "0.3", features = ["env-filter"] } # Optional: for logging
+tokio = { version = "1", features = ["full"] } # "full" feature recommended
 ```
 
-**Features:**
+**Available Cargo Features:**
 
-*   `ipc`: Enables the `ipc://` transport (Unix only).
+*   `ipc`: Enables the `ipc://` transport (Unix-like systems only).
 *   `inproc`: Enables the `inproc://` transport.
-*   `curve`: Enables placeholders for CURVE security (requires `libsodium-rs`).
+*   `curve`: Enables basic infrastructure for CURVE security (requires `libsodium-rs`). The implementation is experimental.
+*   `io-uring`: (Linux-only) Enables the `io_uring` backend for TCP transport. Requires using `#[rzmq::main]` (see [Usage Guide](README.USAGE.md#using-io_uring-linux)).
 
-## Usage Example (Push/Pull)
+**Prerequisites:**
 
+*   **Rust & Cargo**: A recent stable version of Rust.
+*   **Tokio**: `rzmq` is built on Tokio and expects a Tokio runtime.
+*   **Libsodium** (for `curve` feature): If using the `curve` feature, the libsodium development library must be installed on your system.
+*   **Modern Linux Kernel** (for `io-uring` feature): A Linux kernel supporting `io_uring` (typically 5.1+).
+
+## Getting Started / Documentation
+
+For a detailed guide on using `rzmq`, including core concepts, examples, API overviews, and how to use features like `io_uring`, please see the **[Usage Guide (README.USAGE.md)](README.USAGE.md)**.
+
+The library may include an `examples/` directory in its repository showcasing various usage patterns.
+
+The full API reference documentation is available on [docs.rs/rzmq](https://docs.rs/rzmq) (link will be active once published).
+
+A brief example (Push/Pull):
 ```rust
 use rzmq::{Context, SocketType, Msg, ZmqError};
 use std::time::Duration;
 
+// Use #[rzmq::main] if io-uring feature is enabled and on Linux
+// #[cfg(all(target_os = "linux", feature = "io-uring"))]
+// #[rzmq::main]
+// async fn main() -> Result<(), ZmqError> { ... }
+
+// Otherwise, use #[tokio::main]
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
-    // Initialize logging (optional)
-    // tracing_subscriber::fmt::init();
-
-    println!("Creating context...");
     let ctx = Context::new()?;
 
-    println!("Creating PUSH and PULL sockets...");
     let push = ctx.socket(SocketType::Push)?;
     let pull = ctx.socket(SocketType::Pull)?;
 
-    let endpoint = "inproc://push-pull-example"; // Use inproc for simple example
-
-    println!("Binding PULL to {}...", endpoint);
+    let endpoint = "inproc://example";
     pull.bind(endpoint).await?;
-
-    println!("Connecting PUSH to {}...", endpoint);
     push.connect(endpoint).await?;
-
-    // Allow time for in-process connection (usually very fast)
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    const NUM_MESSAGES: usize = 5;
-    println!("PUSH: Sending {} messages...", NUM_MESSAGES);
-    for i in 0..NUM_MESSAGES {
-        let msg_str = format!("Message {}", i);
-        println!("  Sending: {}", msg_str);
-        push.send(Msg::from_vec(msg_str.into_bytes())).await?;
-    }
-    println!("PUSH: Finished sending.");
+    push.send(Msg::from_static(b"Hello rzmq!")).await?;
+    let received = pull.recv().await?;
+    assert_eq!(received.data().unwrap_or_default(), b"Hello rzmq!");
+    println!("Received: {}", String::from_utf8_lossy(received.data().unwrap_or_default()));
 
-    println!("PULL: Receiving messages...");
-    for i in 0..NUM_MESSAGES {
-        match pull.recv().await {
-            Ok(msg) => {
-                let received_str = String::from_utf8_lossy(msg.data().unwrap_or(b""));
-                println!("  Received: {}", received_str);
-                assert_eq!(received_str, format!("Message {}", i));
-            }
-            Err(e) => {
-                eprintln!("PULL: Error receiving message {}: {}", i, e);
-                return Err(e);
-            }
-        }
-    }
-    println!("PULL: Finished receiving.");
-
-    // Terminate context gracefully
-    println!("Terminating context...");
     ctx.term().await?;
-    println!("Context terminated.");
-
     Ok(())
 }
 ```
 
-## API Overview
+## Missing Features / Limitations (Known)
 
-*   **`rzmq::Context`**: Manages sockets. Create using `Context::new()`. Terminate with `context.term().await`.
-*   **`rzmq::Socket`**: Handle to a socket. Created via `context.socket(SocketType::...)`. Offers async methods like `.bind()`, `.connect()`, `.send()`, `.recv()`, `.set_option()`, `.get_option()`, `.close()`, `.monitor()`.
-*   **`rzmq::SocketType`**: Enum defining the socket pattern (`Pub`, `Sub`, `Req`, `Rep`, `Push`, `Pull`, `Dealer`, `Router`).
-*   **`rzmq::Msg`**: Represents a message frame. Use `Msg::from_vec()`, `Msg::from_static()`, etc. Check/set flags with `.flags()`, `.set_flags()`, `.is_more()`. Access data with `.data()`.
-*   **`rzmq::ZmqError`**: Error enum returned by API calls.
-*   **`rzmq::socket::options`**: Contains constants for socket options.
-*   **`rzmq::socket::SocketEvent`**: Enum received from the monitor channel.
-
-(See the code or generated documentation for detailed function signatures).
+*   **Full ZMQ Option Parity:** Many `libzmq` options are not yet implemented (e.g., `ZMQ_LAST_ENDPOINT`, various buffer size controls, `ZMQ_IMMEDIATE`).
+*   **Complete Security:** CURVE cryptography and full ZAP (ZeroMQ Authentication Protocol) are not fully implemented or robust.
+*   **`zmq_poll` Equivalent:** No direct high-level equivalent for polling multiple sockets. Users can manage multiple socket futures using Tokio's `select!`.
+*   **`zmq_proxy` Equivalent:** No built-in high-level proxy function.
+*   **Advanced Pattern Options:** Behavior for some advanced options (e.g., certain `ZMQ_ROUTER_*` flags) needs full verification and implementation.
+*   **Performance:** While built on Tokio, `rzmq` has not yet undergone heavy performance optimization or benchmarking against `libzmq`. Advanced `io_uring` features like explicit zerocopy are not yet deeply integrated.
+*   **Error Handling Parity:** The mapping of internal errors to specific `ZmqError` variants corresponding to all `zmq_errno()` values may not be exhaustive.
+*   **Robustness:** Edge cases, high-concurrency scenarios, and complex network failure conditions require more extensive testing.
 
 ## Running Tests
 
 ```bash
-# Run all tests (some may be skipped if features are disabled)
+# Run default tests
 cargo test
 
 # Run tests enabling specific features
-cargo test --features ipc,inproc
+cargo test --features "ipc,inproc"
+cargo test --features "io-uring" # On Linux
 ```
 
 ## License
 
-This project is licensed under the **Mozilla Public License Version 2.0 (MPL-2.0)**.
-
-See the [LICENSE](LICENSE) file for details. (You will need to create a `LICENSE` file containing the MPL 2.0 text). MPL 2.0 is a copyleft license that applies at the file level.
+This project is licensed under the **Mozilla Public License Version 2.0 (MPL-2.0)**. See the `LICENSE` file in the repository for the full license text.
 
 ## Contributing
 
 Contributions are welcome! If you find bugs, have feature requests, or want to improve the implementation, please:
 
-1.  **Open an Issue:** Discuss the change or report the bug.
-2.  **Fork the Repository:** Create your own fork.
-3.  **Create a Branch:** Make your changes on a separate branch.
-4.  **Run Tests:** Ensure `cargo test` (with relevant features) passes.
-5.  **Format Code:** Run `cargo fmt`.
-6.  **Submit a Pull Request:** Describe your changes clearly.
+1.  **Open an Issue:** Discuss the change or report the bug on the project's issue tracker.
+2.  **Fork the Repository.**
+3.  **Create a Feature Branch.**
+4.  **Implement Changes & Add Tests.**
+5.  **Run `cargo test --all-features` (or relevant feature combinations) and `cargo fmt`.**
+6.  **Submit a Pull Request** with a clear description of your changes.
 
 Thank you for your interest in `rzmq`!

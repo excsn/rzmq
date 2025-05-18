@@ -1,204 +1,307 @@
 # rzmq API Reference
 
-This document provides a quick reference to the main public API components of the `rzmq` library.
+This document provides a reference to the public API components of the `rzmq` library, designed for developers integrating `rzmq` into their applications.
 
-## Note
+## Core Concepts
 
-You must call close() on any socket to release resources associated.
+`rzmq` is an asynchronous, pure-Rust implementation of ZeroMQ messaging patterns, built upon the Tokio asynchronous runtime. It uses an actor-based internal architecture for managing socket state, protocol handling, and I/O operations.
 
-## Overview
+*   **`Context`**: The primary entry point for using `rzmq`. A `Context` manages shared resources and is the factory for creating `Socket` instances. It's lightweight and cloneable.
+*   **`Socket`**: Represents a ZeroMQ-style socket. It provides methods for network operations like binding, connecting, sending, and receiving messages. Sockets are also lightweight, cloneable handles to underlying actor machinery.
+*   **`SocketType`**: An enum defining the messaging pattern of a `Socket` (e.g., PUB, SUB, REQ, REP, PUSH, PULL, DEALER, ROUTER). This choice dictates the socket's communication behavior.
+*   **`Msg`**: Represents a single message part or frame. `rzmq` supports multi-part messages, where a logical message can consist of several `Msg` instances.
+*   **`MsgFlags`**: Flags associated with a `Msg`, primarily `MsgFlags::MORE` to indicate that more parts of a multi-part message will follow.
+*   **Asynchronous Operations**: All network operations (`bind`, `connect`, `send`, `recv`, `close`, `term`) are asynchronous and return `Future`s that must be `.await`ed.
+*   **Socket Options**: Behavior of sockets can be customized using options (e.g., high-water marks, timeouts) set via `Socket::set_option()` and retrieved with `Socket::get_option()`. Constants for these options are typically found in the `rzmq::socket::options` module.
+*   **Error Handling**: Most operations return `Result<T, ZmqError>`, where `ZmqError` is the library's primary error enum.
+*   **Monitoring**: Sockets can be monitored for lifecycle events (e.g., connection, disconnection) using `Socket::monitor()`, which returns a `MonitorReceiver`.
+*   **Graceful Shutdown**: The `Context::term()` method should be called for a graceful shutdown of all resources. Individual sockets can be closed with `Socket::close()`.
 
-`rzmq` is an asynchronous, pure-Rust implementation of ZeroMQ patterns built on Tokio. It uses an actor model internally.
+## Main Entry Points
 
-## Getting Started
+*   **`rzmq::Context::new()`**: Creates a new communication context.
+*   **`rzmq::Context::socket(socket_type: SocketType)`**: Creates a socket of a specific pattern.
+*   **`#[rzmq::main]` (Attribute Macro, conditional on `io-uring` feature)**:
+    ```rust
+    #[cfg(feature = "io-uring")]
+    pub use rzmq_macros::main;
+    ```
+    When the `io-uring` feature is enabled for `rzmq` (and on Linux), this attribute should be used on your `async main` function instead of `#[tokio::main]`. It automatically configures the Tokio runtime to use `tokio-uring`. If the feature is not enabled or not on Linux, it defaults to `#[tokio::main]`.
 
-1.  **Create a Context:** All sockets are created from a `Context`.
-2.  **Create Sockets:** Use `context.socket()` to create sockets of specific types.
-3.  **Use Socket Methods:** Interact with sockets using async methods like `bind`, `connect`, `send`, `recv`.
-4.  **Terminate Context:** Call `context.term().await` for graceful shutdown when done.
+    *Usage:*
+    ```rust
+    // #[rzmq::main] // if io-uring feature is enabled
+    // #[tokio::main] // otherwise
+    // async fn main() { /* ... */ }
+    ```
+
+## Common Types and Patterns
+
+*   **`rzmq::ZmqError`**: The primary enum for errors throughout the library. (See [Error Handling](#error-handling))
+*   **`Result<T, ZmqError>`**: The standard result type for most fallible operations. Often aliased as `rzmq::ZmqResult<T>`.
+*   **`rzmq::Msg`**: The type for message frames.
+*   **`rzmq::Blob`**: An immutable, cheaply cloneable byte sequence, often used for identities or subscription topics.
+
+## Configuration
+
+Configuration is primarily done through socket options.
+
+### Socket Options (Constants)
+
+These constants are typically used with `Socket::set_option()` and `Socket::get_option()`. They are usually located in the `rzmq::socket::options` module.
+
+*   **`rzmq::socket::options::SNDHWM`**: `i32` - Send High-Water Mark (max number of outgoing messages queued).
+*   **`rzmq::socket::options::RCVHWM`**: `i32` - Receive High-Water Mark (max number of incoming messages queued).
+*   **`rzmq::socket::options::LINGER`**: `i32` - Linger period in milliseconds for pending messages on close (-1: infinite, 0: immediate, >0: timeout).
+*   **`rzmq::socket::options::SNDTIMEO`**: `i32` - Send timeout in milliseconds (-1: infinite block, 0: non-blocking, >0: timeout).
+*   **`rzmq::socket::options::RCVTIMEO`**: `i32` - Receive timeout in milliseconds (-1: infinite block, 0: non-blocking (though actual behavior might depend on pattern), >0: timeout).
+*   **`rzmq::socket::options::RECONNECT_IVL`**: `i32` - Initial reconnect interval in milliseconds (0: no reconnect after first failure, -1: use default, >0: interval).
+*   **`rzmq::socket::options::RECONNECT_IVL_MAX`**: `i32` - Maximum reconnect interval in milliseconds (0: disable exponential backoff, >0: max interval).
+*   **`rzmq::socket::options::ROUTING_ID`**: `&[u8]` (passed as value) - Socket identity (e.g., for `DEALER`, `ROUTER`). Max 255 bytes.
+*   **`rzmq::socket::options::SUBSCRIBE`**: `&[u8]` (passed as value) - For `SUB` sockets, subscribes to a topic prefix.
+*   **`rzmq::socket::options::UNSUBSCRIBE`**: `&[u8]` (passed as value) - For `SUB` sockets, unsubscribes from a topic prefix.
+*   **`rzmq::socket::options::TCP_KEEPALIVE`**: `i32` - TCP keepalive mode (-1: disable, 0: use system default, 1: enable).
+*   **`rzmq::socket::options::TCP_KEEPALIVE_IDLE`**: `i32` - TCP keepalive idle time in seconds before probes are sent.
+*   **`rzmq::socket::options::TCP_KEEPALIVE_CNT`**: `i32` - Number of TCP keepalive probes before dropping connection.
+*   **`rzmq::socket::options::TCP_KEEPALIVE_INTVL`**: `i32` - Interval in seconds between TCP keepalive probes.
+*   **`rzmq::socket::options::HEARTBEAT_IVL`**: `i32` - ZMTP heartbeat interval in milliseconds (0: disable).
+*   **`rzmq::socket::options::HEARTBEAT_TIMEOUT`**: `i32` - ZMTP heartbeat timeout in milliseconds.
+*   **`rzmq::socket::options::ROUTER_MANDATORY`**: `i32` (0 or 1) - For `ROUTER` sockets, controls behavior when routing to an unknown identity.
+*   **`rzmq::socket::options::PLAIN_SERVER`**: `i32` (0 or 1) - Configures PLAIN security mechanism as server.
+*   **`rzmq::socket::options::PLAIN_USERNAME`**: `&[u8]` - Username for PLAIN security.
+*   **`rzmq::socket::options::PLAIN_PASSWORD`**: `&[u8]` - Password for PLAIN security.
+*   **`rzmq::socket::options::ZAP_DOMAIN`**: `&[u8]` - ZAP authentication domain.
+*   **`rzmq::socket::options::CURVE_SERVER`**: `i32` (0 or 1) - (Requires `curve` feature) Configures CURVE security as server.
+*   **`rzmq::socket::options::CURVE_PUBLICKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Socket's public key.
+*   **`rzmq::socket::options::CURVE_SECRETKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Socket's secret key.
+*   **`rzmq::socket::options::CURVE_SERVERKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Server's public key (for client sockets).
+*   **`rzmq::socket::options::IO_URING_SNDZEROCOPY`**: `i32` (0 or 1) - (Requires `io-uring` feature) Hint to use zerocopy for sends if possible.
+*   **`rzmq::socket::options::IO_URING_RCVMULTISHOT`**: `i32` (0 or 1) - (Requires `io-uring` feature) Hint to use multishot receive operations if possible.
+
+*Note: Integer option values are typically passed as `&i32_value.to_ne_bytes()` to `set_option`.*
+
+---
+
+## Main Types and Their Public Methods
+
+### `rzmq::Context`
+
+The `Context` is the entry point for creating and managing `rzmq` sockets. It encapsulates shared resources for all sockets created from it.
+
+*   **Constructors:**
+    *   `pub fn new() -> Result<Context, ZmqError>`
+        *   Creates a new, independent `rzmq` context. This is the starting point for any `rzmq` application.
+
+*   **Socket Creation:**
+    *   `pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError>`
+        *   Creates a new `Socket` of the specified `SocketType` (e.g., `SocketType::Push`, `SocketType::Sub`) associated with this context.
+
+*   **Termination:**
+    *   `pub async fn shutdown(&self) -> Result<(), ZmqError>`
+        *   Initiates a graceful background shutdown of all sockets and actors created by this context. This method returns quickly. For a blocking wait until termination is complete, use `term()`.
+    *   `pub async fn term(&self) -> Result<(), ZmqError>`
+        *   Initiates a graceful shutdown of the context and all associated sockets and waits for their clean termination. This is the recommended way to ensure all resources are released before the application exits.
+
+### `rzmq::Socket`
+
+The `Socket` struct is the public handle for interacting with a specific ZeroMQ-style socket. It is cloneable and thread-safe (`Arc`-based).
+
+*   **Connection Management:**
+    *   `pub async fn bind(&self, endpoint: &str) -> Result<(), ZmqError>`
+        *   Binds the socket to a local endpoint string (e.g., `"tcp://127.0.0.1:5555"`, `"ipc:///tmp/rzmq.sock"`, `"inproc://service_a"`). For connection-oriented transports, this allows incoming connections.
+    *   `pub async fn connect(&self, endpoint: &str) -> Result<(), ZmqError>`
+        *   Connects the socket to a remote or local endpoint. This operation typically happens asynchronously in the background.
+    *   `pub async fn disconnect(&self, endpoint: &str) -> Result<(), ZmqError>`
+        *   Disconnects from a specific endpoint that was previously established using `connect()`.
+    *   `pub async fn unbind(&self, endpoint: &str) -> Result<(), ZmqError>`
+        *   Stops listening on a specific endpoint that was previously bound using `bind()`.
+
+*   **Message Sending/Receiving:**
+    *   `pub async fn send(&self, msg: Msg) -> Result<(), ZmqError>`
+        *   Sends a message (`Msg`) according to the socket's specific messaging pattern. For multi-part messages, ensure `MsgFlags::MORE` is set on all but the last part.
+    *   `pub async fn recv(&self) -> Result<Msg, ZmqError>`
+        *   Receives a message (`Msg`) according to the socket's pattern. This method will block (asynchronously) until a message is available or a timeout occurs (if `RCVTIMEO` is set). Check `msg.is_more()` for multi-part messages.
+
+*   **Socket Options:**
+    *   `pub async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError>`
+        *   Sets a socket option using an integer option ID (see [Socket Options](#socket-options-constants)) and a byte slice representing the value.
+    *   `pub async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError>`
+        *   Retrieves the current value of a socket option. The returned `Vec<u8>` must be interpreted according to the option type.
+
+*   **Lifecycle & Monitoring:**
+    *   `pub async fn close(&self) -> Result<(), ZmqError>`
+        *   Initiates a graceful shutdown of this specific socket, closing all its connections and releasing associated resources.
+    *   `pub async fn monitor(&self, capacity: usize) -> Result<MonitorReceiver, ZmqError>`
+        *   Creates a channel for receiving `SocketEvent` notifications about this socket's lifecycle and network activity. `capacity` defines the event buffer size.
+    *   `pub async fn monitor_default(&self) -> Result<MonitorReceiver, ZmqError>`
+        *   A convenience method that calls `monitor()` with a default capacity (`rzmq::socket::events::DEFAULT_MONITOR_CAPACITY`).
+
+---
+
+## Public Enums (Non-Config)
+
+### `rzmq::SocketType`
+
+Defines the ZeroMQ messaging pattern for a `Socket`.
+
+*   **Variants:**
+    *   `Pub`: Publisher for Pub-Sub pattern.
+    *   `Sub`: Subscriber for Pub-Sub pattern.
+    *   `Req`: Request client for Req-Rep pattern.
+    *   `Rep`: Reply server for Req-Rep pattern.
+    *   `Dealer`: Asynchronous request/reply client (often used with `Router`).
+    *   `Router`: Asynchronous request/reply server, routes messages based on identity.
+    *   `Push`: Fan-out message distributor for pipeline pattern.
+    *   `Pull`: Fan-in message collector for pipeline pattern.
+
+### `rzmq::MsgFlags` (Bitflags)
+
+Flags associated with a `Msg` that modify its behavior or indicate its role. Implemented using the `bitflags` crate.
+
+*   **Flags:**
+    *   `MORE`: `0b01` - Indicates that more message parts follow this one in a multi-part message.
+    *   *(Internal: `COMMAND` = `0b10` - Indicates a ZMTP command frame, not typically set by users.)*
+
+### `rzmq::socket::events::SocketEvent`
+
+Events emitted by a socket's monitor channel, detailing lifecycle and connection state changes.
+
+*   **Variants (non-exhaustive):**
+    *   `Listening { endpoint: String }`: Socket has started listening.
+    *   `BindFailed { endpoint: String, error_msg: String }`: Socket failed to bind.
+    *   `Accepted { endpoint: String, peer_addr: String }`: Accepted a new connection.
+    *   `AcceptFailed { endpoint: String, error_msg: String }`: Failed to accept a connection.
+    *   `Connected { endpoint: String, peer_addr: String }`: Connection established (transport layer).
+    *   `ConnectDelayed { endpoint: String, error_msg: String }`: Initial connection failed, retrying will start.
+    *   `ConnectRetried { endpoint: String, interval: Duration }`: Retrying connection after delay.
+    *   `ConnectFailed { endpoint: String, error_msg: String }`: Connection attempt failed definitively.
+    *   `Closed { endpoint: String }`: Connection or listener closed.
+    *   `Disconnected { endpoint: String }`: Peer disconnected or connection terminated.
+    *   `HandshakeFailed { endpoint: String, error_msg: String }`: ZMTP handshake (including security) failed.
+    *   `HandshakeSucceeded { endpoint: String }`: ZMTP handshake succeeded.
+
+---
+
+## Public Structs (Data Carrying)
+
+### `rzmq::Msg`
+
+Represents a single message part (frame) in ZeroMQ communication. It is designed for efficient handling of byte data.
+
+*   **Key Public Methods:**
+    *   `pub fn new() -> Self`
+        *   Creates a new, empty message with no data.
+    *   `pub fn from_vec(data: Vec<u8>) -> Self`
+        *   Creates a message from a `Vec<u8>`, taking ownership of the data.
+    *   `pub fn from_bytes(data: bytes::Bytes) -> Self`
+        *   Creates a message from `bytes::Bytes`.
+    *   `pub fn from_static(data: &'static [u8]) -> Self`
+        *   Creates a message from a static byte slice (zero-copy).
+    *   `pub fn data(&self) -> Option<&[u8]>`
+        *   Returns an optional slice `&[u8]` representing the message payload.
+    *   `pub fn size(&self) -> usize`
+        *   Returns the size of the message payload in bytes.
+    *   `pub fn flags(&self) -> MsgFlags`
+        *   Returns the `MsgFlags` associated with the message.
+    *   `pub fn set_flags(&mut self, flags: MsgFlags)`
+        *   Sets the `MsgFlags` for the message (e.g., to indicate `MsgFlags::MORE`).
+    *   `pub fn is_more(&self) -> bool`
+        *   Checks if the `MsgFlags::MORE` flag is set.
+    *   `pub fn metadata(&self) -> &Metadata`
+        *   (Advanced) Returns an immutable reference to the message's `Metadata` map.
+    *   `pub fn metadata_mut(&mut self) -> &mut Metadata`
+        *   (Advanced) Returns a mutable reference to the message's `Metadata` map.
+
+### `rzmq::Blob`
+
+An immutable, cheaply cloneable byte sequence, typically used for identities in `ROUTER`/`DEALER` sockets or for subscription topics in `PUB`/`SUB`. Internally backed by `bytes::Bytes`.
+
+*   **Key Public Methods & Conversions:**
+    *   `pub fn new() -> Self` (Creates an empty blob)
+    *   `pub fn from_bytes(bytes: bytes::Bytes) -> Self`
+    *   `pub fn from_static(data: &'static [u8]) -> Self`
+    *   `pub fn size(&self) -> usize`
+    *   `pub fn is_empty(&self) -> bool`
+    *   Implements `Deref<Target = [u8]>`
+    *   Implements `AsRef<[u8]>`
+    *   Implements `From<Vec<u8>>`
+    *   Implements `From<&'static [u8]>`
+
+### `rzmq::message::Metadata`
+
+A type map for associating arbitrary typed data with a `Msg`. Rarely directly used by application code unless interacting with advanced ZMTP properties or custom message metadata.
+
+*   **Key Public Methods (async):**
+    *   `pub async fn insert_typed<T: Any + Send + Sync>(&self, value: T) -> Option<Arc<dyn Any + Send + Sync>>`
+    *   `pub async fn get<T: Any + Send + Sync>(&self) -> Option<Arc<T>>`
+    *   `pub async fn contains<T: Any + Send + Sync>(&self) -> bool`
+    *   `pub async fn remove<T: Any + Send + Sync>(&self) -> Option<Arc<dyn Any + Send + Sync>>`
+    *   *(Other methods: `new`, `is_empty`, `len`)*
+
+---
+
+## Public Functions (Free-standing)
+
+Located in the `rzmq` crate root.
+
+*   `pub fn version() -> (i32, i32, i32)`
+    *   Returns the library version as a tuple: `(major, minor, patch)`.
+*   `pub fn version_major() -> i32`
+*   `pub fn version_minor() -> i32`
+*   `pub fn version_patch() -> i32`
+
+---
+
+## Public Type Aliases
+
+*   **`rzmq::socket::events::MonitorReceiver`**:
+    ```rust
+    pub type MonitorReceiver = async_channel::Receiver<SocketEvent>;
+    ```
+    The receiving end of a channel used for socket monitoring events.
+
+---
+
+## Error Handling
+
+### `rzmq::ZmqError` (Enum)
+
+The primary error type used by `rzmq`. It is `Clone`-able.
+
+*   **Variants (non-exhaustive):**
+    *   `IoError { kind: std::io::ErrorKind, message: String }`: Wraps an underlying I/O error.
+    *   `InvalidArgument(String)`: Invalid argument provided (not socket option related).
+    *   `Timeout`: Operation timed out.
+    *   `AddrInUse(String)`: Address already in use (e.g., for `bind`).
+    *   `AddrNotAvailable(String)`: Address not available.
+    *   `ConnectionRefused(String)`: Connection refused by peer.
+    *   `HostUnreachable(String)`: Destination host is unreachable.
+    *   `NetworkUnreachable(String)`: Network is unreachable.
+    *   `ConnectionClosed`: Connection closed by peer or transport.
+    *   `PermissionDenied(String)`: Permission denied for an endpoint operation.
+    *   `InvalidEndpoint(String)`: Endpoint string has an invalid format.
+    *   `EndpointResolutionFailed(String)`: Failed to resolve endpoint (e.g., DNS).
+    *   `InvalidOption(i32)`: Invalid socket option ID.
+    *   `InvalidOptionValue(i32)`: Invalid value for a socket option.
+    *   `InvalidSocketType(&'static str)`: Operation invalid for socket type.
+    *   `InvalidState(&'static str)`: Operation invalid for current socket state (e.g., REQ send twice).
+    *   `ProtocolViolation(String)`: ZMTP protocol violation detected.
+    *   `InvalidMessage(String)`: Invalid message format for the operation.
+    *   `SecurityError(String)`: Generic security mechanism error.
+    *   `AuthenticationFailure(String)`: Authentication with peer failed.
+    *   `EncryptionError(String)`: Error during message encryption/decryption.
+    *   `ResourceLimitReached`: Resource limit hit (e.g., HWM, equivalent to EAGAIN).
+    *   `UnsupportedTransport(String)`: Transport scheme not supported.
+    *   `UnsupportedOption(i32)`: Socket option not supported.
+    *   `UnsupportedFeature(&'static str)`: Feature not supported.
+    *   `Internal(String)`: Internal library error.
+    *   `#[cfg(feature = "io-uring")] UringError(String)`: Error specific to `io_uring` operations.
+
+### `rzmq::ZmqResult<T, E = ZmqError>` (Type Alias)
+
+The standard `Result` type returned by most fallible operations in `rzmq`.
 
 ```rust
-use rzmq::{Context, SocketType, Msg, ZmqError};
-use std::time::Duration;
-
-#[tokio::main]
-async fn main() -> Result<(), ZmqError> {
-    // 1. Create Context
-    let ctx = Context::new()?;
-
-    // 2. Create Sockets
-    let push = ctx.socket(SocketType::Push)?;
-    let pull = ctx.socket(SocketType::Pull)?;
-
-    // 3. Use Socket Methods
-    pull.bind("inproc://example").await?;
-    push.connect("inproc://example").await?;
-    tokio::time::sleep(Duration::from_millis(50)).await; // Allow connection
-
-    push.send(Msg::from_static(b"Hello")).await?;
-    let received = pull.recv().await?;
-    println!("Received: {:?}", received.data());
-
-    // 4. Terminate Context
-    ctx.term().await?;
-
-    Ok(())
-}
+pub type ZmqResult<T, E = ZmqError> = std::result::Result<T, E>;
 ```
-
-## `Context`
-
-Manages sockets and shared resources. It's cheap to clone (`Arc`-based).
-
-*   **`Context::new() -> Result<Self, ZmqError>`**
-    ```rust
-    pub fn new() -> Result<Self, ZmqError>
-    ```
-    Creates a new, independent rzmq context.
-
-*   **`context.socket(socket_type: SocketType) -> Result<Socket, ZmqError>`**
-    ```rust
-    pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError>
-    ```
-    Creates a new `Socket` of the specified `SocketType` associated with this context.
-
-*   **`context.term().await -> Result<(), ZmqError>`**
-    ```rust
-    pub async fn term(self) -> Result<(), ZmqError>
-    ```
-    Initiates a graceful shutdown of the context and all associated sockets. Waits for all background tasks to complete. Consumes the `Context` handle. Must be awaited.
-
-## `Socket`
-
-The public handle for interacting with a specific socket instance. It's cheap to clone (`Arc`-based). All operations are asynchronous.
-
-*   **`socket.bind(endpoint: &str).await -> Result<(), ZmqError>`**
-    ```rust
-    pub async fn bind(&self, endpoint: &str) -> Result<(), ZmqError>
-    ```
-    Binds the socket to listen on a local endpoint (e.g., `"tcp://127.0.0.1:5555"`, `"ipc:///tmp/zmq.sock"`, `"inproc://my_service"`).
-
-*   **`socket.connect(endpoint: &str).await -> Result<(), ZmqError>`**
-    ```rust
-    pub async fn connect(&self, endpoint: &str) -> Result<(), ZmqError>
-    ```
-    Connects the socket to a remote or local endpoint. Handles connection asynchronously in the background.
-
-*   **`socket.disconnect(endpoint: &str).await -> Result<(), ZmqError>`**
-    ```rust
-    pub async fn disconnect(&self, endpoint: &str) -> Result<(), ZmqError>
-    ```
-    Disconnects from a previously connected endpoint.
-
-*   **`socket.unbind(endpoint: &str).await -> Result<(), ZmqError>`**
-    ```rust
-    pub async fn unbind(&self, endpoint: &str) -> Result<(), ZmqError>
-    ```
-    Stops listening on a previously bound endpoint.
-
-*   **`socket.send(msg: Msg).await -> Result<(), ZmqError>`**
-    ```rust
-    pub async fn send(&self, msg: Msg) -> Result<(), ZmqError>
-    ```
-    Sends a message according to the socket's pattern. For multi-part messages, set `MsgFlags::MORE` on all but the last part using `msg.set_flags()`. May return `ZmqError::ResourceLimitReached` (EAGAIN equivalent) if HWM is hit and `SNDTIMEO` is 0, or `ZmqError::Timeout` if `SNDTIMEO` expires.
-
-*   **`socket.recv().await -> Result<Msg, ZmqError>`**
-    ```rust
-    pub async fn recv(&self) -> Result<Msg, ZmqError>
-    ```
-    Receives a message according to the socket's pattern. Blocks asynchronously until a message is available or an error occurs. May return `ZmqError::Timeout` if `RCVTIMEO` expires. Check `msg.is_more()` for multi-part messages.
-
-*   **`socket.set_option(option: i32, value: &[u8]).await -> Result<(), ZmqError>`**
-    ```rust
-    pub async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError>
-    ```
-    Sets a socket option. Use constants from `rzmq::socket::options`. Value format depends on the option (e.g., `i32.to_ne_bytes()` for integer options).
-
-*   **`socket.get_option(option: i32).await -> Result<Vec<u8>, ZmqError>`**
-    ```rust
-    pub async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError>
-    ```
-    Gets a socket option value. Returns bytes which need to be interpreted based on the option.
-
-*   **`socket.close().await -> Result<(), ZmqError>`**
-    ```rust
-    pub async fn close(&self) -> Result<(), ZmqError>
-    ```
-    Initiates graceful shutdown of *this specific socket*. Waits for associated background tasks to complete.
-
-*   **`socket.monitor(capacity: usize).await -> Result<MonitorReceiver, ZmqError>`**
-    ```rust
-    pub async fn monitor(&self, capacity: usize) -> Result<MonitorReceiver, ZmqError>
-    ```
-    Creates a channel to receive `SocketEvent` notifications about this socket's lifecycle (connections, disconnections, errors, etc.). `capacity` sets the event buffer size.
-
-*   **`socket.monitor_default().await -> Result<MonitorReceiver, ZmqError>`**
-    ```rust
-    pub async fn monitor_default(&self) -> Result<MonitorReceiver, ZmqError>
-    ```
-    Creates a monitoring channel with a default capacity.
-
-## `SocketType` (Enum)
-
-Specifies the messaging pattern when creating a socket with `context.socket()`.
-
-*   `Pub`: Publisher (Pub-Sub)
-*   `Sub`: Subscriber (Pub-Sub)
-*   `Req`: Request (Req-Rep)
-*   `Rep`: Reply (Req-Rep)
-*   `Dealer`: Asynchronous Req-Rep (Dealer-Router)
-*   `Router`: Asynchronous Req-Rep (Dealer-Router)
-*   `Push`: Fan-out distributor (Push-Pull)
-*   `Pull`: Fan-in collector (Push-Pull)
-
-## `Msg`
-
-Represents a single message part (frame). Uses `bytes::Bytes` internally for efficiency.
-
-*   `Msg::new()`: Creates an empty message.
-*   `Msg::from_vec(data: Vec<u8>)`: Creates a message from a `Vec`.
-*   `Msg::from_static(data: &'static [u8])`: Creates a message from a static slice (zero-copy).
-*   `msg.data() -> Option<&[u8]>`: Gets a reference to the message payload.
-*   `msg.size() -> usize`: Gets the payload size.
-*   `msg.flags() -> MsgFlags`: Gets the current flags.
-*   `msg.set_flags(flags: MsgFlags)`: Sets the flags (e.g., `MsgFlags::MORE`).
-*   `msg.is_more() -> bool`: Checks if the `MORE` flag is set.
-*   `msg.metadata() -> &Metadata`: Access message metadata (rarely needed by end-users).
-
-## `MsgFlags` (Bitflags)
-
-Flags associated with a `Msg`.
-
-*   `MsgFlags::MORE`: Indicates more message parts follow this one in a multi-part message.
-
-## `ZmqError` (Enum)
-
-Error type returned by most API calls. Variants correspond to common network and ZeroMQ errors (e.g., `Io`, `Timeout`, `AddrInUse`, `ConnectionRefused`, `InvalidState`, `ResourceLimitReached`, `ProtocolViolation`).
-
-## Socket Options
-
-Set/get using `socket.set_option()` / `socket.get_option()` with integer constants found in `rzmq::socket::options`. Common examples:
-
-*   `SNDHWM`, `RCVHWM`: High-water marks (queue limits).
-*   `LINGER`: Time to wait for pending messages on close.
-*   `SNDTIMEO`, `RCVTIMEO`: Send/receive timeouts in milliseconds (-1 = infinite, 0 = immediate, >0 = timeout).
-*   `RECONNECT_IVL`, `RECONNECT_IVL_MAX`: Reconnection intervals.
-*   `SUBSCRIBE`, `UNSUBSCRIBE`: For `Sub` sockets.
-*   `ROUTING_ID`: Socket identity (e.g., for `Dealer`, `Router`).
-*   `TCP_KEEPALIVE`, `TCP_KEEPALIVE_IDLE`, etc.: TCP keepalive settings.
-*   `HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`: ZMTP keepalive settings.
-
-*Note: Option values are typically passed as `&i32.to_ne_bytes()`.*
-
-## Monitoring
-
-Use `socket.monitor()` to get a `MonitorReceiver` channel. Receive `SocketEvent` enum variants from this channel to track socket activity asynchronously.
-
-*   **`MonitorReceiver`**: An `async_channel::Receiver<SocketEvent>`. Use `receiver.recv().await`.
-*   **`SocketEvent`**: Enum detailing events like `Listening`, `Connected`, `Disconnected`, `Accepted`, `BindFailed`, `HandshakeSucceeded`, `HandshakeFailed`, etc. (See `rzmq::socket::events` for variants).
-
-## Version
-
-*   **`rzmq::version() -> (i32, i32, i32)`**: Returns the library version (major, minor, patch).
-
-This reference covers the primary user-facing parts of the `rzmq` library based on the provided code.
+*(This alias is typically defined in `rzmq::error` but used throughout as `rzmq::ZmqResult` or just `Result<_, ZmqError>`).*
