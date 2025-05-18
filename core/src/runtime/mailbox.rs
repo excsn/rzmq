@@ -27,6 +27,6 @@ pub const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
 ///
 /// # Returns
 /// A tuple containing the `MailboxSender` and `MailboxReceiver`.
-pub fn mailbox() -> (MailboxSender, MailboxReceiver) {
-  async_channel::bounded(DEFAULT_MAILBOX_CAPACITY)
+pub fn mailbox(capacity: usize) -> (MailboxSender, MailboxReceiver) {
+  async_channel::bounded(capacity.max(1))
 }

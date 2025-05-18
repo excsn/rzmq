@@ -10,6 +10,7 @@ use crate::runtime::{
   MailboxSender,   // Stored for sockets
   SystemEvent,
   WaitGroup,
+  DEFAULT_MAILBOX_CAPACITY,
 };
 use crate::socket::{self, ISocket, Socket, SocketType}; // For creating and managing Sockets
 
@@ -59,12 +60,13 @@ pub(crate) struct ContextInner {
   /// Flag indicating if context-wide shutdown has been initiated.
   /// Used to prevent redundant shutdown operations and to signal actors.
   pub(crate) shutdown_initiated: AtomicBool,
+  actor_mailbox_capacity: usize,
 }
 
 impl ContextInner {
   /// Creates new shared context state, including initializing libsodium (if CURVE enabled)
   /// and spawning the event listener task.
-  fn new() -> Self {
+  fn new(actor_mailbox_capacity: usize) -> Self {
     #[cfg(feature = "curve")]
     {
       if let Err(_) = libsodium::ensure_init() {
@@ -85,7 +87,12 @@ impl ContextInner {
       event_bus,
       actor_wait_group,
       shutdown_initiated: AtomicBool::new(false),
+      actor_mailbox_capacity,
     }
+  }
+
+  pub(crate) fn get_actor_mailbox_capacity(&self) -> usize {
+    self.actor_mailbox_capacity
   }
 
   /// Generates the next unique handle ID using an atomic counter.
@@ -231,9 +238,22 @@ pub struct Context {
 impl Context {
   /// Creates a new, independent context.
   pub fn new() -> Result<Self, ZmqError> {
-    tracing::debug!("Creating new rzmq Context");
+    Self::with_capacity(None)
+  }
+
+  /// Creates a new, independent context.
+  ///
+  /// # Arguments
+  /// * `actor_mailbox_capacity`: Optionally, specify the bounded capacity for internal
+  ///   actor command mailboxes. If `None`, `rzmq::runtime::DEFAULT_MAILBOX_CAPACITY` is used.
+  ///   Minimum capacity is 1.
+  pub fn with_capacity(actor_mailbox_capacity: Option<usize>) -> Result<Self, ZmqError> {
+    let capacity = actor_mailbox_capacity
+      .map(|c| c.max(1)) // Ensure capacity is at least 1
+      .unwrap_or(DEFAULT_MAILBOX_CAPACITY);
+    tracing::debug!(target_capacity = capacity, "Creating new rzmq Context");
     Ok(Self {
-      inner: Arc::new(ContextInner::new()),
+      inner: Arc::new(ContextInner::new(capacity)),
     })
   }
 

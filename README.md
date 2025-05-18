@@ -11,67 +11,79 @@
 
 ## Motivation
 
-The ZeroMQ library (`libzmq`) is a fantastic piece of engineering that has powered countless distributed systems. However, several motivations drive the development of `rzmq`:
+The ZeroMQ library (`libzmq`) is a robust and widely adopted messaging solution. `rzmq` aims to offer a modern alternative within the Rust ecosystem, driven by several key motivations:
 
 1.  **Pure Rust Implementation:**
-    *   **Safety:** Leverage Rust's memory safety and concurrency guarantees to reduce common bugs found in C/C++ codebases.
-    *   **Ecosystem Integration:** Provide a native Rust library that integrates seamlessly with the burgeoning Rust async ecosystem (Tokio, async/await) without FFI overhead or `unsafe` block proliferation.
-    *   **Build Simplicity:** Eliminate the need for users to have the C `libzmq` library and its development headers installed on their system, simplifying the build process for Rust projects.
+    *   **Memory Safety & Concurrency:** Capitalize on Rust's strong safety guarantees to build a reliable messaging library.
+    *   **Seamless Async Integration:** Provide a native asynchronous experience using Tokio and `async/await`, avoiding FFI complexities.
+    *   **Simplified Build Process:** Eliminate the external dependency on the C `libzmq` library for Rust projects.
 
-2.  **Asynchronous Core:**
-    *   Design from the ground up for asynchronous operation using Tokio, aiming for high concurrency and efficient resource utilization in async Rust applications.
+2.  **Asynchronous-First Design:**
+    *   Architected from the ground up for non-blocking I/O and high concurrency, tailored for async Rust applications.
 
-3.  **Exploring Modern I/O: `io_uring` Acceleration (Linux):**
-    *   A key goal is to leverage modern Linux kernel I/O interfaces like `io_uring` for potentially significant performance improvements in high-throughput scenarios. `rzmq` includes an optional `io_uring` backend (via `tokio-uring`) for its TCP transport, aiming to reduce syscall overhead and enable more efficient data transfer.
+3.  **Exploring Modern I/O for High Performance (Linux):**
+    *   A primary goal is to harness advanced Linux kernel I/O interfaces. `rzmq` features an optional **`io_uring` backend** (via `tokio-uring`) for its TCP transport. This backend aims to reduce syscall overhead and improve data transfer efficiency.
+    *   Further performance enhancements include:
+        *   **TCP Corking:** An option to batch ZMTP frames into fewer TCP segments, potentially reducing network overhead for certain workloads on Linux.
+        *   **Experimental Zerocopy Send:** When using the `io_uring` backend, an experimental option enables a zerocopy send path, aiming to minimize CPU data copies for outgoing messages.
 
 4.  **Learning and Innovation:**
-    *   Reimplementing a complex system like ZeroMQ in a different language and paradigm offers valuable learning opportunities and a chance to explore alternative architectural choices within the Rust ecosystem.
+    *   Reimplementing ZeroMQ offers a platform to explore protocol design and asynchronous patterns within Rust, fostering learning and potential innovation in messaging library architecture.
 
 ## Current Features & Capabilities
 
 `rzmq` currently supports:
 
-*   **Core ZeroMQ API:** `Context` and `Socket` abstractions with asynchronous methods for `bind`, `connect`, `send`, `recv`, setting/getting options, and graceful `close`/`term`.
+*   **Core ZeroMQ API:** A `Context` for managing sockets and `Socket` handles providing asynchronous methods for `bind`, `connect`, `send`, `recv`, option management (`set_option`/`get_option`), and lifecycle control (`close`/`term`).
 *   **Standard Socket Types:**
     *   Request-Reply: `REQ`, `REP`
-    *   Publish-Subscribe: `PUB`, `SUB` (with basic topic filtering)
+    *   Publish-Subscribe: `PUB`, `SUB` (with basic topic prefix filtering)
     *   Pipeline: `PUSH`, `PULL`
-    *   Asynchronous Request-Reply: `DEALER`, `ROUTER` (with identity handling)
+    *   Asynchronous Request-Reply: `DEALER`, `ROUTER` (with ZMTP identity handling)
 *   **Transports:**
-    *   `tcp://` (IPv4 and IPv6)
-    *   `ipc://` (Inter-Process Communication on Unix-like systems, via feature flag)
-    *   `inproc://` (In-Process communication between threads, via feature flag)
-    *   Optional `io_uring` backend for TCP on Linux (via feature flag and `tokio-uring`).
-*   **ZMTP 3.1 Basics:** Implementation of the core ZeroMQ Message Transport Protocol, including greeting, message framing, and basic commands (READY, PING/PONG).
-*   **Common Socket Options:** Support for essential options like `SNDHWM`, `RCVHWM`, `LINGER`, send/receive timeouts, reconnection intervals, TCP keepalives, and ZMTP heartbeats.
-*   **Socket Monitoring:** An event system to monitor socket lifecycle events (connects, disconnects, errors).
-*   **Security Placeholders:** Basic infrastructure for NULL, PLAIN, and CURVE security mechanisms is present, but full, robust implementations (especially CURVE and ZAP) are still under development.
+    *   `tcp://` (IPv4 and IPv6) with an optional `io_uring` backend on Linux.
+    *   `ipc://` (Inter-Process Communication on Unix-like systems, via `ipc` feature flag).
+    *   `inproc://` (In-Process communication between threads, via `inproc` feature flag).
+*   **ZMTP 3.1 Protocol:** Implementation of core protocol elements including Greeting, message Framing, and essential commands like READY, PING/PONG for keepalives.
+*   **Common Socket Options:** Support for key options such as:
+    *   High-Water Marks (`SNDHWM`, `RCVHWM`)
+    *   Timeouts (`SNDTIMEO`, `RCVTIMEO`, `LINGER`)
+    *   Reconnection behavior (`RECONNECT_IVL`, `RECONNECT_IVL_MAX`)
+    *   TCP-specifics (`TCP_KEEPALIVE` settings)
+    *   ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
+    *   Pattern-specific (`SUBSCRIBE`, `UNSUBSCRIBE`, `ROUTING_ID`, `ROUTER_MANDATORY`)
+    *   Performance-related (Linux): `TCP_CORK_OPT`, `IO_URING_SNDZEROCOPY` (when `io-uring` feature is active).
+*   **Socket Monitoring:** An event system (`Socket::monitor()`) for observing socket lifecycle events (connections, disconnections, errors, etc.).
+*   **Basic Security Placeholders:** Infrastructure for NULL, PLAIN, and (feature-gated) CURVE security mechanisms. Full implementation and hardening are ongoing.
 
 ## Goals and Roadmap
 
 While still experimental, the long-term goals for `rzmq` include:
 
-*   **Stability and Robustness:** Achieve a level of stability suitable for consideration in less critical production environments, eventually targeting full production readiness.
-*   **Feature Parity:** Gradually implement more features and socket options found in `libzmq`.
-*   **Performance Optimization:** Continuously improve performance, including deeper integration of `io_uring` features (e.g., zerocopy operations) and general code optimization.
-*   **Comprehensive Security:** Fully implement and test CURVE security and ZAP authentication.
-*   **Community Building:** Foster a community around the project for contributions, feedback, and usage.
+*   **Stability and Robustness:** Mature into a reliable library suitable for a widening range of applications, eventually targeting production-grade stability.
+*   **Feature Parity:** Systematically implement more features and socket options found in `libzmq` to provide a comprehensive ZeroMQ experience.
+*   **Performance Optimization:**
+    *   Continuously improve performance through code optimization and benchmarking.
+    *   Deepen `io_uring` integration: Fully leverage features like zerocopy send/receive, registered buffers, and multishot operations where beneficial.
+    *   Refine TCP Corking and other transport-level optimizations.
+*   **Comprehensive Security:** Complete and rigorously test CURVE security and ZAP (ZeroMQ Authentication Protocol) integration.
+*   **Community and Documentation:** Grow an active user and contributor community, supported by thorough documentation and examples.
 
 ## When to Consider `rzmq` (Currently)
 
-*   **Learning & Exploration:** If you're interested in the internals of ZeroMQ or asynchronous Rust networking.
-*   **Prototyping:** For projects where a pure Rust, async ZeroMQ-like library is desired, and the experimental nature is acceptable.
-*   **Specific `io_uring` Interest:** If you are keen on experimenting with an `io_uring`-backed messaging layer in Rust.
-*   **Contributing:** If you'd like to help build a modern ZeroMQ alternative in Rust.
+*   **Learning & Exploration:** For those interested in ZeroMQ internals, asynchronous Rust, or modern I/O interfaces like `io_uring`.
+*   **Prototyping & Non-Critical Use Cases:** When a pure Rust, `async`-native ZeroMQ-like library is appealing, and the experimental nature is acceptable.
+*   **Early Adoption of `io_uring`:** For developers specifically looking to experiment with or contribute to an `io_uring`-backed messaging layer in Rust.
+*   **Contributing:** If you are passionate about messaging systems and want to help shape a new ZeroMQ implementation in Rust.
 
-For production-critical applications requiring the full stability and feature set of ZeroMQ, the official `libzmq` (often via Rust bindings like `zmq-rs`) remains the recommended choice at this time.
+For production-critical systems demanding the proven stability and full feature set of ZeroMQ, the official C `libzmq` (typically accessed via Rust bindings like `zmq-rs`) remains the established choice at this time.
 
 ## Getting Involved
 
-*   **Rust Developers:** To use `rzmq` in your Rust project, see the [Installation](#installation) section in the Rust-specific [README.md](README.md) and the [Usage Guide](README.USAGE.md).
-*   **Source Code:** (Link to your GitHub repository)
-*   **Issue Tracker:** (Link to your GitHub issues)
-*   **Contributing:** Contributions are highly encouraged! Whether it's bug reports, feature suggestions, documentation improvements, or code contributions, please feel free to get involved. See `CONTRIBUTING.md` (if available) for guidelines.
+*   **For Rust Developers:** To integrate `rzmq` into your Rust project, please refer to the Rust-specific `README.md` (often found in the crate's root or a `rust/` subdirectory if this is a multi-language project overview) and the detailed `README.USAGE.md`. These documents cover installation, features, and API usage from a Rust perspective.
+*   **Source Code:** [https://github.com/excsn/rzmq](https://github.com/excsn/rzmq) (Replace with your actual repository URL)
+*   **Issue Tracker:** (Link to your GitHub issues for bug reports and feature requests)
+*   **Contributing:** Contributions are highly encouraged! Whether it's bug reports, feature suggestions, documentation improvements, or code contributions, please feel free to get involved. Check for a `CONTRIBUTING.md` file in the repository for guidelines.
 
 ## License
 

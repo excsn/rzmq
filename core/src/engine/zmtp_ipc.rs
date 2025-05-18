@@ -2,7 +2,7 @@
 
 #![cfg(feature = "ipc")] // Only compile this file if ipc feature is enabled
 
-use crate::runtime::{mailbox, MailboxSender}; 
+use crate::runtime::{mailbox, MailboxSender};
 use crate::socket::options::{SocketOptions, ZmtpEngineConfig};
 use crate::Context;
 use std::sync::Arc;
@@ -20,10 +20,10 @@ pub(crate) fn create_and_spawn_ipc_engine(
   options: Arc<SocketOptions>,
   is_server: bool,
   context: &Context, // Accept Context reference
-  _parent_id: usize,  // ID of the parent Session actor
+  _parent_id: usize, // ID of the parent Session actor
 ) -> (MailboxSender, JoinHandle<()>) {
-
-  let (tx, rx) = mailbox(); // Mailbox for the engine actor
+  let capacity = context.inner().get_actor_mailbox_capacity();
+  let (tx, rx) = mailbox(capacity);
 
   let config = ZmtpEngineConfig {
     routing_id: options.routing_id.clone(),
@@ -35,7 +35,10 @@ pub(crate) fn create_and_spawn_ipc_engine(
     use_cork: false,
   };
 
-  eprintln!("[DEBUG ENGINE {} PRE-NEW] Creating ZmtpEngineCore, is_server={}", handle, is_server);
+  eprintln!(
+    "[DEBUG ENGINE {} PRE-NEW] Creating ZmtpEngineCore, is_server={}",
+    handle, is_server
+  );
   let core = ZmtpEngineCore::<UnixStream>::new(
     handle,
     session_mailbox,
@@ -45,8 +48,11 @@ pub(crate) fn create_and_spawn_ipc_engine(
     is_server,
     context.clone(), // Pass context clone to the engine core
   );
-  
-  eprintln!("[DEBUG ENGINE {} POST-NEW] ZmtpEngineCore created. Spawning run_loop...", handle);
+
+  eprintln!(
+    "[DEBUG ENGINE {} POST-NEW] ZmtpEngineCore created. Spawning run_loop...",
+    handle
+  );
 
   // Spawn the generic core loop task
   let task_handle = tokio::spawn(core.run_loop()); // run_loop consumes core

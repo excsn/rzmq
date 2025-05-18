@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 #[cfg(not(feature = "io-uring"))]
 use tokio::net::TcpStream as CurrentTcpStream;
+use tokio::task::JoinHandle;
 #[cfg(feature = "io-uring")]
 use tokio_uring::net::TcpStream as CurrentTcpStream;
-use tokio::task::JoinHandle;
 
 use super::core::ZmtpEngineCore;
 
@@ -23,10 +23,10 @@ pub(crate) fn create_and_spawn_tcp_engine(
   options: Arc<SocketOptions>,
   is_server: bool,
   context: &Context, // Accept Context reference
-  _parent_id: usize,  // ID of the parent Session actor
+  _parent_id: usize, // ID of the parent Session actor
 ) -> (MailboxSender, JoinHandle<()>) {
-
-  let (tx, rx) = mailbox(); // Mailbox for the engine actor
+  let capacity = context.inner().get_actor_mailbox_capacity();
+  let (tx, rx) = mailbox(capacity);
 
   let config = ZmtpEngineConfig {
     // Copy relevant fields from socket options

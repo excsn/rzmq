@@ -34,18 +34,23 @@ Provides a `Context` for managing sockets and a `Socket` handle with async metho
 *   **`tcp`**: Reliable TCP transport for network communication.
 *   **`ipc`**: Inter-Process Communication via Unix Domain Sockets (requires `ipc` feature, Unix-like systems only).
 *   **`inproc`**: In-process communication between threads within the same application (requires `inproc` feature).
-*   **`io-uring` (Optional, Linux-only)**: Enables an `io_uring`-based backend for TCP transport via `tokio-uring` for potentially higher performance. Requires using the `#[rzmq::main]` attribute. (Requires `io-uring` feature).
+
+### Performance Enhancements (Optional)
+*   **`io_uring` Backend (Linux-only)**: (Requires `io-uring` feature) Enables an `io_uring`-based backend for TCP transport via `tokio-uring`. This can offer higher performance and lower latency by leveraging Linux's advanced asynchronous I/O interface. Requires using the `#[rzmq::main]` attribute on the application's main function.
+*   **TCP Corking (Linux-only, with `io_uring` or standard TCP)**: (Requires `io-uring` or standard TCP) When enabled via the `TCP_CORK_OPT` socket option, attempts to batch smaller ZMTP frames into fewer TCP segments to reduce network overhead, especially for multi-part messages or frequent small messages.
+*   **Zerocopy Send (Experimental, with `io_uring`)**: (Requires `io-uring` feature and `IO_URING_SNDZEROCOPY` option) Aims to reduce CPU usage and improve throughput for message sending by enabling direct data transfer from userspace buffers to the kernel for network transmission, minimizing data copies.
 
 ### ZMTP 3.1 Protocol Basics
 Implements core aspects of the ZeroMQ Message Transport Protocol version 3.1, including Greeting, Framing, READY command, and PING/PONG keepalives.
 
 ### Common Socket Options
-Supports a range of common socket options for fine-tuning behavior, such as:
+Supports a range of common socket options for fine-tuning behavior, including:
 *   High-Water Marks: `SNDHWM`, `RCVHWM`
 *   Timeouts: `SNDTIMEO`, `RCVTIMEO`, `LINGER`
-*   Connection: `RECONNECT_IVL`, `RECONNECT_IVL_MAX`, `TCP_KEEPALIVE`
+*   Connection: `RECONNECT_IVL`, `RECONNECT_IVL_MAX`, `TCP_KEEPALIVE` options
 *   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE` (for SUB), `ROUTING_ID` (for DEALER/ROUTER), `ROUTER_MANDATORY`
 *   Keepalives: ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
+*   Performance: `TCP_CORK_OPT` (Linux), `IO_URING_SNDZEROCOPY` (Linux, `io-uring` feature)
 
 ### Socket Monitoring
 Offers an event channel via `Socket::monitor()` to observe socket lifecycle events (e.g., connected, disconnected, bind failed), similar to `zmq_socket_monitor`.
@@ -64,12 +69,14 @@ Add `rzmq` to your `Cargo.toml` dependencies. You will also need `tokio`.
 [dependencies]
 # Replace "..." with the desired version or Git source
 # rzmq = "0.1.0" # Example for a published version
-# rzmq = { git = "https://github.com/your-username/rzmq.git", branch = "main" } # Example for Git
+rzmq = { git = "https://github.com/excsn/rzmq.git", branch = "main" } # Or your specific version
 
-# To enable specific features:
-rzmq = { version = "...", features = ["ipc", "inproc", "curve", "io-uring"] }
+# Enable desired features:
+# rzmq = { version = "...", features = ["ipc", "inproc", "curve", "io-uring"] }
 
 tokio = { version = "1", features = ["full"] } # "full" feature recommended
+# For io-uring, ensure tokio-uring is compatible if specified directly by user
+# (though rzmq's io-uring feature will pull in a compatible version)
 ```
 
 **Available Cargo Features:**
@@ -77,14 +84,16 @@ tokio = { version = "1", features = ["full"] } # "full" feature recommended
 *   `ipc`: Enables the `ipc://` transport (Unix-like systems only).
 *   `inproc`: Enables the `inproc://` transport.
 *   `curve`: Enables basic infrastructure for CURVE security (requires `libsodium-rs`). The implementation is experimental.
-*   `io-uring`: (Linux-only) Enables the `io_uring` backend for TCP transport. Requires using `#[rzmq::main]` (see [Usage Guide](README.USAGE.md#using-io_uring-linux)).
+*   `io-uring`: (Linux-only) Enables the `io_uring` backend for TCP transport and related optimizations like Zerocopy Send. Requires using `#[rzmq::main]` (see [Usage Guide](README.USAGE.md#using-io_uring-linux-specific)). This feature also makes `TCP_CORK_OPT` and `IO_URING_SNDZEROCOPY` options available.
 
 **Prerequisites:**
 
-*   **Rust & Cargo**: A recent stable version of Rust.
+*   **Rust & Cargo**: A recent stable version of Rust (e.g., 1.65+).
 *   **Tokio**: `rzmq` is built on Tokio and expects a Tokio runtime.
-*   **Libsodium** (for `curve` feature): If using the `curve` feature, the libsodium development library must be installed on your system.
-*   **Modern Linux Kernel** (for `io-uring` feature): A Linux kernel supporting `io_uring` (typically 5.1+).
+*   **Libsodium** (for `curve` feature): If using the `curve` feature, the libsodium development library must be installed on your system. See [libsodium-rs documentation](https://docs.rs/libsodium-rs/) for details.
+*   **Modern Linux Kernel** (for `io-uring` feature and `TCP_CORK_OPT`):
+    *   For `io_uring`: A Linux kernel version that supports `io_uring` (typically 5.1+ for basic features, 5.6+ for more stable/performant operations, newer for advanced features like multishot).
+    *   For `TCP_CORK`: This is a standard Linux TCP socket option available on most modern kernels.
 
 ## Getting Started / Documentation
 
@@ -99,12 +108,12 @@ A brief example (Push/Pull):
 use rzmq::{Context, SocketType, Msg, ZmqError};
 use std::time::Duration;
 
-// Use #[rzmq::main] if io-uring feature is enabled and on Linux
+// On Linux with "io-uring" feature for rzmq:
 // #[cfg(all(target_os = "linux", feature = "io-uring"))]
 // #[rzmq::main]
-// async fn main() -> Result<(), ZmqError> { ... }
+// async fn main() -> Result<(), ZmqError> { /* ... */ }
 
-// Otherwise, use #[tokio::main]
+// Otherwise (or if io-uring feature is not used):
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
     let ctx = Context::new()?;
@@ -129,24 +138,29 @@ async fn main() -> Result<(), ZmqError> {
 
 ## Missing Features / Limitations (Known)
 
-*   **Full ZMQ Option Parity:** Many `libzmq` options are not yet implemented (e.g., `ZMQ_LAST_ENDPOINT`, various buffer size controls, `ZMQ_IMMEDIATE`).
-*   **Complete Security:** CURVE cryptography and full ZAP (ZeroMQ Authentication Protocol) are not fully implemented or robust.
-*   **`zmq_poll` Equivalent:** No direct high-level equivalent for polling multiple sockets. Users can manage multiple socket futures using Tokio's `select!`.
+*   **Full ZMQ Option Parity:** Many `libzmq` options are not yet implemented (e.g., `ZMQ_LAST_ENDPOINT`, various buffer size controls, `ZMQ_IMMEDIATE`, detailed multicast options).
+*   **Complete Security:** CURVE cryptography and full ZAP (ZeroMQ Authentication Protocol) are not yet production-ready.
+*   **`zmq_poll` Equivalent:** No direct high-level equivalent. Tokio's `select!` macro or task management should be used for concurrent operations on multiple sockets.
 *   **`zmq_proxy` Equivalent:** No built-in high-level proxy function.
-*   **Advanced Pattern Options:** Behavior for some advanced options (e.g., certain `ZMQ_ROUTER_*` flags) needs full verification and implementation.
-*   **Performance:** While built on Tokio, `rzmq` has not yet undergone heavy performance optimization or benchmarking against `libzmq`. Advanced `io_uring` features like explicit zerocopy are not yet deeply integrated.
+*   **Advanced Pattern Options:** Behavior for some advanced options (e.g., certain `ZMQ_ROUTER_*` flags, `SUB` forwarding) needs full verification and implementation.
+*   **Performance:**
+    *   While `io_uring` support is added for potential gains, `rzmq` has not undergone extensive performance optimization or direct benchmarking against `libzmq` across all scenarios.
+    *   Zerocopy receive and advanced `io_uring` buffer management (like registered buffers for multishot) are not yet implemented.
 *   **Error Handling Parity:** The mapping of internal errors to specific `ZmqError` variants corresponding to all `zmq_errno()` values may not be exhaustive.
-*   **Robustness:** Edge cases, high-concurrency scenarios, and complex network failure conditions require more extensive testing.
+*   **Robustness:** Edge cases, high-concurrency stress, diverse network failure modes, and very long-running stability require more extensive testing.
 
 ## Running Tests
 
 ```bash
-# Run default tests
+# Run default tests (standard Tokio backend)
 cargo test
 
-# Run tests enabling specific features
+# Run tests enabling specific transport features (e.g., IPC)
 cargo test --features "ipc,inproc"
-cargo test --features "io-uring" # On Linux
+
+# Run tests with the io_uring backend (on Linux)
+# This will also enable tests that might be specific to io_uring behavior.
+cargo test --features "io-uring"
 ```
 
 ## License

@@ -83,7 +83,8 @@ impl TcpListener {
     parent_socket_id: usize,
   ) -> Result<(MailboxSender, JoinHandle<()>), ZmqError> {
     let actor_type = ActorType::Listener;
-    let (tx, rx) = mailbox(); // Mailbox for this Listener's command loop.
+    let capacity = context.inner().get_actor_mailbox_capacity();
+    let (tx, rx) = mailbox(capacity);
 
     // Bind the OS TCP listener.
     let bind_addr_str = endpoint

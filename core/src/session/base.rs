@@ -41,7 +41,8 @@ impl SessionBase {
     parent_socket_id: usize,
   ) -> (MailboxSender, JoinHandle<()>) {
     let actor_type = ActorType::Session;
-    let (tx, rx) = mailbox();
+    let capacity = context.inner().get_actor_mailbox_capacity();
+    let (tx, rx) = mailbox(capacity);
     let session = SessionBase {
       handle,
       // <<< MODIFIED START [Clone endpoint_uri for logging before move] >>>

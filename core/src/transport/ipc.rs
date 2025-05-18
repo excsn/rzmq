@@ -56,7 +56,8 @@ impl IpcListener {
     parent_socket_id: usize,
   ) -> Result<(MailboxSender, JoinHandle<()>), ZmqError> {
     let actor_type = ActorType::Listener;
-    let (tx, rx) = mailbox();
+    let capacity = context.inner().get_actor_mailbox_capacity();
+    let (tx, rx) = mailbox(capacity);
 
     // Attempt to remove an existing socket file before binding.
     match std::fs::remove_file(&path) {
@@ -390,7 +391,8 @@ impl IpcConnecter {
     parent_socket_id: usize,
   ) -> (MailboxSender, JoinHandle<()>) {
     let actor_type = ActorType::Connecter;
-    let (tx, _rx) = mailbox(); // Mailbox for connecter (receiver currently unused).
+    let capacity = context.inner().get_actor_mailbox_capacity();
+    let (tx, rx) = mailbox(capacity);
 
     let connecter_actor = IpcConnecter {
       handle,
