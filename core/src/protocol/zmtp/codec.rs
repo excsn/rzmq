@@ -1,10 +1,7 @@
-// src/protocol/zmtp/codec.rs
-
 use crate::error::ZmqError;
 use crate::message::{Msg, MsgFlags};
-use crate::protocol::zmtp::command::*; // Use framing constants
+use crate::protocol::zmtp::command::*;
 use bytes::{Buf, BufMut, BytesMut};
-use std::convert::TryInto;
 use tokio_util::codec::{Decoder, Encoder};
 
 /// Codec for ZMTP/3.1 message framing.
@@ -42,6 +39,51 @@ impl ZmtpCodec {
       tracing::trace!(prefix_len = prefix.len(), "ZmtpCodec primed with prefix bytes");
       self.prefix_bytes = Some(prefix);
     }
+  }
+
+  /// Encodes only the ZMTP frame header (flags and length) for the given message
+  /// into the destination `BytesMut` buffer.
+  ///
+  /// The actual message payload from `item.data()` is NOT written by this method.
+  /// This is intended for use with vectored/zerocopy sends where the payload
+  /// is sent from a separate buffer.
+  ///
+  /// # Arguments
+  /// * `item`: A reference to the `Msg` whose header is to be encoded.
+  /// * `dst`: The `BytesMut` buffer to write the header into.
+  ///
+  /// # Returns
+  /// `Ok(())` on success, or a `ZmqError` if an issue occurs (though unlikely for header encoding).
+  pub fn encode_header_only(&self, item: &Msg, dst: &mut BytesMut) -> Result<(), ZmqError> {
+    let data_size = item.size(); // This is the size of the payload that *would* be sent
+    let msg_flags = item.flags();
+
+    let mut zmtp_flags_byte = 0u8;
+    if msg_flags.contains(MsgFlags::MORE) {
+      zmtp_flags_byte |= ZMTP_FLAG_MORE;
+    }
+    if msg_flags.contains(MsgFlags::COMMAND) {
+      zmtp_flags_byte |= ZMTP_FLAG_COMMAND;
+    }
+
+    // ZMTP 3.1 framing:
+    // Short frame: flags(1) + size(1-byte u8)
+    // Long frame:  flags(1) | ZMTP_FLAG_LONG + size(8-byte u64)
+    // Note: ZMTP_FLAG_COMMAND is OR'd into the flags byte.
+    // ZMTP_FLAG_LONG is also OR'd if it's a long message.
+
+    if data_size <= 255 {
+      // Max payload size for a short frame
+      dst.reserve(1 + 1); // 1 byte for flags, 1 byte for u8 length
+      dst.put_u8(zmtp_flags_byte); // Combined flags (MORE, COMMAND)
+      dst.put_u8(data_size as u8);
+    } else {
+      zmtp_flags_byte |= ZMTP_FLAG_LONG; // Set the LONG flag bit
+      dst.reserve(1 + 8); // 1 byte for flags, 8 bytes for u64 length
+      dst.put_u8(zmtp_flags_byte); // Combined flags (MORE, COMMAND, LONG)
+      dst.put_u64(data_size as u64); // Message length as u64
+    }
+    Ok(())
   }
 }
 
@@ -90,7 +132,7 @@ impl Decoder for ZmtpCodec {
   type Error = ZmqError;
 
   fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-    if let Some(mut prefix) = self.prefix_bytes.take() {
+    if let Some(prefix) = self.prefix_bytes.take() {
       if !prefix.is_empty() {
         tracing::trace!(
           prefix_len = prefix.len(),

@@ -1,6 +1,6 @@
 use crate::message::flags::MsgFlags;
 use crate::message::metadata::Metadata;
-use bytes::{Bytes, BytesMut}; // Use Bytes for received, BytesMut for building?
+use bytes::Bytes;
 use std::fmt;
 
 /// Represents a single message part (frame).
@@ -83,6 +83,15 @@ impl Msg {
   /// Checks if the `COMMAND` flag is set.
   pub fn is_command(&self) -> bool {
     self.flags.contains(MsgFlags::COMMAND)
+  }
+
+  /// Returns the internal `Bytes` object if data is present.
+  ///
+  /// This is useful for operations that need to take ownership or a clone
+  /// of the underlying `Bytes` object, such as for zerocopy send operations.
+  /// Cloning `Bytes` is cheap as it is reference-counted.
+  pub fn data_bytes(&self) -> Option<Bytes> {
+    self.data.clone()
   }
 }
 

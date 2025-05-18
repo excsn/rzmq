@@ -90,7 +90,7 @@ impl<S: ZmtpStream> fmt::Debug for ZmtpEngineCore<S> {
     }
 
     debug_struct.field(
-      "expecting_first_frame_of_logical_msg",
+      "expecting_first_frame_of_msg",
       &self.expecting_first_frame_of_msg,
     );
     debug_struct.finish_non_exhaustive()
@@ -584,7 +584,6 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
 
     let mut framed_transport_stream = Framed::new(raw_stream, ZmtpCodec::new());
 
-    // <<< MODIFIED START [Re-cache FD if necessary after Framed takes ownership] >>>
     // This assumes the FD obtained from the stream wrapped by Framed is the same
     // as the initial raw stream. This should be true.
     #[cfg(target_os = "linux")]
@@ -600,7 +599,6 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
         // This would be a critical internal error.
       }
     }
-    // <<< MODIFIED END >>>
 
     match self
       .perform_security_and_ready_handshake(&mut framed_transport_stream, peer_greeting)
@@ -687,29 +685,85 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
           match command_from_session {
             Command::SessionPushCmd { msg } => {
               let is_last_frame_of_user_message = !msg.is_more();
+              let mut current_send_error: Option<ZmqError> = None;
               let mut send_occurred_successfully = false;
 
               #[cfg(target_os = "linux")]
               if self.config.use_cork {
                   if let Some(fd) = self.stream_fd_for_cork {
-                      if self.expecting_first_frame_of_logical_msg && !self.is_corked {
+                      if self.expecting_first_frame_of_msg && !self.is_corked {
                           // This is the first frame of a new logical ZMQ message, and we are not yet corked. Cork it.
                           Self::set_tcp_cork_rawfd(fd, true, self.handle).await;
                           self.is_corked = true;
                       }
-                  } else if self.expecting_first_frame_of_logical_msg { // Log if cork enabled but FD missing
+                  } else if self.expecting_first_frame_of_msg { // Log if cork enabled but FD missing
                       tracing::warn!(engine_handle = self.handle, "TCP_CORK is enabled but stream FD is not available for setting cork.");
                   }
               }
 
+              // --- Determine Send Path (Zerocopy or Standard) ---
+              let use_zc_path = cfg!(feature = "io-uring") && self.config.use_send_zerocopy;
+
+              if use_zc_path {
+                #[cfg(feature = "io-uring")] // Ensures this block only active if io-uring feature is on
+                {
+                  let uring_stream_ref = framed_transport_stream.get_ref(); // S should be tokio_uring::net::TcpStream
+
+                  let zmtp_header_bytes: Bytes = {
+                    let mut temp_buf = bytes::BytesMut::with_capacity(9);
+                    let codec = ZmtpCodec::new();
+                    match codec.encode_header_only(&msg, &mut temp_buf) {
+                        Ok(()) => temp_buf.freeze(),
+                        Err(e) => {
+                            tracing::error!(engine_handle = self.handle, "ZC Send: Failed to encode header: {}", e);
+                            current_send_error = Some(e);
+                            Bytes::new() // Dummy to satisfy type, error will be handled
+                        }
+                    }
+                  };
+
+                  if current_send_error.is_none() {
+                    let payload_bytes: Bytes = msg.data_bytes().unwrap_or_else(Bytes::new);
+                    let bufs = [zmtp_header_bytes.slice(..), payload_bytes.slice(..)];
+                    let total_bytes_to_send = bufs[0].bytes_init() + bufs[1].bytes_init();
+
+                    tracing::trace!(engine_handle = self.handle, header_len = bufs[0].bytes_init(), payload_len = bufs[1].bytes_init(), "Attempting ZC vectored send.");
+                    match uring_stream_ref.send_vectored_zc(&bufs).await {
+                      Ok(bytes_sent) => {
+                        if bytes_sent != total_bytes_to_send {
+                          tracing::error!(engine_handle = self.handle, expected = total_bytes_to_send, actual = bytes_sent, "ZC send_vectored_zc resulted in a partial send.");
+                          current_send_error = Some(ZmqError::from(io::Error::new(io::ErrorKind::WriteZero, "Partial zerocopy send")));
+                        } else {
+                          send_occurred_successfully = true;
+                          tracing::trace!(engine_handle = self.handle, bytes_sent, "ZC vectored send successful.");
+                        }
+                      }
+                      Err(e) => {
+                        tracing::error!(engine_handle = self.handle, error = %e, "Engine ZC send_vectored_zc failed.");
+                        current_send_error = Some(ZmqError::from(e));
+                      }
+                    }
+                  }
+                }
+              } else { // Standard send path
+                if let Err(e) = framed_transport_stream.send(msg).await {
+                  current_send_error = Some(e);
+                } else {
+                  send_occurred_successfully = true;
+                }
+              }
+
               // Current plan: All sends go through framed_stream. Zerocopy path is deferred.
-              if let Err(e) = framed_transport_stream.send(msg).await {
+              if let Some(e) = current_send_error {
                 tracing::error!(engine_handle = self.handle, error = %e, "Engine failed to send message.");
+
                 if !self.session_mailbox.is_closed() {
                   let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await;
                 }
+
                 final_error_for_actor_stop = Some(e);
                 should_break_loop = true;
+
                 // If send fails, ensure cork is released if it was set for this message attempt
                 #[cfg(target_os = "linux")]
                 if self.is_corked {
@@ -719,23 +773,19 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
                   self.is_corked = false;
                   self.expecting_first_frame_of_msg = true; // Reset for next attempt if any
                 }
-              } else {
+              } else if send_occurred_successfully {
                 self.last_activity_time = Instant::now();
-                send_occurred_successfully = true;
-              }
+                self.expecting_first_frame_of_msg = is_last_frame_of_user_message;
 
-              if send_occurred_successfully {
-                  self.expecting_first_frame_of_msg = is_last_frame_of_user_message;
-              }
-
-              #[cfg(target_os = "linux")]
-              if self.is_corked && self.expecting_first_frame_of_msg && send_occurred_successfully {
+                #[cfg(target_os = "linux")]
+                if self.is_corked && self.expecting_first_frame_of_msg && send_occurred_successfully {
                   // This means the frame just sent was the last part of a logical ZMQ message,
                   // and the cork was active. Uncork now.
                   if let Some(fd) = self.stream_fd_for_cork {
                       Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork
                   }
                   self.is_corked = false;
+                }
               }
             }
             Command::Stop => {
