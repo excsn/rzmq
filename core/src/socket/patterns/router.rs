@@ -1,8 +1,6 @@
-// src/socket/patterns/router.rs
-
-use crate::message::Blob; // Use Blob for identities
+use crate::message::Blob;
 use std::collections::HashMap;
-use tokio::sync::Mutex; // Protect the maps
+use tokio::sync::Mutex;
 
 /// Maps peer identities (Blobs) to outgoing pipe write IDs.
 /// Used by ROUTER sockets to send messages to specific peers.
@@ -39,7 +37,6 @@ impl RouterMap {
     if let Some(old_pipe_write_id) = id_to_pipe_guard.insert(identity.clone(), pipe_write_id) {
       if old_pipe_write_id != pipe_write_id {
         let mut _old_read_id: Option<usize> = None; // Provide type usize
-                                                    // <<< MODIFIED END >>>
                                                     // Find the old read ID associated with the old write ID to clean up reverse map
                                                     // Still inefficient without better map structure, logging warning only.
         tracing::warn!(

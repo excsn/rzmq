@@ -33,6 +33,18 @@ pub(crate) fn create_and_spawn_ipc_engine(
     use_send_zerocopy: false,
     use_recv_multishot: false,
     use_cork: false,
+    #[cfg(feature = "io-uring")]
+    recv_multishot_buffer_count: if options.io_uring_recv_multishot {
+      options.io_uring_recv_buffer_count // Use value from SocketOptions if toggle is on
+    } else {
+      DEFAULT_IO_URING_RECV_BUFFER_COUNT // Else, use default (won't be used by engine logic if toggle is off)
+    },
+    #[cfg(feature = "io-uring")]
+    recv_multishot_buffer_capacity: if options.io_uring_recv_multishot {
+      options.io_uring_recv_buffer_size // Use value from SocketOptions if toggle is on
+    } else {
+      DEFAULT_IO_URING_RECV_BUFFER_SIZE // Else, use default
+    },
   };
 
   eprintln!(

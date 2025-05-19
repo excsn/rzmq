@@ -14,7 +14,7 @@ use thiserror::Error;
 /// or `ConnectionAttemptFailed`) to also be `Clone` for use with `tokio::sync::broadcast`.
 /// To achieve this, variants holding non-Clone types like `std::io::Error`
 /// store essential information (kind, message string) instead of the original error.
-#[derive(Error, Debug, Clone)] // Added Clone for use in clonable SystemEvents.
+#[derive(Error, Debug, Clone)]
 #[non_exhaustive] // Indicates that more error variants may be added in the future without breaking API.
 pub enum ZmqError {
   // --- I/O Errors ---

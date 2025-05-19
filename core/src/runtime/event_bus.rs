@@ -1,16 +1,15 @@
-// src/runtime/event_bus.rs
-#![allow(dead_code)] // Allow unused elements during development
+#![allow(dead_code)]
 
-use super::system_events::SystemEvent; // Use the defined event type
+use super::system_events::SystemEvent;
 use tokio::sync::broadcast::{self, error::SendError, Receiver, Sender};
-use tracing; // <<< ADDED
+use tracing;
 
 // Define a reasonable capacity for the bus
 const DEFAULT_EVENT_BUS_CAPACITY: usize = 256;
 
 /// A self-contained event bus for broadcasting system-wide events.
 /// Internally uses tokio::sync::broadcast.
-#[derive(Debug, Clone)] // <<< MODIFIED [Added Clone] >>>
+#[derive(Debug, Clone)]
 pub struct EventBus {
   sender: Sender<SystemEvent>,
 }
@@ -19,14 +18,14 @@ impl EventBus {
   /// Creates a new EventBus with default capacity.
   pub fn new() -> Self {
     let (sender, _) = broadcast::channel(DEFAULT_EVENT_BUS_CAPACITY);
-    tracing::debug!(capacity = DEFAULT_EVENT_BUS_CAPACITY, "Created new EventBus"); // <<< ADDED >>>
+    tracing::debug!(capacity = DEFAULT_EVENT_BUS_CAPACITY, "Created new EventBus");
     Self { sender }
   }
 
   /// Creates a new EventBus with specific capacity.
   pub fn with_capacity(capacity: usize) -> Self {
     let (sender, _) = broadcast::channel(capacity.max(1)); // Ensure capacity >= 1
-    tracing::debug!(capacity = capacity.max(1), "Created new EventBus with capacity"); // <<< ADDED >>>
+    tracing::debug!(capacity = capacity.max(1), "Created new EventBus with capacity");
     Self { sender }
   }
 
@@ -35,7 +34,7 @@ impl EventBus {
   /// Returns the number of active receivers the event was sent to,
   /// or an error if there are no receivers (which might indicate an issue).
   pub fn publish(&self, event: SystemEvent) -> Result<usize, SendError<SystemEvent>> {
-    tracing::trace!(event = ?event, "Publishing event"); // <<< ADDED >>>
+    tracing::trace!(event = ?event, "Publishing event");
     self.sender.send(event)
   }
 

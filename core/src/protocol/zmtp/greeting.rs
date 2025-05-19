@@ -1,11 +1,6 @@
-// src/protocol/zmtp/greeting.rs
-
 use crate::error::ZmqError;
-use crate::security::Mechanism; // Import concrete mechanisms later if needed
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use std::convert::TryInto;
-
-// <<< ADDED GREETING CONSTANTS & STRUCT >>>
 
 pub const GREETING_PREFIX: &[u8; 10] =
   &[0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F];
@@ -24,9 +19,7 @@ pub struct ZmtpGreeting {
   pub mechanism: [u8; MECHANISM_LENGTH], // ASCII mechanism name padded with nulls
   pub as_server: bool,
 }
-// <<< ADDED GREETING CONSTANTS & STRUCT END >>>
 
-// <<< ADDED GREETING FUNCTIONS >>>
 impl ZmtpGreeting {
   /// Creates a greeting message to be sent.
   pub fn encode(mechanism: &[u8; MECHANISM_LENGTH], as_server: bool, buffer: &mut BytesMut) {
@@ -119,4 +112,3 @@ impl ZmtpGreeting {
     std::str::from_utf8(&self.mechanism[..first_null]).unwrap_or("<invalid_utf8>")
   }
 }
-// <<< ADDED GREETING FUNCTIONS END >>>

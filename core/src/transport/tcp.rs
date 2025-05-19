@@ -81,7 +81,7 @@ impl TcpListener {
     monitor_tx: Option<MonitorSender>,
     context: Context,
     parent_socket_id: usize,
-  ) -> Result<(MailboxSender, JoinHandle<()>), ZmqError> {
+  ) -> Result<(MailboxSender, JoinHandle<()>, String), ZmqError> {
     let actor_type = ActorType::Listener;
     let capacity = context.inner().get_actor_mailbox_capacity();
     let (tx, rx) = mailbox(capacity);
@@ -132,7 +132,8 @@ impl TcpListener {
     };
 
     let local_addr = tokio_listener_arc.local_addr().map_err(ZmqError::from)?;
-    tracing::info!(listener_handle = handle, ?local_addr, uri = %endpoint, "TCP Listener bound successfully");
+    let resolved_uri = format!("tcp://{}", local_addr);
+    tracing::info!(listener_handle = handle, local_addr = %resolved_uri, user_provided_uri = %endpoint, "TCP Listener bound successfully");
 
     // Prepare TCP configuration for accepted streams.
     let transport_config = TcpTransportConfig {
@@ -148,7 +149,7 @@ impl TcpListener {
     let accept_options_clone = options.clone();
     let accept_config_clone = transport_config.clone();
     let accept_monitor_tx_clone = monitor_tx.clone();
-    let endpoint_for_accept_loop = endpoint.clone();
+    let endpoint_for_accept_loop = resolved_uri.clone();
     let context_for_accept_loop = context.clone();
     let parent_socket_id_for_accept_loop = parent_socket_id;
     let accept_loop_parent_handle = handle; // Accept loop's parent for eventing is this Listener.
@@ -176,7 +177,7 @@ impl TcpListener {
 
     let listener_actor = TcpListener {
       handle,
-      endpoint,
+      endpoint: resolved_uri.clone(),
       mailbox_receiver: rx,
       listener_handle: accept_loop_task_join_handle,
       context: context.clone(),
@@ -186,7 +187,7 @@ impl TcpListener {
     let command_loop_join_handle = tokio::spawn(listener_actor.run_command_loop());
     context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
 
-    Ok((tx, command_loop_join_handle))
+    Ok((tx, command_loop_join_handle, resolved_uri))
   }
 
   async fn run_command_loop(mut self) {

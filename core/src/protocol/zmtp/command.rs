@@ -1,7 +1,3 @@
-// src/protocol/zmtp/command.rs
-
-// <<< ADDED ZMTP FRAMING CONSTANTS >>>
-
 use std::collections::HashMap;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};

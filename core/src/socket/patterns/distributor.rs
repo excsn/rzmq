@@ -1,14 +1,9 @@
-// src/socket/patterns/distributor.rs
-
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::runtime::MailboxSender;
 use crate::socket::core::send_msg_with_timeout;
-// Needed if sending commands back for cleanup
-use crate::CoreState; // Need CoreState to get Senders
+use crate::CoreState;
 use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::Mutex; // Use Tokio Mutex if state needs internal mutation
+use tokio::sync::Mutex;
 
 /// Distributes messages to a set of connected pipes (write IDs).
 #[derive(Debug, Default)]
@@ -50,7 +45,7 @@ impl Distributor {
   pub async fn send_to_all(
     &self,
     msg: &Msg,
-    core_handle: usize, // Added core_handle parameter
+    core_handle: usize,
     core_state_mutex: &Mutex<CoreState>,
   ) -> Result<(), Vec<(usize, ZmqError)>> {
     let peer_ids = self.get_peer_ids().await;

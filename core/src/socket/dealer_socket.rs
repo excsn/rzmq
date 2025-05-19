@@ -1,19 +1,18 @@
-// src/socket/dealer_socket.rs
-
-use crate::delegate_to_core; // Macro for delegating API calls to SocketCore.
+use crate::delegate_to_core;
 use crate::error::ZmqError;
-use crate::message::{Blob, Msg, MsgFlags}; // Blob not directly used here, but often with DEALER/ROUTER.
+use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
-use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore}; // Core components.
+use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
 use crate::socket::options::SocketOptions;
-use crate::socket::patterns::{FairQueue, LoadBalancer}; // DEALER uses LoadBalancer (out) and FairQueue (in).
-use crate::socket::{ISocket, SourcePipeReadId}; // The trait this struct implements.
+use crate::socket::patterns::{FairQueue, LoadBalancer};
+use crate::socket::{ISocket, SourcePipeReadId}; 
 
-use async_trait::async_trait;
-use std::collections::HashMap; // For pipe_read_to_write_id map.
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex, MutexGuard}; // Mutex for internal state, oneshot for API replies.
+
+use async_trait::async_trait;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::timeout; // For send/recv timeouts.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,7 +289,7 @@ impl ISocket for DealerSocket {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
         let mut state_map_guard = self.pipe_state.lock().await;
-        let mut current_pipe_state = state_map_guard.entry(pipe_read_id).or_insert(IncomingPipeState::Idle);
+        let current_pipe_state = state_map_guard.entry(pipe_read_id).or_insert(IncomingPipeState::Idle);
         let is_last_part_of_transport_msg = !msg.is_more(); // Whether this is the last ZMTP frame
 
         tracing::trace!(

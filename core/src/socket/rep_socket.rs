@@ -1,5 +1,3 @@
-// src/socket/rep_socket.rs
-
 use crate::delegate_to_core;
 use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
@@ -13,7 +11,7 @@ use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
@@ -85,7 +83,7 @@ impl ISocket for RepSocket {
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    let mut current_state_guard = self.state.lock().await;
+    let current_state_guard = self.state.lock().await;
     if !matches!(*current_state_guard, RepState::ReadyToReceive) {
       return Err(ZmqError::InvalidState(
         "REP socket must call send() before receiving again",
@@ -183,7 +181,6 @@ impl ISocket for RepSocket {
     *current_state_guard = RepState::ReceivedRequest(peer_info);
     drop(current_state_guard);
 
-    // <<< MODIFIED START [Perform await before tracing macro] >>>
     // Pre-calculate the value that involves an await.
     let num_prefix_frames_for_log = actual_payload
       .metadata()
@@ -197,7 +194,6 @@ impl ISocket for RepSocket {
       num_prefix_frames = num_prefix_frames_for_log, // Use the pre-calculated value
       "REP received complete request, ready to send reply"
     );
-    // <<< MODIFIED END >>>
     Ok(actual_payload)
   }
 

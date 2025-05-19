@@ -1,5 +1,3 @@
-// src/socket/options.rs
-
 use std::time::Duration;
 
 use crate::{Blob, ZmqError};
@@ -15,6 +13,7 @@ pub const RECONNECT_IVL: i32 = 18; // ZMQ_RECONNECT_IVL
 pub const RECONNECT_IVL_MAX: i32 = 21; // ZMQ_RECONNECT_IVL_MAX
 pub const RCVTIMEO: i32 = 27;
 pub const SNDTIMEO: i32 = 28;
+pub const LAST_ENDPOINT: i32 = 32;
 pub const TCP_KEEPALIVE: i32 = 34;
 pub const TCP_KEEPALIVE_IDLE: i32 = 35;
 pub const TCP_KEEPALIVE_CNT: i32 = 36;
@@ -49,6 +48,24 @@ pub const IO_URING_RCVMULTISHOT: i32 = 1171;
 /// Socket option: Enable/disable TCP_CORK (Linux only).
 /// Value is i32 (0 or 1).
 pub const TCP_CORK_OPT: i32 = 1172; 
+
+/// Socket option (i32): Number of buffers to use in the io_uring multishot receive pool.
+/// Only effective if `IO_URING_RCVMULTISHOT` (the boolean flag) is also enabled.
+/// Default: 16. Min: 1.
+#[cfg(feature = "io-uring")]
+pub const IO_URING_RECV_BUFFER_COUNT: i32 = 1173;
+
+/// Socket option (i32): Size of each buffer (in bytes) in the io_uring multishot receive pool.
+/// Only effective if `IO_URING_RCVMULTISHOT` (the boolean flag) is also enabled.
+/// Default: 65536 (64KB). Min: 1024.
+#[cfg(feature = "io-uring")]
+pub const IO_URING_RECV_BUFFER_SIZE: i32 = 1174;
+
+#[cfg(feature = "io-uring")]
+pub const DEFAULT_IO_URING_RECV_BUFFER_COUNT: usize = 16;
+/// Default size (in bytes) for each buffer in the io_uring multishot receive pool.
+#[cfg(feature = "io-uring")]
+pub const DEFAULT_IO_URING_RECV_BUFFER_SIZE: usize = 65536; // 64KB
 
 // Key Length Constants (from libsodium)
 #[cfg(feature = "curve")]
@@ -109,6 +126,10 @@ pub(crate) struct SocketOptions {
   pub io_uring_send_zerocopy: bool,
   pub io_uring_recv_multishot: bool,
   pub tcp_cork: bool,
+  #[cfg(feature = "io-uring")]
+  pub io_uring_recv_buffer_count: usize,
+  #[cfg(feature = "io-uring")]
+  pub io_uring_recv_buffer_size: usize,
 }
 
 impl Default for SocketOptions {
@@ -146,7 +167,11 @@ impl Default for SocketOptions {
       curve_server_key: None,
       io_uring_send_zerocopy: false,
       io_uring_recv_multishot: false,
-      tcp_cork: false, 
+      tcp_cork: false,
+      #[cfg(feature = "io-uring")]
+      io_uring_recv_buffer_count: DEFAULT_IO_URING_RECV_BUFFER_COUNT,
+      #[cfg(feature = "io-uring")]
+      io_uring_recv_buffer_size: DEFAULT_IO_URING_RECV_BUFFER_SIZE,
     }
   }
 }
@@ -178,8 +203,11 @@ pub(crate) struct ZmtpEngineConfig {
   pub use_recv_multishot: bool,
   // TCP Corking
   pub use_cork: bool,
+  #[cfg(feature = "io-uring")]
+  pub recv_multishot_buffer_count: usize,
+  #[cfg(feature = "io-uring")]
+  pub recv_multishot_buffer_capacity: usize,
 }
-// <<< ADDED TcpConfig STRUCT END >>>
 
 // --- Helper functions for parsing option values ---
 /// Parses a byte slice representing an integer option (like HWM, linger).
@@ -231,7 +259,6 @@ pub(crate) fn parse_timeout_option(value: &[u8], option_id: i32) -> Result<Optio
 }
 
 pub(crate) fn parse_linger_option(value: &[u8]) -> Result<Option<Duration>, ZmqError> {
-  // <<< MODIFIED END >>>
   let val = parse_i32_option(value)?;
   match val {
     -1 => Ok(None),                                     // None represents infinite linger

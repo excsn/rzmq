@@ -1,5 +1,3 @@
-// src/runtime/waitgroup.rs
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -188,7 +186,6 @@ mod tests {
 
     let wg_clone_wait = wg.clone();
     let mut wait_task = tokio::spawn(async move {
-      // <<< Marked mut >>>
       wg_clone_wait.wait().await; // Should block
     });
 
@@ -200,12 +197,10 @@ mod tests {
     wg.done(); // Count is 1
     assert_eq!(wg.get_count(), 1);
     // Wait should still be blocked
-    // <<< MODIFIED START: Correct check >>>
     assert!(
       timeout(Duration::from_millis(10), &mut wait_task).await.is_err(),
       "Wait task should still be blocked after one done()"
     );
-    // <<< MODIFIED END >>>
 
     wg.done(); // Count is 0
     assert_eq!(wg.get_count(), 0);

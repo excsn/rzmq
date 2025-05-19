@@ -1,16 +1,13 @@
-// tests/dealer_router_advanced.rs
-
 use common::wait_for_monitor_event;
 use rzmq::socket::options::ROUTER_MANDATORY;
 use rzmq::socket::SocketEvent;
-// <<< Added Import >>>
-use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
+use rzmq::{Msg, MsgFlags, SocketType, ZmqError};
 use serial_test::serial;
-use std::collections::{HashMap, HashSet}; // <<< Added HashMap >>>
-use std::sync::Arc; // <<< Added Arc >>>
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Barrier; // <<< Added Barrier >>>
-use tokio::task; // <<< Added task >>>
+use tokio::sync::Barrier;
+use tokio::task;
 
 mod common;
 
@@ -187,7 +184,7 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_false() -> Result<
     "ROUTER sending to unknown ID {:?} (mandatory=false, identity frame)...",
     unknown_id_data
   );
-  // <<< MODIFIED START [Assertion for ROUTER_MANDATORY=false] >>>
+  
   let send_id_res = router.send(id_msg).await;
   assert!(
     send_id_res.is_ok(),
@@ -301,14 +298,13 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
   let router = ctx.socket(SocketType::Router)?;
   let endpoint = "tcp://127.0.0.1:5613"; // Unique port
 
-  // <<< ADDED: Setup monitoring for the router >>>
   println!("Setting up monitor for ROUTER...");
   let monitor_rx = router.monitor_default().await?;
   println!("Monitor setup.");
 
   println!("Binding ROUTER to {}...", endpoint);
   router.bind(endpoint).await?;
-  // <<< ADDED: Wait for Listening event >>>
+  
   println!("ROUTER waiting for Listening event...");
   wait_for_monitor_event(
     &monitor_rx,
@@ -331,7 +327,6 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
     println!("Connecting DEALER to {}...", endpoint);
     dealer.connect(endpoint).await?;
 
-    // <<< ADDED: Wait for Accepted/Handshake event on Router >>>
     println!("ROUTER waiting for Accepted/Handshake event...");
     let connected_event = wait_for_monitor_event(&monitor_rx, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
       matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
@@ -345,7 +340,6 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
       _ => unreachable!(),
     }
     println!("ROUTER received connection event for: {}", dealer_endpoint_uri);
-    // <<< ADDED END >>>
 
     // Dealer sends a message so Router learns its identity
     println!("DEALER sending initial message...");
@@ -365,7 +359,6 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
     // Dealer socket is dropped here
   } // dealer dropped
 
-  // <<< MODIFIED: Wait for Disconnected event instead of sleep >>>
   println!("ROUTER waiting for Disconnected event for {}...", dealer_endpoint_uri);
   wait_for_monitor_event(
     &monitor_rx,
@@ -376,7 +369,6 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
   .await
   .map_err(|e| ZmqError::Internal(format!("Disconnect event wait failed: {}", e)))?;
   println!("ROUTER received Disconnected event.");
-  // <<< MODIFIED END >>>
 
   // Router attempts to send to the now-disconnected dealer
   let mut id_msg = Msg::from_vec(dealer_identity.clone());

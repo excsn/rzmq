@@ -1,20 +1,14 @@
-// src/socket/core.rs
-
-// --- Imports ---
-// Import specific socket pattern implementations.
 use super::{DealerSocket, PubSocket, PullSocket, PushSocket, RepSocket, ReqSocket, RouterSocket, SubSocket};
-use crate::context::Context; // For accessing EventBus, handle generation, inproc registry.
-use crate::error::ZmqError; // Custom error type.
+use crate::context::Context;
+use crate::error::ZmqError;
 use crate::runtime::{
-  self, mailbox, ActorDropGuard, ActorType, Command, EventBus, MailboxReceiver, MailboxSender, SystemEvent, WaitGroup,
-}; // Core runtime primitives. `SocketMailbox` was removed.
-use crate::session::SessionBase; // For spawning Session actors.
-use crate::socket::events::{MonitorSender, SocketEvent}; // For socket monitoring.
-                                                         // Import all socket option constants and parsing helpers.
+  mailbox, ActorDropGuard, ActorType, Command, MailboxReceiver, MailboxSender, SystemEvent,
+};
+use crate::socket::events::{MonitorSender, SocketEvent}; 
 use crate::socket::options::{
-  self, parse_blob_option, parse_bool_option, parse_duration_ms_option, parse_heartbeat_option, parse_i32_option,
-  parse_keepalive_mode_option, parse_linger_option, parse_reconnect_ivl_max_option, parse_reconnect_ivl_option,
-  parse_secs_duration_option, parse_timeout_option, parse_u32_option, SocketOptions, ZmtpEngineConfig, HEARTBEAT_IVL,
+  self, parse_blob_option, parse_bool_option, parse_heartbeat_option, parse_i32_option,
+  parse_keepalive_mode_option,
+  parse_secs_duration_option, parse_timeout_option, parse_u32_option, SocketOptions, HEARTBEAT_IVL,
   HEARTBEAT_TIMEOUT, LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME, RCVHWM, RCVTIMEO, RECONNECT_IVL,
   RECONNECT_IVL_MAX, ROUTER_MANDATORY, ROUTING_ID, SNDHWM, SNDTIMEO, SUBSCRIBE, TCP_KEEPALIVE, TCP_KEEPALIVE_CNT,
   TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTVL, UNSUBSCRIBE, ZAP_DOMAIN, TCP_CORK_OPT,
@@ -23,33 +17,35 @@ use crate::socket::options::{
 use crate::socket::options::{
   IO_URING_RCVMULTISHOT,
   IO_URING_SNDZEROCOPY,
+  IO_URING_RECV_BUFFER_COUNT,
+  IO_URING_RECV_BUFFER_SIZE,
+  DEFAULT_IO_URING_RECV_BUFFER_COUNT,
+  DEFAULT_IO_URING_RECV_BUFFER_SIZE,
 };
 #[cfg(feature = "curve")]
 use crate::socket::options::{
   parse_key_option, CURVE_KEY_LEN, CURVE_PUBLICKEY, CURVE_SECRETKEY, CURVE_SERVER, CURVE_SERVERKEY,
 };
-// Patterns module not directly used here, but ISocket impls use it.
-// use crate::socket::patterns;
-use crate::socket::types::SocketType; // Enum for socket types.
-use crate::socket::ISocket; // Trait implemented by specific socket patterns.
-use crate::transport::endpoint::{parse_endpoint, Endpoint}; // For parsing endpoint strings.
-                                                            // Import transport-specific actor spawners and helpers.
+use crate::socket::types::SocketType;
+use crate::socket::ISocket;
+use crate::transport::endpoint::{parse_endpoint, Endpoint}; 
+                                                            
 #[cfg(feature = "inproc")]
 use crate::transport::inproc::{bind_inproc, connect_inproc, disconnect_inproc, unbind_inproc};
 #[cfg(feature = "ipc")]
-use crate::transport::ipc::{create_and_spawn_ipc_engine, IpcConnecter, IpcListener};
-use crate::transport::tcp::{create_and_spawn_tcp_engine, TcpConnecter, TcpListener};
-use crate::{Blob, Msg}; // Core message types.
+use crate::transport::ipc::{IpcConnecter, IpcListener};
+use crate::transport::tcp::{TcpConnecter, TcpListener};
+use crate::Msg;
 
-// Tokio and standard library imports.
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
 use async_channel::{bounded, Receiver as AsyncReceiver, SendError, Sender as AsyncSender, TrySendError};
-use futures::future::join_all; // For managing multiple futures (e.g., unbinding inproc names).
-use std::collections::{HashMap, HashSet, VecDeque}; // Data structures.
-use std::sync::{Arc, Weak}; // For shared ownership and weak references.
-use std::time::{Duration, Instant}; // For timeouts and linger.
-use tokio::sync::{broadcast, oneshot, Mutex, MutexGuard}; // Synchronization primitives.
-use tokio::task::JoinHandle; // For managing spawned actor tasks.
-use tokio::time::{interval, timeout, Interval}; // For periodic checks (linger).
+use futures::future::join_all;
+use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, timeout, Interval};
 
 // --- Structs: EndpointInfo, EndpointType, CoreState ---
 
@@ -93,6 +89,7 @@ pub(crate) struct CoreState {
   #[cfg(feature = "inproc")]
   pub(crate) bound_inproc_names: HashSet<String>,
   pub(crate) monitor_tx: Option<MonitorSender>,
+  pub(crate) last_bound_endpoint: Option<String>,
 }
 
 impl CoreState {
@@ -107,6 +104,7 @@ impl CoreState {
       #[cfg(feature = "inproc")]
       bound_inproc_names: HashSet::new(),
       monitor_tx: None,
+      last_bound_endpoint: None,
     }
   }
 
@@ -409,7 +407,7 @@ impl ShutdownCoordinator {
 
 // --- Struct: SocketCore ---
 #[derive(Debug)]
-pub(crate) struct SocketCore {
+pub struct SocketCore {
   pub(crate) handle: usize,
   pub(crate) context: Context,
   pub(crate) command_sender: MailboxSender,
@@ -581,7 +579,7 @@ impl SocketCore {
   async fn run_command_loop(
     core_arc: Arc<SocketCore>,
     socket_logic_strong: Arc<dyn ISocket>,
-    mut command_receiver: MailboxReceiver,
+    command_receiver: MailboxReceiver,
     mut system_event_rx: broadcast::Receiver<SystemEvent>,
   ) {
     let core_handle = core_arc.handle;
@@ -609,7 +607,7 @@ impl SocketCore {
             match event_result {
               Ok(SystemEvent::ContextTerminating) => {
                 tracing::info!(handle = core_handle, "SocketCore received ContextTerminating event.");
-                let mut coordinator_guard = core_arc.shutdown_coordinator.lock().await;
+                let coordinator_guard = core_arc.shutdown_coordinator.lock().await;
                 if coordinator_guard.current_phase() == ShutdownPhase::Running {
                   drop(coordinator_guard);
                   Self::publish_socket_closing(&core_arc.context, core_handle).await;
@@ -622,7 +620,7 @@ impl SocketCore {
               }
               Ok(SystemEvent::SocketClosing { socket_id }) if socket_id == core_handle => {
                 tracing::debug!(handle = core_handle, "SocketCore received its own SocketClosing event.");
-                let mut coordinator_guard = core_arc.shutdown_coordinator.lock().await;
+                let coordinator_guard = core_arc.shutdown_coordinator.lock().await;
                 if coordinator_guard.current_phase() == ShutdownPhase::Running {
                   drop(coordinator_guard);
                   Self::initiate_shutdown_phase(core_arc.clone()).await;
@@ -718,7 +716,7 @@ impl SocketCore {
                 let is_my_binding_name = { core_arc.core_state.lock().await.bound_inproc_names.contains(&target_inproc_name) };
                 if is_my_binding_name {
                   tracing::debug!(handle = core_handle, binder_name=%target_inproc_name, connector_pipe_id = closed_by_connector_pipe_read_id, "Processing InprocPipePeerClosed event.");
-                  let mut binder_core_state_guard = core_arc.core_state.lock().await;
+                  let binder_core_state_guard = core_arc.core_state.lock().await;
                   let mut binder_read_id_to_cleanup: Option<usize> = None;
                   for info in binder_core_state_guard.endpoints.values() {
                     if let Some((binder_writes_here, binder_reads_from_here)) = info.pipe_ids {
@@ -743,7 +741,7 @@ impl SocketCore {
               Err(broadcast::error::RecvError::Closed) => {
                 tracing::error!(handle = core_handle, "System event bus closed unexpectedly!");
                 final_error_for_actorstop = Some(ZmqError::Internal("SocketCore: Event bus closed".into()));
-                let mut coordinator_guard = core_arc.shutdown_coordinator.lock().await;
+                let coordinator_guard = core_arc.shutdown_coordinator.lock().await;
                 if coordinator_guard.current_phase() == ShutdownPhase::Running {
                   drop(coordinator_guard);
                   Self::publish_socket_closing(&core_arc.context, core_handle).await;
@@ -764,7 +762,7 @@ impl SocketCore {
                 match command {
                   Command::Stop => {
                     tracing::info!(handle=core_handle, "SocketCore received direct Stop command.");
-                    let mut coordinator_guard = core_arc.shutdown_coordinator.lock().await;
+                    let coordinator_guard = core_arc.shutdown_coordinator.lock().await;
                     if coordinator_guard.current_phase() == ShutdownPhase::Running {
                       drop(coordinator_guard);
                       Self::publish_socket_closing(&core_arc.context, core_handle).await;
@@ -857,7 +855,7 @@ impl SocketCore {
               Err(_) => {
                 tracing::info!(handle = core_handle, "SocketCore command mailbox closed. Initiating shutdown.");
                 final_error_for_actorstop = Some(ZmqError::Internal("SocketCore: Command mailbox closed".into()));
-                let mut coordinator_guard = core_arc.shutdown_coordinator.lock().await;
+                let coordinator_guard = core_arc.shutdown_coordinator.lock().await;
                 if coordinator_guard.current_phase() == ShutdownPhase::Running {
                   drop(coordinator_guard);
                   Self::publish_socket_closing(&core_arc.context, core_handle).await;
@@ -1206,11 +1204,18 @@ impl SocketCore {
     let context_clone = core_arc.context.clone();
     let parent_socket_id_val = core_arc.handle;
 
-    let bind_res = match parse_result {
+    // This variable will store the URI that should be used for last_bound_endpoint
+    // and for the Listening event. It's only set upon full success of a branch.
+    let mut actual_uri_for_state_update: Option<String> = None;
+
+    // This will be the result sent back to the user.
+    let final_user_bind_result: Result<(), ZmqError>;
+
+    match parse_result {
       Ok(Endpoint::Tcp(_addr, ref uri)) => {
-        let mut state_g = core_arc.core_state.lock().await;
+        let state_g = core_arc.core_state.lock().await;
         if state_g.endpoints.contains_key(uri) {
-          Err(ZmqError::AddrInUse(uri.clone()))
+          final_user_bind_result = Err(ZmqError::AddrInUse(uri.clone()))
         } else {
           let monitor_tx_c = state_g.get_monitor_sender_clone();
           let options_a = Arc::new(state_g.options.clone());
@@ -1227,41 +1232,47 @@ impl SocketCore {
             parent_socket_id_val,
           );
           match listener_res {
-            Ok((child_mb, child_th)) => {
+            Ok((child_mb, child_th, resolved_tcp_uri)) => {
               let mut state_w = core_arc.core_state.lock().await;
-              state_w.endpoints.insert(
-                uri.clone(),
-                EndpointInfo {
-                  mailbox: child_mb,
-                  task_handle: child_th,
-                  endpoint_type: EndpointType::Listener,
-                  endpoint_uri: uri.clone(),
-                  pipe_ids: None,
-                  handle_id: child_h,
-                  target_endpoint_uri: None,
-                  is_outbound_connection: false,
-                },
-              );
-              state_w
-                .send_monitor_event(SocketEvent::Listening { endpoint: uri.clone() })
-                .await;
-              Ok(())
+
+              // Final check: ensure this resolved URI isn't somehow already an active endpoint.
+              if state_w.endpoints.contains_key(&resolved_tcp_uri) {
+                child_th.abort();
+                final_user_bind_result = Err(ZmqError::AddrInUse(resolved_tcp_uri))
+              } else {
+                state_w.endpoints.insert(
+                  resolved_tcp_uri.clone(),
+                  EndpointInfo {
+                    mailbox: child_mb,
+                    task_handle: child_th,
+                    endpoint_type: EndpointType::Listener,
+                    endpoint_uri: resolved_tcp_uri.clone(),
+                    pipe_ids: None,
+                    handle_id: child_h,
+                    target_endpoint_uri: None,
+                    is_outbound_connection: false,
+                  },
+                );
+                actual_uri_for_state_update = Some(resolved_tcp_uri); 
+                final_user_bind_result = Ok(());
+              }
             }
-            Err(e) => Err(e),
+            Err(e) => final_user_bind_result = Err(e)
           }
         }
       }
       #[cfg(feature = "ipc")]
       Ok(Endpoint::Ipc(ref path, ref uri)) => {
-        let mut state_g = core_arc.core_state.lock().await;
+        let state_g = core_arc.core_state.lock().await;
         if state_g.endpoints.contains_key(uri) {
-          Err(ZmqError::AddrInUse(uri.clone()))
+          final_user_bind_result = Err(ZmqError::AddrInUse(uri.clone()))
         } else {
           let monitor_tx_c = state_g.get_monitor_sender_clone();
           let options_a = Arc::new(state_g.options.clone());
           drop(state_g);
           let child_h = context_clone.inner().next_handle();
           let handle_src = context_clone.inner().next_handle.clone();
+
           let listener_res = IpcListener::create_and_spawn(
             child_h,
             uri.clone(),
@@ -1273,27 +1284,25 @@ impl SocketCore {
             parent_socket_id_val,
           );
           match listener_res {
-            Ok((child_mb, child_th)) => {
+            Ok((child_mb, child_th, resolved_ipc_uri)) => {
               let mut state_w = core_arc.core_state.lock().await;
               state_w.endpoints.insert(
-                uri.clone(),
+                resolved_ipc_uri.clone(),
                 EndpointInfo {
                   mailbox: child_mb,
                   task_handle: child_th,
                   endpoint_type: EndpointType::Listener,
-                  endpoint_uri: uri.clone(),
+                  endpoint_uri: resolved_ipc_uri.clone(),
                   pipe_ids: None,
                   handle_id: child_h,
                   target_endpoint_uri: None,
                   is_outbound_connection: false,
                 },
               );
-              state_w
-                .send_monitor_event(SocketEvent::Listening { endpoint: uri.clone() })
-                .await;
-              Ok(())
+              actual_uri_for_state_update = Some(resolved_ipc_uri);
+              final_user_bind_result = Ok(());
             }
-            Err(e) => Err(e),
+            Err(e) => final_user_bind_result = Err(e),
           }
         }
       }
@@ -1303,38 +1312,55 @@ impl SocketCore {
         let name_c = name.clone();
         let is_bound = core_c.core_state.lock().await.bound_inproc_names.contains(&name_c);
         if is_bound {
-          Err(ZmqError::AddrInUse(format!("inproc://{}", name)))
+          final_user_bind_result = Err(ZmqError::AddrInUse(format!("inproc://{}", name)))
         } else {
           match bind_inproc(name_c.clone(), core_c).await {
-            // bind_inproc takes Arc<SocketCore>
             Ok(()) => {
-              let mut state_g = core_arc.core_state.lock().await; // Re-lock to send monitor
-              state_g
-                .send_monitor_event(SocketEvent::Listening {
-                  endpoint: format!("inproc://{}", name_c),
-                })
-                .await;
-              Ok(())
+              actual_uri_for_state_update = Some(format!("inproc://{}", name_c)); 
+              final_user_bind_result = Ok(());
             }
-            Err(e) => Err(e),
+            Err(e) => final_user_bind_result = Err(e),
           }
         }
       }
-      Err(e) => Err(e),
-      _ => Err(ZmqError::UnsupportedTransport(endpoint.to_string())),
+      Err(e) => final_user_bind_result = Err(e), // Error from parse_endpoint
+      _ => final_user_bind_result = Err(ZmqError::UnsupportedTransport(endpoint.to_string())),
     };
-    if let Err(e) = &bind_res {
+
+    if final_user_bind_result.is_ok() {
+      if let Some(ref actual_uri) = actual_uri_for_state_update {
+        // This is the success path where everything worked and we have a URI.
+        let mut state_w = core_arc.core_state.lock().await;
+        state_w.last_bound_endpoint = Some(actual_uri.clone());
+        state_w.send_monitor_event(SocketEvent::Listening { endpoint: actual_uri.clone() }).await;
+      } else {
+        // This case means final_user_bind_result was Ok(()), but actual_uri_for_state_update is None.
+        // This indicates a logic error in one of the match arms above where Ok(()) was returned
+        // without setting actual_uri_for_state_update.
+        tracing::error!(
+          handle=core_handle,
+          user_uri=%endpoint,
+          "CRITICAL: Bind operation reported success (Ok) but the resolved URI was not captured. This is an internal logic error."
+        );
+        // Even though final_user_bind_result is Ok, we failed to update state correctly.
+        // The user will get Ok, but LAST_ENDPOINT might be stale or wrong.
+        // For robustness, we might consider changing final_user_bind_result to an error here,
+        // but that would mask where the original logic error occurred.
+        // The tracing::error is important.
+      }
+    } else if let Err(ref e) = final_user_bind_result {
+      // Bind operation failed, send BindFailed event with the original user-provided endpoint.
       core_arc
-        .core_state
-        .lock()
-        .await
-        .send_monitor_event(SocketEvent::BindFailed {
-          endpoint: endpoint.clone(),
-          error_msg: format!("{}", e),
-        })
-        .await;
+          .core_state
+          .lock()
+          .await
+          .send_monitor_event(SocketEvent::BindFailed {
+              endpoint: endpoint.clone(), // Use original endpoint for error reporting
+              error_msg: format!("{}", e),
+          })
+          .await;
     }
-    let _ = reply_tx.send(bind_res);
+    let _ = reply_tx.send(final_user_bind_result);
   }
 
   async fn handle_user_connect(
@@ -1400,24 +1426,6 @@ impl SocketCore {
         // Its ActorStopping event will trigger full cleanup via process_child_completion.
         if state_g.endpoints.remove(&res_uri_val).is_some() {
           tracing::debug!(handle = core_handle, child_actor_id = child_id_val, disconnected_uri = %res_uri_val, "SocketCore marked endpoint for disconnect. Session will stop via events.");
-          // The specific session needs to be told to stop. This is tricky without a direct command.
-          // Option 1: Publish a targeted event (e.g., DisconnectPeer { session_id })
-          // Option 2: The ISocket::disconnect might need to do more than just send UserDisconnect.
-          // For now, rely on the fact that removing it from `endpoints` means no new messages will be routed.
-          // The session will eventually be cleaned up when the main socket closes or context terms.
-          // This might not be immediate, which differs from a direct Stop.
-          // To make it more immediate, we'd need the session's mailbox.
-          // The EndpointInfo has 'mailbox', which *is* the session's command mailbox.
-          // Let's send a Stop command directly to the session.
-          if let Some(info_for_stop) = state_g.endpoints.get(&res_uri_val) { // Should not be Some, as we just removed. This logic is flawed.
-             // Correct logic: Get mailbox before removing.
-             // This part is complex due to lock ownership. Let's assume for now that removing it
-             // from the list of active endpoints is sufficient, and it will be cleaned up.
-             // The original code sent Stop and then `publish_socket_closing` for the child.
-             // The child (Session) should listen to its own SocketClosing event if we publish one.
-             // This needs a more robust way for SocketCore to signal a *specific child session* to stop.
-             // For now, we remove it. It will be cleaned up on general socket/context termination.
-          }
         }
       }
     } else if endpoint.starts_with("inproc://") {
@@ -1469,7 +1477,7 @@ impl SocketCore {
       )));
     }
 
-    if let Some((uri, mailbox, child_id)) = listener_info_opt {
+    if let Some((uri, mailbox, _child_id)) = listener_info_opt {
       if state_g.endpoints.remove(&uri).is_some() {
         drop(state_g); // Release lock before sending command
         tracing::debug!(handle = core_handle, listener_uri = %uri, "Sending Stop to Listener for unbind.");
@@ -1740,10 +1748,7 @@ impl SocketCore {
       tracing::info!(binder_handle = binder_core_handle, connector_uri = %connector_uri, "Inproc connection accepted by binder and pipes attached.");
     } else {
       // Connection was rejected by the binder's logic (though current logic always accepts).
-      let error_msg_str = accept_result
-        .as_ref()
-        .err()
-        .map_or("Binder rejected connection".to_string(), |e| format!("{}", e));
+
       // Emit ConnectFailed from the binder's perspective (should this be an AcceptFailed?)
       // The connector will emit ConnectFailed based on the reply_tx.
       // For binder, perhaps a specific "BindingRequestRejected" monitor event would be better.
@@ -1800,7 +1805,6 @@ impl SocketCore {
       state_transitioned_to_linger = coordinator_g.record_child_stopped(child_handle, core_h);
     }
 
-    // <<< MODIFIED START [Handle immediate transition to CleaningPipes] >>>
     // If recording the stop caused a transition to Lingering, check linger conditions
     if state_transitioned_to_linger {
       // Need CoreState lock to check queues and pass to advance_to_cleaning
@@ -1829,7 +1833,6 @@ impl SocketCore {
     }
     // Release coordinator lock if not advancing to cleaning
     drop(coordinator_g);
-    // <<< MODIFIED END >>>
 
 
     let mut removed_endpoint_info_for_reconnect: Option<EndpointInfo> = None;
@@ -2181,6 +2184,18 @@ impl SocketCore {
         tracing::debug!(handle = core_arc.handle, "IO_URING_RCVMULTISHOT set to {}", state_g.options.io_uring_recv_multishot);
         return Ok(());
       }
+
+      if option == options::IO_URING_RECV_BUFFER_COUNT {
+        let count = options::parse_i32_option(value)?.max(1) as usize; // Ensure at least 1
+        state_g.options.io_uring_recv_buffer_count = count;
+        tracing::debug!(handle = core_arc.handle, "IO_URING_RECV_BUFFER_COUNT set to {}", count);
+        return Ok(());
+      } else if option == options::IO_URING_RECV_BUFFER_SIZE {
+        let size = options::parse_i32_option(value)?.max(1024) as usize; // Ensure min size, e.g., 1KB
+        state_g.options.io_uring_recv_buffer_size = size;
+        tracing::debug!(handle = core_arc.handle, "IO_URING_RECV_BUFFER_SIZE set to {}", size);
+        return Ok(());
+      }
     }
 
 
@@ -2292,13 +2307,26 @@ impl SocketCore {
 
     let state_g = core_arc.core_state.lock().await;
 
+    if option == options::LAST_ENDPOINT {
+      return match &state_g.last_bound_endpoint {
+        Some(endpoint_str) => Ok(endpoint_str.as_bytes().to_vec()),
+        None => Ok(Vec::new()),
+      };
+    }
+    
      #[cfg(feature = "io-uring")]
     {
-        if option == options::IO_URING_SNDZEROCOPY {
-            return Ok((state_g.options.io_uring_send_zerocopy as i32).to_ne_bytes().to_vec());
-        } else if option == options::IO_URING_RCVMULTISHOT {
-            return Ok((state_g.options.io_uring_recv_multishot as i32).to_ne_bytes().to_vec());
-        }
+      if option == options::IO_URING_SNDZEROCOPY {
+        return Ok((state_g.options.io_uring_send_zerocopy as i32).to_ne_bytes().to_vec());
+      } else if option == options::IO_URING_RCVMULTISHOT {
+        return Ok((state_g.options.io_uring_recv_multishot as i32).to_ne_bytes().to_vec());
+      }
+      
+      if option == options::IO_URING_RECV_BUFFER_COUNT {
+        return Ok((state_g.options.io_uring_recv_buffer_count as i32).to_ne_bytes().to_vec());
+      } else if option == options::IO_URING_RECV_BUFFER_SIZE {
+        return Ok((state_g.options.io_uring_recv_buffer_size as i32).to_ne_bytes().to_vec());
+      }
     }
 
     if option == TCP_CORK_OPT {

@@ -1,6 +1,3 @@
-// src/socket/events.rs
-
-use crate::error::ZmqError;
 use std::time::Duration;
 
 /// Represents significant events occurring within a socket or its connections.

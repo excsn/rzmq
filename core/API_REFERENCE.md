@@ -60,6 +60,7 @@ These constants are typically used with `Socket::set_option()` and `Socket::get_
 *   **`rzmq::socket::options::ROUTING_ID`**: `&[u8]` (passed as value) - Socket identity (e.g., for `DEALER`, `ROUTER`). Max 255 bytes.
 *   **`rzmq::socket::options::SUBSCRIBE`**: `&[u8]` (passed as value) - For `SUB` sockets, subscribes to a topic prefix.
 *   **`rzmq::socket::options::UNSUBSCRIBE`**: `&[u8]` (passed as value) - For `SUB` sockets, unsubscribes from a topic prefix.
+*   **`rzmq::socket::options::LAST_ENDPOINT`**: `i32` (read-only) - Retrieves the last endpoint string that the socket successfully bound to. Useful when binding to an ephemeral port (e.g., "tcp://127.0.0.1:0"). Returns an empty string if the socket has not been bound.
 *   **`rzmq::socket::options::TCP_KEEPALIVE`**: `i32` - TCP keepalive mode (-1: disable, 0: use system default, 1: enable).
 *   **`rzmq::socket::options::TCP_KEEPALIVE_IDLE`**: `i32` - TCP keepalive idle time in seconds before probes are sent.
 *   **`rzmq::socket::options::TCP_KEEPALIVE_CNT`**: `i32` - Number of TCP keepalive probes before dropping connection.
@@ -75,10 +76,13 @@ These constants are typically used with `Socket::set_option()` and `Socket::get_
 *   **`rzmq::socket::options::CURVE_PUBLICKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Socket's public key.
 *   **`rzmq::socket::options::CURVE_SECRETKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Socket's secret key.
 *   **`rzmq::socket::options::CURVE_SERVERKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Server's public key (for client sockets).
-*   **`rzmq::socket::options::IO_URING_SNDZEROCOPY`**: `i32` (0 or 1) - (Requires `io-uring` feature) Hint to use zerocopy for sends if possible.
-*   **`rzmq::socket::options::IO_URING_RCVMULTISHOT`**: `i32` (0 or 1) - (Requires `io-uring` feature) Hint to use multishot receive operations if possible.
+*   **`rzmq::socket::options::TCP_CORK_OPT`**: `i32` (0 or 1) - (Linux only) Enables/disables TCP_CORK option on the underlying socket to potentially batch small sends.
+*   **`rzmq::socket::options::IO_URING_SNDZEROCOPY`**: `i32` (0 or 1) - (Requires `io-uring` feature, Linux only) Hint to use zerocopy for sends if possible.
+*   **`rzmq::socket::options::IO_URING_RCVMULTISHOT`**: `i32` (0 or 1) - (Requires `io-uring` feature, Linux only) Hint to use multishot receive operations if possible.
+*   **`rzmq::socket::options::IO_URING_RECV_BUFFER_COUNT`**: `i32` - (Requires `io-uring` feature, Linux only) Number of buffers in the io_uring multishot receive pool. Effective only if `IO_URING_RCVMULTISHOT` is enabled. Default: 16, Min: 1.
+*   **`rzmq::socket::options::IO_URING_RECV_BUFFER_SIZE`**: `i32` - (Requires `io-uring` feature, Linux only) Size (in bytes) of each buffer in the io_uring multishot receive pool. Effective only if `IO_URING_RCVMULTISHOT` is enabled. Default: 65536 (64KB), Min: 1024.
 
-*Note: Integer option values are typically passed as `&i32_value.to_ne_bytes()` to `set_option`.*
+*Note: Integer option values are typically passed as `&i32_value.to_ne_bytes()` to `set_option` (e.g., `&(1i32).to_ne_bytes()` for true/enable). Byte slice options (like `ROUTING_ID`, `SUBSCRIBE`) are passed directly.*
 
 ---
 

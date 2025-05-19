@@ -26,6 +26,7 @@ The ZeroMQ library (`libzmq`) is a robust and widely adopted messaging solution.
     *   Further performance enhancements include:
         *   **TCP Corking:** An option to batch ZMTP frames into fewer TCP segments, potentially reducing network overhead for certain workloads on Linux.
         *   **Experimental Zerocopy Send:** When using the `io_uring` backend, an experimental option enables a zerocopy send path, aiming to minimize CPU data copies for outgoing messages.
+        *   **Experimental Multishot Receive:** (When `io_uring` feature is active) Utilizes `io_uring`'s multishot receive capabilities to submit multiple receive buffers to the kernel at once, potentially reducing syscall overhead. The behavior and buffer pool are configurable via socket options.
 
 4.  **Learning and Innovation:**
     *   Reimplementing ZeroMQ offers a platform to explore protocol design and asynchronous patterns within Rust, fostering learning and potential innovation in messaging library architecture.
@@ -49,10 +50,16 @@ The ZeroMQ library (`libzmq`) is a robust and widely adopted messaging solution.
     *   High-Water Marks (`SNDHWM`, `RCVHWM`)
     *   Timeouts (`SNDTIMEO`, `RCVTIMEO`, `LINGER`)
     *   Reconnection behavior (`RECONNECT_IVL`, `RECONNECT_IVL_MAX`)
+    *   Retrieving last bound endpoint (`LAST_ENDPOINT`)
     *   TCP-specifics (`TCP_KEEPALIVE` settings)
     *   ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
     *   Pattern-specific (`SUBSCRIBE`, `UNSUBSCRIBE`, `ROUTING_ID`, `ROUTER_MANDATORY`)
-    *   Performance-related (Linux): `TCP_CORK_OPT`, `IO_URING_SNDZEROCOPY` (when `io-uring` feature is active).
+    *   Performance-related (Linux, requires `io-uring` feature where noted):
+        *   `TCP_CORK_OPT`
+        *   `IO_URING_SNDZEROCOPY`
+        *   `IO_URING_RCVMULTISHOT`
+        *   `IO_URING_RECV_BUFFER_COUNT`
+        *   `IO_URING_RECV_BUFFER_SIZE`
 *   **Socket Monitoring:** An event system (`Socket::monitor()`) for observing socket lifecycle events (connections, disconnections, errors, etc.).
 *   **Basic Security Placeholders:** Infrastructure for NULL, PLAIN, and (feature-gated) CURVE security mechanisms. Full implementation and hardening are ongoing.
 

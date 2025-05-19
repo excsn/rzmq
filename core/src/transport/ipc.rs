@@ -54,7 +54,7 @@ impl IpcListener {
     monitor_tx: Option<MonitorSender>,
     context: Context,
     parent_socket_id: usize,
-  ) -> Result<(MailboxSender, JoinHandle<()>), ZmqError> {
+  ) -> Result<(MailboxSender, JoinHandle<()>, String), ZmqError> {
     let actor_type = ActorType::Listener;
     let capacity = context.inner().get_actor_mailbox_capacity();
     let (tx, rx) = mailbox(capacity);
@@ -91,7 +91,7 @@ impl IpcListener {
     let accept_loop_task_join_handle = tokio::spawn(IpcListener::run_accept_loop(
       accept_loop_handle_id,
       accept_loop_parent_handle,
-      endpoint_uri_for_accept_loop,
+      endpoint_uri_for_accept_loop.clone(),
       path_for_accept_loop,
       accept_listener_arc,
       accept_options_clone,
@@ -108,7 +108,7 @@ impl IpcListener {
 
     let listener_actor = IpcListener {
       handle,
-      endpoint: endpoint_uri,
+      endpoint: endpoint_uri.clone(),
       path, // Store path for Drop.
       mailbox_receiver: rx,
       listener_handle: Some(accept_loop_task_join_handle),
@@ -119,7 +119,7 @@ impl IpcListener {
     let command_loop_join_handle = tokio::spawn(listener_actor.run_command_loop());
     context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
 
-    Ok((tx, command_loop_join_handle))
+    Ok((tx, command_loop_join_handle, endpoint_uri))
   }
 
   async fn run_command_loop(mut self) {

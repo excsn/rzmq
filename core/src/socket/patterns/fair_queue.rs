@@ -1,12 +1,6 @@
-// src/socket/patterns/fair_queue.rs
-
 use crate::error::ZmqError;
 use crate::message::Msg;
-use async_channel::{Receiver, Sender, TryRecvError}; // Use async-channel for internal queue
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc; // Use Arc if queue needs shared access (e.g. for HWM tracking)
-
-// <<< ADDED FairQueue STRUCT >>>
+use async_channel::{Receiver, Sender, TryRecvError};
 
 /// Buffers incoming messages from multiple pipes in a single queue
 /// for fair consumption by the socket's `recv()` method.
@@ -101,4 +95,3 @@ impl FairQueue {
     self.receiver.is_empty()
   }
 }
-// <<< ADDED FairQueue STRUCT END >>>

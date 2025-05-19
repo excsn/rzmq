@@ -2,14 +2,11 @@
 
 use crate::context::Context;
 use crate::error::ZmqError;
-use crate::runtime::{self, mailbox, ActorType, Command, EventBus, MailboxReceiver, MailboxSender, SystemEvent};
-use crate::session::ISession;
+use crate::runtime::{mailbox, ActorType, Command, MailboxReceiver, MailboxSender, SystemEvent};
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::{Blob, Msg};
 
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
-use async_trait::async_trait;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -45,9 +42,7 @@ impl SessionBase {
     let (tx, rx) = mailbox(capacity);
     let session = SessionBase {
       handle,
-      // <<< MODIFIED START [Clone endpoint_uri for logging before move] >>>
       endpoint_uri: endpoint_uri.clone(), // Clone here if original endpoint_uri is needed later
-      // <<< MODIFIED END >>>
       engine_mailbox: None,
       engine_task_handle: None,
       mailbox_receiver: rx,
@@ -62,7 +57,6 @@ impl SessionBase {
       parent_socket_id,
     };
 
-    // <<< MODIFIED START [Access session.endpoint_uri before it's moved] >>>
     // If you need endpoint_uri for logging here, use the one passed in or clone from session
     // For the tracing macro, we can use the `endpoint_uri` argument directly,
     // or clone `session.endpoint_uri` before the move if we specifically want the one from the struct.
@@ -75,7 +69,6 @@ impl SessionBase {
 
     // Log after spawning, using the cloned/argument value.
     tracing::debug!(session_handle = handle, uri = %endpoint_uri_for_log, "SessionBase task spawned. Publishing ActorStarted event.");
-    // <<< MODIFIED END >>>
 
     context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
 

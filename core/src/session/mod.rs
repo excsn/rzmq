@@ -1,13 +1,6 @@
-// src/session/mod.rs
-
 pub mod base; // Contains SessionBase implementation
-// <<< ADDED MODULE DECLARATIONS END >>>
-
-// <<< ADDED EXPORTS >>>
 pub(crate) use base::SessionBase;
-// <<< ADDED EXPORTS END >>>
 
-// <<< ADDED ISESSION TRAIT >>>
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::MailboxSender; // Mailbox of the Engine

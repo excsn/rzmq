@@ -1,5 +1,3 @@
-// tests/req_rep_advanced.rs (or add to tests/req_rep.rs)
-
 use rzmq::{Context, Msg, SocketType, ZmqError};
 use std::time::Duration;
 mod common; // Assumes common.rs is in the tests/ directory
@@ -203,9 +201,7 @@ async fn test_req_rep_rep_disconnects_while_req_waiting() -> Result<(), ZmqError
     println!("REP received Request.");
 
     println!("REP socket going out of scope (will trigger close)...");
-    // <<< ADDED EXPLICIT CLOSE >>>
     rep_socket.close().await?;
-    // <<< ADDED EXPLICIT CLOSE END >>>
     // rep_socket is dropped here, initiating close/cleanup
   } // rep_socket is dropped, its underlying actor should signal detachment
 
@@ -219,7 +215,6 @@ async fn test_req_rep_rep_disconnects_while_req_waiting() -> Result<(), ZmqError
   let recv_result = common::recv_timeout(&req, LONG_TIMEOUT).await;
   println!("REQ recv result: {:?}", recv_result);
 
-  // <<< MODIFIED START >>>
   // *** CHECK THE EXPECTED OUTCOME ***
   // When the target REP disconnects, ReqSocket::pipe_detached resets the state to ReadyToSend.
   // The recv() call, upon unblocking (likely due to the timeout in recv_timeout),
@@ -230,7 +225,6 @@ async fn test_req_rep_rep_disconnects_while_req_waiting() -> Result<(), ZmqError
     recv_result
   );
   println!("REQ correctly failed with InvalidState after REP disconnect.");
-  // <<< MODIFIED END >>>
 
   // Optional: Verify REQ can now send again due to state reset
   println!("REQ attempting send after REP disconnect (should succeed if state reset)...");

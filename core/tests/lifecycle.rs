@@ -1,8 +1,6 @@
-// tests/lifecycle.rs
-
 use rzmq::socket::options::SNDTIMEO;
 use rzmq::socket::SocketEvent;
-use rzmq::{Context, Msg, Socket, SocketType, ZmqError};
+use rzmq::{Msg, SocketType, ZmqError};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify; // For signalling
@@ -182,7 +180,7 @@ async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Resul
 
   // ... (setup push_monitor, bind push, check Listening) ...
   println!("Setting up PUSH monitor...");
-  let mut push_monitor = push.monitor_default().await?;
+  let push_monitor = push.monitor_default().await?;
 
   let endpoint = "tcp://127.0.0.1:5641"; // Keep unique port
 
@@ -265,7 +263,6 @@ async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Resul
   );
   println!("PUSH correctly failed sending after PULL disconnected.");
 
-  // <<< ADDED START: Explicitly close PUSH before terminating context >>>
   println!("Closing PUSH socket explicitly before context term...");
   let push_close_res = push.close().await;
   println!("PUSH close result: {:?}", push_close_res);
@@ -273,7 +270,6 @@ async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Resul
   assert!(push_close_res.is_ok(), "PUSH close failed unexpectedly");
   // Allow a moment for the close command to be processed and shutdown to initiate
   tokio::time::sleep(Duration::from_millis(50)).await;
-  // <<< ADDED END >>>
 
   println!("Terminating context...");
   ctx.term().await?; // Terminate context gracefully
@@ -281,7 +277,6 @@ async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Resul
   println!("Checking if monitor channel is closed...");
   match timeout(SHORT_TIMEOUT, push_monitor.recv()).await {
     Ok(Ok(event)) => {
-      // <<< MODIFIED START: Allow specific final events, but fail on ConnectDelayed >>>
       // It's possible to receive a final 'Closed' or 'Disconnected' related to the *listener*
       // being shut down as part of the PUSH socket closing, *before* the monitor channel itself closes.
       // However, receiving ConnectDelayed is definitely wrong.
@@ -301,7 +296,6 @@ async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Resul
           );
         }
       }
-      // <<< MODIFIED END >>>
     }
     Ok(Err(_recv_err)) => {
       println!("PUSH Monitor channel correctly closed after context term.");
@@ -371,7 +365,6 @@ async fn test_concurrent_term_and_op() -> Result<(), ZmqError> {
 
   println!("Main task initiating context termination...");
 
-  // <<< MODIFIED: Use Notify for termination signal >>>
   let termination_complete = Arc::new(Notify::new());
   let termination_complete_clone = termination_complete.clone();
 
@@ -382,7 +375,6 @@ async fn test_concurrent_term_and_op() -> Result<(), ZmqError> {
     termination_complete_clone.notify_waiters(); // Signal completion
     result // Return the result
   });
-  // <<< MODIFIED END >>>
 
   // Wait for EITHER termination to signal completion OR the send task to signal completion
   tokio::select! {

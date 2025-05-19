@@ -1,18 +1,16 @@
-// src/socket/pub_socket.rs
-
-use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to SocketCore.
+use crate::{delegate_to_core, Blob};
 use crate::error::ZmqError;
-use crate::message::Msg; // For send method.
+use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
-use crate::socket::core::SocketCore; // Core components.
-use crate::socket::patterns::Distributor; // PUB uses a Distributor to send to all peers.
-use crate::socket::ISocket; // The trait this struct implements.
+use crate::socket::core::SocketCore;
+use crate::socket::patterns::Distributor;
+use crate::socket::ISocket;
 
-use std::collections::HashMap; // For pipe_read_to_write_id map.
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{oneshot, Mutex}; // Mutex for internal state, oneshot for API replies.
+use tokio::sync::Mutex;
 
 /// Implements the PUB (Publish) socket pattern.
 /// PUB sockets distribute messages to all connected SUB (Subscribe) peers.

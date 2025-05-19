@@ -168,7 +168,7 @@ Handle for interacting with a socket.
     Stops listening on a bound endpoint.
 *   **`pub async fn send(&self, msg: Msg) -> Result<(), ZmqError>`**
     Sends a message.
-*   **`pub async fn recv(&self) -> Result<Msg, ZmqError>`**
+*   **`pub async fn recv(&self, msg: Msg) -> Result<Msg, ZmqError>`**
     Receives a message.
 *   **`pub async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError>`**
     Sets a socket option. `value` is typically `&some_i32.to_ne_bytes()` for integer options or `b"string_value"` for byte slice options.
@@ -290,6 +290,15 @@ use rzmq::socket::options::SUBSCRIBE;
 sub_socket.set_option(SUBSCRIBE, b"NASDAQ:").await?; // Subscribe to messages starting with "NASDAQ:"
 sub_socket.set_option(SUBSCRIBE, b"").await?;      // Subscribe to all messages
 ```
+Example: Getting `LAST_ENDPOINT` after binding to an ephemeral TCP port
+```rust
+use rzmq::socket::options::LAST_ENDPOINT;
+// pull_socket is a Socket, e.g., SocketType::Pull
+pull_socket.bind("tcp://127.0.0.1:0").await?; // Bind to OS-assigned port
+let endpoint_bytes = pull_socket.get_option(LAST_ENDPOINT).await?;
+let resolved_endpoint = String::from_utf8(endpoint_bytes).unwrap();
+println!("Socket bound to: {}", resolved_endpoint); // e.g., "tcp://127.0.0.1:54321"
+```
 
 ### Monitoring Socket Events
 Track socket lifecycle events:
@@ -357,10 +366,12 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
 
 3.  **`io_uring` Specific Options**: (Optional)
     You can hint at `io_uring`-specific behaviors using socket options if the underlying transport uses them (these are currently experimental and their effect depends on `tokio-uring`'s capabilities):
-    *   `rzmq::socket::options::IO_URING_SNDZEROCOPY`
-    *   `rzmq::socket::options::IO_URING_RCVMULTISHOT`
+    *   `rzmq::socket::options::IO_URING_SNDZEROCOPY`: (Boolean) Hint to use zerocopy for sends if possible.
+    *   `rzmq::socket::options::IO_URING_RCVMULTISHOT`: (Boolean) Hint to use multishot receive operations if possible.
+    *   `rzmq::socket::options::IO_URING_RECV_BUFFER_COUNT`: (Integer) Number of buffers in the multishot receive pool (default: 16, min: 1).
+    *   `rzmq::socket::options::IO_URING_RECV_BUFFER_SIZE`: (Integer) Size of each buffer (in bytes) in the multishot receive pool (default: 65536, min: 1024).
 
-    These are boolean options (pass `&(1i32).to_ne_bytes()` for true, `&(0i32).to_ne_bytes()` for false).
+    These are set using `socket.set_option(OPTION_CONST, &value.to_ne_bytes()).await?`. Boolean options typically use `1i32` for true and `0i32` for false.
 
 ## Error Handling
 

@@ -16,19 +16,48 @@ use crate::security::{Mechanism, NullMechanism, PlainMechanism};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::{Blob, Context, MsgFlags};
 
+#[cfg(feature = "io-uring")]
+use super::uring_recv::{UringMultishotReceiver, UringRecvActiveFuture};
+
 use std::collections::HashMap;
+use std::future::Future;
 use std::os::fd::{AsRawFd, RawFd};
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 use std::{fmt, marker::PhantomData};
 
 use bytes::BytesMut;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
+
 #[cfg(target_os = "linux")]
 use socket2::SockRef; // For setting TCP_CORK
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::interval;
 use tokio_util::codec::Framed;
+
+#[cfg(feature = "io-uring")]
+use tokio_uring::buf::BufResult; // For the output type of recv_multishot
+
+/// Enum to hold different types of active receive futures, or indicate none are active.
+/// This allows ZmtpEngineCore to have a consistently typed field for its active receive future.
+#[derive(Debug)] // derive Debug
+pub(crate) enum ActiveReceiveFuture {
+  #[cfg(feature = "io-uring")]
+  UringMultishot(Pin<Box<dyn Future<Output = BufResult<(usize, Vec<BytesMut>)>> + Send>>),
+  #[cfg(not(feature = "io-uring"))]
+  UringMultishot(Result<(), ()>),
+  /// Indicates no specific future is active, or io-uring is not in use for receive.
+  /// The select! arm guard condition will prevent polling if this is the state.
+  NotActive,
+}
+
+impl Default for ActiveReceiveFuture {
+  fn default() -> Self {
+    ActiveReceiveFuture::NotActive
+  }
+}
 
 /// Core ZMTP engine logic, generic over the underlying stream type `S`.
 /// This struct encapsulates the state and logic for handling the ZMTP protocol,
@@ -64,6 +93,9 @@ pub(crate) struct ZmtpEngineCore<S: ZmtpStream> {
   stream_fd_for_cork: Option<RawFd>,
   // Tracks if the *next* send is the first frame of a new logical ZMQ message
   expecting_first_frame_of_msg: bool,
+  #[cfg(feature = "io-uring")]
+  multishot_receiver: Option<UringMultishotReceiver>,
+  active_receive_future_holder: ActiveReceiveFuture,
 }
 
 impl<S: ZmtpStream> fmt::Debug for ZmtpEngineCore<S> {
@@ -89,10 +121,7 @@ impl<S: ZmtpStream> fmt::Debug for ZmtpEngineCore<S> {
       debug_struct.field("stream_fd_for_cork", &self.stream_fd_for_cork);
     }
 
-    debug_struct.field(
-      "expecting_first_frame_of_msg",
-      &self.expecting_first_frame_of_msg,
-    );
+    debug_struct.field("expecting_first_frame_of_msg", &self.expecting_first_frame_of_msg);
     debug_struct.finish_non_exhaustive()
   }
 }
@@ -121,6 +150,22 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
       }
     };
 
+    #[cfg(feature = "io-uring")]
+    let ms_receiver_init = if config.use_recv_multishot {
+      tracing::debug!(
+        engine_handle = handle,
+        num_bufs = config.recv_multishot_buffer_count,
+        buf_cap = config.recv_multishot_buffer_capacity,
+        "Initializing UringMultishotReceiver"
+      );
+      Some(UringMultishotReceiver::new(
+        config.recv_multishot_buffer_count,
+        config.recv_multishot_buffer_capacity,
+      ))
+    } else {
+      None
+    };
+
     Self {
       handle,
       session_mailbox,
@@ -141,6 +186,9 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
       #[cfg(target_os = "linux")]
       stream_fd_for_cork: initial_fd_for_cork,
       expecting_first_frame_of_msg: true,
+      #[cfg(feature = "io-uring")]
+      multishot_receiver: ms_receiver_init,
+      active_receive_future_holder: ActiveReceiveFuture::NotActive,
     }
   }
 
@@ -522,12 +570,39 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
     }
   }
 
+  #[cfg(feature = "io-uring")]
+  fn try_arm_multishot_recv_future(&mut self, stream_ref: &S) {
+    /// Ensure we only proceed if multishot is configured and no future is currently active
+    if !self.config.use_recv_multishot || !matches!(self.active_receive_future_holder, ActiveReceiveFuture::NotActive) {
+      return;
+    }
+
+    if let Some(ms_manager) = self.multishot_receiver_manager.as_mut() {
+      if let Some(buffers_to_submit) = ms_manager.take_buffers_for_submission() {
+        if !buffers_to_submit.is_empty() {
+          // S is CurrentTcpStream. When io-uring is on, this is tokio_uring::net::TcpStream.
+          // The type of stream_ref.recv_multishot(...) will match the Uring variant.
+          let future = Box::pin(stream_ref.recv_multishot(buffers_to_submit));
+          self.active_receive_future_holder = ActiveReceiveFuture::UringMultishot(future);
+          tracing::trace!(engine_handle = self.handle, "Armed recv_multishot operation.");
+        } else {
+          tracing::trace!(
+            engine_handle = self.handle,
+            "No available buffers to arm recv_multishot."
+          );
+        }
+      }
+    }
+  }
+
   pub async fn run_loop(mut self) {
     tokio::task::yield_now().await;
+
     let engine_actor_handle = self.handle;
     let engine_actor_type = ActorType::Engine;
     let engine_context_clone = self.context.clone();
     let role_str = if self.is_server { "Server" } else { "Client" };
+
     tracing::info!(
       engine_handle = engine_actor_handle,
       role = role_str,
@@ -645,305 +720,473 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
     }
     self.last_activity_time = Instant::now();
 
-    tracing::debug!(
-      engine_handle = engine_actor_handle,
-      "ZmtpEngineCore entering main message loop."
-    );
+    #[cfg(feature = "io-uring")]
+    if self.config.use_recv_multishot && final_error_for_actor_stop.is_none() {
+      // Pass `framed_transport_stream.get_ref()` which is &S
+      self.try_arm_multishot_recv_future(framed_transport_stream.get_ref());
+    }
 
-    let keepalive_ping_enabled = self.heartbeat_ivl.map_or(false, |d| !d.is_zero());
-    let mut ping_check_timer = if keepalive_ping_enabled {
-      let configured_ivl = self.heartbeat_ivl.unwrap();
-      let check_frequency = configured_ivl
-        .checked_sub(Duration::from_millis(50))
-        .unwrap_or(configured_ivl);
-      let mut timer = interval(check_frequency.max(Duration::from_millis(100)));
-      timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-      Some(timer)
-    } else {
-      None
-    };
+    if final_error_for_actor_stop.is_none() {
+      tracing::debug!(
+        engine_handle = engine_actor_handle,
+        "ZmtpEngineCore entering main message loop."
+      );
 
-    let mut pong_timeout_timer = interval(self.heartbeat_timeout);
-    pong_timeout_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+      let keepalive_ping_enabled = self.heartbeat_ivl.map_or(false, |d| !d.is_zero());
+      let mut ping_check_timer = if keepalive_ping_enabled {
+        let configured_ivl = self.heartbeat_ivl.unwrap();
+        let check_frequency = configured_ivl
+          .checked_sub(Duration::from_millis(50))
+          .unwrap_or(configured_ivl);
+        let mut timer = interval(check_frequency.max(Duration::from_millis(100)));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Some(timer)
+      } else {
+        None
+      };
 
-    let mut should_break_loop = false;
+      let mut pong_timeout_timer = interval(self.heartbeat_timeout);
+      pong_timeout_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    while !should_break_loop {
-      tokio::select! {
-        biased;
+      let mut should_break_loop = false;
 
-        session_command_result = self.mailbox_receiver.recv() => {
-          let command_from_session = match session_command_result {
-            Ok(cmd) => cmd,
-            Err(_) => {
-              tracing::info!(engine_handle = engine_actor_handle, "Engine command mailbox (from Session) closed. Stopping.");
-              should_break_loop = true;
-              if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed".into())); }
-              continue;
+      while !should_break_loop {
+        tokio::select! {
+          biased;
+
+          session_command_result = self.mailbox_receiver.recv() => {
+            let command_from_session = match session_command_result {
+              Ok(cmd) => cmd,
+              Err(_) => {
+                tracing::info!(engine_handle = engine_actor_handle, "Engine command mailbox (from Session) closed. Stopping.");
+                should_break_loop = true;
+                if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed".into())); }
+                continue;
+              }
+            };
+            match command_from_session {
+              Command::SessionPushCmd { msg } => {
+                let is_last_frame_of_user_message = !msg.is_more();
+                let mut current_send_error: Option<ZmqError> = None;
+                let mut send_occurred_successfully = false;
+
+                #[cfg(target_os = "linux")]
+                if self.config.use_cork {
+                    if let Some(fd) = self.stream_fd_for_cork {
+                        if self.expecting_first_frame_of_msg && !self.is_corked {
+                            // This is the first frame of a new logical ZMQ message, and we are not yet corked. Cork it.
+                            Self::set_tcp_cork_rawfd(fd, true, self.handle).await;
+                            self.is_corked = true;
+                        }
+                    } else if self.expecting_first_frame_of_msg { // Log if cork enabled but FD missing
+                        tracing::warn!(engine_handle = self.handle, "TCP_CORK is enabled but stream FD is not available for setting cork.");
+                    }
+                }
+
+                // --- Determine Send Path (Zerocopy or Standard) ---
+                let use_zc_path = cfg!(feature = "io-uring") && self.config.use_send_zerocopy;
+
+                if use_zc_path {
+                  #[cfg(feature = "io-uring")] // Ensures this block only active if io-uring feature is on
+                  {
+                    let uring_stream_ref = framed_transport_stream.get_ref(); // S should be tokio_uring::net::TcpStream
+
+                    let zmtp_header_bytes: Bytes = {
+                      let mut temp_buf = bytes::BytesMut::with_capacity(9);
+                      let codec = ZmtpCodec::new();
+                      match codec.encode_header_only(&msg, &mut temp_buf) {
+                          Ok(()) => temp_buf.freeze(),
+                          Err(e) => {
+                              tracing::error!(engine_handle = self.handle, "ZC Send: Failed to encode header: {}", e);
+                              current_send_error = Some(e);
+                              Bytes::new() // Dummy to satisfy type, error will be handled
+                          }
+                      }
+                    };
+
+                    if current_send_error.is_none() {
+                      let payload_bytes: Bytes = msg.data_bytes().unwrap_or_else(Bytes::new);
+                      let bufs = [zmtp_header_bytes.slice(..), payload_bytes.slice(..)];
+                      let total_bytes_to_send = bufs[0].bytes_init() + bufs[1].bytes_init();
+
+                      tracing::trace!(engine_handle = self.handle, header_len = bufs[0].bytes_init(), payload_len = bufs[1].bytes_init(), "Attempting ZC vectored send.");
+                      match uring_stream_ref.send_vectored_zc(&bufs).await {
+                        Ok(bytes_sent) => {
+                          if bytes_sent != total_bytes_to_send {
+                            tracing::error!(engine_handle = self.handle, expected = total_bytes_to_send, actual = bytes_sent, "ZC send_vectored_zc resulted in a partial send.");
+                            current_send_error = Some(ZmqError::from(io::Error::new(io::ErrorKind::WriteZero, "Partial zerocopy send")));
+                          } else {
+                            send_occurred_successfully = true;
+                            tracing::trace!(engine_handle = self.handle, bytes_sent, "ZC vectored send successful.");
+                          }
+                        }
+                        Err(e) => {
+                          tracing::error!(engine_handle = self.handle, error = %e, "Engine ZC send_vectored_zc failed.");
+                          current_send_error = Some(ZmqError::from(e));
+                        }
+                      }
+                    }
+                  }
+                } else { // Standard send path
+                  if let Err(e) = framed_transport_stream.send(msg).await {
+                    current_send_error = Some(e);
+                  } else {
+                    send_occurred_successfully = true;
+                  }
+                }
+
+                // Current plan: All sends go through framed_stream. Zerocopy path is deferred.
+                if let Some(e) = current_send_error {
+                  tracing::error!(engine_handle = self.handle, error = %e, "Engine failed to send message.");
+
+                  if !self.session_mailbox.is_closed() {
+                    let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await;
+                  }
+
+                  final_error_for_actor_stop = Some(e);
+                  should_break_loop = true;
+
+                  // If send fails, ensure cork is released if it was set for this message attempt
+                  #[cfg(target_os = "linux")]
+                  if self.is_corked {
+                    if let Some(fd) = self.stream_fd_for_cork {
+                      Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork on error
+                    }
+                    self.is_corked = false;
+                    self.expecting_first_frame_of_msg = true; // Reset for next attempt if any
+                  }
+                } else if send_occurred_successfully {
+                  self.last_activity_time = Instant::now();
+                  self.expecting_first_frame_of_msg = is_last_frame_of_user_message;
+
+                  #[cfg(target_os = "linux")]
+                  if self.is_corked && self.expecting_first_frame_of_msg && send_occurred_successfully {
+                    // This means the frame just sent was the last part of a logical ZMQ message,
+                    // and the cork was active. Uncork now.
+                    if let Some(fd) = self.stream_fd_for_cork {
+                        Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork
+                    }
+                    self.is_corked = false;
+                  }
+                }
+              }
+              Command::Stop => {
+                tracing::info!(engine_handle = engine_actor_handle, "Engine received Stop command.");
+                should_break_loop = true;
+              }
+              _ => { /* Unhandled command */ }
             }
-          };
-          match command_from_session {
-            Command::SessionPushCmd { msg } => {
-              let is_last_frame_of_user_message = !msg.is_more();
-              let mut current_send_error: Option<ZmqError> = None;
-              let mut send_occurred_successfully = false;
+          }
+
+            // Arm 1: Standard Framed Receive (if multishot NOT configured OR not io-uring)
+          frame_decode_result = async { framed_transport_stream.next().await },
+              if !(cfg!(feature = "io-uring") && self.config.use_recv_multishot) => {
+            match frame_decode_result {
+              Some(Ok(decoded_msg)) => {
+                self.last_activity_time = Instant::now();
+
+                // Any valid frame received from peer means peer is active.
+                // If we were corked waiting to send more, this implies the other side might expect a turn.
+                // Also, TCP ACKs might have flushed our send buffer.
+                // It's safer to reset cork state.
+                if self.expecting_first_frame_of_msg == false { // We were in the middle of sending a logical message
+                  tracing::trace!(engine_handle = self.handle, "Data received from peer mid-send; ZMQ message send interrupted by receive.");
+                }
+                self.expecting_first_frame_of_msg = true;
+                #[cfg(target_os = "linux")]
+                if self.is_corked {
+                  if let Some(fd) = self.stream_fd_for_cork {
+                    tracing::trace!(engine_handle = self.handle, "Data received from peer, ensuring TCP_CORK is off if it was on.");
+                    Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork on receiving data
+                  }
+                  self.is_corked = false;
+                }
+
+                if decoded_msg.is_command() {
+                  if let Some(zmtp_cmd) = ZmtpCommand::parse(&decoded_msg) {
+                    match zmtp_cmd {
+                      ZmtpCommand::Ping(ping_context) => {
+                        let pong_reply = ZmtpCommand::create_pong(&ping_context);
+                        if let Err(e) = framed_transport_stream.send(pong_reply).await {
+                          if !self.session_mailbox.is_closed() { let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await; }
+                          should_break_loop = true; final_error_for_actor_stop = Some(e);
+                        } else { self.last_activity_time = Instant::now(); }
+                      }
+                      ZmtpCommand::Pong(_) => {
+                        if self.waiting_for_pong { self.waiting_for_pong = false; self.last_ping_sent_time = None; }
+                        else { tracing::warn!(engine_handle = engine_actor_handle, "Received unexpected PONG."); }
+                      }
+                      ZmtpCommand::Error => {
+                        if !self.session_mailbox.is_closed() { let _ = self.session_mailbox.send(Command::EngineError { error: ZmqError::ProtocolViolation("Received ZMTP ERROR".into()) }).await; }
+                        should_break_loop = true; final_error_for_actor_stop = Some(ZmqError::ProtocolViolation("Received ZMTP ERROR from peer".into()));
+                      }
+                      _ => { /* Ignore other commands like Ready, Unknown */ }
+                    }
+                  }
+                } else {
+                  if self.session_mailbox.send(Command::EnginePushCmd { msg: decoded_msg }).await.is_err() {
+                    should_break_loop = true;
+                    if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed on incoming data".into())); }
+                  }
+                }
+              }
+              Some(Err(e)) => {
+                if !self.session_mailbox.is_closed() { let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await; }
+                should_break_loop = true; final_error_for_actor_stop = Some(e);
+              }
+              None => {
+                should_break_loop = true;
+                if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::ConnectionClosed); }
+              }
+            }
+          }
+
+          // --- Arm 2: io_uring Multishot Receive Completion ---
+            // This arm is always compiled (due to ActiveReceiveFuture::NotActive variant).
+            // It's only *polled* if active_receive_future_holder is UringMultishot
+            // AND the overall config.use_recv_multishot is true.
+            // The pattern matching extracts the future.
+            Ok(uring_recv_result) = async { // Use Ok() to match if future resolves
+              match &mut self.active_receive_future_holder {
+                #[cfg(feature = "io-uring")]
+                ActiveReceiveFuture::UringMultishot(fut) => {
+                    Ok(fut.await) // Return BufResult<(usize, Vec<BytesMut>)>
+                }
+                _ => {
+
+                  // Effectively disables this branch
+                  if cfg!(feature = "io-uring") {
+                    std::future::pending().await
+                  } else {
+                    std::future::pending::<Result<(), ()>>().await
+                  }
+                }
+              }
+            }, if cfg!(feature = "io-uring") && self.config.use_recv_multishot && matches!(self.active_receive_future_holder, ActiveReceiveFuture::UringMultishot(_)) => {
+                // This block is entered only if:
+                // 1. io-uring feature is enabled (static cfg)
+                // 2. config.use_recv_multishot is true (runtime cfg)
+                // 3. active_receive_future_holder was Some(UringMultishot(fut)) (runtime state)
+                // 4. The UringMultishot future (fut.await) has completed.
+
+                #[cfg(feature = "io-uring")] // This cfg ensures types like BufResult are available
+                {
+                    // The future has completed, so reset the holder.
+                    self.active_receive_future_holder = ActiveReceiveFuture::NotActive;
+
+                    let ms_manager = self.multishot_receiver_manager.as_mut()
+                        .expect("ms_manager must be Some if use_recv_multishot was true and future was UringMultishot");
+
+                    // `uring_recv_await_result` here is the `BufResult<(usize, Vec<BytesMut>)>`
+                    match uring_recv_await_result {
+                        Ok((num_filled, returned_buffers)) => {
+                            tracing::trace!(engine_handle = self.handle, num_filled, num_returned = returned_buffers.len(), "recv_multishot completed successfully");
+                            self.last_activity_time = Instant::now();
+
+                            // Reset cork state on any successful receive activity
+                            self.expecting_first_frame_of_msg = true;
+                            #[cfg(target_os = "linux")]
+                            if self.is_corked {
+                                if let Some(fd) = self.cached_fd_for_cork {
+                                    tracing::trace!(engine_handle = self.handle, "Data received via multishot, ensuring TCP_CORK is off.");
+                                    Self::set_tcp_cork_on_fd(fd, false, self.handle).await;
+                                }
+                                self.is_corked = false;
+                            }
+
+                            match ms_manager.process_completed_submission(num_filled, returned_buffers) {
+                                Ok(decoded_msgs_vec) => {
+                                    if decoded_msgs_vec.is_empty() && num_filled > 0 {
+                                        tracing::trace!(engine_handle = self.handle, "Multishot recv got data ({} buffers filled), but no full ZMTP messages decoded yet (partial frame likely).", num_filled);
+                                    }
+                                    for msg_frame in decoded_msgs_vec {
+                                        if should_break_loop { break; } // Check if a previous message processing decided to stop
+
+                                        if msg_frame.is_command() {
+                                            if let Some(zmtp_cmd) = ZmtpCommand::parse(&msg_frame) {
+                                                match zmtp_cmd {
+                                                    ZmtpCommand::Ping(ping_context) => {
+                                                        tracing::debug!(engine_handle = self.handle, "Received PING from peer (multishot). Replying with PONG.");
+                                                        let pong_reply = ZmtpCommand::create_pong(&ping_context);
+                                                        let mut pong_send_ok = false;
+                                                        #[cfg(target_os="linux")] let mut pong_was_corked_for_reply = false;
+
+                                                        #[cfg(target_os = "linux")]
+                                                        if self.config.use_cork {
+                                                            if let Some(fd) = self.cached_fd_for_cork {
+                                                                if !self.is_corked { // PONG is a new logical message
+                                                                    Self::set_tcp_cork_on_fd(fd, true, self.handle).await;
+                                                                    self.is_corked = true;
+                                                                    pong_was_corked_for_reply = true;
+                                                                }
+                                                            }
+                                                        }
+
+                                                        // PONG reply uses standard send path for now
+                                                        if let Err(e) = framed_transport_stream.send(pong_reply).await {
+                                                            tracing::error!(engine_handle = self.handle, error = %e, "Failed to send PONG reply (from multishot recv path).");
+                                                            final_error_for_actor_stop = Some(e);
+                                                            should_break_loop = true;
+                                                        } else {
+                                                            self.last_activity_time = Instant::now();
+                                                            pong_send_ok = true;
+                                                        }
+
+                                                        #[cfg(target_os = "linux")]
+                                                        if pong_was_corked_for_reply && pong_send_ok {
+                                                            if let Some(fd) = self.cached_fd_for_cork {
+                                                                Self::set_tcp_cork_on_fd(fd, false, self.handle).await;
+                                                            }
+                                                            self.is_corked = false;
+                                                        }
+                                                        self.expecting_first_frame_of_msg = true;
+                                                    }
+                                                    ZmtpCommand::Pong(_) => {
+                                                        tracing::debug!(engine_handle = self.handle, "Received PONG from peer (multishot).");
+                                                        if self.waiting_for_pong {
+                                                            self.waiting_for_pong = false;
+                                                            self.last_ping_sent_time = None;
+                                                        } else {
+                                                            tracing::warn!(engine_handle = self.handle, "Received unexpected PONG (was not waiting).");
+                                                        }
+                                                    }
+                                                    ZmtpCommand::Error => {
+                                                        tracing::warn!(engine_handle = self.handle, "Received ZMTP ERROR command from peer (multishot).");
+                                                        let err = ZmqError::ProtocolViolation("Received ZMTP ERROR from peer".into());
+                                                        if !self.session_mailbox.is_closed() {
+                                                            let _ = self.session_mailbox.send(Command::EngineError { error: err.clone() }).await;
+                                                        }
+                                                        final_error_for_actor_stop = Some(err);
+                                                        should_break_loop = true;
+                                                    }
+                                                    _ => { /* Other commands like READY are informational */ }
+                                                }
+                                            } else {
+                                                tracing::warn!(engine_handle = self.handle, "Failed to parse ZMTP command received via multishot.");
+                                            }
+                                        } else { // Data message
+                                            if self.session_mailbox.send(Command::EnginePushCmd { msg: msg_frame }).await.is_err() {
+                                                tracing::warn!(engine_handle = self.handle, "Session mailbox closed while sending data from multishot recv.");
+                                                should_break_loop = true;
+                                                if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed on ZC incoming data".into()));}
+                                            }
+                                        }
+                                    } // End for loop over decoded_msgs_vec
+                                }
+                                Err(e) => { // Codec error from process_completed_submission
+                                    tracing::error!(engine_handle = self.handle, error = %e, "Error processing ZC received buffers in UringMultishotReceiver.");
+                                    final_error_for_actor_stop = Some(e);
+                                    should_break_loop = true;
+                                }
+                            }
+                        }
+                        Err(e) => { // Error from the recv_multishot future itself (e.g., stream error)
+                            tracing::error!(engine_handle = self.handle, error = %e, "recv_multishot future failed directly.");
+                            let zmq_err = ZmqError::from(e); // Convert io::Error to ZmqError
+                            if !self.session_mailbox.is_closed() {
+                                let _ = self.session_mailbox.send(Command::EngineError { error: zmq_err.clone() }).await;
+                            }
+                            final_error_for_actor_stop = Some(zmq_err);
+                            should_break_loop = true;
+                        }
+                    }
+
+                    // After handling completion or error, try to re-arm for the next round,
+                    // but only if the loop isn't already breaking due to a fatal error.
+                    if !should_break_loop {
+                        self.try_arm_multishot_recv_future(framed_transport_stream.get_ref());
+                    }
+                }
+            }
+
+          // --- Heartbeat PING Timer Arm ---
+          // This arm fires if keepalive is enabled, we are not already waiting for a PONG,
+          // and the ping_check_timer ticks.
+          _ = async { ping_check_timer.as_mut().unwrap().tick().await }, if keepalive_ping_enabled && !self.waiting_for_pong && ping_check_timer.is_some() => {
+            // Check if it's time to send a PING based on last_activity_time and heartbeat_ivl
+            let now = Instant::now();
+            if now.duration_since(self.last_activity_time) >= self.heartbeat_ivl.unwrap() {
+              tracing::trace!(engine_handle = self.handle, "Heartbeat interval elapsed. Sending PING.");
+              let ping_to_send = ZmtpCommand::create_ping(0, b""); // TTL and Context for PING
+              let mut ping_sent_successfully = false;
 
               #[cfg(target_os = "linux")]
               if self.config.use_cork {
-                  if let Some(fd) = self.stream_fd_for_cork {
-                      if self.expecting_first_frame_of_msg && !self.is_corked {
-                          // This is the first frame of a new logical ZMQ message, and we are not yet corked. Cork it.
-                          Self::set_tcp_cork_rawfd(fd, true, self.handle).await;
-                          self.is_corked = true;
-                      }
-                  } else if self.expecting_first_frame_of_msg { // Log if cork enabled but FD missing
-                      tracing::warn!(engine_handle = self.handle, "TCP_CORK is enabled but stream FD is not available for setting cork.");
+                if let Some(fd) = self.cached_fd_for_cork {
+                  // PING is a new logical message. If not already corked (e.g., from a previous send
+                  // that didn't complete with its last frame), cork now.
+                  if !self.is_corked {
+                    Self::set_tcp_cork_on_fd(fd, true, self.handle).await;
+                    self.is_corked = true;
                   }
-              }
-
-              // --- Determine Send Path (Zerocopy or Standard) ---
-              let use_zc_path = cfg!(feature = "io-uring") && self.config.use_send_zerocopy;
-
-              if use_zc_path {
-                #[cfg(feature = "io-uring")] // Ensures this block only active if io-uring feature is on
-                {
-                  let uring_stream_ref = framed_transport_stream.get_ref(); // S should be tokio_uring::net::TcpStream
-
-                  let zmtp_header_bytes: Bytes = {
-                    let mut temp_buf = bytes::BytesMut::with_capacity(9);
-                    let codec = ZmtpCodec::new();
-                    match codec.encode_header_only(&msg, &mut temp_buf) {
-                        Ok(()) => temp_buf.freeze(),
-                        Err(e) => {
-                            tracing::error!(engine_handle = self.handle, "ZC Send: Failed to encode header: {}", e);
-                            current_send_error = Some(e);
-                            Bytes::new() // Dummy to satisfy type, error will be handled
-                        }
-                    }
-                  };
-
-                  if current_send_error.is_none() {
-                    let payload_bytes: Bytes = msg.data_bytes().unwrap_or_else(Bytes::new);
-                    let bufs = [zmtp_header_bytes.slice(..), payload_bytes.slice(..)];
-                    let total_bytes_to_send = bufs[0].bytes_init() + bufs[1].bytes_init();
-
-                    tracing::trace!(engine_handle = self.handle, header_len = bufs[0].bytes_init(), payload_len = bufs[1].bytes_init(), "Attempting ZC vectored send.");
-                    match uring_stream_ref.send_vectored_zc(&bufs).await {
-                      Ok(bytes_sent) => {
-                        if bytes_sent != total_bytes_to_send {
-                          tracing::error!(engine_handle = self.handle, expected = total_bytes_to_send, actual = bytes_sent, "ZC send_vectored_zc resulted in a partial send.");
-                          current_send_error = Some(ZmqError::from(io::Error::new(io::ErrorKind::WriteZero, "Partial zerocopy send")));
-                        } else {
-                          send_occurred_successfully = true;
-                          tracing::trace!(engine_handle = self.handle, bytes_sent, "ZC vectored send successful.");
-                        }
-                      }
-                      Err(e) => {
-                        tracing::error!(engine_handle = self.handle, error = %e, "Engine ZC send_vectored_zc failed.");
-                        current_send_error = Some(ZmqError::from(e));
-                      }
-                    }
-                  }
-                }
-              } else { // Standard send path
-                if let Err(e) = framed_transport_stream.send(msg).await {
-                  current_send_error = Some(e);
+                  // If it *was* already corked (e.g. user sent frame1, then PING timer fired),
+                  // we keep it corked, send the PING, then uncork because PING is a complete message.
                 } else {
-                  send_occurred_successfully = true;
+                  tracing::warn!(engine_handle = self.handle, "TCP_CORK enabled for PING but stream FD is not available.");
                 }
               }
 
-              // Current plan: All sends go through framed_stream. Zerocopy path is deferred.
-              if let Some(e) = current_send_error {
-                tracing::error!(engine_handle = self.handle, error = %e, "Engine failed to send message.");
-
-                if !self.session_mailbox.is_closed() {
-                  let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await;
+              match framed_transport_stream.send(ping_to_send).await {
+                Ok(()) => {
+                  self.last_activity_time = now;      // Update activity time after successful PING send
+                  self.last_ping_sent_time = Some(now);
+                  self.waiting_for_pong = true;
+                  pong_timeout_timer.reset(); // Reset the PONG timeout timer
+                  ping_sent_successfully = true;
+                  tracing::debug!(engine_handle = self.handle, "PING sent. Waiting for PONG.");
                 }
-
-                final_error_for_actor_stop = Some(e);
-                should_break_loop = true;
-
-                // If send fails, ensure cork is released if it was set for this message attempt
-                #[cfg(target_os = "linux")]
-                if self.is_corked {
-                  if let Some(fd) = self.stream_fd_for_cork {
-                    Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork on error
+                Err(e) => {
+                  tracing::error!(engine_handle = self.handle, error = %e, "Engine failed to send PING.");
+                  if !self.session_mailbox.is_closed() {
+                    let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await;
                   }
-                  self.is_corked = false;
-                  self.expecting_first_frame_of_msg = true; // Reset for next attempt if any
-                }
-              } else if send_occurred_successfully {
-                self.last_activity_time = Instant::now();
-                self.expecting_first_frame_of_msg = is_last_frame_of_user_message;
-
-                #[cfg(target_os = "linux")]
-                if self.is_corked && self.expecting_first_frame_of_msg && send_occurred_successfully {
-                  // This means the frame just sent was the last part of a logical ZMQ message,
-                  // and the cork was active. Uncork now.
-                  if let Some(fd) = self.stream_fd_for_cork {
-                      Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork
+                  final_error_for_actor_stop = Some(e);
+                  should_break_loop = true;
+                  // If PING send fails, ensure cork is released if it was set for this attempt
+                  #[cfg(target_os = "linux")]
+                  if self.is_corked {
+                    if let Some(fd) = self.cached_fd_for_cork {
+                      Self::set_tcp_cork_on_fd(fd, false, self.handle).await; // Uncork on error
+                    }
+                    self.is_corked = false;
                   }
-                  self.is_corked = false;
                 }
               }
-            }
-            Command::Stop => {
-              tracing::info!(engine_handle = engine_actor_handle, "Engine received Stop command.");
-              should_break_loop = true;
-            }
-            _ => { /* Unhandled command */ }
-          }
-        }
 
-        frame_decode_result = framed_transport_stream.next() => {
-          match frame_decode_result {
-            Some(Ok(decoded_msg)) => {
-              self.last_activity_time = Instant::now();
-
-              // Any valid frame received from peer means peer is active.
-              // If we were corked waiting to send more, this implies the other side might expect a turn.
-              // Also, TCP ACKs might have flushed our send buffer.
-              // It's safer to reset cork state.
-              if self.expecting_first_frame_of_msg == false { // We were in the middle of sending a logical message
-                tracing::trace!(engine_handle = self.handle, "Data received from peer mid-send; ZMQ message send interrupted by receive.");
-              }
-              self.expecting_first_frame_of_msg = true;
+              // PING is a self-contained, single-frame logical ZMTP message.
+              // So, if cork was active, it should be released after sending it.
               #[cfg(target_os = "linux")]
-              if self.is_corked {
-                if let Some(fd) = self.stream_fd_for_cork {
-                  tracing::trace!(engine_handle = self.handle, "Data received from peer, ensuring TCP_CORK is off if it was on.");
-                  Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork on receiving data
+              if self.is_corked && ping_sent_successfully {
+                if let Some(fd) = self.cached_fd_for_cork {
+                  Self::set_tcp_cork_on_fd(fd, false, self.handle).await; // Uncork after PING
                 }
                 self.is_corked = false;
               }
-
-              if decoded_msg.is_command() {
-                if let Some(zmtp_cmd) = ZmtpCommand::parse(&decoded_msg) {
-                  match zmtp_cmd {
-                    ZmtpCommand::Ping(ping_context) => {
-                      let pong_reply = ZmtpCommand::create_pong(&ping_context);
-                      if let Err(e) = framed_transport_stream.send(pong_reply).await {
-                        if !self.session_mailbox.is_closed() { let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await; }
-                        should_break_loop = true; final_error_for_actor_stop = Some(e);
-                      } else { self.last_activity_time = Instant::now(); }
-                    }
-                    ZmtpCommand::Pong(_) => {
-                      if self.waiting_for_pong { self.waiting_for_pong = false; self.last_ping_sent_time = None; }
-                      else { tracing::warn!(engine_handle = engine_actor_handle, "Received unexpected PONG."); }
-                    }
-                    ZmtpCommand::Error => {
-                      if !self.session_mailbox.is_closed() { let _ = self.session_mailbox.send(Command::EngineError { error: ZmqError::ProtocolViolation("Received ZMTP ERROR".into()) }).await; }
-                      should_break_loop = true; final_error_for_actor_stop = Some(ZmqError::ProtocolViolation("Received ZMTP ERROR from peer".into()));
-                    }
-                    _ => { /* Ignore other commands like Ready, Unknown */ }
-                  }
-                }
-              } else {
-                if self.session_mailbox.send(Command::EnginePushCmd { msg: decoded_msg }).await.is_err() {
-                  should_break_loop = true;
-                  if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed on incoming data".into())); }
-                }
-              }
-            }
-            Some(Err(e)) => {
-              if !self.session_mailbox.is_closed() { let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await; }
-              should_break_loop = true; final_error_for_actor_stop = Some(e);
-            }
-            None => {
-              should_break_loop = true;
-              if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::ConnectionClosed); }
+              // After sending a PING, the next user data send will be the start of a new logical message.
+              self.expecting_first_frame_of_msg = true;
             }
           }
-        }
 
-        // --- Heartbeat PING Timer Arm ---
-        // This arm fires if keepalive is enabled, we are not already waiting for a PONG,
-        // and the ping_check_timer ticks.
-        _ = async { ping_check_timer.as_mut().unwrap().tick().await }, if keepalive_ping_enabled && !self.waiting_for_pong && ping_check_timer.is_some() => {
-          // Check if it's time to send a PING based on last_activity_time and heartbeat_ivl
-          let now = Instant::now();
-          if now.duration_since(self.last_activity_time) >= self.heartbeat_ivl.unwrap() {
-            tracing::trace!(engine_handle = self.handle, "Heartbeat interval elapsed. Sending PING.");
-            let ping_to_send = ZmtpCommand::create_ping(0, b""); // TTL and Context for PING
-            let mut ping_sent_successfully = false;
-
-            #[cfg(target_os = "linux")]
-            if self.config.use_cork {
-              if let Some(fd) = self.cached_fd_for_cork {
-                // PING is a new logical message. If not already corked (e.g., from a previous send
-                // that didn't complete with its last frame), cork now.
-                if !self.is_corked {
-                  Self::set_tcp_cork_on_fd(fd, true, self.handle).await;
-                  self.is_corked = true;
-                }
-                // If it *was* already corked (e.g. user sent frame1, then PING timer fired),
-                // we keep it corked, send the PING, then uncork because PING is a complete message.
-              } else {
-                tracing::warn!(engine_handle = self.handle, "TCP_CORK enabled for PING but stream FD is not available.");
-              }
+          // --- PONG Timeout Arm ---
+          _ = pong_timeout_timer.tick(), if self.waiting_for_pong => {
+            tracing::warn!(engine_handle = self.handle, timeout = ?self.heartbeat_timeout, "Timed out waiting for PONG.");
+            if !self.session_mailbox.is_closed() {
+              let _ = self.session_mailbox.send(Command::EngineError { error: ZmqError::Timeout }).await;
             }
+            final_error_for_actor_stop = Some(ZmqError::Timeout);
+            should_break_loop = true;
 
-            match framed_transport_stream.send(ping_to_send).await {
-              Ok(()) => {
-                self.last_activity_time = now;      // Update activity time after successful PING send
-                self.last_ping_sent_time = Some(now);
-                self.waiting_for_pong = true;
-                pong_timeout_timer.reset(); // Reset the PONG timeout timer
-                ping_sent_successfully = true;
-                tracing::debug!(engine_handle = self.handle, "PING sent. Waiting for PONG.");
-              }
-              Err(e) => {
-                tracing::error!(engine_handle = self.handle, error = %e, "Engine failed to send PING.");
-                if !self.session_mailbox.is_closed() {
-                  let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await;
-                }
-                final_error_for_actor_stop = Some(e);
-                should_break_loop = true;
-                // If PING send fails, ensure cork is released if it was set for this attempt
-                #[cfg(target_os = "linux")]
-                if self.is_corked {
-                  if let Some(fd) = self.cached_fd_for_cork {
-                    Self::set_tcp_cork_on_fd(fd, false, self.handle).await; // Uncork on error
-                  }
-                  self.is_corked = false;
-                }
-              }
-            }
-
-            // PING is a self-contained, single-frame logical ZMTP message.
-            // So, if cork was active, it should be released after sending it.
+            // If we timed out waiting for PONG, and we were corked (perhaps waiting to send more data
+            // that never happened because the PING failed to elicit a PONG), ensure we uncork.
             #[cfg(target_os = "linux")]
-            if self.is_corked && ping_sent_successfully {
+            if self.is_corked {
               if let Some(fd) = self.cached_fd_for_cork {
-                Self::set_tcp_cork_on_fd(fd, false, self.handle).await; // Uncork after PING
+                Self::set_tcp_cork_on_fd(fd, false, self.handle).await;
               }
               self.is_corked = false;
             }
-            // After sending a PING, the next user data send will be the start of a new logical message.
-            self.expecting_first_frame_of_msg = true;
+            self.expecting_first_frame_of_msg = true; // Reset for any future communication
           }
-        }
-
-        // --- PONG Timeout Arm ---
-        _ = pong_timeout_timer.tick(), if self.waiting_for_pong => {
-          tracing::warn!(engine_handle = self.handle, timeout = ?self.heartbeat_timeout, "Timed out waiting for PONG.");
-          if !self.session_mailbox.is_closed() {
-            let _ = self.session_mailbox.send(Command::EngineError { error: ZmqError::Timeout }).await;
-          }
-          final_error_for_actor_stop = Some(ZmqError::Timeout);
-          should_break_loop = true;
-
-          // If we timed out waiting for PONG, and we were corked (perhaps waiting to send more data
-          // that never happened because the PING failed to elicit a PONG), ensure we uncork.
-          #[cfg(target_os = "linux")]
-          if self.is_corked {
-            if let Some(fd) = self.cached_fd_for_cork {
-              Self::set_tcp_cork_on_fd(fd, false, self.handle).await;
-            }
-            self.is_corked = false;
-          }
-          self.expecting_first_frame_of_msg = true; // Reset for any future communication
         }
       }
     }
