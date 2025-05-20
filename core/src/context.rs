@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Orde
 use std::sync::Arc;
 
 #[cfg(feature = "curve")]
-use libsodium_rs as libsodium; // For CURVE security initialization
+use libsodium_rs as libsodium;
+use tracing::warn; // For CURVE security initialization
 
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock}; // broadcast for EventBus, Mutex/RwLock for shared state
@@ -347,7 +348,7 @@ impl Context {
       // Use eprintln for higher chance of visibility during shutdown/panic.
       // Check if already panicking to avoid making things worse.
       if !std::thread::panicking() {
-        eprintln!(
+        warn!(
           "WARN: Failed to publish ActorStopping event for handle {}: {} (receivers={})",
           handle_id,
           e,
@@ -377,7 +378,7 @@ impl Context {
       // Log a warning if done() is called when count is already zero.
       // This indicates a potential logic error (e.g., double stop).
       if !std::thread::panicking() {
-        eprintln!(
+        warn!(
           "WARN: Attempted WaitGroup done() for handle {} ({:?}) but count was already zero!",
           handle_id, actor_type
         );
