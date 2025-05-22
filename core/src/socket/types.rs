@@ -111,6 +111,23 @@ impl Socket {
     self.inner.recv().await
   }
 
+  /// Sends a sequence of message frames atomically as one logical message.
+  /// The exact interpretation of "atomically" and how frames are handled
+  /// (e.g., prepending identities or delimiters) depends on the socket type.
+  ///
+  /// For ROUTER: The first frame in `frames` MUST be the destination identity,
+  ///             and it MUST have the MORE flag set if subsequent frames exist.
+  ///             The implementation will insert the empty delimiter.
+  ///             The payload frames follow.
+  /// For DEALER: All frames are payload sent to a chosen peer, with an empty
+  ///             delimiter prepended automatically by the DEALER implementation.
+  /// Other types: May error or have specific behavior.
+  ///
+  /// The `frames` Vec should have MsgFlags::MORE set correctly on all but the last Msg.
+  pub async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError> {
+    self.inner.send_multipart(frames).await
+  }
+
   /// Sets a socket option asynchronously.
   /// Options control various aspects of the socket's behavior (e.g., high-water marks, timeouts).
   /// Refer to ZMQ documentation for standard option IDs and their meanings.

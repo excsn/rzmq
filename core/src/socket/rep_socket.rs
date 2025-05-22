@@ -278,6 +278,10 @@ impl ISocket for RepSocket {
     Ok(())
   }
 
+  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
+    unimplemented!("Not Implemented yet")
+  }
+
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
     Err(ZmqError::UnsupportedOption(option))
   }

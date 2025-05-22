@@ -65,12 +65,14 @@ use std::time::Duration;
 // Otherwise (or if io-uring feature is not used):
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
-    let ctx = Context::new()?;
+    let ctx = Context::new()?; // Use default capacities
 
     let push_socket = ctx.socket(SocketType::Push)?;
     let pull_socket = ctx.socket(SocketType::Pull)?;
 
-    let endpoint = "inproc://qstart-pushpull"; // In-process for simplicity
+    // For this example, use the "inproc" feature.
+    // Ensure rzmq is added with `features = ["inproc"]` in Cargo.toml
+    let endpoint = "inproc://qstart-pushpull";
 
     pull_socket.bind(endpoint).await?;
     push_socket.connect(endpoint).await?;
@@ -103,7 +105,7 @@ use std::time::Duration;
 // #[rzmq::main] // if io-uring
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
-    let ctx = Context::new()?;
+    let ctx = Context::with_capacity(Some(128))?; // Example: specify mailbox capacity
 
     let req_socket = ctx.socket(SocketType::Req)?;
     let rep_socket = ctx.socket(SocketType::Rep)?;
@@ -146,7 +148,9 @@ async fn main() -> Result<(), ZmqError> {
 Manages sockets and shared resources.
 
 *   **`pub fn new() -> Result<Context, ZmqError>`**
-    Creates a new, independent `rzmq` context.
+    Creates a new, independent `rzmq` context with default internal capacities.
+*   **`pub fn with_capacity(actor_mailbox_capacity: Option<usize>) -> Result<Context, ZmqError>`**
+    Creates a new, independent `rzmq` context. `actor_mailbox_capacity` optionally specifies the bounded capacity for internal actor command mailboxes. If `None`, a default capacity is used. The minimum capacity used will be 1.
 *   **`pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError>`**
     Creates a new `Socket` of the specified `SocketType` associated with this context.
 *   **`pub async fn shutdown(&self) -> Result<(), ZmqError>`**
@@ -167,9 +171,11 @@ Handle for interacting with a socket.
 *   **`pub async fn unbind(&self, endpoint: &str) -> Result<(), ZmqError>`**
     Stops listening on a bound endpoint.
 *   **`pub async fn send(&self, msg: Msg) -> Result<(), ZmqError>`**
-    Sends a message.
-*   **`pub async fn recv(&self, msg: Msg) -> Result<Msg, ZmqError>`**
-    Receives a message.
+    Sends a message. For multi-part messages, use `MsgFlags::MORE` on all but the last part.
+*   **`pub async fn recv(&self) -> Result<Msg, ZmqError>`**
+    Receives a message. Check `msg.is_more()` for multi-part messages.
+*   **`pub async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError>`**
+    Sends a sequence of `Msg` frames as a single logical message. The library handles necessary delimiters (e.g., for DEALER/ROUTER). The caller should set `MsgFlags::MORE` appropriately on the input `frames` if the *application payload itself* is multi-part; the final frame of the application payload should not have `MORE`.
 *   **`pub async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError>`**
     Sets a socket option. `value` is typically `&some_i32.to_ne_bytes()` for integer options or `b"string_value"` for byte slice options.
 *   **`pub async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError>`**
@@ -179,7 +185,7 @@ Handle for interacting with a socket.
 *   **`pub async fn monitor(&self, capacity: usize) -> Result<MonitorReceiver, ZmqError>`**
     Creates a channel for receiving `SocketEvent` notifications.
 *   **`pub async fn monitor_default(&self) -> Result<MonitorReceiver, ZmqError>`**
-    Creates a monitor channel with default capacity.
+    Creates a monitor channel with default capacity (`rzmq::socket::DEFAULT_MONITOR_CAPACITY`).
 
 ### `rzmq::Msg` and `rzmq::MsgFlags`
 
@@ -192,6 +198,7 @@ Handle for interacting with a socket.
     *   `Msg::from_static(data: &'static [u8])` (zero-copy for static data)
 *   **Accessing data and flags:**
     *   `msg.data() -> Option<&[u8]>`
+    *   `msg.data_bytes() -> Option<bytes::Bytes>` (cheaply cloneable internal `Bytes`)
     *   `msg.size() -> usize`
     *   `msg.flags() -> MsgFlags`
     *   `msg.set_flags(flags: MsgFlags)`
@@ -207,24 +214,36 @@ An immutable, reference-counted byte sequence, often used for identities or subs
 ### Creating Sockets
 Sockets are created from a `Context` instance, specifying a `SocketType`:
 ```rust
-use rzmq::{Context, SocketType};
-let ctx = Context::new()?;
-let publisher = ctx.socket(SocketType::Pub)?;
-let subscriber = ctx.socket(SocketType::Sub)?;
+use rzmq::{Context, SocketType, ZmqError}; // Add ZmqError for the Result type
+
+async fn setup_sockets() -> Result<(), ZmqError> {
+    let ctx = Context::new()?;
+    let publisher = ctx.socket(SocketType::Pub)?;
+    let subscriber = ctx.socket(SocketType::Sub)?;
+    // ... use publisher and subscriber ...
+    ctx.term().await?; // Example of context termination
+    Ok(())
+}
 ```
 
 ### Binding and Connecting
 *   **Bind (Server-side):** Sockets that accept incoming connections use `bind`.
     ```rust
-    // REP socket acting as a server
-    rep_socket.bind("tcp://*:5555").await?; // Listen on all interfaces, port 5555
-    rep_socket.bind("inproc://my-service").await?;
+    // rep_socket is a Socket of SocketType::Rep
+    // async fn bind_example(rep_socket: &rzmq::Socket) -> Result<(), ZmqError> {
+    //     rep_socket.bind("tcp://*:5555").await?; // Listen on all interfaces, port 5555
+    //     rep_socket.bind("inproc://my-service").await?; // Requires "inproc" feature
+    //     Ok(())
+    // }
     ```
 *   **Connect (Client-side):** Sockets that initiate connections use `connect`.
     ```rust
-    // REQ socket acting as a client
-    req_socket.connect("tcp://server-address:5555").await?;
-    req_socket.connect("inproc://my-service").await?;
+    // req_socket is a Socket of SocketType::Req
+    // async fn connect_example(req_socket: &rzmq::Socket) -> Result<(), ZmqError> {
+    //     req_socket.connect("tcp://server-address:5555").await?;
+    //     req_socket.connect("inproc://my-service").await?; // Requires "inproc" feature
+    //     Ok(())
+    // }
     ```
 Connections are typically asynchronous. `rzmq` handles retries for TCP connections if `RECONNECT_IVL` is set appropriately.
 
@@ -232,94 +251,139 @@ Connections are typically asynchronous. `rzmq` handles retries for TCP connectio
 *   **Sending:**
     ```rust
     use rzmq::Msg;
-    let message = Msg::from_static(b"Data to send");
-    socket.send(message).await?;
+    // async fn send_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
+    //     let message = Msg::from_static(b"Data to send");
+    //     socket.send(message).await?;
+    //     Ok(())
+    // }
     ```
 *   **Receiving:**
     ```rust
-    let received_message = socket.recv().await?;
-    if let Some(data) = received_message.data() {
-        println!("Received: {}", String::from_utf8_lossy(data));
-    }
+    // async fn recv_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
+    //     let received_message = socket.recv().await?;
+    //     if let Some(data) = received_message.data() {
+    //         println!("Received: {}", String::from_utf8_lossy(data));
+    //     }
+    //     Ok(())
+    // }
     ```
 
 ### Multi-Part Messages
 To send or receive a message composed of multiple frames:
-*   **Sending:** Set `MsgFlags::MORE` on all frames except the last one.
+*   **Sending with `send()`:** Set `MsgFlags::MORE` on all frames except the last one.
     ```rust
     use rzmq::{Msg, MsgFlags};
-    let mut frame1 = Msg::from_static(b"Identity");
-    frame1.set_flags(MsgFlags::MORE);
-    let mut frame2 = Msg::from_static(b""); // Empty delimiter
-    frame2.set_flags(MsgFlags::MORE);
-    let frame3 = Msg::from_static(b"Actual payload");
+    // async fn send_multipart_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
+    //     let mut frame1 = Msg::from_static(b"Identity");
+    //     frame1.set_flags(MsgFlags::MORE);
+    //     let mut frame2 = Msg::from_static(b""); // Empty delimiter
+    //     frame2.set_flags(MsgFlags::MORE);
+    //     let frame3 = Msg::from_static(b"Actual payload"); // Last frame, no MORE flag
 
-    // Assuming 'socket' is a ROUTER or DEALER
-    // socket.send(frame1).await?;
-    // socket.send(frame2).await?;
-    // socket.send(frame3).await?;
+    //     // Assuming 'socket' is a ROUTER or DEALER that handles these frames appropriately
+    //     socket.send(frame1).await?;
+    //     socket.send(frame2).await?;
+    //     socket.send(frame3).await?;
+    //     Ok(())
+    // }
     ```
+*   **Sending with `send_multipart()`:** (Recommended for ROUTER/DEALER)
+    ```rust
+    use rzmq::{Msg, MsgFlags};
+    // async fn send_multipart_atomic_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
+    //     // For ROUTER: first frame is identity, subsequent are payload.
+    //     // For DEALER: all frames are payload, delimiter is prepended.
+    //     // Caller sets MORE flags for application payload parts.
+    //     let identity_frame = Msg::from_static(b"destination_peer_id"); // No MORE flag if single payload frame follows
+    //     let payload_frame = Msg::from_static(b"Hello to peer");
+
+    //     // If application payload itself is multi-part:
+    //     // let mut app_payload_part1 = Msg::from_static(b"Part 1");
+    //     // app_payload_part1.set_flags(MsgFlags::MORE);
+    //     // let app_payload_part2 = Msg::from_static(b"Part 2");
+    //     // socket.send_multipart(vec![identity_frame, app_payload_part1, app_payload_part2]).await?;
+
+    //     socket.send_multipart(vec![identity_frame, payload_frame]).await?;
+    //     Ok(())
+    // }
+    ```
+
 *   **Receiving:** After `socket.recv().await?`, check `msg.is_more()`. If `true`, call `recv()` again for the next part.
     ```rust
-    let mut all_frames = Vec::new();
-    loop {
-        let frame = socket.recv().await?;
-        let is_last_part = !frame.is_more();
-        all_frames.push(frame);
-        if is_last_part {
-            break;
-        }
-    }
-    // Now 'all_frames' contains all parts of the logical message.
+    // async fn recv_multipart_example(socket: &rzmq::Socket) -> Result<Vec<Msg>, ZmqError> {
+    //     let mut all_frames = Vec::new();
+    //     loop {
+    //         let frame = socket.recv().await?;
+    //         let is_last_part = !frame.is_more();
+    //         all_frames.push(frame);
+    //         if is_last_part {
+    //             break;
+    //         }
+    //     }
+    //     // Now 'all_frames' contains all parts of the logical message.
+    //     Ok(all_frames)
+    // }
     ```
 
 ### Socket Options
 Fine-tune socket behavior using `set_option` and `get_option`.
-Refer to the "Socket Options (Constants)" section in the main [README.md](README.md#socket-options-constants) for a list of common options and their types.
+Refer to the "Socket Options (Constants)" section in the main [API Reference](#socket-options-constants) for a list of common options and their types.
 
 Example: Setting `SNDTIMEO` (send timeout)
 ```rust
-use rzmq::socket::options::SNDTIMEO;
-// Set send timeout to 500ms
-socket.set_option(SNDTIMEO, &(500i32).to_ne_bytes()).await?;
+use rzmq::socket::SNDTIMEO; // Assuming options are re-exported under rzmq::socket
+// async fn set_sndtimeo_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
+//     // Set send timeout to 500ms
+//     socket.set_option(SNDTIMEO, &(500i32).to_ne_bytes()).await?;
+//     Ok(())
+// }
 ```
 Example: Subscribing a `SUB` socket
 ```rust
-use rzmq::socket::options::SUBSCRIBE;
-// sub_socket is a Socket of SocketType::Sub
-sub_socket.set_option(SUBSCRIBE, b"NASDAQ:").await?; // Subscribe to messages starting with "NASDAQ:"
-sub_socket.set_option(SUBSCRIBE, b"").await?;      // Subscribe to all messages
+use rzmq::socket::SUBSCRIBE; // Assuming options are re-exported under rzmq::socket
+// async fn subscribe_example(sub_socket: &rzmq::Socket) -> Result<(), ZmqError> {
+//     // sub_socket is a Socket of SocketType::Sub
+//     sub_socket.set_option(SUBSCRIBE, b"NASDAQ:").await?; // Subscribe to messages starting with "NASDAQ:"
+//     sub_socket.set_option(SUBSCRIBE, b"").await?;      // Subscribe to all messages
+//     Ok(())
+// }
 ```
 Example: Getting `LAST_ENDPOINT` after binding to an ephemeral TCP port
 ```rust
-use rzmq::socket::options::LAST_ENDPOINT;
-// pull_socket is a Socket, e.g., SocketType::Pull
-pull_socket.bind("tcp://127.0.0.1:0").await?; // Bind to OS-assigned port
-let endpoint_bytes = pull_socket.get_option(LAST_ENDPOINT).await?;
-let resolved_endpoint = String::from_utf8(endpoint_bytes).unwrap();
-println!("Socket bound to: {}", resolved_endpoint); // e.g., "tcp://127.0.0.1:54321"
+use rzmq::socket::LAST_ENDPOINT; // Assuming options are re-exported under rzmq::socket
+// async fn get_last_endpoint_example(pull_socket: &rzmq::Socket) -> Result<(), ZmqError> {
+//     // pull_socket is a Socket, e.g., SocketType::Pull
+//     pull_socket.bind("tcp://127.0.0.1:0").await?; // Bind to OS-assigned port
+//     let endpoint_bytes = pull_socket.get_option(LAST_ENDPOINT).await?;
+//     let resolved_endpoint = String::from_utf8(endpoint_bytes).unwrap_or_default();
+//     println!("Socket bound to: {}", resolved_endpoint); // e.g., "tcp://127.0.0.1:54321"
+//     Ok(())
+// }
 ```
 
 ### Monitoring Socket Events
 Track socket lifecycle events:
 ```rust
-use rzmq::socket::events::SocketEvent;
-// ... setup socket ...
-let mut monitor_rx = socket.monitor_default().await?;
-tokio::spawn(async move {
-    while let Ok(event) = monitor_rx.recv().await {
-        match event {
-            SocketEvent::Connected { endpoint, peer_addr } => {
-                println!("Socket connected to {} (peer: {})", endpoint, peer_addr);
-            }
-            SocketEvent::Disconnected { endpoint } => {
-                println!("Socket disconnected from {}", endpoint);
-            }
-            // Handle other events like Listening, Accepted, BindFailed, etc.
-            _ => println!("Monitor: {:?}", event),
-        }
-    }
-});
+use rzmq::socket::SocketEvent; // Assuming events are re-exported under rzmq::socket
+// async fn monitor_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
+//     let mut monitor_rx = socket.monitor_default().await?;
+//     tokio::spawn(async move {
+//         while let Ok(event) = monitor_rx.recv().await {
+//             match event {
+//                 SocketEvent::Connected { endpoint, peer_addr } => {
+//                     println!("Socket connected to {} (peer: {})", endpoint, peer_addr);
+//                 }
+//                 SocketEvent::Disconnected { endpoint } => {
+//                     println!("Socket disconnected from {}", endpoint);
+//                 }
+//                 // Handle other events like Listening, Accepted, BindFailed, etc.
+//                 _ => println!("Monitor: {:?}", event),
+//             }
+//         }
+//         println!("Monitor channel closed.");
+//     });
+//     Ok(())
+// }
 ```
 
 ### Closing Sockets and Context Termination
@@ -344,14 +408,14 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
 1.  **Enable Feature**: Add the `io-uring` feature for `rzmq` in your `Cargo.toml`:
     ```toml
     [dependencies]
-    rzmq = { version = "...", features = ["io-uring"] }
+    rzmq = { version = "...", features = ["io-uring"] } # Or git source
     ```
 2.  **Use `#[rzmq::main]`**: Modify your application's `main` function to use the `#[rzmq::main]` attribute instead of `#[tokio::main]`.
     ```rust
-    // Make sure rzmq::main is in scope if using this attribute
-    // use rzmq::main as rzmq_main; // if needed for disambiguation
+    // In your main.rs or lib.rs if re-exporting from a library
+    // pub use rzmq::main as rzmq_main_attr; // Optional rename if `main` is ambiguous
 
-    #[rzmq::main] // Or #[rzmq_main]
+    #[rzmq::main] // Or #[rzmq_main_attr]
     async fn main() -> Result<(), rzmq::ZmqError> {
         // Your rzmq application code...
         let ctx = rzmq::Context::new()?;
@@ -365,11 +429,11 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
     The `#[rzmq::main]` macro automatically configures the Tokio runtime to use `tokio-uring` when the conditions are met. If not on Linux or the `io-uring` feature is disabled, it defaults to `#[tokio::main]`.
 
 3.  **`io_uring` Specific Options**: (Optional)
-    You can hint at `io_uring`-specific behaviors using socket options if the underlying transport uses them (these are currently experimental and their effect depends on `tokio-uring`'s capabilities):
-    *   `rzmq::socket::options::IO_URING_SNDZEROCOPY`: (Boolean) Hint to use zerocopy for sends if possible.
-    *   `rzmq::socket::options::IO_URING_RCVMULTISHOT`: (Boolean) Hint to use multishot receive operations if possible.
-    *   `rzmq::socket::options::IO_URING_RECV_BUFFER_COUNT`: (Integer) Number of buffers in the multishot receive pool (default: 16, min: 1).
-    *   `rzmq::socket::options::IO_URING_RECV_BUFFER_SIZE`: (Integer) Size of each buffer (in bytes) in the multishot receive pool (default: 65536, min: 1024).
+    You can hint at `io_uring`-specific behaviors using socket options if the underlying transport uses them:
+    *   `rzmq::socket::IO_URING_SNDZEROCOPY`: (Boolean) Hint to use zerocopy for sends.
+    *   `rzmq::socket::IO_URING_RCVMULTISHOT`: (Boolean) Hint to use multishot receive.
+    *   `rzmq::socket::IO_URING_RECV_BUFFER_COUNT`: (Integer) Number of buffers in the multishot receive pool (default: 16, min: 1).
+    *   `rzmq::socket::IO_URING_RECV_BUFFER_SIZE`: (Integer) Size of each buffer (in bytes) in the multishot receive pool (default: 65536, min: 1024).
 
     These are set using `socket.set_option(OPTION_CONST, &value.to_ne_bytes()).await?`. Boolean options typically use `1i32` for true and `0i32` for false.
 
@@ -386,10 +450,18 @@ The primary error type is `rzmq::ZmqError`. It's an enum covering various error 
     *   `ResourceLimitReached`: Send/receive buffer high-water mark reached (acts like EAGAIN).
     *   `HostUnreachable(String)`: For `ROUTER` with `ROUTER_MANDATORY`, if peer identity is unknown.
     *   `InvalidEndpoint(String)`: Malformed endpoint string.
-    *   `UringError(String)`: (`io-uring` feature) An error specific to an `io_uring` operation.
+    *   *(See the full list in the API Reference or `rzmq::ZmqError` documentation for more variants.)*
 
 *   **Result Type Alias**:
+    `rzmq::error::ZmqResult<T>` is an alias for `Result<T, rzmq::ZmqError>`.
+    Most API functions return this type (or `Result<(), rzmq::ZmqError>`).
     ```rust
-    pub type ZmqResult<T, E = ZmqError> = std::result::Result<T, E>;
+    // Example of handling errors
+    // async fn my_operation(socket: &rzmq::Socket) {
+    //     match socket.send(Msg::from_static(b"test")).await {
+    //         Ok(()) => println!("Message sent!"),
+    //         Err(rzmq::ZmqError::Timeout) => eprintln!("Send timed out"),
+    //         Err(e) => eprintln!("An error occurred: {}", e),
+    //     }
+    // }
     ```
-    Most API functions return this type (or `Result<(), ZmqError>`).

@@ -5,7 +5,7 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
 use crate::socket::options::SocketOptions;
 use crate::socket::patterns::{FairQueue, LoadBalancer};
-use crate::socket::{ISocket, SourcePipeReadId}; 
+use crate::socket::{ISocket, SourcePipeReadId};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -266,6 +266,151 @@ impl ISocket for DealerSocket {
     Ok(received_msg)
   }
 
+  /// Sends a sequence of application frames as one logical message.
+  /// The DEALER socket will automatically prepend an empty delimiter once for the entire sequence.
+  /// All frames in the input `app_frames` vector are considered parts of a single
+  /// application message to be sent after the delimiter.
+  /// The MORE flags on the input `app_frames` should be set by the caller to indicate
+  /// multiple parts of the *application message*; the last frame should not have MORE.
+  async fn send_multipart(&self, app_frames: Vec<Msg>) -> Result<(), ZmqError> {
+    if app_frames.is_empty() {
+      tracing::trace!(
+        handle = self.core.handle,
+        "DEALER send_multipart: app_frames is empty. Sending delimiter + one empty payload frame."
+      );
+      // To send an "empty" application message, we effectively send one empty payload frame.
+      // The original self.send() method would prepend the delimiter.
+      // To replicate that here while controlling the sequence:
+      let mut single_empty_payload_frame = Msg::new();
+      // No MORE flag as it's the only (and last) app payload frame.
+      return self.send_multipart(vec![single_empty_payload_frame]).await; // Recursive call with a single empty frame
+    }
+
+    // --- Select a peer pipe and get its sender ONCE for the whole multipart message ---
+    let timeout_opt: Option<Duration> = { self.core_state().await.options.sndtimeo };
+
+    let pipe_write_id = loop {
+      if let Some(id) = self.load_balancer.get_next_pipe().await {
+        break id;
+      }
+      // No peer currently available, behavior depends on timeout settings.
+      match timeout_opt {
+        Some(duration) if duration.is_zero() => {
+          tracing::trace!(
+            handle = self.core.handle,
+            "DEALER send_multipart (non-blocking): No connected peers"
+          );
+          return Err(ZmqError::ResourceLimitReached);
+        }
+        None => {
+          // Infinite timeout
+          tracing::trace!(
+            handle = self.core.handle,
+            "DEALER send_multipart blocking: Waiting for available peer..."
+          );
+          self.load_balancer.wait_for_pipe().await; // Wait for notification.
+          continue; // Loop back to try getting a pipe again.
+        }
+        Some(duration) => {
+          // Timed blocking send
+          tracing::trace!(
+            handle = self.core.handle,
+            ?duration,
+            "DEALER send_multipart timed wait: Waiting for available peer..."
+          );
+          match timeout(duration, self.load_balancer.wait_for_pipe()).await {
+            Ok(()) => continue, // Wait succeeded, pipe might be available now.
+            Err(_timeout_elapsed) => {
+              tracing::debug!(
+                handle = self.core.handle,
+                ?duration,
+                "DEALER send_multipart timed out waiting for peer"
+              );
+              return Err(ZmqError::Timeout); // Timeout elapsed.
+            }
+          }
+        }
+      }
+    };
+
+    let pipe_tx = {
+      let core_state_guard = self.core_state().await;
+      if let Some(pipe_sender) = core_state_guard.get_pipe_sender(pipe_write_id) {
+        pipe_sender
+      } else {
+        tracing::error!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          "DEALER send_multipart: Pipe sender disappeared after selection."
+        );
+        self.load_balancer.remove_pipe(pipe_write_id).await;
+        return Err(ZmqError::Internal("Pipe sender consistency error (send_multipart)".into()));
+      }
+    };
+
+    // --- Send the Delimiter (Manually, as we are controlling the whole sequence now) ---
+    tracing::trace!(
+      handle = self.core.handle,
+      pipe_id = pipe_write_id,
+      "DEALER send_multipart: Prepending empty delimiter"
+    );
+    let mut delimiter = Msg::new();
+    delimiter.set_flags(MsgFlags::MORE); // Delimiter always has MORE before app payload
+
+    match send_msg_with_timeout(&pipe_tx, delimiter, timeout_opt, self.core.handle, pipe_write_id).await {
+      Ok(()) => {} // Delimiter sent successfully
+      Err(e) => {
+        // Error sending delimiter
+        if matches!(e, ZmqError::ConnectionClosed | ZmqError::Internal(_)) {
+          self.load_balancer.remove_pipe(pipe_write_id).await;
+        }
+        return Err(e);
+      }
+    }
+
+    // --- Send all user-provided frames sequentially ---
+    let num_app_frames = app_frames.len();
+    for (i, mut frame) in app_frames.into_iter().enumerate() {
+      // The caller of send_multipart is responsible for setting MORE flags on input `app_frames`
+      // to delineate parts of *their* logical application message.
+      // However, for the *entire ZMQ message*, the very last frame (which is the last frame
+      // from `app_frames`) must NOT have the MORE flag.
+      if i == num_app_frames - 1 {
+        // This is the last frame from the input `app_frames` vec
+        frame.set_flags(frame.flags() & !MsgFlags::MORE); // Ensure MORE is unset
+      } else {
+        // For intermediate application frames, ensure MORE is set.
+        frame.set_flags(frame.flags() | MsgFlags::MORE);
+      }
+
+      tracing::trace!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          frame_idx = i,
+          flags = ?frame.flags(),
+          size = frame.size(),
+          "DEALER send_multipart: Sending app frame"
+      );
+      match send_msg_with_timeout(&pipe_tx, frame, timeout_opt, self.core.handle, pipe_write_id).await {
+        Ok(()) => {} // Frame sent successfully
+        Err(e) => {
+          // Error sending a payload part
+          if matches!(e, ZmqError::ConnectionClosed | ZmqError::Internal(_)) {
+            self.load_balancer.remove_pipe(pipe_write_id).await;
+          }
+          // If a part fails, the message is now corrupt/incomplete from peer's perspective.
+          return Err(e);
+        }
+      }
+    }
+    tracing::trace!(
+      handle = self.core.handle,
+      pipe_id = pipe_write_id,
+      "DEALER send_multipart: All app frames sent"
+    );
+    Ok(())
+  }
+
   // --- Pattern-Specific Option Handling ---
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
     // DEALER sockets do not have specific pattern options like SUBSCRIBE/UNSUBSCRIBE.
@@ -426,7 +571,11 @@ impl ISocket for DealerSocket {
     // Notify the incoming fair queue that a new pipe is attached (for potential internal tracking).
     self.incoming_queue.pipe_attached(pipe_read_id);
     // Initialize pipe state to Idle
-    self.pipe_state.lock().await.insert(pipe_read_id, IncomingPipeState::Idle);
+    self
+      .pipe_state
+      .lock()
+      .await
+      .insert(pipe_read_id, IncomingPipeState::Idle);
   }
 
   async fn update_peer_identity(&self, pipe_read_id: usize, identity: Option<Blob>) {

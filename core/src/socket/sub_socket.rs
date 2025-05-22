@@ -249,6 +249,10 @@ impl ISocket for SubSocket {
     }
   }
 
+  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
+    Err(ZmqError::InvalidState("SUB sockets cannot send data messages"))
+  }
+
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     // SUB sockets do not have specific readable pattern options beyond what SocketCore provides.
     delegate_to_core!(self, UserGetOpt, option: option)

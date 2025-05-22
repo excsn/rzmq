@@ -123,6 +123,21 @@ pub trait ISocket: Send + Sync + 'static {
   /// This typically involves reading from internal pipes or queues populated by `SocketCore`.
   async fn recv(&self) -> Result<Msg, ZmqError>;
 
+  /// Sends a sequence of message frames atomically as one logical message.
+  /// The exact interpretation of "atomically" and how frames are handled
+  /// (e.g., prepending identities or delimiters) depends on the socket type.
+  ///
+  /// For ROUTER: The first frame in `frames` MUST be the destination identity,
+  ///             and it MUST have the MORE flag set if subsequent frames exist.
+  ///             The implementation will insert the empty delimiter.
+  ///             The payload frames follow.
+  /// For DEALER: All frames are payload sent to a chosen peer, with an empty
+  ///             delimiter prepended automatically by the DEALER implementation.
+  /// Other types: May error or have specific behavior.
+  ///
+  /// The `frames` Vec should have MsgFlags::MORE set correctly on all but the last Msg.
+  async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError>;
+
   /// Applies a socket option. Some options might be handled by `SocketCore` directly,
   /// while others might require pattern-specific logic via `set_pattern_option`.
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError>;

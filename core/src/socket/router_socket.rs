@@ -241,7 +241,7 @@ impl ISocket for RouterSocket {
 
       match send_result {
         Ok(()) => Ok(()),
-        Err(e @ ZmqError::ConnectionClosed) => {
+        Err(_e @ ZmqError::ConnectionClosed) => {
           tracing::warn!(
             handle = self.core.handle,
             pipe_id = target_pipe_id,
@@ -309,6 +309,167 @@ impl ISocket for RouterSocket {
     result
   }
 
+  async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError> {
+    if frames.is_empty() {
+      return Err(ZmqError::InvalidMessage("Cannot send an empty set of frames.".into()));
+    }
+
+    // The Mutex on `current_send_target` is crucial here.
+    // This new method effectively acts as the "transaction" that holds that lock
+    // for the duration of sending all these frames.
+    let mut current_target_guard = self.current_send_target.lock().await;
+
+    // --- Ensure we are in a state to send a new identity for a new message ---
+    if current_target_guard.is_some() {
+      tracing::error!(
+          handle = self.core.handle,
+          current_target = ?*current_target_guard,
+          "send_full_message called while current_send_target is already Some. This indicates a logic error or unfinished prior send via individual send() calls."
+      );
+      return Err(ZmqError::InvalidState(
+        "Router socket is already in the middle of sending a multi-part message via individual send() calls.".into(),
+      ));
+    }
+
+    // --- Frame 1: Must be the Destination Identity ---
+    // We will consume the first frame from the input `frames` vector.
+    // To do this without complex Vec manipulation if `frames` is large,
+    // we iterate through an owned version or use an iterator.
+    // For simplicity, let's assume frames isn't excessively large.
+    let mut frames_iter = frames.into_iter(); // Consumes the input Vec
+
+    let mut destination_identity_frame = match frames_iter.next() {
+      Some(f) => f,
+      None => return Err(ZmqError::Internal("frames vector became empty unexpectedly".into())), // Should be caught by initial is_empty
+    };
+
+    if destination_identity_frame.data().unwrap_or_default().is_empty() {
+      return Err(ZmqError::InvalidMessage(
+        "First frame (destination identity) cannot be empty.".into(),
+      ));
+    }
+    // Ensure the identity frame has the MORE flag, as delimiter and payload will follow.
+    destination_identity_frame.set_flags(destination_identity_frame.flags() | MsgFlags::MORE);
+
+    let destination_id_blob = Blob::from(destination_identity_frame.data().unwrap_or_default().to_vec());
+    let core_opts = self.core_state().await.options.clone();
+    let timeout_opt: Option<Duration> = core_opts.sndtimeo;
+    let router_mandatory_opt: bool = core_opts.router_mandatory;
+
+    // Find target pipe write ID
+    let pipe_write_id = match self.router_map.get_pipe(&destination_id_blob).await {
+      Some(id) => id,
+      None => {
+        return if router_mandatory_opt {
+          Err(ZmqError::HostUnreachable(format!(
+            "Peer {:?} not connected or identity unknown (ROUTER_MANDATORY=true)",
+            destination_id_blob
+          )))
+        } else {
+          tracing::debug!(
+            handle = self.core.handle,
+            ?destination_id_blob,
+            "ROUTER send_full_message (mandatory=false): Destination unknown. Silently dropping."
+          );
+          Ok(()) // Silently drop
+        };
+      }
+    };
+
+    let pipe_tx = {
+      let core_state_guard = self.core_state().await;
+      match core_state_guard.get_pipe_sender(pipe_write_id) {
+        Some(tx) => tx,
+        None => return Err(ZmqError::HostUnreachable("Peer disconnected before send".into())),
+      }
+    };
+
+    // --- Actually send Identity Frame (using the internal send_msg_with_timeout) ---
+    tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, "Sending full_message IDENTITY");
+    match send_msg_with_timeout(
+      &pipe_tx,
+      destination_identity_frame,
+      timeout_opt,
+      self.core.handle,
+      pipe_write_id,
+    )
+    .await
+    {
+      Ok(()) => {
+        // Lock the target now that identity is successfully initiated
+        *current_target_guard = Some(pipe_write_id);
+      }
+      Err(e) => {
+        // current_target_guard remains None, MutexGuard drops, lock released.
+        tracing::error!(handle = self.core.handle, dest_id = ?destination_id_blob, error=%e, "Failed to send full_message IDENTITY");
+        return Err(e);
+      }
+    }
+
+    // At this point, current_target_guard is Some(pipe_write_id) and the MutexGuard is still held.
+
+    // --- Send Empty Delimiter Frame ---
+    let mut delimiter_frame = Msg::new();
+    delimiter_frame.set_flags(MsgFlags::MORE); // Delimiter always has MORE before payload
+
+    tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, "Sending full_message DELIMITER");
+    if let Err(e) = send_msg_with_timeout(&pipe_tx, delimiter_frame, timeout_opt, self.core.handle, pipe_write_id).await
+    {
+      tracing::error!(handle = self.core.handle, dest_id = ?destination_id_blob, error=%e, "Failed to send full_message DELIMITER");
+      *current_target_guard = None; // Must unlock target before returning
+      return Err(e);
+    }
+
+    // --- Send Remaining Frames (Actual Payload) ---
+    // The remaining frames in `frames_iter` are the payload.
+    // The caller of `send_full_message` is responsible for ensuring MORE flags are
+    // correctly set on these payload frames (all but the last should have MORE).
+    let remaining_payload_frames: Vec<Msg> = frames_iter.collect();
+
+    if remaining_payload_frames.is_empty() {
+      // If app_payload was empty, we must send one final frame (can be empty) without MORE.
+      let last_empty_payload_frame = Msg::new();
+      tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, "Sending full_message LAST EMPTY PAYLOAD");
+      if let Err(e) = send_msg_with_timeout(
+        &pipe_tx,
+        last_empty_payload_frame,
+        timeout_opt,
+        self.core.handle,
+        pipe_write_id,
+      )
+      .await
+      {
+        tracing::error!(handle = self.core.handle, dest_id = ?destination_id_blob, error=%e, "Failed to send full_message LAST EMPTY PAYLOAD");
+        *current_target_guard = None; // Unlock
+        return Err(e);
+      }
+    } else {
+      let num_payload_to_send = remaining_payload_frames.len();
+      for (i, mut payload_frame) in remaining_payload_frames.into_iter().enumerate() {
+        // Ensure the very last frame of the entire message sequence does not have MORE.
+        if i == num_payload_to_send - 1 {
+          payload_frame.set_flags(payload_frame.flags() & !MsgFlags::MORE);
+        }
+        // else: trust caller set MORE correctly on intermediate payload frames.
+
+        tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, part=i, flags=?payload_frame.flags(), "Sending full_message PAYLOAD frame");
+        if let Err(e) =
+          send_msg_with_timeout(&pipe_tx, payload_frame, timeout_opt, self.core.handle, pipe_write_id).await
+        {
+          tracing::error!(handle = self.core.handle, dest_id = ?destination_id_blob, error=%e, part=i, "Failed to send full_message PAYLOAD frame");
+          *current_target_guard = None; // Unlock
+          return Err(e);
+        }
+      }
+    }
+
+    // --- All parts sent successfully, unlock target ---
+    *current_target_guard = None;
+    tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, "Full message sent successfully, target released.");
+    Ok(())
+    // MutexGuard `current_target_guard` is dropped here, releasing the Mutex.
+  }
+
   // --- Pattern Specific Options ---
   async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     if option == ROUTER_MANDATORY {
@@ -341,7 +502,7 @@ impl ISocket for RouterSocket {
         let buffer = partial_guard.entry(pipe_read_id).or_insert_with(Vec::new);
 
         let is_first_part_for_peer = buffer.is_empty();
-        let mut current_msg = msg; // Shadow msg
+        let current_msg = msg; // Shadow msg
         let is_last_part = !current_msg.is_more();
 
         if is_first_part_for_peer {

@@ -1,7 +1,7 @@
 # rzmq - Async, Pure Rust ZeroMQ
 
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq) 
+[![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
 
 `rzmq` is an asynchronous, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, built on top of the [Tokio](https://tokio.rs/) runtime. It aims to provide a familiar ZeroMQ-style API within the Rust async ecosystem, allowing developers to build distributed and concurrent applications without a dependency on the C `libzmq` library.
 
@@ -10,7 +10,7 @@
 **Please Note:** This project is currently **experimental** and under active development.
 
 *   It is **NOT** yet production-ready.
-*   It does **NOT** have full feature parity with `libzmq`.
+*   It does **NOT** have full feature parity with `libzmq` and may not be interoperable yet.
 *   The API may still change.
 *   While core patterns are implemented, robustness, performance, and error handling might not match `libzmq` in all edge cases.
 
@@ -37,7 +37,7 @@ Provides a `Context` for managing sockets and a `Socket` handle with async metho
 
 ### Performance Enhancements (Optional)
 *   **`io_uring` Backend (Linux-only)**: (Requires `io-uring` feature) Enables an `io_uring`-based backend for TCP transport via `tokio-uring`. This can offer higher performance and lower latency by leveraging Linux's advanced asynchronous I/O interface. Requires using the `#[rzmq::main]` attribute on the application's main function.
-*   **TCP Corking (Linux-only)**: (Requires `io-uring` or standard TCP) When enabled via the `TCP_CORK_OPT` socket option, attempts to batch smaller ZMTP frames by setting the `TCP_CORK` socket option on the underlying TCP stream. This can reduce the number of TCP segments sent, potentially improving efficiency for multi-part messages or frequent small messages.
+*   **TCP Corking (Linux-only)**: When enabled via the `TCP_CORK_OPT` socket option, attempts to batch smaller ZMTP frames by setting the `TCP_CORK` socket option on the underlying TCP stream. This can reduce the number of TCP segments sent, potentially improving efficiency for multi-part messages or frequent small messages.
 *   **Zerocopy Send (Experimental, with `io_uring`)**: (Requires `io-uring` feature and `IO_URING_SNDZEROCOPY` option, Linux-only) Aims to reduce CPU usage and improve throughput for message sending by using `sendmsg` with `MSG_ZEROCOPY` or `send_vectored_zc` (via `tokio-uring`), minimizing data copies from userspace to the kernel for network transmission.
 *   **Multishot Receive (Experimental, with `io_uring`)**: (Requires `io-uring` feature and `IO_URING_RCVMULTISHOT` option, Linux-only) Leverages `io_uring`'s multishot receive operations (`IORING_OP_RECVMSG_MULTISHOT` or `IORING_OP_RECV_MULTISHOT`) to submit multiple receive buffers to the kernel at once, potentially reducing syscall overhead for high-message-rate scenarios. Buffer pool size and individual buffer capacity are configurable via `IO_URING_RECV_BUFFER_COUNT` and `IO_URING_RECV_BUFFER_SIZE` options.
 
@@ -76,14 +76,13 @@ Add `rzmq` to your `Cargo.toml` dependencies. You will also need `tokio`.
 [dependencies]
 # Replace "..." with the desired version or Git source
 # rzmq = "0.1.0" # Example for a published version
-rzmq = { git = "https://github.com/excsn/rzmq.git", branch = "main" } # Or your specific version
+rzmq = { git = "https://github.com/your-username/rzmq.git", branch = "main" } # Or your specific version/fork
 
 # Enable desired features:
 # rzmq = { version = "...", features = ["ipc", "inproc", "curve", "io-uring"] }
 
-tokio = { version = "1", features = ["full"] } # "full" feature recommended
-# For io-uring, ensure tokio-uring is compatible if specified directly by user
-# (though rzmq's io-uring feature will pull in a compatible version)
+tokio = { version = "1", features = ["full"] } # "full" feature recommended for general use
+# For io-uring, rzmq's io-uring feature will pull in a compatible tokio-uring.
 ```
 
 **Available Cargo Features:**
@@ -91,11 +90,11 @@ tokio = { version = "1", features = ["full"] } # "full" feature recommended
 *   `ipc`: Enables the `ipc://` transport (Unix-like systems only).
 *   `inproc`: Enables the `inproc://` transport.
 *   `curve`: Enables basic infrastructure for CURVE security (requires `libsodium-rs`). The implementation is experimental.
-*   `io-uring`: (Linux-only) Enables the `io_uring` backend for TCP transport and related optimizations like Zerocopy Send and Multishot Receive. Requires using `#[rzmq::main]` (see [Usage Guide](README.USAGE.md#using-io_uring-linux-specific)). This feature also makes `TCP_CORK_OPT`, `IO_URING_SNDZEROCOPY`, `IO_URING_RCVMULTISHOT`, `IO_URING_RECV_BUFFER_COUNT`, and `IO_URING_RECV_BUFFER_SIZE` options available.
+*   `io-uring`: (Linux-only) Enables the `io_uring` backend for TCP transport and related optimizations like Zerocopy Send and Multishot Receive. Requires using `#[rzmq::main]` (see [Usage Guide (README.USAGE.md)](README.USAGE.md#using-io_uring-linux-specific)). This feature also makes `TCP_CORK_OPT`, `IO_URING_SNDZEROCOPY`, `IO_URING_RCVMULTISHOT`, `IO_URING_RECV_BUFFER_COUNT`, and `IO_URING_RECV_BUFFER_SIZE` options available.
 
 **Prerequisites:**
 
-*   **Rust & Cargo**: A recent stable version of Rust (e.g., 1.65+).
+*   **Rust & Cargo**: A recent stable version of Rust (e.g., 1.70+ recommended).
 *   **Tokio**: `rzmq` is built on Tokio and expects a Tokio runtime.
 *   **Libsodium** (for `curve` feature): If using the `curve` feature, the libsodium development library must be installed on your system. See [libsodium-rs documentation](https://docs.rs/libsodium-rs/) for details.
 *   **Modern Linux Kernel** (for `io-uring` feature, `TCP_CORK_OPT`):
@@ -104,11 +103,11 @@ tokio = { version = "1", features = ["full"] } # "full" feature recommended
 
 ## Getting Started / Documentation
 
-For a detailed guide on using `rzmq`, including core concepts, examples, API overviews, and how to use features like `io_uring`, please see the **[Usage Guide (README.USAGE.md)](README.USAGE.md)**.
+For a detailed guide on using `rzmq`, including core concepts, examples, API overviews, and how to use features like `io_uring`, please see the **[Usage Guide (README.USAGE.md)](README.USAGE.md)** (you'll need to create this file).
 
 The library may include an `examples/` directory in its repository showcasing various usage patterns.
 
-The full API reference documentation is available on [docs.rs/rzmq](https://docs.rs/rzmq) (link will be active once published).
+The full API reference documentation can be generated locally using `cargo doc --open`. (A link to [docs.rs/rzmq](https://docs.rs/rzmq) will be active once published).
 
 A brief example (Push/Pull):
 ```rust
@@ -128,47 +127,68 @@ async fn main() -> Result<(), ZmqError> {
     let push = ctx.socket(SocketType::Push)?;
     let pull = ctx.socket(SocketType::Pull)?;
 
-    let endpoint = "inproc://example";
+    let endpoint = "inproc://example"; // "inproc" requires the "inproc" feature
     pull.bind(endpoint).await?;
     push.connect(endpoint).await?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await; // Allow connections to establish
 
     push.send(Msg::from_static(b"Hello rzmq!")).await?;
     let received = pull.recv().await?;
     assert_eq!(received.data().unwrap_or_default(), b"Hello rzmq!");
     println!("Received: {}", String::from_utf8_lossy(received.data().unwrap_or_default()));
 
+    // Cleanly shut down the context and all associated sockets
     ctx.term().await?;
     Ok(())
 }
 ```
+*(Note: The example uses `inproc` which requires the `inproc` feature enabled for `rzmq`.)*
 
 ## Missing Features / Limitations (Known)
 
-*   **Full ZMQ Option Parity:** Many `libzmq` options are not yet implemented (e.g., various buffer size controls, `ZMQ_IMMEDIATE`, detailed multicast options). `ZMQ_LAST_ENDPOINT` is now implemented.
+*   **Full ZMQ Option Parity:** Many `libzmq` options are not yet implemented (e.g., various buffer size controls, `ZMQ_IMMEDIATE`, detailed multicast options).
 *   **Complete Security:** CURVE cryptography and full ZAP (ZeroMQ Authentication Protocol) are not yet production-ready.
 *   **`zmq_poll` Equivalent:** No direct high-level equivalent. Tokio's `select!` macro or task management should be used for concurrent operations on multiple sockets.
 *   **`zmq_proxy` Equivalent:** No built-in high-level proxy function.
 *   **Advanced Pattern Options:** Behavior for some advanced options (e.g., certain `ZMQ_ROUTER_*` flags, `SUB` forwarding) needs full verification and implementation.
 *   **Performance:**
     *   While `io_uring` support is added for potential gains, `rzmq` has not undergone extensive performance optimization or direct benchmarking against `libzmq` across all scenarios.
-    *   Zerocopy receive and advanced `io_uring` buffer management (like registered buffers for multishot) are not yet implemented.
+    *   Advanced `io_uring` buffer management (like registered buffers for multishot receive) is not yet implemented.
 *   **Error Handling Parity:** The mapping of internal errors to specific `ZmqError` variants corresponding to all `zmq_errno()` values may not be exhaustive.
 *   **Robustness:** Edge cases, high-concurrency stress, diverse network failure modes, and very long-running stability require more extensive testing.
 
 ## Running Tests
 
 ```bash
-# Run default tests (standard Tokio backend)
+# Run default tests (standard Tokio backend, no optional features)
 cargo test
 
-# Run tests enabling specific transport features (e.g., IPC)
+# Run tests enabling specific transport features (e.g., IPC and Inproc)
 cargo test --features "ipc,inproc"
 
 # Run tests with the io_uring backend (on Linux)
 # This will also enable tests that might be specific to io_uring behavior.
 cargo test --features "io-uring"
+
+# Run all tests with all available features
+cargo test --all-features
 ```
+
+## Benchmarks
+
+Benchmarks are located in the `core/benches` directory and can be run using Criterion:
+
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run a specific benchmark (e.g., PUSH/PULL throughput)
+cargo bench --bench pull_throughput
+
+# Run benchmarks with specific features (e.g., io_uring for multishot_recv_bench)
+cargo bench --features "io-uring" --bench multishot_recv_bench
+```
+Some benchmarks, like `generic_client_benchmark`, may require environment variables for configuration (e.g., target server address, socket type).
 
 ## License
 

@@ -1,13 +1,13 @@
 // src/socket/req_socket.rs
 
-use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to SocketCore.
 use crate::error::ZmqError;
 use crate::message::{Msg, MsgFlags}; // For send/recv and managing MORE flag.
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore}; // Core components and send helper.
 use crate::socket::options::SocketOptions; // For initial socket options (e.g., RCVHWM for queue).
 use crate::socket::patterns::{FairQueue, LoadBalancer}; // REQ uses LoadBalancer (out) and FairQueue (in for reply).
-use crate::socket::ISocket; // The trait this struct implements.
+use crate::socket::ISocket;
+use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to SocketCore. // The trait this struct implements.
 
 use async_trait::async_trait;
 use std::collections::HashMap; // For pipe_read_to_write_id map.
@@ -345,6 +345,10 @@ impl ISocket for ReqSocket {
         Err(e)
       }
     }
+  }
+
+  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
+    unimplemented!("Not Implemented yet")
   }
 
   // --- Pattern-Specific Option Handling ---

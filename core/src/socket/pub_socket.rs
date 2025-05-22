@@ -126,6 +126,10 @@ impl ISocket for PubSocket {
     Err(ZmqError::InvalidState("PUB sockets cannot receive messages"))
   }
 
+  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
+    unimplemented!("Not Implemented yet")
+  }
+
   // --- Pattern-Specific Option Handling ---
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
     // PUB sockets typically ignore options like SUBSCRIBE or UNSUBSCRIBE,

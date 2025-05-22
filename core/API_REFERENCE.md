@@ -12,33 +12,33 @@ This document provides a reference to the public API components of the `rzmq` li
 *   **`Msg`**: Represents a single message part or frame. `rzmq` supports multi-part messages, where a logical message can consist of several `Msg` instances.
 *   **`MsgFlags`**: Flags associated with a `Msg`, primarily `MsgFlags::MORE` to indicate that more parts of a multi-part message will follow.
 *   **Asynchronous Operations**: All network operations (`bind`, `connect`, `send`, `recv`, `close`, `term`) are asynchronous and return `Future`s that must be `.await`ed.
-*   **Socket Options**: Behavior of sockets can be customized using options (e.g., high-water marks, timeouts) set via `Socket::set_option()` and retrieved with `Socket::get_option()`. Constants for these options are typically found in the `rzmq::socket::options` module.
+*   **Socket Options**: Behavior of sockets can be customized using options (e.g., high-water marks, timeouts) set via `Socket::set_option()` and retrieved with `Socket::get_option()`. Constants for these options are typically accessible via `rzmq::socket::OPTION_NAME`.
 *   **Error Handling**: Most operations return `Result<T, ZmqError>`, where `ZmqError` is the library's primary error enum.
 *   **Monitoring**: Sockets can be monitored for lifecycle events (e.g., connection, disconnection) using `Socket::monitor()`, which returns a `MonitorReceiver`.
 *   **Graceful Shutdown**: The `Context::term()` method should be called for a graceful shutdown of all resources. Individual sockets can be closed with `Socket::close()`.
 
 ## Main Entry Points
 
-*   **`rzmq::Context::new()`**: Creates a new communication context.
+*   **`rzmq::Context::new()`**: Creates a new communication context with default internal capacities.
+*   **`rzmq::Context::with_capacity(actor_mailbox_capacity: Option<usize>)`**: Creates a new communication context, allowing specification of internal actor mailbox capacities.
 *   **`rzmq::Context::socket(socket_type: SocketType)`**: Creates a socket of a specific pattern.
-*   **`#[rzmq::main]` (Attribute Macro, conditional on `io-uring` feature)**:
-    ```rust
-    #[cfg(feature = "io-uring")]
-    pub use rzmq_macros::main;
-    ```
-    When the `io-uring` feature is enabled for `rzmq` (and on Linux), this attribute should be used on your `async main` function instead of `#[tokio::main]`. It automatically configures the Tokio runtime to use `tokio-uring`. If the feature is not enabled or not on Linux, it defaults to `#[tokio::main]`.
+*   **`#[rzmq::main]` (Attribute Macro)**:
+    This attribute macro should be used on your `async main` function.
+    *   If the `io-uring` feature is enabled for `rzmq` (and the target OS is Linux), this macro expands to `#[tokio_uring::main]`, automatically configuring the Tokio runtime to use `io-uring` for enhanced performance.
+    *   Otherwise (if `io-uring` feature is not enabled or not on Linux), it defaults to `#[tokio::main]`.
 
     *Usage:*
     ```rust
-    // #[rzmq::main] // if io-uring feature is enabled
-    // #[tokio::main] // otherwise
-    // async fn main() { /* ... */ }
+    #[rzmq::main]
+    async fn main() {
+        // Your rzmq application code here
+    }
     ```
 
 ## Common Types and Patterns
 
 *   **`rzmq::ZmqError`**: The primary enum for errors throughout the library. (See [Error Handling](#error-handling))
-*   **`Result<T, ZmqError>`**: The standard result type for most fallible operations. Often aliased as `rzmq::ZmqResult<T>`.
+*   **`rzmq::error::ZmqResult<T>`**: The standard result type for most fallible operations, equivalent to `Result<T, rzmq::ZmqError>`.
 *   **`rzmq::Msg`**: The type for message frames.
 *   **`rzmq::Blob`**: An immutable, cheaply cloneable byte sequence, often used for identities or subscription topics.
 
@@ -48,39 +48,39 @@ Configuration is primarily done through socket options.
 
 ### Socket Options (Constants)
 
-These constants are typically used with `Socket::set_option()` and `Socket::get_option()`. They are usually located in the `rzmq::socket::options` module.
+These constants are typically used with `Socket::set_option()` and `Socket::get_option()`. They are accessible via `rzmq::socket::OPTION_NAME` (e.g., `rzmq::socket::SNDHWM`).
 
-*   **`rzmq::socket::options::SNDHWM`**: `i32` - Send High-Water Mark (max number of outgoing messages queued).
-*   **`rzmq::socket::options::RCVHWM`**: `i32` - Receive High-Water Mark (max number of incoming messages queued).
-*   **`rzmq::socket::options::LINGER`**: `i32` - Linger period in milliseconds for pending messages on close (-1: infinite, 0: immediate, >0: timeout).
-*   **`rzmq::socket::options::SNDTIMEO`**: `i32` - Send timeout in milliseconds (-1: infinite block, 0: non-blocking, >0: timeout).
-*   **`rzmq::socket::options::RCVTIMEO`**: `i32` - Receive timeout in milliseconds (-1: infinite block, 0: non-blocking (though actual behavior might depend on pattern), >0: timeout).
-*   **`rzmq::socket::options::RECONNECT_IVL`**: `i32` - Initial reconnect interval in milliseconds (0: no reconnect after first failure, -1: use default, >0: interval).
-*   **`rzmq::socket::options::RECONNECT_IVL_MAX`**: `i32` - Maximum reconnect interval in milliseconds (0: disable exponential backoff, >0: max interval).
-*   **`rzmq::socket::options::ROUTING_ID`**: `&[u8]` (passed as value) - Socket identity (e.g., for `DEALER`, `ROUTER`). Max 255 bytes.
-*   **`rzmq::socket::options::SUBSCRIBE`**: `&[u8]` (passed as value) - For `SUB` sockets, subscribes to a topic prefix.
-*   **`rzmq::socket::options::UNSUBSCRIBE`**: `&[u8]` (passed as value) - For `SUB` sockets, unsubscribes from a topic prefix.
-*   **`rzmq::socket::options::LAST_ENDPOINT`**: `i32` (read-only) - Retrieves the last endpoint string that the socket successfully bound to. Useful when binding to an ephemeral port (e.g., "tcp://127.0.0.1:0"). Returns an empty string if the socket has not been bound.
-*   **`rzmq::socket::options::TCP_KEEPALIVE`**: `i32` - TCP keepalive mode (-1: disable, 0: use system default, 1: enable).
-*   **`rzmq::socket::options::TCP_KEEPALIVE_IDLE`**: `i32` - TCP keepalive idle time in seconds before probes are sent.
-*   **`rzmq::socket::options::TCP_KEEPALIVE_CNT`**: `i32` - Number of TCP keepalive probes before dropping connection.
-*   **`rzmq::socket::options::TCP_KEEPALIVE_INTVL`**: `i32` - Interval in seconds between TCP keepalive probes.
-*   **`rzmq::socket::options::HEARTBEAT_IVL`**: `i32` - ZMTP heartbeat interval in milliseconds (0: disable).
-*   **`rzmq::socket::options::HEARTBEAT_TIMEOUT`**: `i32` - ZMTP heartbeat timeout in milliseconds.
-*   **`rzmq::socket::options::ROUTER_MANDATORY`**: `i32` (0 or 1) - For `ROUTER` sockets, controls behavior when routing to an unknown identity.
-*   **`rzmq::socket::options::PLAIN_SERVER`**: `i32` (0 or 1) - Configures PLAIN security mechanism as server.
-*   **`rzmq::socket::options::PLAIN_USERNAME`**: `&[u8]` - Username for PLAIN security.
-*   **`rzmq::socket::options::PLAIN_PASSWORD`**: `&[u8]` - Password for PLAIN security.
-*   **`rzmq::socket::options::ZAP_DOMAIN`**: `&[u8]` - ZAP authentication domain.
-*   **`rzmq::socket::options::CURVE_SERVER`**: `i32` (0 or 1) - (Requires `curve` feature) Configures CURVE security as server.
-*   **`rzmq::socket::options::CURVE_PUBLICKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Socket's public key.
-*   **`rzmq::socket::options::CURVE_SECRETKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Socket's secret key.
-*   **`rzmq::socket::options::CURVE_SERVERKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Server's public key (for client sockets).
-*   **`rzmq::socket::options::TCP_CORK_OPT`**: `i32` (0 or 1) - (Linux only) Enables/disables TCP_CORK option on the underlying socket to potentially batch small sends.
-*   **`rzmq::socket::options::IO_URING_SNDZEROCOPY`**: `i32` (0 or 1) - (Requires `io-uring` feature, Linux only) Hint to use zerocopy for sends if possible.
-*   **`rzmq::socket::options::IO_URING_RCVMULTISHOT`**: `i32` (0 or 1) - (Requires `io-uring` feature, Linux only) Hint to use multishot receive operations if possible.
-*   **`rzmq::socket::options::IO_URING_RECV_BUFFER_COUNT`**: `i32` - (Requires `io-uring` feature, Linux only) Number of buffers in the io_uring multishot receive pool. Effective only if `IO_URING_RCVMULTISHOT` is enabled. Default: 16, Min: 1.
-*   **`rzmq::socket::options::IO_URING_RECV_BUFFER_SIZE`**: `i32` - (Requires `io-uring` feature, Linux only) Size (in bytes) of each buffer in the io_uring multishot receive pool. Effective only if `IO_URING_RCVMULTISHOT` is enabled. Default: 65536 (64KB), Min: 1024.
+*   **`rzmq::socket::SNDHWM`**: `i32` - Send High-Water Mark (max number of outgoing messages queued).
+*   **`rzmq::socket::RCVHWM`**: `i32` - Receive High-Water Mark (max number of incoming messages queued).
+*   **`rzmq::socket::LINGER`**: `i32` - Linger period in milliseconds for pending messages on close (-1: infinite, 0: immediate, >0: timeout).
+*   **`rzmq::socket::SNDTIMEO`**: `i32` - Send timeout in milliseconds (-1: infinite block, 0: non-blocking, >0: timeout).
+*   **`rzmq::socket::RCVTIMEO`**: `i32` - Receive timeout in milliseconds (-1: infinite block, 0: non-blocking (though actual behavior might depend on pattern), >0: timeout).
+*   **`rzmq::socket::RECONNECT_IVL`**: `i32` - Initial reconnect interval in milliseconds (0: no reconnect after first failure, -1: use default, >0: interval).
+*   **`rzmq::socket::RECONNECT_IVL_MAX`**: `i32` - Maximum reconnect interval in milliseconds (0: disable exponential backoff, >0: max interval).
+*   **`rzmq::socket::ROUTING_ID`**: `&[u8]` (passed as value) - Socket identity (e.g., for `DEALER`, `ROUTER`). Max 255 bytes.
+*   **`rzmq::socket::SUBSCRIBE`**: `&[u8]` (passed as value) - For `SUB` sockets, subscribes to a topic prefix.
+*   **`rzmq::socket::UNSUBSCRIBE`**: `&[u8]` (passed as value) - For `SUB` sockets, unsubscribes from a topic prefix.
+*   **`rzmq::socket::LAST_ENDPOINT`**: `i32` (read-only) - Retrieves the last endpoint string that the socket successfully bound to. Useful when binding to an ephemeral port (e.g., "tcp://127.0.0.1:0"). Returns an empty string if the socket has not been bound.
+*   **`rzmq::socket::TCP_KEEPALIVE`**: `i32` - TCP keepalive mode (-1: disable, 0: use system default, 1: enable).
+*   **`rzmq::socket::TCP_KEEPALIVE_IDLE`**: `i32` - TCP keepalive idle time in seconds before probes are sent.
+*   **`rzmq::socket::TCP_KEEPALIVE_CNT`**: `i32` - Number of TCP keepalive probes before dropping connection.
+*   **`rzmq::socket::TCP_KEEPALIVE_INTVL`**: `i32` - Interval in seconds between TCP keepalive probes.
+*   **`rzmq::socket::HEARTBEAT_IVL`**: `i32` - ZMTP heartbeat interval in milliseconds (0: disable).
+*   **`rzmq::socket::HEARTBEAT_TIMEOUT`**: `i32` - ZMTP heartbeat timeout in milliseconds.
+*   **`rzmq::socket::ROUTER_MANDATORY`**: `i32` (0 or 1) - For `ROUTER` sockets, controls behavior when routing to an unknown identity.
+*   **`rzmq::socket::PLAIN_SERVER`**: `i32` (0 or 1) - Configures PLAIN security mechanism as server.
+*   **`rzmq::socket::PLAIN_USERNAME`**: `&[u8]` - Username for PLAIN security.
+*   **`rzmq::socket::PLAIN_PASSWORD`**: `&[u8]` - Password for PLAIN security.
+*   **`rzmq::socket::ZAP_DOMAIN`**: `&[u8]` - ZAP authentication domain.
+*   **`rzmq::socket::CURVE_SERVER`**: `i32` (0 or 1) - (Requires `curve` feature) Configures CURVE security as server.
+*   **`rzmq::socket::CURVE_PUBLICKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Socket's public key.
+*   **`rzmq::socket::CURVE_SECRETKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Socket's secret key.
+*   **`rzmq::socket::CURVE_SERVERKEY`**: `&[u8]` (32 bytes) - (Requires `curve` feature) Server's public key (for client sockets).
+*   **`rzmq::socket::TCP_CORK_OPT`**: `i32` (0 or 1) - (Linux only) Enables/disables TCP_CORK option on the underlying socket to potentially batch small sends.
+*   **`rzmq::socket::IO_URING_SNDZEROCOPY`**: `i32` (0 or 1) - (Requires `io-uring` feature, Linux only) Hint to use zerocopy for sends if possible.
+*   **`rzmq::socket::IO_URING_RCVMULTISHOT`**: `i32` (0 or 1) - (Requires `io-uring` feature, Linux only) Hint to use multishot receive operations if possible.
+*   **`rzmq::socket::IO_URING_RECV_BUFFER_COUNT`**: `i32` - (Requires `io-uring` feature, Linux only) Number of buffers in the io_uring multishot receive pool. Effective only if `IO_URING_RCVMULTISHOT` is enabled. Default: 16, Min: 1.
+*   **`rzmq::socket::IO_URING_RECV_BUFFER_SIZE`**: `i32` - (Requires `io-uring` feature, Linux only) Size (in bytes) of each buffer in the io_uring multishot receive pool. Effective only if `IO_URING_RCVMULTISHOT` is enabled. Default: 65536 (64KB), Min: 1024.
 
 *Note: Integer option values are typically passed as `&i32_value.to_ne_bytes()` to `set_option` (e.g., `&(1i32).to_ne_bytes()` for true/enable). Byte slice options (like `ROUTING_ID`, `SUBSCRIBE`) are passed directly.*
 
@@ -94,7 +94,9 @@ The `Context` is the entry point for creating and managing `rzmq` sockets. It en
 
 *   **Constructors:**
     *   `pub fn new() -> Result<Context, ZmqError>`
-        *   Creates a new, independent `rzmq` context. This is the starting point for any `rzmq` application.
+        *   Creates a new, independent `rzmq` context with default internal capacities.
+    *   `pub fn with_capacity(actor_mailbox_capacity: Option<usize>) -> Result<Context, ZmqError>`
+        *   Creates a new, independent `rzmq` context, allowing optional specification of the bounded capacity for internal actor command mailboxes. If `None`, a default capacity is used. Minimum capacity is 1.
 
 *   **Socket Creation:**
     *   `pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError>`
@@ -125,6 +127,12 @@ The `Socket` struct is the public handle for interacting with a specific ZeroMQ-
         *   Sends a message (`Msg`) according to the socket's specific messaging pattern. For multi-part messages, ensure `MsgFlags::MORE` is set on all but the last part.
     *   `pub async fn recv(&self) -> Result<Msg, ZmqError>`
         *   Receives a message (`Msg`) according to the socket's pattern. This method will block (asynchronously) until a message is available or a timeout occurs (if `RCVTIMEO` is set). Check `msg.is_more()` for multi-part messages.
+    *   `pub async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError>`
+        *   Sends a sequence of message frames atomically as one logical message.
+        *   For `ROUTER`: The first frame in `frames` MUST be the destination identity, followed by payload frames. The implementation inserts the required empty delimiter.
+        *   For `DEALER`: All frames are payload sent to a chosen peer, with an empty delimiter prepended automatically.
+        *   Other types may error or have type-specific behavior (e.g., PUSH might send all frames sequentially to one peer).
+        *   The caller should set `MsgFlags::MORE` correctly on the input `frames` to delineate parts of their logical application message; the last frame should not have `MORE` set.
 
 *   **Socket Options:**
     *   `pub async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError>`
@@ -138,7 +146,7 @@ The `Socket` struct is the public handle for interacting with a specific ZeroMQ-
     *   `pub async fn monitor(&self, capacity: usize) -> Result<MonitorReceiver, ZmqError>`
         *   Creates a channel for receiving `SocketEvent` notifications about this socket's lifecycle and network activity. `capacity` defines the event buffer size.
     *   `pub async fn monitor_default(&self) -> Result<MonitorReceiver, ZmqError>`
-        *   A convenience method that calls `monitor()` with a default capacity (`rzmq::socket::events::DEFAULT_MONITOR_CAPACITY`).
+        *   A convenience method that calls `monitor()` with a default capacity (`rzmq::socket::DEFAULT_MONITOR_CAPACITY`).
 
 ---
 
@@ -166,9 +174,9 @@ Flags associated with a `Msg` that modify its behavior or indicate its role. Imp
     *   `MORE`: `0b01` - Indicates that more message parts follow this one in a multi-part message.
     *   *(Internal: `COMMAND` = `0b10` - Indicates a ZMTP command frame, not typically set by users.)*
 
-### `rzmq::socket::events::SocketEvent`
+### `rzmq::socket::SocketEvent`
 
-Events emitted by a socket's monitor channel, detailing lifecycle and connection state changes.
+Events emitted by a socket's monitor channel, detailing lifecycle and connection state changes. Accessible via `rzmq::socket::SocketEvent`.
 
 *   **Variants (non-exhaustive):**
     *   `Listening { endpoint: String }`: Socket has started listening.
@@ -203,6 +211,8 @@ Represents a single message part (frame) in ZeroMQ communication. It is designed
         *   Creates a message from a static byte slice (zero-copy).
     *   `pub fn data(&self) -> Option<&[u8]>`
         *   Returns an optional slice `&[u8]` representing the message payload.
+    *   `pub fn data_bytes(&self) -> Option<bytes::Bytes>`
+        *   Returns an `Option<bytes::Bytes>` clone of the internal payload. Cloning `Bytes` is cheap (reference-counted).
     *   `pub fn size(&self) -> usize`
         *   Returns the size of the message payload in bytes.
     *   `pub fn flags(&self) -> MsgFlags`
@@ -233,7 +243,7 @@ An immutable, cheaply cloneable byte sequence, typically used for identities in 
 
 ### `rzmq::message::Metadata`
 
-A type map for associating arbitrary typed data with a `Msg`. Rarely directly used by application code unless interacting with advanced ZMTP properties or custom message metadata.
+A type map for associating arbitrary typed data with a `Msg`. Rarely directly used by application code unless interacting with advanced ZMTP properties or custom message metadata. Accessible via `rzmq::message::Metadata`.
 
 *   **Key Public Methods (async):**
     *   `pub async fn insert_typed<T: Any + Send + Sync>(&self, value: T) -> Option<Arc<dyn Any + Send + Sync>>`
@@ -258,11 +268,12 @@ Located in the `rzmq` crate root.
 
 ## Public Type Aliases
 
-*   **`rzmq::socket::events::MonitorReceiver`**:
+*   **`rzmq::socket::MonitorReceiver`**:
     ```rust
-    pub type MonitorReceiver = async_channel::Receiver<SocketEvent>;
+    // In rzmq::socket::events:
+    // pub type MonitorReceiver = async_channel::Receiver<SocketEvent>;
     ```
-    The receiving end of a channel used for socket monitoring events.
+    The receiving end of a channel used for socket monitoring events. Accessible via `rzmq::socket::MonitorReceiver`.
 
 ---
 
@@ -299,13 +310,11 @@ The primary error type used by `rzmq`. It is `Clone`-able.
     *   `UnsupportedOption(i32)`: Socket option not supported.
     *   `UnsupportedFeature(&'static str)`: Feature not supported.
     *   `Internal(String)`: Internal library error.
-    *   `#[cfg(feature = "io-uring")] UringError(String)`: Error specific to `io_uring` operations.
 
-### `rzmq::ZmqResult<T, E = ZmqError>` (Type Alias)
+### `rzmq::error::ZmqResult<T>` (Type Alias)
 
-The standard `Result` type returned by most fallible operations in `rzmq`.
-
+The standard `Result` type returned by most fallible operations in `rzmq`. Defined in `rzmq::error` as:
 ```rust
 pub type ZmqResult<T, E = ZmqError> = std::result::Result<T, E>;
 ```
-*(This alias is typically defined in `rzmq::error` but used throughout as `rzmq::ZmqResult` or just `Result<_, ZmqError>`).*
+Users would typically use `Result<_, rzmq::ZmqError>` or `use rzmq::error::ZmqResult;`.

@@ -212,6 +212,10 @@ impl ISocket for PushSocket {
     Err(ZmqError::InvalidState("PUSH sockets cannot receive messages"))
   }
 
+  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
+    unimplemented!("Not Implemented yet")
+  }
+
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     // Delegate to SocketCore for common options like SNDHWM, SNDTIMEO.
     delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec())

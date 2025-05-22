@@ -149,6 +149,10 @@ impl ISocket for PullSocket {
     result
   }
 
+  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
+    Err(ZmqError::InvalidState("PULL sockets cannot send messages"))
+  }
+
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     // Most options are handled by SocketCore. RCVHWM might affect FairQueue capacity,
     // but changing HWM on an active queue is complex and often not supported directly
