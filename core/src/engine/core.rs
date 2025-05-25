@@ -561,12 +561,14 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
   // Helper to set TCP_CORK
   #[cfg(target_os = "linux")]
   async fn set_tcp_cork_rawfd(fd: RawFd, enable: bool, engine_handle: usize) {
+    use std::os::fd::FromRawFd;
+
     tracing::trace!(engine_handle, fd, cork_enable = enable, "Attempting to set TCP_CORK");
     // Using a blocking task for setsockopt as socket2 is blocking.
     // This is okay for infrequent operations like corking.
     let res = tokio::task::spawn_blocking(move || {
-      let socket = unsafe { SockRef::from(fd) };
-      let result = socket.set_tcp_cork(enable);
+      let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
+      let result = socket.set_cork(enable);
       std::mem::forget(socket); // Crucial: prevent SockRef from closing the FD
       result
     })
