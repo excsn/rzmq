@@ -565,7 +565,7 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
     // Using a blocking task for setsockopt as socket2 is blocking.
     // This is okay for infrequent operations like corking.
     let res = tokio::task::spawn_blocking(move || {
-      let socket = unsafe { SockRef::from_fd(fd) };
+      let socket = unsafe { SockRef::from(fd) };
       let result = socket.set_tcp_cork(enable);
       std::mem::forget(socket); // Crucial: prevent SockRef from closing the FD
       result
@@ -682,16 +682,8 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
     // as the initial raw stream. This should be true.
     #[cfg(target_os = "linux")]
     if self.config.use_cork && self.stream_fd_for_cork.is_none() {
-      if let Some(fs) = self.framed_stream.as_ref() {
-        self.stream_fd_for_cork = Some(fs.get_ref().as_raw_fd());
-        tracing::debug!(engine_handle = self.handle, fd = ?self.stream_fd_for_cork, "TCP_CORK enabled, cached FD from framed_stream in run_loop.");
-      } else {
-        tracing::error!(
-          engine_handle = self.handle,
-          "Cannot get FD for corking: framed_stream is None post-handshake attempt."
-        );
-        // This would be a critical internal error.
-      }
+      self.stream_fd_for_cork = Some(framed_transport_stream.get_ref().as_raw_fd());
+      tracing::debug!(engine_handle = self.handle, fd = ?self.stream_fd_for_cork, "TCP_CORK enabled, cached FD from framed_stream in run_loop.");
     }
 
     match self
@@ -1131,11 +1123,11 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
 
               #[cfg(target_os = "linux")]
               if self.config.use_cork {
-                if let Some(fd) = self.cached_fd_for_cork {
+                if let Some(fd) = self.stream_fd_for_cork {
                   // PING is a new logical message. If not already corked (e.g., from a previous send
                   // that didn't complete with its last frame), cork now.
                   if !self.is_corked {
-                    Self::set_tcp_cork_on_fd(fd, true, self.handle).await;
+                    Self::set_tcp_cork_rawfd(fd, true, self.handle).await;
                     self.is_corked = true;
                   }
                   // If it *was* already corked (e.g. user sent frame1, then PING timer fired),
@@ -1164,8 +1156,8 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
                   // If PING send fails, ensure cork is released if it was set for this attempt
                   #[cfg(target_os = "linux")]
                   if self.is_corked {
-                    if let Some(fd) = self.cached_fd_for_cork {
-                      Self::set_tcp_cork_on_fd(fd, false, self.handle).await; // Uncork on error
+                    if let Some(fd) = self.stream_fd_for_cork {
+                      Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork on error
                     }
                     self.is_corked = false;
                   }
@@ -1176,8 +1168,8 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
               // So, if cork was active, it should be released after sending it.
               #[cfg(target_os = "linux")]
               if self.is_corked && ping_sent_successfully {
-                if let Some(fd) = self.cached_fd_for_cork {
-                  Self::set_tcp_cork_on_fd(fd, false, self.handle).await; // Uncork after PING
+                if let Some(fd) = self.stream_fd_for_cork {
+                  Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork after PING
                 }
                 self.is_corked = false;
               }
@@ -1199,8 +1191,8 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
             // that never happened because the PING failed to elicit a PONG), ensure we uncork.
             #[cfg(target_os = "linux")]
             if self.is_corked {
-              if let Some(fd) = self.cached_fd_for_cork {
-                Self::set_tcp_cork_on_fd(fd, false, self.handle).await;
+              if let Some(fd) = self.stream_fd_for_cork {
+                Self::set_tcp_cork_rawfd(fd, false, self.handle).await;
               }
               self.is_corked = false;
             }
