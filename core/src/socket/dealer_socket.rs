@@ -15,9 +15,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::RwLockReadGuard;
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore}; // Added Semaphore
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tokio::time::timeout as tokio_timeout;
+
+use super::patterns::WritePipeCoordinator;
 
 // Maximum number of parts that can be buffered by send()
 const MAX_DEALER_SEND_BUFFER_PARTS: usize = 64; // Example
@@ -51,123 +53,138 @@ struct DealerSocketOutgoingProcessor {
   queue_activity_notifier: Arc<Notify>,    // Notified when queue gets a message or a peer gets a message
   peer_availability_notifier: Arc<Notify>, // Notified when a peer connects/disconnects
   stop_signal: Arc<Notify>,                // To stop this processor task
+  pipe_send_coordinator: Arc<WritePipeCoordinator>,
 }
 
 impl DealerSocketOutgoingProcessor {
-  async fn run(self) {
+  pub async fn run(self) {
+    // Consumes self to run the loop
     tracing::debug!(
       "[DealerProc {}] Outgoing queue processor task started.",
       self.core_handle
     );
+
     loop {
-      let mut popped_message_parts: Option<Vec<Msg>> = None;
+      let mut popped_message_parts_to_send: Option<Vec<Msg>> = None;
 
-      // Wait for:
-      // 1. Stop signal
-      // 2. Queue activity (message added) AND a peer is available
-      // 3. Peer availability (a peer connected) AND queue has messages
+      // Phase 1: Wait for work or stop signal
       tokio::select! {
-          biased; // Prioritize stop_signal if ready at the same time as others
+        biased; // Prioritize stop_signal
 
-          _ = self.stop_signal.notified() => {
-              tracing::debug!("[DealerProc {}] Stop signal received. Exiting processor loop.", self.core_handle);
-              break; // Exit the main loop directly
-          }
+        _ = self.stop_signal.notified() => {
+          tracing::debug!("[DealerProc {}] Stop signal received. Exiting processor loop.", self.core_handle);
+          break; // Exit the main loop directly
+        }
 
-          // Wait for either a message to be added to the queue (and peers might be available)
-                // OR for a peer to become available (and messages might be in the queue)
-                // This select acts as a gate: once one notifier fires, we proceed to check actual state.
-                _ = async {
-                    tokio::select! {
-                        _ = self.queue_activity_notifier.notified() => {
-                            tracing::trace!("[DealerProc {}] Woke on queue_activity_notifier.", self.core_handle);
-                        },
-                        _ = self.peer_availability_notifier.notified() => {
-                            tracing::trace!("[DealerProc {}] Woke on peer_availability_notifier.", self.core_handle);
-                        },
-                    }
-          } => {
-              // Activity occurred. Now, check conditions and try to pop.
-              let mut queue_guard = self.pending_queue.lock().await;
-              if !queue_guard.is_empty() && self.load_balancer.has_pipes().await {
-                  // Conditions met: queue has messages AND a peer is available.
-                  popped_message_parts = queue_guard.pop_front();
-                  // queue_guard is dropped here
-              }
-              // If conditions not met (e.g., notified but queue now empty, or peer detached just now),
-              // popped_message_parts remains None, and we loop back to select!.
+        _ = async { // This inner async block creates a future for the select arm
+          tokio::select! {
+            _ = self.queue_activity_notifier.notified() => {
+              tracing::trace!("[DealerProc {}] Woke on queue_activity_notifier.", self.core_handle);
+            },
+            _ = self.peer_availability_notifier.notified() => {
+              tracing::trace!("[DealerProc {}] Woke on peer_availability_notifier.", self.core_handle);
+            },
           }
+        } => {
+          let mut queue_guard = self.pending_queue.lock().await;
+          if !queue_guard.is_empty() && self.load_balancer.has_pipes().await {
+            popped_message_parts_to_send = queue_guard.pop_front();
+          }
+        }
       } // end of outer select!
 
-      // If popped_message_parts is Some, we got a message to send.
-      // If it's None, it means the stop_signal branch was taken, and we should exit.
-      if let Some(current_message_parts) = popped_message_parts {
+      // Phase 2: Process the popped message if any
+      if let Some(current_message_to_send) = popped_message_parts_to_send {
         tracing::trace!(
           "[DealerProc {}] Processing message from outgoing queue ({} parts).",
           self.core_handle,
-          current_message_parts.len()
+          current_message_to_send.len()
         );
 
-        // Attempt to get a peer. get_next_pipe is quick if peers exist.
         if let Some(pipe_write_id) = self.load_balancer.get_next_pipe().await {
-          let timeout_opt: Option<Duration>;
+          let snd_timeout_opt: Option<Duration>;
           let pipe_tx_opt;
           {
             let core_s = self.core_accessor.core_state.read();
-            timeout_opt = core_s.options.sndtimeo;
+            snd_timeout_opt = core_s.options.sndtimeo;
             pipe_tx_opt = core_s.get_pipe_sender(pipe_write_id);
           }
 
           if let Some(pipe_tx) = pipe_tx_opt {
-            let mut re_queue_message = false;
-            for (idx, msg_part) in current_message_parts.iter().cloned().enumerate() {
-              match send_msg_with_timeout(&pipe_tx, msg_part, timeout_opt, self.core_handle, pipe_write_id).await {
+            let send_permit_result = self
+              .pipe_send_coordinator
+              .acquire_send_permit(pipe_write_id, snd_timeout_opt)
+              .await;
+
+            let _send_permit: OwnedSemaphorePermit;
+
+            match send_permit_result {
+              Ok(permit) => {
+                _send_permit = permit;
+              }
+              Err(e) => {
+                tracing::warn!(
+                  "[DealerProc {}] Failed to acquire send permit for pipe {}: {}. Re-queuing message.",
+                  self.core_handle,
+                  pipe_write_id,
+                  e
+                );
+                if matches!(e, ZmqError::HostUnreachable(_)) {
+                  self.load_balancer.remove_pipe(pipe_write_id).await;
+                  self.peer_availability_notifier.notify_waiters();
+                }
+                let mut qg = self.pending_queue.lock().await;
+                qg.push_front(current_message_to_send);
+                drop(qg);
+                self.queue_activity_notifier.notify_one();
+                continue;
+              }
+            }
+            // --- Permit is now held by _send_permit ---
+
+            let mut re_queue_this_message = false;
+            for (idx, msg_part) in current_message_to_send.iter().cloned().enumerate() {
+              match send_msg_with_timeout(&pipe_tx, msg_part, snd_timeout_opt, self.core_handle, pipe_write_id).await {
                 Ok(()) => { /* part sent successfully */ }
                 Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
                   tracing::warn!(
-                    "[DealerProc {}] HWM/Timeout sending part {} of queued msg to pipe {}. Re-queuing.",
+                    "[DealerProc {}] HWM/Timeout sending part {} of queued msg to pipe {}. Re-queuing entire message.",
                     self.core_handle,
                     idx,
                     pipe_write_id
                   );
-                  re_queue_message = true;
-                  break; // Stop sending parts of this message
+                  re_queue_this_message = true;
+                  break;
                 }
                 Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::Internal(_)) => {
                   tracing::warn!(
-                    "[DealerProc {}] Pipe {} closed/error for queued msg part {}: {}. Removing pipe, re-queuing.",
-                    self.core_handle,
-                    pipe_write_id,
-                    idx,
-                    e
+                    "[DealerProc {}] Pipe {} closed/error for queued msg part {}: {}. Removing pipe, re-queuing entire message.",
+                    self.core_handle, pipe_write_id, idx, e
                   );
                   self.load_balancer.remove_pipe(pipe_write_id).await;
-                  self.peer_availability_notifier.notify_waiters(); // Signal peer status change
-                  re_queue_message = true;
-                  break; // Stop sending parts of this message
+                  if let Some(sem) = self.pipe_send_coordinator.remove_pipe(pipe_write_id).await {
+                    sem.close();
+                  }
+                  self.peer_availability_notifier.notify_waiters();
+                  re_queue_this_message = true;
+                  break;
                 }
                 Err(e) => {
-                  // Other unexpected errors
                   tracing::error!(
-                    "[DealerProc {}] Unexpected error sending queued msg part {} to pipe {}: {}. Re-queuing.",
-                    self.core_handle,
-                    idx,
-                    pipe_write_id,
-                    e
+                    "[DealerProc {}] Unexpected error sending queued msg part {} to pipe {}: {}. Re-queuing entire message.",
+                    self.core_handle, idx, pipe_write_id, e
                   );
-                  re_queue_message = true;
-                  break; // Stop sending parts of this message
+                  re_queue_this_message = true;
+                  break;
                 }
               }
-            }
-            if re_queue_message {
+            } // End for loop sending parts
+
+            if re_queue_this_message {
               let mut queue_guard = self.pending_queue.lock().await;
-              queue_guard.push_front(current_message_parts); // Put entire original message back
+              queue_guard.push_front(current_message_to_send);
               drop(queue_guard);
-              // We might want to notify queue_activity_notifier here if we expect other tasks
-              // to be waiting on its HWM, but this processor will loop and retry.
-              // If it was re-queued because a peer was *removed*, peer_availability_notifier
-              // was already signaled.
+              self.queue_activity_notifier.notify_one();
             } else {
               tracing::trace!(
                 "[DealerProc {}] Successfully sent all parts of a queued message to pipe {}.",
@@ -176,36 +193,39 @@ impl DealerSocketOutgoingProcessor {
               );
             }
           } else {
-            // Pipe sender gone for selected pipe_write_id
             tracing::warn!(
-              "[DealerProc {}] Pipe sender for {} disappeared. Re-queuing message.",
+              "[DealerProc {}] Pipe sender for {} disappeared before sending. Removing from LB, re-queuing message.",
               self.core_handle,
               pipe_write_id
             );
-            self.load_balancer.remove_pipe(pipe_write_id).await; // Ensure it's removed
+            self.load_balancer.remove_pipe(pipe_write_id).await;
+            if let Some(sem) = self.pipe_send_coordinator.remove_pipe(pipe_write_id).await {
+              sem.close();
+            }
             self.peer_availability_notifier.notify_waiters();
+
             let mut queue_guard = self.pending_queue.lock().await;
-            queue_guard.push_front(current_message_parts);
+            queue_guard.push_front(current_message_to_send);
             drop(queue_guard);
+            self.queue_activity_notifier.notify_one();
           }
         } else {
-          // No peer available from load_balancer even after notification
           tracing::trace!(
-            "[DealerProc {}] No peer available from LB for queued message. Re-queuing.",
+            "[DealerProc {}] No peer available from LB for queued message. Re-queuing message.",
             self.core_handle
           );
           let mut queue_guard = self.pending_queue.lock().await;
-          queue_guard.push_front(current_message_parts);
+          queue_guard.push_front(current_message_to_send);
           drop(queue_guard);
-          // The message is back in the queue. The loop will wait for peer_availability or queue_activity again.
         }
       } else {
         tracing::trace!(
-          "[DealerProc {}] No message popped (or conditions not met after activity). Continuing to wait.",
+          "[DealerProc {}] No message popped from queue (or conditions not met after activity). Continuing to wait.",
           self.core_handle
         );
       }
     } // end main loop
+
     tracing::debug!(
       "[DealerProc {}] Outgoing queue processor task finished execution.",
       self.core_handle
@@ -227,6 +247,7 @@ pub(crate) struct DealerSocket {
   processor_task_handle: Mutex<Option<JoinHandle<()>>>,
   processor_stop_signal: Arc<Notify>,
   current_send_transaction: Mutex<DealerSendTransaction>,
+  pipe_send_coordinator: Arc<WritePipeCoordinator>,
 }
 
 impl DealerSocket {
@@ -238,6 +259,7 @@ impl DealerSocket {
     let peer_notifier_arc = Arc::new(Notify::new());
     let stop_signal_arc = Arc::new(Notify::new());
 
+    let pipe_send_coordinator = Arc::new(WritePipeCoordinator::new());
     let processor = DealerSocketOutgoingProcessor {
       core_handle: core.handle,
       pending_queue: pending_queue_arc.clone(),
@@ -246,6 +268,7 @@ impl DealerSocket {
       queue_activity_notifier: queue_notifier_arc.clone(),
       peer_availability_notifier: peer_notifier_arc.clone(),
       stop_signal: stop_signal_arc.clone(),
+      pipe_send_coordinator: pipe_send_coordinator.clone(),
     };
 
     let processor_jh = tokio::spawn(processor.run());
@@ -262,19 +285,12 @@ impl DealerSocket {
       processor_task_handle: Mutex::new(Some(processor_jh)),
       processor_stop_signal: stop_signal_arc,
       current_send_transaction: Mutex::new(DealerSendTransaction::Idle),
+      pipe_send_coordinator,
     }
   }
 
   fn core_state(&self) -> RwLockReadGuard<'_, CoreState> {
     self.core.core_state.read()
-  }
-
-  fn prepare_full_send_sequence(&self, user_msg: Msg) -> Vec<Msg> {
-    let mut delimiter = Msg::new();
-    delimiter.set_flags(MsgFlags::MORE);
-    let mut final_user_msg = user_msg;
-    final_user_msg.set_flags(final_user_msg.flags() & !MsgFlags::MORE);
-    vec![delimiter, final_user_msg]
   }
 
   fn prepare_full_multipart_send_sequence(&self, user_frames: Vec<Msg>) -> Vec<Msg> {
@@ -646,6 +662,7 @@ impl ISocket for DealerSocket {
       .await
       .insert(pipe_read_id, pipe_write_id);
     self.load_balancer.add_pipe(pipe_write_id).await;
+    self.pipe_send_coordinator.add_pipe(pipe_write_id).await;
     self.incoming_queue.pipe_attached(pipe_read_id);
     self
       .pipe_state
@@ -672,6 +689,10 @@ impl ISocket for DealerSocket {
     let maybe_write_id = self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
     if let Some(write_id) = maybe_write_id {
       self.load_balancer.remove_pipe(write_id).await;
+
+      if let Some(semaphore) = self.pipe_send_coordinator.remove_pipe(write_id).await {
+        semaphore.close();
+      }
     }
     self.incoming_queue.pipe_detached(pipe_read_id);
     self.pipe_state.lock().await.remove(&pipe_read_id);
@@ -685,125 +706,111 @@ impl DealerSocket {
     let global_sndtimeo: Option<Duration> = core_opts.sndtimeo;
     let global_sndhwm: usize = core_opts.sndhwm.max(1);
 
-    // Try to get a peer. This is non-blocking if LoadBalancer has peers.
-    // It might briefly lock if other sends are also trying to pick a peer.
-    let mut tried_direct_send = false;
     if let Some(pipe_write_id) = self.load_balancer.get_next_pipe().await {
-      tried_direct_send = true;
+      // Acquire permit for this pipe BEFORE getting pipe_tx and sending
+      let _send_permit = match self
+        .pipe_send_coordinator
+        .acquire_send_permit(pipe_write_id, global_sndtimeo)
+        .await
+      {
+        Ok(permit) => permit,
+        Err(e) => {
+          // Could be ZmqError::Timeout if permit not acquired, or Internal if pipe gone
+          tracing::debug!(
+            "[Dealer {}] Failed to acquire send permit for pipe {}: {}. Queuing message.",
+            self.core.handle,
+            pipe_write_id,
+            e
+          );
+          // Fall through to queuing logic, do NOT try to send directly.
+          // If acquire_send_permit itself returns HostUnreachable, it means the pipe was removed from coordinator.
+          if matches!(e, ZmqError::HostUnreachable(_)) {
+            self.load_balancer.remove_pipe(pipe_write_id).await; // Ensure LB is also updated
+            self.peer_availability_notifier.notify_waiters();
+          }
+          // Force queuing by simulating direct send failure
+          return self
+            .queue_message_after_send_failure(full_message_parts, global_sndhwm, global_sndtimeo)
+            .await;
+        }
+      };
+      // Permit is now held, _send_permit will release it on drop.
+
       let pipe_tx_opt = { self.core_state().get_pipe_sender(pipe_write_id) };
 
       if let Some(pipe_tx) = pipe_tx_opt {
         let mut pipe_send_failed_critically = false;
         for (idx, msg_part) in full_message_parts.iter().cloned().enumerate() {
           match send_msg_with_timeout(&pipe_tx, msg_part, global_sndtimeo, self.core.handle, pipe_write_id).await {
-            Ok(()) => {
-              continue;
-            }
+            Ok(()) => continue,
             Err(e @ ZmqError::ResourceLimitReached) | Err(e @ ZmqError::Timeout) => {
-              tracing::debug!(
-                "[Dealer {}] Direct send to pipe {} (part {}) failed (HWM/Timeout): {}. Will queue.",
-                self.core.handle,
-                pipe_write_id,
-                idx,
-                e
-              );
-              // Fall through to global queuing for HWM/Timeout on direct send
-              pipe_send_failed_critically = true; // Treat as needing queue
+              pipe_send_failed_critically = true;
               break;
             }
             Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::Internal(_)) => {
-              tracing::warn!(
-                "[Dealer {}] Direct send to pipe {} (part {}) failed fatally: {}. Removing pipe, will queue.",
-                self.core.handle,
-                pipe_write_id,
-                idx,
-                e
-              );
               self.load_balancer.remove_pipe(pipe_write_id).await;
               self.peer_availability_notifier.notify_waiters();
-              pipe_send_failed_critically = true; // Treat as needing queue
+              // Also remove from coordinator as pipe is dead
+              if let Some(sem) = self.pipe_send_coordinator.remove_pipe(pipe_write_id).await {
+                sem.close();
+              }
+              pipe_send_failed_critically = true;
               break;
             }
-            Err(e) => return Err(e), // Other unexpected errors are propagated
+            Err(e) => return Err(e),
           }
         }
         if !pipe_send_failed_critically {
           return Ok(());
-        } // Successfully sent all parts directly
+        }
+        // If critically failed, fall through to queue
       } else {
-        // Pipe sender gone
-        tracing::warn!(
-          "[Dealer {}] Pipe {} sender gone. Will queue.",
-          self.core.handle,
-          pipe_write_id
-        );
         self.load_balancer.remove_pipe(pipe_write_id).await;
         self.peer_availability_notifier.notify_waiters();
-        // Fall through to global queuing
+        if let Some(sem) = self.pipe_send_coordinator.remove_pipe(pipe_write_id).await {
+          sem.close();
+        }
+        // Fall through to queue
       }
     }
+    // If no peer, or direct send failed critically, queue it:
+    self
+      .queue_message_after_send_failure(full_message_parts, global_sndhwm, global_sndtimeo)
+      .await
+  }
 
-    println!("sending queuing");
-    // No peer available from LB, or direct send to chosen peer failed non-fatally (HWM/Timeout/Closed).
-    // Proceed to queue the message.
-    if !tried_direct_send {
-      tracing::trace!(
-        "[Dealer {}] No peer immediately available from LB. Attempting to queue message ({} parts).",
-        self.core.handle,
-        full_message_parts.len()
-      );
-    }
-
+  // Helper for the queuing part of send_logical_message
+  async fn queue_message_after_send_failure(
+    &self,
+    full_message_parts: Vec<Msg>,
+    global_sndhwm: usize,
+    global_sndtimeo: Option<Duration>,
+  ) -> Result<(), ZmqError> {
+    tracing::trace!(
+      "[Dealer {}] No peer immediately available or direct send failed. Attempting to queue message ({} parts).",
+      self.core.handle,
+      full_message_parts.len()
+    );
     loop {
-      // Loop for SNDTIMEO if global queue is full
       let mut queue_guard = self.pending_outgoing_queue.lock().await;
       if queue_guard.len() < global_sndhwm {
-        tracing::debug!(
-          "[Dealer {}] Queuing message ({} parts). Current queue_len: {}. HWM: {}",
-          self.core.handle,
-          full_message_parts.len(),
-          queue_guard.len(),
-          global_sndhwm
-        );
         queue_guard.push_back(full_message_parts);
         drop(queue_guard);
-        self.outgoing_queue_activity_notifier.notify_one(); // Notify processor
+        self.outgoing_queue_activity_notifier.notify_one();
         return Ok(());
       }
       drop(queue_guard);
-
+      // ... (timeout logic for waiting on queue_activity_notifier as before) ...
       match global_sndtimeo {
-        Some(duration) if duration.is_zero() => {
-          tracing::debug!(
-            "[Dealer {}] Global queue full, SNDTIMEO=0. Send failed (ResourceLimitReached).",
-            self.core.handle
-          );
-          return Err(ZmqError::ResourceLimitReached);
-        }
+        Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
         Some(duration) => {
-          tracing::debug!(
-            "[Dealer {}] Global queue full, SNDTIMEO={:?}. Waiting for space.",
-            self.core.handle,
-            duration
-          );
           match tokio_timeout(duration, self.outgoing_queue_activity_notifier.notified()).await {
             Ok(()) => { /* Notified, loop to re-check queue */ }
-            Err(_) => {
-              tracing::debug!(
-                "[Dealer {}] Timeout waiting for space in global queue.",
-                self.core.handle
-              );
-              return Err(ZmqError::Timeout);
-            }
+            Err(_) => return Err(ZmqError::Timeout),
           }
         }
         None => {
-          tracing::debug!(
-            "[Dealer {}] Global queue full, SNDTIMEO=infinite. Waiting for space.",
-            self.core.handle
-          );
           self.outgoing_queue_activity_notifier.notified().await;
-          // Loop to re-check queue
         }
       }
     }

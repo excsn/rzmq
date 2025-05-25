@@ -200,7 +200,7 @@ impl TcpListener {
     Ok((tx, command_loop_join_handle, resolved_uri))
   }
 
-  async fn run_command_loop(mut self) {
+  async fn run_command_loop(self) {
     let listener_cmd_loop_handle = self.handle;
     let listener_cmd_loop_actor_type = ActorType::Listener;
     let endpoint_uri_clone_log = self.endpoint.clone();
