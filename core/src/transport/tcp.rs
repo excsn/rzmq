@@ -135,6 +135,15 @@ impl TcpListener {
     let resolved_uri = format!("tcp://{}", local_addr);
     tracing::info!(listener_handle = handle, local_addr = %resolved_uri, user_provided_uri = %endpoint, "TCP Listener bound successfully");
 
+    // Determine max connections for this listener
+    let max_conns_for_listener = options.max_connections.unwrap_or(std::usize::MAX); // Fallback to effectively no limit if None
+    let connection_limiter = Arc::new(tokio::sync::Semaphore::new(max_conns_for_listener.max(1))); // Ensure at least 1
+    tracing::info!(
+      listener_handle = handle,
+      max_concurrent_connections = max_conns_for_listener,
+      "TCP Listener will use connection limiter."
+    );
+
     // Prepare TCP configuration for accepted streams.
     let transport_config = TcpTransportConfig {
       tcp_nodelay: options.tcp_nodelay,
@@ -168,6 +177,7 @@ impl TcpListener {
       accept_monitor_tx_clone,
       context_for_accept_loop.clone(),
       parent_socket_id_for_accept_loop,
+      connection_limiter.clone(),
     ));
     context.publish_actor_started(
       accept_loop_handle_id,
@@ -282,17 +292,20 @@ impl TcpListener {
 
   async fn run_accept_loop(
     accept_loop_handle: usize,
-    listener_cmd_loop_handle: usize,
+    _listener_cmd_loop_handle: usize, // For logging/context, not direct control here
     endpoint_uri: String,
-    listener: Arc<CurrentTcpListener>,
-    transport_config: TcpTransportConfig,
+    listener: Arc<CurrentTcpListener>,    // Or TokioUnixListener
+    transport_config: TcpTransportConfig, // Or equivalent for IPC
     socket_options: Arc<SocketOptions>,
     handle_source: Arc<std::sync::atomic::AtomicUsize>,
     monitor_tx: Option<MonitorSender>,
     context: Context,
     parent_socket_core_id: usize,
+    connection_limiter: Arc<tokio::sync::Semaphore>,
   ) {
     let accept_loop_actor_type = ActorType::AcceptLoop;
+    // ActorDropGuard ensures ActorStopping is published if this task panics or is abruptly cancelled
+    // without calling waive().
     let actor_drop_guard = ActorDropGuard::new(
       context.clone(),
       accept_loop_handle,
@@ -300,151 +313,185 @@ impl TcpListener {
       Some(endpoint_uri.clone()),
     );
 
-    tracing::debug!(handle = accept_loop_handle, parent_handle = listener_cmd_loop_handle, uri = %endpoint_uri, "TCP Listener accept loop started");
-    let mut loop_error_to_report: Option<ZmqError> = None; // Store ZmqError
+    tracing::debug!(handle = accept_loop_handle, uri = %endpoint_uri, "Accept loop started with connection limiting.");
+    let mut loop_error_to_report: Option<ZmqError> = None;
 
+    // This loop will run until the task is cancelled (aborted by its parent)
+    // or a fatal, unrecoverable error occurs within the loop.
     loop {
-      tokio::select! {
-        biased;
-        accept_result = listener.accept() => {
-          match accept_result {
-            Ok((tcp_stream, peer_addr)) => {
-              let peer_addr_str = peer_addr.to_string();
-              tracing::info!(listener_accept_loop_handle = accept_loop_handle, peer = %peer_addr_str, "Accepted new TCP connection");
+      // 1. Acquire a connection permit.
+      //    This is a point where the task can be cancelled.
+      let permit = match connection_limiter.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_semaphore_closed_error) => {
+          tracing::error!(
+            "Accept loop {}: Connection limiter semaphore closed. Stopping.",
+            accept_loop_handle
+          );
+          loop_error_to_report = Some(ZmqError::Internal("Connection limiter closed".into()));
+          break; // Fatal error for the accept loop
+        }
+      };
+      tracing::trace!("Accept loop {}: Acquired connection permit.", accept_loop_handle);
 
-              if let Some(ref tx) = monitor_tx {
-                let event = SocketEvent::Accepted { endpoint: endpoint_uri.clone(), peer_addr: peer_addr_str.clone() };
-                let tx_clone = tx.clone();
-                let endpoint_uri_clone_for_log = endpoint_uri.clone();
-                let peer_addr_str = peer_addr_str.clone();
-                tokio::spawn(async move {
+      // 2. We have a permit. Now accept a connection.
+      //    This is another point where the task can be cancelled.
+      let accept_result = listener.accept().await;
 
-                 if let Err(e) = tx_clone.send(event).await {
-                    tracing::warn!(
-                      endpoint = %endpoint_uri_clone_for_log,
-                      peer = %peer_addr_str,
-                      error = ?e,
-                      "Failed to send Accepted monitor event"
-                    );
-                  }
-                });
-              }
+      match accept_result {
+        Ok((stream, peer_addr)) => {
+          // Successfully accepted a stream
+          let peer_addr_str = peer_addr.to_string(); // For TCP
+                                                     // For IPC: let peer_addr_str = format!("ipc-peer-fd-{}", stream.as_raw_fd());
+          tracing::info!(
+            "Accepted new connection from {} (permit for handle {})",
+            peer_addr_str,
+            accept_loop_handle
+          );
 
-              if let Err(e) = apply_tcp_socket_options(&tcp_stream, &transport_config) {
-                tracing::error!(accept_loop_handle = accept_loop_handle, peer = %peer_addr_str, error = %e, "Failed to apply TCP options. Dropping.");
+          // (Emit SocketEvent::Accepted if monitor_tx exists)
+          if let Some(ref tx) = monitor_tx {
+            let event = SocketEvent::Accepted {
+              endpoint: endpoint_uri.clone(),
+              peer_addr: peer_addr_str.clone(),
+            };
+            // Send event in a non-blocking way or fire-and-forget task
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+              let _ = tx_clone.send(event).await;
+            });
+          }
 
-                if let Some(ref tx) = monitor_tx {
-                  let event = SocketEvent::AcceptFailed { endpoint: endpoint_uri.clone(), error_msg: format!("Apply options failed: {}", e) };
-                  let tx_clone = tx.clone();
-                  let endpoint_uri_clone_for_log = endpoint_uri.clone();
+          // Apply TCP options (or other transport-specific pre-engine setup)
+          if let Err(e) = apply_tcp_socket_options(&stream, &transport_config) {
+            // Adjust for IPC
+            tracing::error!("Failed to apply TCP options for {}: {}. Dropping.", peer_addr_str, e);
+            drop(permit); // Release permit as connection setup failed
+            drop(stream);
+            continue; // Go back to try and get another permit/connection
+          }
 
-                  tokio::spawn(async move {
-                    if let Err(e_send) = tx_clone.send(event).await {
-                      tracing::warn!(
-                        endpoint = %endpoint_uri_clone_for_log,
-                        peer = %peer_addr_str,
-                        original_error = %e,
-                        send_error = ?e_send,
-                        "Failed to send AcceptFailed (options) monitor event"
-                      );
-                    }
-                  });
-                }
-                drop(tcp_stream);
-                continue;
-              }
+          // Spawn the dedicated task to handle this connection.
+          // This new task now owns the `permit` and the `stream`.
+          let session_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          let engine_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          let connection_specific_uri = format!("tcp://{}", peer_addr_str); // Adjust for IPC
 
-              let session_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-              let engine_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-              let connection_specific_uri = format!("tcp://{}", peer_addr_str);
+          let conn_context = context.clone();
+          let conn_socket_options = socket_options.clone();
+          let conn_monitor_tx = monitor_tx.clone();
+          let listener_uri_for_event = endpoint_uri.clone();
 
-              let (session_cmd_mailbox, session_task_join_handle) = SessionBase::create_and_spawn(
-                session_handle_id,
-                connection_specific_uri.clone(),
-                monitor_tx.clone(),
-                context.clone(),
-                parent_socket_core_id,
-              );
+          tokio::spawn(async move {
+            // This task now owns `permit`. It will be dropped when this task ends.
+            let (session_cmd_mailbox, session_task_join_handle) = SessionBase::create_and_spawn(
+              session_handle_id,
+              connection_specific_uri.clone(),
+              conn_monitor_tx.clone(),
+              conn_context.clone(),
+              parent_socket_core_id,
+            );
 
-              let (engine_mailbox, engine_task_join_handle_inner) = create_and_spawn_tcp_engine(
-                engine_handle_id,
-                session_cmd_mailbox.clone(),
-                tcp_stream,
-                socket_options.clone(),
-                true, // Server-side engine
-                &context,
-                session_handle_id, // Engine's parent is Session
-              );
+            let (engine_mailbox, engine_task_join_handle_inner) = create_and_spawn_tcp_engine(
+              // or _ipc_engine
+              engine_handle_id,
+              session_cmd_mailbox.clone(),
+              stream,
+              conn_socket_options.clone(),
+              true,
+              &conn_context,
+              session_handle_id,
+            );
 
-              let attach_cmd = Command::Attach {
-                engine_mailbox,
-                engine_handle: Some(engine_handle_id),
-                engine_task_handle: Some(engine_task_join_handle_inner),
-              };
-              if session_cmd_mailbox.send(attach_cmd).await.is_err() {
-                tracing::error!(session_handle = session_handle_id, uri = %connection_specific_uri, "Failed to send Attach to Session.");
-                // If attach fails, Session will likely stop, Engine might too.
-                // Accept loop continues to accept other connections.
-                continue;
-              }
+            let attach_cmd = Command::Attach {
+              engine_mailbox,
+              engine_handle: Some(engine_handle_id),
+              engine_task_handle: Some(engine_task_join_handle_inner),
+            };
 
+            let mut session_setup_ok = true;
+            if session_cmd_mailbox.send(attach_cmd).await.is_err() {
+              tracing::error!("Failed to Attach engine for {}", connection_specific_uri);
+              session_setup_ok = false;
+            } else {
               let event = SystemEvent::NewConnectionEstablished {
                 parent_core_id: parent_socket_core_id,
                 endpoint_uri: connection_specific_uri.clone(),
-                target_endpoint_uri: endpoint_uri.clone(),
+                target_endpoint_uri: listener_uri_for_event,
                 session_mailbox: session_cmd_mailbox,
                 session_handle_id,
                 session_task_id: session_task_join_handle.id(),
               };
-              if context.event_bus().publish(event).is_err() {
-                tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, "Failed to publish NewConnectionEstablished event.");
-                loop_error_to_report = Some(ZmqError::Internal("Event bus publish failed for NewConnectionEstablished".into()));
-                break;
+              if conn_context.event_bus().publish(event).is_err() {
+                tracing::error!(
+                  "Failed to publish NewConnectionEstablished for {}",
+                  connection_specific_uri
+                );
+                session_setup_ok = false;
               }
             }
-            Err(e) => {
-              tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, error = %e, "Error accepting TCP connection");
-              if let Some(ref tx) = monitor_tx {
-                let event = SocketEvent::AcceptFailed { endpoint: endpoint_uri.clone(), error_msg: format!("{}", e) };
-                let tx_clone = tx.clone();
-                let endpoint_uri_clone_for_log = endpoint_uri.clone();
 
-                let e = e.to_string();
-                tokio::spawn(async move {
-                  if let Err(e_send) = tx_clone.send(event).await {
-                    tracing::warn!(
-                      endpoint = %endpoint_uri_clone_for_log,
-                      original_error = %e,
-                      send_error = ?e_send,
-                      "Failed to send AcceptFailed (general) monitor event"
-                    );
-                  }
-                });
+            if !session_setup_ok {
+              // If session setup failed, ensure the session task is cleaned up.
+              // The permit will be dropped when this spawned task exits.
+              if !session_task_join_handle.is_finished() {
+                session_task_join_handle.abort();
+                // Also consider aborting engine_task_join_handle_inner if it's separate
+                // and doesn't get cleaned up by the session aborting.
               }
-              if is_fatal_accept_error(&e) {
-                tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, error = %e, "Fatal error in TCP accept loop, stopping.");
-                loop_error_to_report = Some(ZmqError::from_io_endpoint(e, &endpoint_uri));
-                break;
+            } else {
+              // Session setup was okay, now wait for the session to complete its lifecycle.
+              if let Err(e) = session_task_join_handle.await {
+                if !e.is_cancelled() {
+                  // Log only if it wasn't a planned cancellation
+                  tracing::error!("Session task for {} panicked: {:?}", connection_specific_uri, e);
+                }
               }
-              sleep(Duration::from_millis(100)).await;
             }
-          }
+            drop(permit); // Permit is dropped when this connection-handling task scope ends.
+            tracing::debug!(
+              "Connection handling task for {} finished, permit released.",
+              connection_specific_uri
+            );
+          }); // End of tokio::spawn for connection handling
         }
-        _ = tokio::time::sleep(Duration::from_secs(60 * 5)) => {
-          tracing::warn!(handle = accept_loop_handle, uri = %endpoint_uri, "TCP Listener accept loop timed out (safety break).");
-          loop_error_to_report = Some(ZmqError::Internal("TCP Accept loop safety timeout".into()));
-          break;
+        Err(e) => {
+          // Error from listener.accept()
+          tracing::error!("Error accepting connection (handle {}): {}", accept_loop_handle, e);
+          drop(permit); // Release permit as we didn't use the slot
+
+          // (Emit SocketEvent::AcceptFailed if monitor_tx exists)
+          if let Some(ref tx) = monitor_tx {
+            let event = SocketEvent::AcceptFailed {
+              endpoint: endpoint_uri.clone(),
+              error_msg: e.to_string(),
+            };
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+              let _ = tx_clone.send(event).await;
+            });
+          }
+
+          if is_fatal_accept_error(&e) {
+            // Or is_fatal_ipc_accept_error
+            loop_error_to_report = Some(ZmqError::from_io_endpoint(e, &endpoint_uri));
+            break; // Break main accept loop on fatal error
+          }
+          // Non-fatal accept error, brief pause before trying to acquire permit again
+          sleep(Duration::from_millis(100)).await;
         }
       }
-    }
-    tracing::debug!(handle = accept_loop_handle, parent_handle = listener_cmd_loop_handle, uri = %endpoint_uri, "TCP Listener accept loop finished");
-    actor_drop_guard.waive();
+    } // end loop
+
+    // Loop exited (either by break on fatal error, or task cancellation)
+    actor_drop_guard.waive(); // Signal normal loop completion to prevent drop guard from double-publishing.
     context.publish_actor_stopping(
       accept_loop_handle,
       accept_loop_actor_type,
       Some(endpoint_uri),
       loop_error_to_report,
     );
+    tracing::info!("Accept loop {} fully stopped.", accept_loop_handle);
   }
 }
 

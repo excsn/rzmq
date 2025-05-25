@@ -46,7 +46,7 @@ impl Distributor {
     &self,
     msg: &Msg,
     core_handle: usize,
-    core_state_mutex: &Mutex<CoreState>,
+    core_state_mutex: &parking_lot::RwLock<CoreState>,
   ) -> Result<(), Vec<(usize, ZmqError)>> {
     let peer_ids = self.get_peer_ids().await;
     tracing::debug!(handle = core_handle, ?peer_ids, "Distributor::send_to_all: Distributing to peer_ids");
@@ -54,13 +54,12 @@ impl Distributor {
       return Ok(());
     }
 
-    let core_state_guard = core_state_mutex.lock().await;
     let mut failed_pipes = Vec::new();
     let mut send_futures = Vec::new();
-    let timeout_opt = core_state_guard.options.sndtimeo;
+    let timeout_opt = core_state_mutex.read().options.sndtimeo;
 
     for pipe_write_id in peer_ids {
-      if let Some(sender) = core_state_guard.get_pipe_sender(pipe_write_id) {
+      if let Some(sender) = core_state_mutex.read().get_pipe_sender(pipe_write_id) {
         let msg_clone = msg.clone();
         let payload_preview_str = msg_clone.data()
             .map(|d| String::from_utf8_lossy(&d.iter().take(20).copied().collect::<Vec<_>>()).into_owned()) // Convert Cow to owned String
@@ -103,7 +102,6 @@ impl Distributor {
         ));
       }
     }
-    drop(core_state_guard);
 
     let results = futures::future::join_all(send_futures).await;
 

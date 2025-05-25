@@ -430,8 +430,16 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
     if !self.is_server {
       let mut client_ready_props = HashMap::new();
       client_ready_props.insert("Socket-Type".to_string(), local_socket_type_name.as_bytes().to_vec());
+      
       if let Some(id_blob) = local_routing_id {
         if !id_blob.is_empty() && id_blob.len() <= 255 {
+          tracing::info!(
+            engine_handle = self.handle,
+            role = "Client", // General client role
+            socket_type = %local_socket_type_name, // e.g., "DEALER"
+            ready_identity_payload = ?String::from_utf8_lossy(id_blob.as_ref()),
+            "Client engine constructing READY: Adding 'Identity' property."
+          );
           client_ready_props.insert("Identity".to_string(), id_blob.to_vec());
         } else {
           tracing::warn!(
@@ -440,6 +448,15 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
             "Client local routing ID invalid (empty or too long), not sending in READY."
           );
         }
+      } else {
+        tracing::info!(
+            engine_handle = self.handle,
+            role = "Client",
+            socket_type = %local_socket_type_name,
+            "Client engine constructing READY: No local ROUTING_ID set, 'Identity' property will not be sent."
+        );
+        // If no ROUTING_ID is set, we simply don't add the "Identity" property.
+        // Libzmq ROUTER receiving this will typically auto-assign a ZMTP-level identity.
       }
       let client_ready_msg = ZmtpReady::create_msg(client_ready_props);
       tracing::debug!(engine_handle = self.handle, "Client sending ZMTP READY command.");
@@ -500,8 +517,10 @@ impl<S: ZmtpStream + AsRawFd> ZmtpEngineCore<S> {
     // Extract Identity from peer's READY command if present
     if let Some(id_bytes_vec) = peer_ready_command_parsed.properties.get("Identity") {
       if !id_bytes_vec.is_empty() && id_bytes_vec.len() <= 255 {
-        identity_from_ready_command = Some(Blob::from(id_bytes_vec.clone()));
-        tracing::debug!(engine_handle = self.handle, peer_identity_from_ready = ?identity_from_ready_command, "Extracted Identity from peer's READY command.");
+        let id_blob = Blob::from(id_bytes_vec.clone());
+        let ready_identity_payload = String::from_utf8_lossy(id_blob.as_ref()).to_string();
+        identity_from_ready_command = Some(id_blob);
+        tracing::debug!(engine_handle = self.handle, peer_identity_from_ready = ?ready_identity_payload, "Extracted Identity from peer's READY command.");
       } else {
         tracing::warn!(
           engine_handle = self.handle,

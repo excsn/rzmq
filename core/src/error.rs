@@ -1,10 +1,5 @@
-// src/error.rs
-
 use std::io;
 use thiserror::Error;
-// tokio::sync::mpsc and oneshot are not directly used for error definitions themselves,
-// but errors related to them (like SendError) might be wrapped or lead to ZmqError.
-// For now, no direct import is needed here.
 
 /// Defines the custom error type for the rzmq library.
 /// This enum covers various categories of errors that can occur,

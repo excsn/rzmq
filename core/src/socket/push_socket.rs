@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use parking_lot::RwLockReadGuard;
 use tokio::sync::{oneshot, Mutex, MutexGuard}; // oneshot for API replies.
 use tokio::time::timeout as tokio_timeout; // For send timeout on peer wait.
 
@@ -49,8 +50,8 @@ impl PushSocket {
   }
 
   /// Helper to get a locked guard for the `CoreState` within `SocketCore`.
-  async fn core_state(&self) -> MutexGuard<'_, CoreState> {
-    self.core.core_state.lock().await
+  fn core_state(&self) -> RwLockReadGuard<'_, CoreState> {
+    self.core.core_state.read()
   }
 }
 
@@ -97,7 +98,7 @@ impl ISocket for PushSocket {
     }
 
     // Get SNDTIMEO from options before potentially blocking on peer selection.
-    let timeout_opt: Option<Duration> = { self.core_state().await.options.sndtimeo };
+    let timeout_opt: Option<Duration> = { self.core_state().options.sndtimeo };
 
     // Select a peer pipe using the load balancer, waiting if necessary based on SNDTIMEO.
     let pipe_write_id = loop {
@@ -157,7 +158,7 @@ impl ISocket for PushSocket {
 
     // Get the sender channel for the selected pipe from CoreState.
     let pipe_tx = {
-      let core_state_guard = self.core_state().await;
+      let core_state_guard = self.core_state();
       core_state_guard.get_pipe_sender(pipe_write_id).ok_or_else(|| {
         // This indicates a consistency issue.
         tracing::error!(

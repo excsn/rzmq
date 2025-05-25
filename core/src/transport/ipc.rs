@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs; // For asynchronous file system operations (removing socket file) - though Drop uses std::fs
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream}; // Tokio's Unix domain socket types
-use tokio::sync::broadcast; // For EventBus subscription
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore}; // For EventBus subscription
 use tokio::task::JoinHandle; // For managing spawned tasks
 use tokio::time::{sleep, timeout}; // For delays and timeouts
 
@@ -88,6 +88,14 @@ impl IpcListener {
     let accept_loop_handle_id = context_for_accept_loop.inner().next_handle();
     let accept_loop_actor_type = ActorType::AcceptLoop;
 
+    let max_conns_for_listener = options.max_connections.unwrap_or(std::usize::MAX);
+    let connection_limiter = Arc::new(tokio::sync::Semaphore::new(max_conns_for_listener.max(1)));
+    tracing::info!(
+      listener_handle = handle,
+      max_concurrent_connections = max_conns_for_listener,
+      "IPC Listener will use connection limiter."
+    );
+
     let accept_loop_task_join_handle = tokio::spawn(IpcListener::run_accept_loop(
       accept_loop_handle_id,
       accept_loop_parent_handle,
@@ -99,6 +107,7 @@ impl IpcListener {
       accept_monitor_tx_clone,
       context_for_accept_loop.clone(),
       parent_socket_id_for_accept_loop,
+      connection_limiter.clone(),
     ));
     context.publish_actor_started(
       accept_loop_handle_id,
@@ -221,16 +230,19 @@ impl IpcListener {
   }
 
   async fn run_accept_loop(
-    accept_loop_handle: usize,
-    listener_cmd_loop_handle: usize,
-    endpoint_uri: String,
-    path: PathBuf, // Path for logging.
-    listener: Arc<TokioUnixListener>,
-    socket_options: Arc<SocketOptions>,
-    handle_source: Arc<std::sync::atomic::AtomicUsize>,
-    monitor_tx: Option<MonitorSender>,
-    context: Context,
-    parent_socket_core_id: usize,
+    // == Parameters based on your original provided code structure ==
+    accept_loop_handle: usize,          // Unique ID for this accept loop actor itself
+    listener_cmd_loop_handle: usize,    // ID of the parent Listener command loop actor (for context/logging)
+    endpoint_uri: String,               // The URI this listener is bound to (e.g., "ipc:///tmp/sock")
+    path: PathBuf,                      // The filesystem path (was in your original).
+    listener: Arc<TokioUnixListener>,   // The actual OS listener socket
+    socket_options: Arc<SocketOptions>, // Shared socket options
+    handle_source: Arc<std::sync::atomic::AtomicUsize>, // For generating new actor handles
+    monitor_tx: Option<MonitorSender>,  // For sending monitor events
+    context: Context,                   // The rzmq Context
+    parent_socket_core_id: usize,       // The ID of the ultimate parent SocketCore
+    // == New Parameter for Connection Limiting ==
+    connection_limiter: Arc<Semaphore>,
   ) {
     let accept_loop_actor_type = ActorType::AcceptLoop;
     let actor_drop_guard = ActorDropGuard::new(
@@ -240,104 +252,245 @@ impl IpcListener {
       Some(endpoint_uri.clone()),
     );
 
-    tracing::debug!(handle = accept_loop_handle, parent_handle = listener_cmd_loop_handle, uri = %endpoint_uri, path = ?path, "IPC Listener accept loop started");
+    tracing::debug!(
+        handle = accept_loop_handle,
+        parent_handle = listener_cmd_loop_handle,
+        uri = %endpoint_uri,
+        path = ?path,
+        "IPC Listener accept loop started. Max connections for this listener: {}. Waiting for connections...",
+        connection_limiter.available_permits() // Informational: initial available permits
+    );
     let mut loop_error_to_report: Option<ZmqError> = None;
 
+    // This loop continues until the task is cancelled (aborted by its parent Listener command loop)
+    // or a fatal, unrecoverable error occurs within this loop.
     loop {
-      tokio::select! {
-        biased;
-        accept_result = listener.accept() => {
-          match accept_result {
-            Ok((unix_stream, _peer_addr_os_specific)) => {
-              let peer_addr_str = format!("ipc-peer-fd-{}", unix_stream.as_raw_fd());
-              tracing::info!(listener_accept_loop_handle = accept_loop_handle, path = ?path, peer = %peer_addr_str, "Accepted new IPC connection");
+      // 1. Acquire a connection permit.
+      //    This .await is a point where the task can be cancelled if its JoinHandle is aborted
+      //    by the parent Listener's command loop.
+      let permit: OwnedSemaphorePermit = match connection_limiter.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_semaphore_closed_error) => {
+          // This occurs if the Semaphore itself is closed. This is unexpected in normal operation
+          // and indicates a severe issue or a very specific (unhandled here) shutdown sequence.
+          tracing::error!(
+            "Accept loop {}: IPC Connection limiter semaphore closed unexpectedly. Stopping.",
+            accept_loop_handle
+          );
+          loop_error_to_report = Some(ZmqError::Internal("IPC Connection limiter closed".into()));
+          break; // Exit the accept loop as it cannot function without the limiter.
+        }
+      };
+      tracing::trace!("Accept loop {}: Acquired IPC connection permit.", accept_loop_handle);
 
-              if let Some(ref tx) = monitor_tx {
-                let event = SocketEvent::Accepted { endpoint: endpoint_uri.clone(), peer_addr: peer_addr_str.clone() };
-                let tx_clone = tx.clone();
-                tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
+      // 2. We have a permit. Now, attempt to accept an IPC connection.
+      //    This .await is also a point where the task can be cancelled by its parent.
+      //    If cancelled here, `accept_result` will be an `Err`.
+      let accept_result = listener.accept().await;
+
+      match accept_result {
+        Ok((unix_stream, _ipc_peer_addr_os_specific)) => {
+          // Successfully accepted a UnixStream.
+          // `_ipc_peer_addr_os_specific` is `std::os::unix::net::SocketAddr` for UnixStream.
+          // We can create a synthetic peer address string for logging/uniqueness.
+          let peer_addr_str = format!("ipc-peer-fd-{}", unix_stream.as_raw_fd());
+
+          tracing::info!(
+              listener_accept_loop_handle = accept_loop_handle, // Using var name from your original log
+              path = ?path, // Using var name from your original log
+              peer = %peer_addr_str,
+              "Accepted new IPC connection"
+          );
+
+          if let Some(ref tx) = monitor_tx {
+            let event = SocketEvent::Accepted {
+              endpoint: endpoint_uri.clone(), // Listener's endpoint URI
+              peer_addr: peer_addr_str.clone(),
+            };
+            let tx_clone = tx.clone();
+            // Spawn a task for sending monitor event to avoid blocking accept loop
+            tokio::spawn({
+              let peer_addr_str = peer_addr_str.clone();
+              let endpoint_uri = endpoint_uri.clone();
+              async move {
+                if tx_clone.send(event).await.is_err() {
+                  tracing::warn!(uri = %endpoint_uri, peer = %peer_addr_str, "Failed to send Accepted monitor event for IPC connection");
+                }
               }
+            });
+          }
 
-              // UnixStream does not have options like NODELAY or KEEPALIVE.
+          // IPC streams generally don't have socket options like NODELAY or KEEPALIVE
+          // that are applied post-accept like TCP. If there were any, they'd go here.
 
-              let session_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-              let engine_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-              let connection_specific_uri = format!("ipc://{}", peer_addr_str);
+          let session_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          let engine_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+          // The `connection_specific_uri` for an accepted IPC connection.
+          // Using the synthetic peer_addr_str makes it unique per connection for tracking.
+          let connection_specific_uri = format!("ipc://{}", peer_addr_str);
+
+          // Clone necessary Arcs and values to move into the new connection handling task.
+          let conn_context = context.clone();
+          let conn_socket_options = socket_options.clone();
+          let conn_monitor_tx = monitor_tx.clone();
+          let listener_uri_for_event_publish = endpoint_uri.clone(); // For NewConnectionEstablished event
+
+          // Spawn the dedicated task to handle this connection.
+          // This new task now owns the `permit` and the `unix_stream`.
+          tokio::spawn({
+            let endpoint_uri = endpoint_uri.clone();
+            async move {
+              // This task owns `permit`. It will be dropped when this task's scope ends.
               let (session_cmd_mailbox, session_task_join_handle) = SessionBase::create_and_spawn(
                 session_handle_id,
-                connection_specific_uri.clone(),
-                monitor_tx.clone(),
-                context.clone(),
-                parent_socket_core_id,
+                connection_specific_uri.clone(), // URI for this specific connection
+                conn_monitor_tx.clone(),         // Monitor sender for the session
+                conn_context.clone(),            // rzmq Context
+                parent_socket_core_id,           // Parent SocketCore ID
               );
 
+              // Create and spawn the ZMTP engine for this IPC stream
               let (engine_mailbox, engine_task_join_handle_inner) = create_and_spawn_ipc_engine(
                 engine_handle_id,
-                session_cmd_mailbox.clone(),
-                unix_stream,
-                socket_options.clone(),
-                true, // Server-side engine.
-                &context,
-                session_handle_id, // Engine's parent is Session.
+                session_cmd_mailbox.clone(), // Session's mailbox for engine to report to
+                unix_stream,                 // The accepted UnixStream is moved here
+                conn_socket_options.clone(), // Socket options for the engine
+                true,                        // Server-side engine role
+                &conn_context,               // rzmq Context reference
+                session_handle_id,           // Engine's parent is this Session
               );
 
+              // Attach the engine to the session
               let attach_cmd = Command::Attach {
                 engine_mailbox,
                 engine_handle: Some(engine_handle_id),
                 engine_task_handle: Some(engine_task_join_handle_inner),
               };
+
+              let mut session_setup_ok = true;
               if session_cmd_mailbox.send(attach_cmd).await.is_err() {
-                tracing::error!(session_handle = session_handle_id, uri = %connection_specific_uri, "Failed to send Attach to new IPC Session.");
-                // If attach fails, Session will stop, Engine might too. Accept loop continues.
-                continue;
+                tracing::error!(
+                    session_handle = session_handle_id,
+                    uri = %connection_specific_uri,
+                    "Failed to send Attach command to new IPC Session."
+                );
+                session_setup_ok = false;
+              } else {
+                // Publish NewConnectionEstablished event
+                let event = SystemEvent::NewConnectionEstablished {
+                  parent_core_id: parent_socket_core_id,
+                  endpoint_uri: connection_specific_uri.clone(), // Peer-specific URI
+                  target_endpoint_uri: listener_uri_for_event_publish.clone(), // Listener's original URI
+                  session_mailbox: session_cmd_mailbox,          // session_cmd_mailbox is moved here
+                  session_handle_id,
+                  session_task_id: session_task_join_handle.id(),
+                };
+                if conn_context.event_bus().publish(event).is_err() {
+                  tracing::error!(
+                      accept_loop_handle = accept_loop_handle, // Log with accept_loop_handle for context
+                      uri = %endpoint_uri, // Log with listener's URI
+                      "Failed to publish NewConnectionEstablished for IPC connection to {}",
+                      connection_specific_uri
+                  );
+                  session_setup_ok = false;
+                }
               }
 
-              let event = SystemEvent::NewConnectionEstablished {
-                parent_core_id: parent_socket_core_id,
-                endpoint_uri: connection_specific_uri.clone(),
-                target_endpoint_uri: endpoint_uri.clone(),
-                session_mailbox: session_cmd_mailbox,
-                session_handle_id,
-                session_task_id: session_task_join_handle.id(),
-              };
-              if context.event_bus().publish(event).is_err() {
-                tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, "Failed to publish NewConnectionEstablished for IPC.");
-                loop_error_to_report = Some(ZmqError::Internal("Event bus publish failed for IPC NewConnectionEstablished".into()));
-                break;
+              if !session_setup_ok {
+                // If session setup failed (e.g., attach or event publish failed),
+                // ensure the session task is cleaned up.
+                if !session_task_join_handle.is_finished() {
+                  session_task_join_handle.abort();
+                  // The engine task (engine_task_join_handle_inner) should ideally be
+                  // cleaned up by the Session when it stops. If not, explicit abort here.
+                }
+              } else {
+                // Session setup was okay. Now wait for the session to complete its lifecycle.
+                // This await ensures this spawned task (and thus the permit) lives as long as the session.
+                if let Err(e) = session_task_join_handle.await {
+                  if !e.is_cancelled() {
+                    // Log only if it wasn't a planned cancellation
+                    tracing::error!(
+                      "IPC Session task for {} (handle {}) panicked: {:?}",
+                      connection_specific_uri,
+                      session_handle_id,
+                      e
+                    );
+                  }
+                }
               }
+              // `permit` is dropped here when this spawned task's scope ends.
+              // This happens regardless of how the session_task_join_handle.await completed
+              // (normally, panicked, or cancelled).
+              drop(permit);
+              tracing::debug!(
+                "IPC Connection handling task for {} (session {}) finished, permit released.",
+                connection_specific_uri,
+                session_handle_id
+              );
             }
-            Err(e) => {
-              tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, error = %e, "Error accepting new IPC connection");
-              if let Some(ref tx) = monitor_tx {
-                let event = SocketEvent::AcceptFailed { endpoint: endpoint_uri.clone(), error_msg: format!("{}", e) };
-                let tx_clone = tx.clone();
-                tokio::spawn(async move { if tx_clone.send(event).await.is_err() { /* Warn */ } });
+          }); // End of tokio::spawn for connection handling
+        } // End Ok arm of accept_result
+        Err(err) => {
+          // Error from listener.accept()
+          // IMPORTANT: Release the permit acquired for this accept attempt, as no connection was successfully handled.
+          drop(permit);
+
+          tracing::error!(
+              accept_loop_handle = accept_loop_handle,
+              uri = %endpoint_uri,
+              error = %err,
+              "Error accepting new IPC connection"
+          );
+          if let Some(ref tx) = monitor_tx {
+            let event = SocketEvent::AcceptFailed {
+              endpoint: endpoint_uri.clone(),
+              error_msg: format!("{}", err),
+            };
+            let tx_clone = tx.clone();
+            tokio::spawn({
+              let endpoint_uri = endpoint_uri.clone();
+              let err_str = err.to_string();
+              async move {
+                if tx_clone.send(event).await.is_err() {
+                  tracing::warn!(uri = %endpoint_uri, error = %err_str, "Failed to send AcceptFailed monitor event for IPC");
+                }
               }
-              if is_fatal_ipc_accept_error(&e) {
-                tracing::error!(accept_loop_handle = accept_loop_handle, uri = %endpoint_uri, error = %e, "Fatal error in IPC accept loop, stopping.");
-                loop_error_to_report = Some(ZmqError::from_io_endpoint(e, &endpoint_uri));
-                break;
-              }
-              sleep(Duration::from_millis(100)).await;
-            }
+            });
           }
-        }
-        _ = tokio::time::sleep(Duration::from_secs(60 * 5)) => {
-          tracing::warn!(handle = accept_loop_handle, uri = %endpoint_uri, "IPC Listener accept loop timed out (safety break).");
-          loop_error_to_report = Some(ZmqError::Internal("IPC Accept loop safety timeout".into()));
-          break;
-        }
-      } // end select!
+
+          if is_fatal_ipc_accept_error(&err) {
+            // Using your original helper
+            tracing::error!(
+                accept_loop_handle = accept_loop_handle,
+                uri = %endpoint_uri,
+                error = %err,
+                "Fatal error in IPC accept loop, stopping."
+            );
+            loop_error_to_report = Some(ZmqError::from_io_endpoint(err, &endpoint_uri));
+            break; // Break the main accept loop on fatal error
+          }
+          // Non-fatal accept error, pause briefly before trying to acquire permit again.
+          // This was in your original code.
+          sleep(Duration::from_millis(100)).await;
+        } // End Err arm of accept_result
+      } // End match accept_result
     } // end loop
 
-    tracing::debug!(handle = accept_loop_handle, parent_handle = listener_cmd_loop_handle, uri = %endpoint_uri, "IPC Listener accept loop finished");
-    actor_drop_guard.waive();
+    // Loop exited (either by break on fatal error, or task cancellation by parent Listener command loop)
+    actor_drop_guard.waive(); // Signal normal loop completion to prevent drop guard from double-publishing.
     context.publish_actor_stopping(
       accept_loop_handle,
       accept_loop_actor_type,
-      Some(endpoint_uri),
+      Some(endpoint_uri.clone()), // Use cloned endpoint_uri for safety if self/parameters are gone
       loop_error_to_report,
+    );
+    tracing::info!(
+        handle = accept_loop_handle,
+        uri = %endpoint_uri, // Use cloned endpoint_uri for logging
+        path = ?path,        // Use cloned path for logging
+        "IPC Listener accept loop actor fully stopped."
     );
   }
 }

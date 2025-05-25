@@ -1241,6 +1241,7 @@ dependencies = [
  "criterion",
  "futures",
  "libsodium-rs",
+ "parking_lot",
  "rand",
  "rzmq_macros",
  "serial_test",

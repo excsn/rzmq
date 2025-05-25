@@ -12,6 +12,7 @@ use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to Socket
 
 use async_channel::Sender as AsyncSender; // For sending commands over pipes.
 use async_trait::async_trait;
+use parking_lot::RwLockReadGuard;
 use std::collections::HashMap; // For pipe_read_to_write_id map.
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,8 +57,8 @@ impl SubSocket {
   }
 
   /// Helper to get a locked guard for the `CoreState` within `SocketCore`.
-  async fn core_state(&self) -> MutexGuard<'_, CoreState> {
-    self.core.core_state.lock().await
+  fn core_state(&self) -> RwLockReadGuard<'_, CoreState> {
+    self.core.core_state.read()
   }
 
   /// Constructs a ZMTP SUBSCRIBE or CANCEL message.
@@ -119,7 +120,6 @@ impl SubSocket {
     // Collect all target pipe senders to send the command to.
     let mut target_pipe_senders: Vec<(usize, AsyncSender<Msg>)> = Vec::new();
     {
-      let state_guard = self.core_state().await;
       let pipe_map_guard = self.pipe_read_to_write_id.lock().await;
 
       if pipe_map_guard.is_empty() {
@@ -131,6 +131,7 @@ impl SubSocket {
       }
       target_pipe_senders.reserve(pipe_map_guard.len());
 
+      let state_guard = self.core_state();
       for pipe_write_id in pipe_map_guard.values() {
         if let Some(sender) = state_guard.get_pipe_sender(*pipe_write_id) {
           target_pipe_senders.push((*pipe_write_id, sender));
@@ -210,7 +211,7 @@ impl ISocket for SubSocket {
   /// unless a `RCVTIMEO` is set.
   async fn recv(&self) -> Result<Msg, ZmqError> {
     // Get RCVTIMEO from options.
-    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
 
     // Attempt to pop a message from the fair queue (which only contains matched messages).
     let pop_future = self.fair_queue.pop_message();
@@ -377,7 +378,7 @@ impl ISocket for SubSocket {
 
       // Get the sender for *this specific* pipe
       let sender_option = {
-        let core_state_guard = self.core_state().await;
+        let core_state_guard = self.core_state();
         core_state_guard.get_pipe_sender(pipe_write_id)
         // core_state lock released here
       };

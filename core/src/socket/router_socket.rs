@@ -14,8 +14,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{Mutex, MutexGuard};
+use parking_lot::RwLockReadGuard;
+use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit};
 use tokio::time::timeout;
+
+use super::patterns::WritePipeCoordinator;
+
+#[derive(Debug)]
+struct ActiveFragmentedSend {
+  target_pipe_id: usize,
+  _permit: OwnedSemaphorePermit,
+}
 
 #[derive(Debug)]
 pub(crate) struct RouterSocket {
@@ -26,7 +35,8 @@ pub(crate) struct RouterSocket {
   // Key: pipe_read_id
   partial_incoming: Mutex<HashMap<usize, Vec<Msg>>>,
   /// Set when the Identity frame is sent, cleared when the last payload frame is sent.
-  current_send_target: Mutex<Option<usize>>,
+  current_send_target: Mutex<Option<ActiveFragmentedSend>>,
+  pipe_send_coordinator: WritePipeCoordinator,
   // Map Pipe Read ID -> Identity (needed for prepending on receive)
   // Duplicates RouterMap's reverse map but might be convenient here
   pipe_to_identity: Mutex<HashMap<usize, Blob>>,
@@ -41,12 +51,13 @@ impl RouterSocket {
       incoming_queue: FairQueue::new(queue_capacity),
       partial_incoming: Mutex::new(HashMap::new()),
       current_send_target: Mutex::new(None),
+      pipe_send_coordinator: WritePipeCoordinator::new(),
       pipe_to_identity: Mutex::new(HashMap::new()),
     }
   }
 
-  async fn core_state(&self) -> MutexGuard<'_, CoreState> {
-    self.core.core_state.lock().await
+  fn core_state(&self) -> RwLockReadGuard<'_, CoreState> {
+    self.core.core_state.read()
   }
 
   /// Creates a temporary identity Blob from a pipe ID.
@@ -93,7 +104,7 @@ impl ISocket for RouterSocket {
   // --- Pattern-Specific Logic ---
   async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
     let mut current_target_guard = self.current_send_target.lock().await;
-    let core_opts = self.core_state().await.options.clone(); // Clone options for use
+    let core_opts = self.core_state().options.clone(); // Clone options for use
     let timeout_opt: Option<Duration> = core_opts.sndtimeo;
     let router_mandatory_opt: bool = core_opts.router_mandatory;
 
@@ -138,12 +149,16 @@ impl ISocket for RouterSocket {
         }
       };
 
+      let permit = self
+        .pipe_send_coordinator
+        .acquire_send_permit(pipe_write_id, timeout_opt)
+        .await?;
       // Get sender channel
       let pipe_tx = {
         // Re-lock core_state briefly if needed, or ensure it's still valid
         // If we already cloned options, maybe we don't need to lock again just for sender if it's cached
         // But get_pipe_sender typically needs the lock.
-        let core_state_guard = self.core_state().await;
+        let core_state_guard = self.core_state();
         match core_state_guard.get_pipe_sender(pipe_write_id) {
           Some(tx) => tx,
           None => {
@@ -163,7 +178,10 @@ impl ISocket for RouterSocket {
 
       match send_msg_with_timeout(&pipe_tx, msg, timeout_opt, self.core.handle, pipe_write_id).await {
         Ok(()) => {
-          *current_target_guard = Some(pipe_write_id);
+          *current_target_guard = Some(ActiveFragmentedSend {
+            target_pipe_id: pipe_write_id,
+            _permit: permit,
+          });
           tracing::trace!(
             handle = self.core.handle,
             ?destination_id,
@@ -203,10 +221,11 @@ impl ISocket for RouterSocket {
       }
     } else {
       // --- Subsequent Frame(s): Payload ---
-      let target_pipe_id = current_target_guard.unwrap();
+      let active_info = current_target_guard.as_ref().unwrap(); // is_some() check done
+      let target_pipe_id = active_info.target_pipe_id;
 
       let pipe_tx = {
-        let core_state_guard = self.core_state().await;
+        let core_state_guard = self.core_state();
         match core_state_guard.get_pipe_sender(target_pipe_id) {
           Some(tx) => tx,
           None => {
@@ -281,7 +300,7 @@ impl ISocket for RouterSocket {
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
 
     // Pop message frame (could be Identity or Payload part) from the fair queue
     let pop_future = self.incoming_queue.pop_message();
@@ -314,45 +333,14 @@ impl ISocket for RouterSocket {
       return Err(ZmqError::InvalidMessage("Cannot send an empty set of frames.".into()));
     }
 
-    // The Mutex on `current_send_target` is crucial here.
-    // This new method effectively acts as the "transaction" that holds that lock
-    // for the duration of sending all these frames.
-    let mut current_target_guard = self.current_send_target.lock().await;
-
-    // --- Ensure we are in a state to send a new identity for a new message ---
-    if current_target_guard.is_some() {
-      tracing::error!(
-          handle = self.core.handle,
-          current_target = ?*current_target_guard,
-          "send_full_message called while current_send_target is already Some. This indicates a logic error or unfinished prior send via individual send() calls."
-      );
-      return Err(ZmqError::InvalidState(
-        "Router socket is already in the middle of sending a multi-part message via individual send() calls.".into(),
-      ));
-    }
-
-    // --- Frame 1: Must be the Destination Identity ---
-    // We will consume the first frame from the input `frames` vector.
-    // To do this without complex Vec manipulation if `frames` is large,
-    // we iterate through an owned version or use an iterator.
-    // For simplicity, let's assume frames isn't excessively large.
-    let mut frames_iter = frames.into_iter(); // Consumes the input Vec
-
-    let mut destination_identity_frame = match frames_iter.next() {
-      Some(f) => f,
-      None => return Err(ZmqError::Internal("frames vector became empty unexpectedly".into())), // Should be caught by initial is_empty
-    };
-
-    if destination_identity_frame.data().unwrap_or_default().is_empty() {
+    let destination_id_blob = Blob::from(frames[0].data().unwrap_or_default().to_vec());
+    if destination_id_blob.is_empty() {
       return Err(ZmqError::InvalidMessage(
         "First frame (destination identity) cannot be empty.".into(),
       ));
     }
-    // Ensure the identity frame has the MORE flag, as delimiter and payload will follow.
-    destination_identity_frame.set_flags(destination_identity_frame.flags() | MsgFlags::MORE);
 
-    let destination_id_blob = Blob::from(destination_identity_frame.data().unwrap_or_default().to_vec());
-    let core_opts = self.core_state().await.options.clone();
+    let core_opts = self.core_state().options.clone();
     let timeout_opt: Option<Duration> = core_opts.sndtimeo;
     let router_mandatory_opt: bool = core_opts.router_mandatory;
 
@@ -376,49 +364,65 @@ impl ISocket for RouterSocket {
       }
     };
 
+    // Check if the target pipe is busy with a fragmented send from the `send()` method.
+    // The subsequent acquire_send_permit will handle the actual waiting if needed.
+    {
+      let current_send_guard = self.current_send_target.lock().await;
+      if let Some(active_info) = &*current_send_guard {
+        if active_info.target_pipe_id == pipe_write_id {
+          tracing::debug!("send_multipart for pipe {} will wait on its per-pipe semaphore because a fragmented send() is active to it.", pipe_write_id);
+        }
+      }
+    }
+
+    // Acquire the per-pipe send permit. This blocks if the pipe is busy
+    // from EITHER a fragmented send() OR another send_multipart().
+    let _permit = self
+      .pipe_send_coordinator
+      .acquire_send_permit(pipe_write_id, timeout_opt)
+      .await?;
+    // If acquire_send_permit re  turns error, propagate it.
+
     let pipe_tx = {
-      let core_state_guard = self.core_state().await;
+      let core_state_guard = self.core_state();
       match core_state_guard.get_pipe_sender(pipe_write_id) {
         Some(tx) => tx,
         None => return Err(ZmqError::HostUnreachable("Peer disconnected before send".into())),
       }
     };
 
+    // --- Frame 1: Must be the Destination Identity ---
+    // We will consume the first frame from the input `frames` vector.
+    // To do this without complex Vec manipulation if `frames` is large,
+    // we iterate through an owned version or use an iterator.
+    // For simplicity, let's assume frames isn't excessively large.
+    let mut frames_iter = frames.into_iter(); // Consumes the input Vec
+
+    let mut destination_identity_frame = match frames_iter.next() {
+      Some(f) => f,
+      None => return Err(ZmqError::Internal("frames vector became empty unexpectedly".into())), // Should be caught by initial is_empty
+    };
+
+    // Ensure the identity frame has the MORE flag, as delimiter and payload will follow.
+    destination_identity_frame.set_flags(destination_identity_frame.flags() | MsgFlags::MORE);
+
     // --- Actually send Identity Frame (using the internal send_msg_with_timeout) ---
     tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, "Sending full_message IDENTITY");
-    match send_msg_with_timeout(
+    send_msg_with_timeout(
       &pipe_tx,
       destination_identity_frame,
       timeout_opt,
       self.core.handle,
       pipe_write_id,
     )
-    .await
-    {
-      Ok(()) => {
-        // Lock the target now that identity is successfully initiated
-        *current_target_guard = Some(pipe_write_id);
-      }
-      Err(e) => {
-        // current_target_guard remains None, MutexGuard drops, lock released.
-        tracing::error!(handle = self.core.handle, dest_id = ?destination_id_blob, error=%e, "Failed to send full_message IDENTITY");
-        return Err(e);
-      }
-    }
-
-    // At this point, current_target_guard is Some(pipe_write_id) and the MutexGuard is still held.
+    .await?;
 
     // --- Send Empty Delimiter Frame ---
     let mut delimiter_frame = Msg::new();
     delimiter_frame.set_flags(MsgFlags::MORE); // Delimiter always has MORE before payload
 
     tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, "Sending full_message DELIMITER");
-    if let Err(e) = send_msg_with_timeout(&pipe_tx, delimiter_frame, timeout_opt, self.core.handle, pipe_write_id).await
-    {
-      tracing::error!(handle = self.core.handle, dest_id = ?destination_id_blob, error=%e, "Failed to send full_message DELIMITER");
-      *current_target_guard = None; // Must unlock target before returning
-      return Err(e);
-    }
+    send_msg_with_timeout(&pipe_tx, delimiter_frame, timeout_opt, self.core.handle, pipe_write_id).await?;
 
     // --- Send Remaining Frames (Actual Payload) ---
     // The remaining frames in `frames_iter` are the payload.
@@ -430,19 +434,14 @@ impl ISocket for RouterSocket {
       // If app_payload was empty, we must send one final frame (can be empty) without MORE.
       let last_empty_payload_frame = Msg::new();
       tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, "Sending full_message LAST EMPTY PAYLOAD");
-      if let Err(e) = send_msg_with_timeout(
+      send_msg_with_timeout(
         &pipe_tx,
         last_empty_payload_frame,
         timeout_opt,
         self.core.handle,
         pipe_write_id,
       )
-      .await
-      {
-        tracing::error!(handle = self.core.handle, dest_id = ?destination_id_blob, error=%e, "Failed to send full_message LAST EMPTY PAYLOAD");
-        *current_target_guard = None; // Unlock
-        return Err(e);
-      }
+      .await?;
     } else {
       let num_payload_to_send = remaining_payload_frames.len();
       for (i, mut payload_frame) in remaining_payload_frames.into_iter().enumerate() {
@@ -453,28 +452,20 @@ impl ISocket for RouterSocket {
         // else: trust caller set MORE correctly on intermediate payload frames.
 
         tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, part=i, flags=?payload_frame.flags(), "Sending full_message PAYLOAD frame");
-        if let Err(e) =
-          send_msg_with_timeout(&pipe_tx, payload_frame, timeout_opt, self.core.handle, pipe_write_id).await
-        {
-          tracing::error!(handle = self.core.handle, dest_id = ?destination_id_blob, error=%e, part=i, "Failed to send full_message PAYLOAD frame");
-          *current_target_guard = None; // Unlock
-          return Err(e);
-        }
+        send_msg_with_timeout(&pipe_tx, payload_frame, timeout_opt, self.core.handle, pipe_write_id).await?;
       }
     }
 
     // --- All parts sent successfully, unlock target ---
-    *current_target_guard = None;
-    tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, "Full message sent successfully, target released.");
+    tracing::trace!(handle = self.core.handle, dest_id = ?destination_id_blob, pipe_id = pipe_write_id, "Full message sent successfully");
     Ok(())
-    // MutexGuard `current_target_guard` is dropped here, releasing the Mutex.
   }
 
   // --- Pattern Specific Options ---
   async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     if option == ROUTER_MANDATORY {
       let val = crate::socket::options::parse_bool_option(value)?;
-      self.core_state().await.options.router_mandatory = val;
+      self.core.core_state.write().options.router_mandatory = val;
       tracing::debug!(handle = self.core.handle, "ROUTER_MANDATORY set to {}", val);
       Ok(())
     } else {
@@ -483,7 +474,7 @@ impl ISocket for RouterSocket {
   }
   async fn get_pattern_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     if option == ROUTER_MANDATORY {
-      let val = self.core_state().await.options.router_mandatory;
+      let val = self.core_state().options.router_mandatory;
       Ok((val as i32).to_ne_bytes().to_vec())
     } else {
       Err(ZmqError::UnsupportedOption(option))
@@ -666,11 +657,15 @@ impl ISocket for RouterSocket {
       .router_map
       .add_peer(initial_identity_to_use.clone(), pipe_read_id, pipe_write_id)
       .await;
+    
     self
       .pipe_to_identity
       .lock()
       .await
       .insert(pipe_read_id, initial_identity_to_use);
+
+    self.pipe_send_coordinator.add_pipe(pipe_write_id).await;
+
     self.incoming_queue.pipe_attached(pipe_read_id);
   }
 
@@ -766,58 +761,44 @@ impl ISocket for RouterSocket {
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
-    tracing::debug!(
-      handle = self.core.handle,
-      pipe_read_id = pipe_read_id,
-      "ROUTER detaching pipe"
-    );
+    tracing::debug!("ROUTER detaching pipe_read_id: {}", pipe_read_id);
 
-    // 1. Try to find the identity and write pipe ID for the detaching read pipe ID
-    let maybe_identity: Option<Blob> = {
-      let id_map_guard = self.pipe_to_identity.lock().await;
-      id_map_guard.get(&pipe_read_id).cloned()
-      // id_map_guard lock released here
-    };
-
-    // We need the write_id associated with this identity to check against current_send_target
-    let maybe_write_id: Option<usize> = if let Some(ref identity) = maybe_identity {
-      // Use the public get_pipe method BEFORE removing the mapping
+    let removed_identity = self.pipe_to_identity.lock().await.remove(&pipe_read_id);
+    let pipe_write_id_to_clean = if let Some(ref identity) = removed_identity {
+      // Get the write_id associated with this identity BEFORE removing from router_map
       self.router_map.get_pipe(identity).await
     } else {
       None
     };
 
-    // 2. Remove peer from router map (uses read ID)
+    // Remove from main RouterMap (this also handles its internal reverse map)
     self.router_map.remove_peer_by_read_pipe(pipe_read_id).await;
 
-    // 3. Remove from local identity map
-    let _removed_identity = self.pipe_to_identity.lock().await.remove(&pipe_read_id);
+    // Remove from send coordinator
+    if let Some(write_id) = pipe_write_id_to_clean {
+      if let Some(semaphore) = self.pipe_send_coordinator.remove_pipe(write_id).await {
+        semaphore.close(); // Close the semaphore to wake up any waiters with an error
+      }
 
-    // 4. Notify FairQueue helper
-    self.incoming_queue.pipe_detached(pipe_read_id);
-
-    // 5. Clear any partial messages from this pipe
-    self.partial_incoming.lock().await.remove(&pipe_read_id);
-
-    // 6. Clear pending send target if it matched the detached pipe's write ID
-    if let Some(write_pipe_id) = maybe_write_id {
-      let mut target_guard = self.current_send_target.lock().await;
-      if *target_guard == Some(write_pipe_id) {
-        tracing::warn!(
-          handle = self.core.handle,
-          pipe_read_id = pipe_read_id,
-          pipe_write_id = write_pipe_id,
-          "Current ROUTER send target pipe detached. Clearing target."
-        );
-        *target_guard = None;
+      // Clean up active_fragmented_send if it was for the detached pipe
+      let mut active_frag_guard = self.current_send_target.lock().await;
+      if let Some(active_info) = &*active_frag_guard {
+        if active_info.target_pipe_id == write_id {
+          *active_frag_guard = None; // Drops the permit, releases the lock
+          tracing::warn!(
+            "Fragmented send was active on detached pipe {}. Cleared state.",
+            write_id
+          );
+        }
       }
     } else {
-      // If we couldn't find the identity or write_id (e.g., mapping was already gone), we can't reliably check the target.
-      tracing::trace!(
-        handle = self.core.handle,
-        pipe_read_id = pipe_read_id,
-        "Could not verify write_id for detached pipe to clear send target."
+      tracing::warn!(
+        "Could not find write_id for detached read_pipe_id {} to clean send coordinator/fragmented_send state",
+        pipe_read_id
       );
     }
+
+    self.incoming_queue.pipe_detached(pipe_read_id);
+    self.partial_incoming.lock().await.remove(&pipe_read_id);
   }
 } // end impl ISocket for RouterSocket

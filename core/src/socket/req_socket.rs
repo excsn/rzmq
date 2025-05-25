@@ -10,6 +10,7 @@ use crate::socket::ISocket;
 use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to SocketCore. // The trait this struct implements.
 
 use async_trait::async_trait;
+use parking_lot::RwLockReadGuard;
 use std::collections::HashMap; // For pipe_read_to_write_id map.
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,8 +71,8 @@ impl ReqSocket {
   }
 
   /// Helper to get a locked guard for the `CoreState` within `SocketCore`.
-  async fn core_state(&self) -> MutexGuard<'_, CoreState> {
-    self.core.core_state.lock().await
+  fn core_state(&self) -> RwLockReadGuard<'_, CoreState> {
+    self.core.core_state.read()
   }
 }
 
@@ -142,7 +143,7 @@ impl ISocket for ReqSocket {
     }
 
     // Get SNDTIMEO from options before potentially blocking on peer selection.
-    let timeout_opt: Option<Duration> = { self.core_state().await.options.sndtimeo };
+    let timeout_opt: Option<Duration> = { self.core_state().options.sndtimeo };
 
     // Select a peer pipe using the load balancer, waiting if necessary based on SNDTIMEO.
     let pipe_write_id = loop {
@@ -189,7 +190,7 @@ impl ISocket for ReqSocket {
 
     // Get the sender channel for the selected pipe from CoreState.
     let pipe_tx = {
-      let core_state_guard = self.core_state().await;
+      let core_state_guard = self.core_state();
       core_state_guard.get_pipe_sender(pipe_write_id).ok_or_else(|| {
         tracing::error!(
           handle = self.core.handle,
@@ -275,7 +276,7 @@ impl ISocket for ReqSocket {
     }
 
     // Get RCVTIMEO from options.
-    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
 
     // Pop the reply message from the (capacity 1) incoming fair queue.
     let pop_future = self.incoming_reply_queue.pop_message();

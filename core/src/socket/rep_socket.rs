@@ -8,6 +8,7 @@ use crate::socket::patterns::FairQueue;
 use crate::socket::{ISocket, SourcePipeReadId};
 
 use async_trait::async_trait;
+use parking_lot::RwLockReadGuard;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,8 +46,8 @@ impl RepSocket {
     }
   }
 
-  async fn core_state(&self) -> MutexGuard<'_, CoreState> {
-    self.core.core_state.lock().await
+  fn core_state(&self) -> RwLockReadGuard<'_, CoreState> {
+    self.core.core_state.read()
   }
 }
 
@@ -91,7 +92,7 @@ impl ISocket for RepSocket {
     }
     drop(current_state_guard);
 
-    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
 
     let first_part;
     let mut source_pipe_read_id_from_meta: Option<usize> = None;
@@ -228,7 +229,7 @@ impl ISocket for RepSocket {
     };
 
     let pipe_tx = {
-      let core_state_guard = self.core_state().await;
+      let core_state_guard = self.core_state();
       match core_state_guard.get_pipe_sender(pipe_write_id_for_reply) {
         Some(tx) => tx,
         None => {
@@ -253,7 +254,7 @@ impl ISocket for RepSocket {
       frames_to_send.push_front(prefix_msg_part);
     }
 
-    let timeout_opt: Option<Duration> = { self.core_state().await.options.sndtimeo };
+    let timeout_opt: Option<Duration> = { self.core_state().options.sndtimeo };
 
     for frame_to_send in frames_to_send {
       if let Err(e) = send_msg_with_timeout(

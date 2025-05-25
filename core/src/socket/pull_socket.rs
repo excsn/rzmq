@@ -9,6 +9,7 @@ use crate::socket::patterns::FairQueue; // PULL uses a FairQueue to collect mess
 use crate::socket::ISocket;
 
 use async_trait::async_trait;
+use parking_lot::RwLockReadGuard;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, MutexGuard}; // oneshot for API replies.
@@ -46,8 +47,8 @@ impl PullSocket {
   }
 
   /// Helper to get a locked guard for the `CoreState` within `SocketCore`.
-  async fn core_state(&self) -> MutexGuard<'_, CoreState> {
-    self.core.core_state.lock().await
+  fn core_state(&self) -> RwLockReadGuard<'_, CoreState> {
+    self.core.core_state.read()
   }
 }
 
@@ -99,7 +100,7 @@ impl ISocket for PullSocket {
     }
 
     // Get RCVTIMEO from options.
-    let rcvtimeo_opt: Option<Duration> = { self.core_state().await.options.rcvtimeo };
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
 
     // Attempt to pop a message from the fair queue.
     let pop_future = self.fair_queue.pop_message();

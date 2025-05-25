@@ -21,6 +21,7 @@ async-recursion = "^1.0"
 tokio = { version = "^1", features = ["fs", "rt", "rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
 tokio-util = { version = "^0.7", features = ["codec"] }
 futures = "^0.3"
+parking_lot = "^0"
 
 # --- I/O & Buffers ---
 bytes = "^1.4" # Efficient byte buffer handling

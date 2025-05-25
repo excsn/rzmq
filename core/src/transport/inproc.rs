@@ -31,12 +31,11 @@ pub(crate) async fn bind_inproc(
   core_arc
     .context
     .inner()
-    .register_inproc(name.clone(), core_arc.handle) // Pass binder's own handle ID.
-    .await?;
+    .register_inproc(name.clone(), core_arc.handle)?;
 
   // Also, track locally within the binder's CoreState that it has bound this name.
   // This can be useful for cleanup or diagnostics.
-  let mut binder_core_state = core_arc.core_state.lock().await;
+  let mut binder_core_state = core_arc.core_state.write();
   binder_core_state.bound_inproc_names.insert(name);
   tracing::info!(binder_core_handle = core_arc.handle, inproc_name = %binder_core_state.bound_inproc_names.iter().last().unwrap(), "Inproc endpoint bound successfully");
   Ok(())
@@ -68,7 +67,7 @@ pub(crate) async fn connect_inproc(
 
   // 1. Lookup binder information (specifically, binder_core_id) in the context registry.
   //    The InprocBinding struct now only contains `binder_core_id`.
-  let _binder_info = match core_arc.context.inner().lookup_inproc(&name).await {
+  let _binder_info = match core_arc.context.inner().lookup_inproc(&name) {
     Some(info) => info, // `info` is `InprocBinding { binder_core_id }`.
     None => {
       // Binder not found in the registry.
@@ -80,7 +79,9 @@ pub(crate) async fn connect_inproc(
         endpoint: connector_uri_str.clone(),
         error_msg: err_msg,
       };
-      if let Some(monitor) = core_arc.core_state.lock().await.get_monitor_sender_clone() {
+
+      let monitor_result = core_arc.core_state.read().get_monitor_sender_clone();
+      if let Some(monitor) = monitor_result {
         let _ = monitor.send(event).await; // Best effort.
       }
       let _ = reply_tx_user.send(Err(zmq_err)); // Send error back to user.
@@ -91,13 +92,17 @@ pub(crate) async fn connect_inproc(
   // but `InprocBindingRequest` is published with `target_inproc_name`, and the binder filters by that.
 
   // 2. Create the pair of asynchronous channels (pipes) for bi-directional communication.
-  let mut connector_core_state = core_arc.core_state.lock().await;
   // Determine HWM for the pipes based on socket options (max of SNDHWM/RCVHWM, min 1).
-  let pipe_hwm = connector_core_state
+  let pipe_hwm = {
+    
+    let connector_core_state = core_arc.core_state.read();
+    connector_core_state
     .options
     .rcvhwm
     .max(connector_core_state.options.sndhwm)
-    .max(1);
+    .max(1)
+  };
+  
   // Generate unique IDs for the connector's perspective of the pipes.
   let pipe_id_connector_writes_to_binder = core_arc.context.inner().next_handle();
   let pipe_id_connector_reads_from_binder = pipe_id_connector_writes_to_binder + 1; // Ensure uniqueness.
@@ -106,12 +111,10 @@ pub(crate) async fn connect_inproc(
   let (tx_connector_to_binder, rx_binder_from_connector) = bounded::<Msg>(pipe_hwm);
   // Pipe 2: Binder -> Connector
   let (tx_binder_to_connector, rx_connector_from_binder) = bounded::<Msg>(pipe_hwm);
-  drop(connector_core_state);
 
   // Store connector's ends and spawn reader
-  let mut connector_core_state_again = core_arc.core_state.lock().await;
   // Connector sends on this pipe
-  connector_core_state_again
+  core_arc.core_state.write()
     .pipes_tx
     .insert(pipe_id_connector_writes_to_binder, tx_connector_to_binder.clone()); // Store clone
 
@@ -125,7 +128,8 @@ pub(crate) async fn connect_inproc(
     pipe_id_connector_reads_from_binder,
     rx_connector_from_binder.clone(), // Pass clone to reader task
   ));
-  connector_core_state_again
+
+  core_arc.core_state.write()
     .pipe_reader_task_handles
     .insert(pipe_id_connector_reads_from_binder, pipe_reader_task_join_handle);
 
@@ -141,11 +145,10 @@ pub(crate) async fn connect_inproc(
     target_endpoint_uri: Some(connector_uri_str.clone()),
     is_outbound_connection: true,
   };
-  connector_core_state_again
+  core_arc.core_state.write()
     .endpoints
     .insert(connector_uri_str.clone(), endpoint_info);
-  let monitor_tx_for_event = connector_core_state_again.get_monitor_sender_clone();
-  drop(connector_core_state_again);
+  let monitor_tx_for_event = core_arc.core_state.read().get_monitor_sender_clone();
 
   // Publish event with CORRECT ends for the Binder
   let (reply_tx_internal_binder, reply_rx_internal_binder) = oneshot::channel();
@@ -167,10 +170,11 @@ pub(crate) async fn connect_inproc(
     tracing::error!(connector_core_handle = connector_core_handle, inproc_name = %name, "Failed to publish InprocBindingRequest event to EventBus.");
     let err = ZmqError::Internal("Event bus publish failed for inproc connect request".into());
     // Attempt to clean up pipes stored in connector's CoreState.
-    let mut cs = core_arc.core_state.lock().await;
-    cs.endpoints.remove(&connector_uri_str);
-    cs.remove_pipe_state(pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder);
-    drop(cs);
+    {
+      let mut cs = core_arc.core_state.write();
+      cs.endpoints.remove(&connector_uri_str);
+      cs.remove_pipe_state(pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder);
+    }
     let _ = reply_tx_user.send(Err(err));
     return;
   }
@@ -213,10 +217,13 @@ pub(crate) async fn connect_inproc(
       // Connection explicitly rejected by the binder.
       tracing::warn!(connector_core_handle = connector_core_handle, inproc_name = %name, "Inproc connection rejected by binder: {}", e);
       // Cleanup pipes and endpoint info stored in connector's CoreState.
-      let mut cs = core_arc.core_state.lock().await;
-      cs.endpoints.remove(&connector_uri_str);
-      cs.remove_pipe_state(pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder);
-      drop(cs);
+      
+      {
+        let mut cs = core_arc.core_state.write();
+        cs.endpoints.remove(&connector_uri_str);
+        cs.remove_pipe_state(pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder);
+      }
+
       // Emit ConnectFailed monitor event.
       if let Some(monitor) = monitor_tx_for_event {
         let event = SocketEvent::ConnectFailed {
@@ -232,11 +239,14 @@ pub(crate) async fn connect_inproc(
       let error_msg = format!("Binder for inproc endpoint '{}' failed to reply or disappeared", name);
       tracing::error!(connector_core_handle = connector_core_handle, inproc_name = %name, "{}", error_msg);
       let zmq_err = ZmqError::Internal(error_msg.clone());
+
       // Cleanup pipes and endpoint info.
-      let mut cs = core_arc.core_state.lock().await;
-      cs.endpoints.remove(&connector_uri_str);
-      cs.remove_pipe_state(pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder);
-      drop(cs);
+      {
+        let mut cs = core_arc.core_state.write();
+        cs.endpoints.remove(&connector_uri_str);
+        cs.remove_pipe_state(pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder);
+      }
+
       // Emit ConnectFailed monitor event.
       if let Some(monitor) = monitor_tx_for_event {
         let event = SocketEvent::ConnectFailed {
@@ -256,7 +266,7 @@ pub(crate) async fn connect_inproc(
 /// Connected peers must be explicitly closed or disconnected.
 pub(crate) async fn unbind_inproc(name: &str, context: &Context) {
   tracing::debug!(inproc_name = %name, "Unbinding inproc endpoint from context registry");
-  context.inner().unregister_inproc(name).await;
+  context.inner().unregister_inproc(name);
 }
 
 /// Handles disconnecting an in-process endpoint from the connector's side.
@@ -282,8 +292,7 @@ pub(crate) async fn disconnect_inproc(
   tracing::debug!(connector_core_handle = connector_core_handle, %endpoint_uri, "Disconnecting inproc endpoint via event");
 
   // 1. Find and remove the EndpointInfo for this inproc connection from the connector's state.
-  let mut connector_core_state = core_arc.core_state.lock().await;
-  let removed_endpoint_info = match connector_core_state.endpoints.remove(endpoint_uri) {
+  let removed_endpoint_info = match core_arc.core_state.write().endpoints.remove(endpoint_uri) {
     Some(info) => info,
     None => {
       // Endpoint not found, perhaps already disconnected or never fully connected.
@@ -297,10 +306,9 @@ pub(crate) async fn disconnect_inproc(
     Some(ids) => ids,
     None => {
       // Should not happen if endpoint_info was valid. Restore and error.
-      connector_core_state
+      core_arc.core_state.write()
         .endpoints
         .insert(endpoint_uri.to_string(), removed_endpoint_info);
-      drop(connector_core_state);
       tracing::error!(connector_core_handle = connector_core_handle, %endpoint_uri, "Inproc disconnect failed: Missing pipe IDs for stored endpoint info.");
       return Err(ZmqError::Internal(
         "Missing pipe IDs for stored inproc endpoint during disconnect".into(),
@@ -330,12 +338,11 @@ pub(crate) async fn disconnect_inproc(
   }
 
   // 4. Clean up local state (pipes, reader task) for the connector.
-  let pipes_were_removed = connector_core_state.remove_pipe_state(pipe_id_connector_writes, pipe_id_connector_reads);
-  let monitor_tx_for_event = connector_core_state.get_monitor_sender_clone();
+  let pipes_were_removed = core_arc.core_state.write().remove_pipe_state(pipe_id_connector_writes, pipe_id_connector_reads);
+  let monitor_tx_for_event = core_arc.core_state.read().get_monitor_sender_clone();
   // EndpointInfo for the dummy task_handle associated with inproc is implicitly cleaned by `endpoints.remove`.
   // `removed_endpoint_info.task_handle.abort()` is not strictly necessary if it's a dummy.
   removed_endpoint_info.task_handle.abort(); // Abort the dummy task handle just in case.
-  drop(connector_core_state); // Release lock.
 
   // 5. Notify the connector's `ISocket` logic about the pipe detachment.
   if pipes_were_removed {

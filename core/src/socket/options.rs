@@ -39,6 +39,8 @@ pub const CURVE_SECRETKEY: i32 = 49;
 #[cfg(feature = "curve")]
 pub const CURVE_SERVERKEY: i32 = 50;
 
+pub const MAX_CONNECTIONS: i32 = 1000;
+
 // IO Uring Options
 #[cfg(feature = "io-uring")]
 pub const IO_URING_SNDZEROCOPY: i32 = 1170;
@@ -47,7 +49,7 @@ pub const IO_URING_RCVMULTISHOT: i32 = 1171;
 
 /// Socket option: Enable/disable TCP_CORK (Linux only).
 /// Value is i32 (0 or 1).
-pub const TCP_CORK_OPT: i32 = 1172; 
+pub const TCP_CORK_OPT: i32 = 1172;
 
 /// Socket option (i32): Number of buffers to use in the io_uring multishot receive pool.
 /// Only effective if `IO_URING_RCVMULTISHOT` (the boolean flag) is also enabled.
@@ -84,7 +86,7 @@ pub(crate) struct SocketOptions {
   pub sndtimeo: Option<Duration>,
   // Connection Behavior
   pub linger: Option<Duration>, // ZMQ uses -1 for infinite, 0 for immediate, >0 for ms -> map to Duration
-  pub reconnect_ivl: Option<Duration>,     // Initial reconnect interval (None = ZMQ default, often 0 = no reconnect)
+  pub reconnect_ivl: Option<Duration>, // Initial reconnect interval (None = ZMQ default, often 0 = no reconnect)
   pub reconnect_ivl_max: Option<Duration>, // Max reconnect interval (for exponential backoff)
   // pub backlog: Option<u32>, // TODO - For listener
   // Identity
@@ -96,7 +98,8 @@ pub(crate) struct SocketOptions {
   pub tcp_keepalive_count: Option<u32>,
   pub tcp_keepalive_interval: Option<Duration>,
   pub tcp_nodelay: bool, // Usually enabled by default
-  
+  pub max_connections: Option<usize>,
+
   /// Interval between sending ZMTP PING probes if no traffic received.
   /// `None` disables PINGs.
   pub heartbeat_ivl: Option<Duration>,
@@ -107,10 +110,10 @@ pub(crate) struct SocketOptions {
   /// ROUTER behavior when routing ID is unknown.
   /// Default false (drop message). True = return EHOSTUNREACH.
   pub router_mandatory: bool,
-  
+
   pub zap_domain: Option<String>, // ZAP Domain
   // Add other commonly used options as needed
-  pub plain_server: Option<bool>, // Role override
+  pub plain_server: Option<bool>,     // Role override
   pub plain_username: Option<String>, // Security options stored here?
   pub plain_password: Option<String>,
   // Curve Auth
@@ -138,11 +141,11 @@ impl Default for SocketOptions {
       // ZMQ Defaults:
       rcvhwm: 1000,
       sndhwm: 1000,
-      rcvtimeo: None,               // -1 in ZMQ
-      sndtimeo: None,               // -1 in ZMQ
-      linger: Some(Duration::ZERO), // 0 in ZMQ (different from socket default!)
+      rcvtimeo: None,                                  // -1 in ZMQ
+      sndtimeo: None,                                  // -1 in ZMQ
+      linger: Some(Duration::ZERO),                    // 0 in ZMQ (different from socket default!)
       reconnect_ivl: Some(Duration::from_millis(100)), // ZMQ default is 100ms
-      reconnect_ivl_max: Some(Duration::ZERO), // ZMQ default is 0 (disable max/backoff)
+      reconnect_ivl_max: Some(Duration::ZERO),         // ZMQ default is 0 (disable max/backoff)
       routing_id: None,
       socket_type_name: "UNKNOWN".to_string(), // Default, should be set on creation
       tcp_keepalive_enabled: 0,                // 0 (use system default) in ZMQ
@@ -150,6 +153,7 @@ impl Default for SocketOptions {
       tcp_keepalive_count: None,
       tcp_keepalive_interval: None,
       tcp_nodelay: true, // Common default for messaging
+      max_connections: Some(1024),
       heartbeat_ivl: None, // Disabled by default
       heartbeat_timeout: None,
       router_mandatory: false, // Default ZMQ behavior is to drop silently
@@ -301,9 +305,9 @@ pub(crate) fn parse_blob_option(value: &[u8]) -> Result<Blob, ZmqError> {
 pub(crate) fn parse_heartbeat_option(value: &[u8], option_id: i32) -> Result<Option<Duration>, ZmqError> {
   let val = parse_i32_option(value).map_err(|_| ZmqError::InvalidOptionValue(option_id))?;
   match val {
-    0 => Ok(None), // 0 disables heartbeat
+    0 => Ok(None),                                      // 0 disables heartbeat
     1.. => Ok(Some(Duration::from_millis(val as u64))), // Positive timeout
-    _ => Err(ZmqError::InvalidOptionValue(option_id)), // Negative values invalid
+    _ => Err(ZmqError::InvalidOptionValue(option_id)),  // Negative values invalid
   }
 }
 
@@ -311,26 +315,41 @@ pub(crate) fn parse_heartbeat_option(value: &[u8], option_id: i32) -> Result<Opt
 /// Parses a fixed-length binary key option.
 pub(crate) fn parse_key_option<const N: usize>(value: &[u8], option_id: i32) -> Result<[u8; N], ZmqError> {
   value.try_into().map_err(|_| {
-      tracing::error!(option=option_id, expected_len=N, actual_len=value.len(), "Invalid key length");
-      ZmqError::InvalidOptionValue(option_id)
+    tracing::error!(
+      option = option_id,
+      expected_len = N,
+      actual_len = value.len(),
+      "Invalid key length"
+    );
+    ZmqError::InvalidOptionValue(option_id)
   })
 }
 
 pub(crate) fn parse_reconnect_ivl_option(value: &[u8]) -> Result<Option<Duration>, ZmqError> {
   let val = parse_i32_option(value)?;
   match val {
-      -1 => Ok(None), // Treat -1 as disable? ZMQ uses 0. Let's use 0.
-      0 => Ok(None), // 0 disables reconnect according to ZMQ docs for IVL
-      1.. => Ok(Some(Duration::from_millis(val as u64))),
-      _ => Err(ZmqError::InvalidOptionValue(RECONNECT_IVL)),
+    -1 => Ok(None), // Treat -1 as disable? ZMQ uses 0. Let's use 0.
+    0 => Ok(None),  // 0 disables reconnect according to ZMQ docs for IVL
+    1.. => Ok(Some(Duration::from_millis(val as u64))),
+    _ => Err(ZmqError::InvalidOptionValue(RECONNECT_IVL)),
   }
 }
 
 pub(crate) fn parse_reconnect_ivl_max_option(value: &[u8]) -> Result<Option<Duration>, ZmqError> {
   let val = parse_i32_option(value)?;
   match val {
-      0 => Ok(Some(Duration::ZERO)), // 0 disables max/backoff according to ZMQ docs
-      1.. => Ok(Some(Duration::from_millis(val as u64))),
-      _ => Err(ZmqError::InvalidOptionValue(RECONNECT_IVL_MAX)),
+    0 => Ok(Some(Duration::ZERO)), // 0 disables max/backoff according to ZMQ docs
+    1.. => Ok(Some(Duration::from_millis(val as u64))),
+    _ => Err(ZmqError::InvalidOptionValue(RECONNECT_IVL_MAX)),
+  }
+}
+
+pub(crate) fn parse_max_connections_option(value: &[u8], option_id: i32) -> Result<Option<usize>, ZmqError> {
+  let val = parse_i32_option(value).map_err(|_| ZmqError::InvalidOptionValue(option_id))?;
+  match val {
+    -1 => Ok(None),                                    // ZMQ often uses -1 for "no limit" or "system default"
+    0 => Err(ZmqError::InvalidOptionValue(option_id)), // 0 is invalid for max connections
+    1.. => Ok(Some(val as usize)),
+    _ => Err(ZmqError::InvalidOptionValue(option_id)),
   }
 }

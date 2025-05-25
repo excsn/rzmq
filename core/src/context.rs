@@ -2,17 +2,14 @@
 
 use crate::error::ZmqError;
 use crate::runtime::{
-  mailbox, // For creating mailboxes
   ActorType,
-  Command, // MailboxSender sends Commands
   EventBus,
-  MailboxReceiver, // Not directly used in Context, but MailboxSender implies it
-  MailboxSender,   // Stored for sockets
+  MailboxSender, 
   SystemEvent,
   WaitGroup,
   DEFAULT_MAILBOX_CAPACITY,
 };
-use crate::socket::{self, ISocket, Socket, SocketType}; // For creating and managing Sockets
+use crate::socket::{Socket, SocketType}; // For creating and managing Sockets
 
 use std::collections::HashMap;
 use std::fmt;
@@ -24,7 +21,6 @@ use libsodium_rs as libsodium;
 use tracing::warn; // For CURVE security initialization
 
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex, RwLock}; // broadcast for EventBus, Mutex/RwLock for shared state
 
 /// Information stored in the inproc registry for a bound endpoint.
 /// This is used by in-process connectors to find the binder.
@@ -47,10 +43,10 @@ pub(crate) struct ContextInner {
   /// This allows the context (or other authorized entities) to potentially interact
   /// directly with a socket's command processing loop if absolutely necessary,
   /// though most inter-socket coordination is now event-driven.
-  pub(crate) sockets: RwLock<HashMap<usize, MailboxSender>>,
+  pub(crate) sockets: parking_lot::RwLock<HashMap<usize, MailboxSender>>,
   /// Registry for in-process bindings. Key is the inproc address name (e.g., "my-service").
   #[cfg(feature = "inproc")]
-  pub(crate) inproc_registry: RwLock<HashMap<String, InprocBinding>>,
+  pub(crate) inproc_registry: parking_lot::RwLock<HashMap<String, InprocBinding>>,
 
   // --- Shutdown Coordination ---
   /// Central event bus for broadcasting system-wide notifications (e.g., termination, actor lifecycle).
@@ -82,9 +78,9 @@ impl ContextInner {
 
     Self {
       next_handle: Arc::new(std::sync::atomic::AtomicUsize::new(1)), // Start handle IDs from 1.
-      sockets: RwLock::new(HashMap::new()),
+      sockets: parking_lot::RwLock::new(HashMap::new()),
       #[cfg(feature = "inproc")]
-      inproc_registry: RwLock::new(HashMap::new()),
+      inproc_registry: parking_lot::RwLock::new(HashMap::new()),
       event_bus,
       actor_wait_group,
       shutdown_initiated: AtomicBool::new(false),
@@ -104,8 +100,8 @@ impl ContextInner {
   /// Registers a newly created socket actor's command mailbox.
   /// The WaitGroup increment for the socket actor happens *after* its task is spawned,
   /// via an `ActorStarted` event published by the spawner.
-  pub(crate) async fn register_socket(&self, handle: usize, command_sender: MailboxSender) {
-    let mut sockets_w = self.sockets.write().await;
+  pub(crate) fn register_socket(&self, handle: usize, command_sender: MailboxSender) {
+    let mut sockets_w = self.sockets.write();
     sockets_w.insert(handle, command_sender);
     tracing::debug!(socket_handle = handle, "Socket command mailbox registered");
   }
@@ -113,8 +109,8 @@ impl ContextInner {
   /// Unregisters a socket actor's command mailbox.
   /// The WaitGroup decrement for the socket actor happens when it publishes an
   /// `ActorStopping` event just before its task terminates.
-  pub(crate) async fn unregister_socket(&self, handle: usize) {
-    let mut sockets_w = self.sockets.write().await;
+  pub(crate) fn unregister_socket(&self, handle: usize) {
+    let mut sockets_w = self.sockets.write();
     if sockets_w.remove(&handle).is_some() {
       tracing::debug!(socket_handle = handle, "Socket command mailbox unregistered");
     } else {
@@ -192,8 +188,8 @@ impl ContextInner {
   /// Registers an in-process binding. The `binder_core_id` identifies the `SocketCore`
   /// that is binding to this name, allowing it to filter `InprocBindingRequest` events.
   #[cfg(feature = "inproc")]
-  pub(crate) async fn register_inproc(&self, name: String, binder_core_id: usize) -> Result<(), ZmqError> {
-    let mut registry = self.inproc_registry.write().await;
+  pub(crate) fn register_inproc(&self, name: String, binder_core_id: usize) -> Result<(), ZmqError> {
+    let mut registry = self.inproc_registry.write();
     if registry.contains_key(&name) {
       Err(ZmqError::AddrInUse(format!("inproc://{}", name)))
     } else {
@@ -205,8 +201,8 @@ impl ContextInner {
 
   /// Unregisters an in-process binding.
   #[cfg(feature = "inproc")]
-  pub(crate) async fn unregister_inproc(&self, name: &str) {
-    let mut registry = self.inproc_registry.write().await;
+  pub(crate) fn unregister_inproc(&self, name: &str) {
+    let mut registry = self.inproc_registry.write();
     if registry.remove(name).is_some() {
       tracing::debug!(inproc_name = %name, "Unregistered inproc binding");
     }
@@ -214,13 +210,13 @@ impl ContextInner {
 
   /// Looks up an in-process binding by name.
   #[cfg(feature = "inproc")]
-  pub(crate) async fn lookup_inproc(&self, name: &str) -> Option<InprocBinding> {
-    self.inproc_registry.read().await.get(name).cloned()
+  pub(crate) fn lookup_inproc(&self, name: &str) -> Option<InprocBinding> {
+    self.inproc_registry.read().get(name).cloned()
   }
 
   /// Gets the command mailbox sender for a specific registered socket.
-  pub(crate) async fn get_socket_command_sender(&self, handle: usize) -> Option<MailboxSender> {
-    self.sockets.read().await.get(&handle).cloned()
+  pub(crate) fn get_socket_command_sender(&self, handle: usize) -> Option<MailboxSender> {
+    self.sockets.read().get(&handle).cloned()
   }
 
   /// Provides access to the shared `EventBus` instance Arc.
@@ -271,7 +267,7 @@ impl Context {
     let inner_clone = self.inner.clone();
     let cmd_sender_clone = command_sender.clone();
     tokio::spawn(async move {
-      inner_clone.register_socket(handle, cmd_sender_clone).await;
+      inner_clone.register_socket(handle, cmd_sender_clone);
     });
 
     // The public `Socket` handle now needs the command_sender to interact with its `SocketCore`.
