@@ -688,9 +688,7 @@ impl DealerSocket {
     // Try to get a peer. This is non-blocking if LoadBalancer has peers.
     // It might briefly lock if other sends are also trying to pick a peer.
     let mut tried_direct_send = false;
-    println!("sending");
     if let Some(pipe_write_id) = self.load_balancer.get_next_pipe().await {
-      println!("tried sending");
       tried_direct_send = true;
       let pipe_tx_opt = { self.core_state().get_pipe_sender(pipe_write_id) };
 
@@ -699,7 +697,6 @@ impl DealerSocket {
         for (idx, msg_part) in full_message_parts.iter().cloned().enumerate() {
           match send_msg_with_timeout(&pipe_tx, msg_part, global_sndtimeo, self.core.handle, pipe_write_id).await {
             Ok(()) => {
-              println!("did sending");
               continue;
             }
             Err(e @ ZmqError::ResourceLimitReached) | Err(e @ ZmqError::Timeout) => {

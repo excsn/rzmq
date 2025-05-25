@@ -7,10 +7,10 @@ use tokio::task::JoinHandle; // Added for explicit JoinHandle type
 use tokio::time::sleep;
 
 // --- Example Constants ---
-const NUM_DEALERS_EXAMPLE: usize = 3;
-const NUM_MSGS_PER_DEALER_EXAMPLE: usize = 5;
+const NUM_DEALERS_EXAMPLE: usize = 32;
+const NUM_MSGS_PER_DEALER_EXAMPLE: usize = 500000;
 const BIND_ADDR_EXAMPLE: &str = "tcp://127.0.0.1:8960";
-const SETUP_TIMEOUT_EXAMPLE: Duration = Duration::from_secs(10);
+const SETUP_TIMEOUT_EXAMPLE: Duration = Duration::from_secs(60);
 const HWM_EXAMPLE: i32 = 1000;
 
 // --- Setup Function (remains largely the same) ---
@@ -45,6 +45,9 @@ async fn setup_dealer_router_example(
     dealer
       .set_option(rzmq::socket::options::RCVHWM, &HWM_EXAMPLE.to_ne_bytes())
       .await?;
+    // dealer
+    //   .set_option(rzmq::socket::options::RECONNECT_IVL, &(-1i32).to_ne_bytes())
+    //   .await?;
     println!("[Setup] DEALER {} connecting to {}...", i, BIND_ADDR_EXAMPLE);
     dealer.connect(BIND_ADDR_EXAMPLE).await?;
     println!("[Setup] DEALER {} connected.", i);
@@ -188,7 +191,7 @@ async fn run_dealer_task(
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::TRACE) // Adjust log level (INFO, DEBUG, TRACE)
+    .with_max_level(tracing::Level::INFO) // Adjust log level (INFO, DEBUG, TRACE)
     .with_thread_ids(true)
     .with_thread_names(true)
     .with_target(true)
