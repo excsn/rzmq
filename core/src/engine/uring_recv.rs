@@ -10,7 +10,8 @@ use std::collections::VecDeque;
 use std::{future::Future, pin::Pin};
 
 use bytes::{BufMut, BytesMut}; // BufMut for extend_from_slice
-use tokio_uring::{buf::BufResult, net::TcpStream as UringTcpStream};
+use tokio_uring::{BufResult, net::TcpStream as UringTcpStream};
+use tokio_util::codec::Decoder;
 
 const MIN_BUFFER_CAPACITY_FOR_REUSE: usize = 1024; // If buffer becomes too small after partial consume, reallocate
 
@@ -92,7 +93,7 @@ impl UringMultishotReceiver {
     // Buffer to accumulate data for the codec, including any prefix from previous partial decodes.
     // The codec's internal prefix_bytes will be used.
     // We feed one filled uring buffer at a time (plus codec's prefix) to the codec.
-    let mut current_chunk_for_codec = self.codec.prefix_bytes.take().unwrap_or_else(BytesMut::new);
+    let mut current_chunk_for_codec = self.codec.take_prefix_bytes().take().unwrap_or_else(BytesMut::new);
 
     for i in 0..buffers_returned_from_uring.len() {
       let mut processed_buffer = buffers_returned_from_uring.remove(0); // Take ownership of first buffer
@@ -124,7 +125,7 @@ impl UringMultishotReceiver {
           }
           Err(e) => {
             // Decoding error. Store remaining data as prefix and return error.
-            self.codec.prefix_bytes = Some(current_chunk_for_codec);
+            self.codec.set_prefix_bytes(Some(current_chunk_for_codec));
             // Recycle the original processed_buffer (and any others remaining in buffers_returned_from_uring)
             processed_buffer.clear();
             self.available_buffers.push(processed_buffer);
@@ -153,9 +154,9 @@ impl UringMultishotReceiver {
     // After processing all buffers from this uring completion,
     // any remaining data in current_chunk_for_codec is the new prefix.
     if !current_chunk_for_codec.is_empty() {
-      self.codec.prefix_bytes = Some(current_chunk_for_codec);
+      self.codec.set_prefix_bytes(Some(current_chunk_for_codec));
     } else {
-      self.codec.prefix_bytes = None;
+      self.codec.set_prefix_bytes(None);
     }
 
     Ok(all_decoded_msgs)
@@ -170,13 +171,14 @@ impl UringMultishotReceiver {
 mod tests {
   use super::*;
   use crate::message::{Msg, MsgFlags}; // For creating test messages
-  use bytes::BufMut; // For BytesMut::put_slice
+  use bytes::BufMut;
+use tokio_util::codec::Encoder; // For BytesMut::put_slice
 
   // Helper to create a ZMTP-framed message in a BytesMut
   // This bypasses needing a full engine to send.
   fn create_zmtp_frame(payload: &[u8], is_more: bool) -> BytesMut {
     let mut codec = ZmtpCodec::new();
-    let mut msg = Msg::from_slice(payload);
+    let mut msg = Msg::from_vec(payload.to_vec());
     if is_more {
       msg.set_flags(MsgFlags::MORE);
     }
@@ -195,7 +197,7 @@ mod tests {
       assert_eq!(buf.capacity(), 1024);
       assert_eq!(buf.len(), 0);
     }
-    assert!(receiver.codec.prefix_bytes.is_none());
+    assert!(receiver.codec.prefix_bytes().is_none());
   }
 
   #[test]
@@ -254,7 +256,7 @@ mod tests {
     assert_eq!(decoded_msgs.len(), 1);
     assert_eq!(decoded_msgs[0].data().unwrap(), payload);
     assert!(!decoded_msgs[0].is_more());
-    assert!(receiver.codec.prefix_bytes.is_none());
+    assert!(receiver.codec.prefix_bytes().is_none());
     assert_eq!(receiver.available_buffers.len(), 1); // Buffer recycled
   }
 
@@ -277,7 +279,7 @@ mod tests {
     assert!(decoded_msgs[0].is_more());
     assert_eq!(decoded_msgs[1].data().unwrap(), payload2);
     assert!(!decoded_msgs[1].is_more());
-    assert!(receiver.codec.prefix_bytes.is_none() || receiver.codec.prefix_bytes.as_ref().unwrap().is_empty());
+    assert!(receiver.codec.prefix_bytes().is_none() || receiver.codec.prefix_bytes().unwrap().is_empty());
     assert_eq!(receiver.available_buffers.len(), 1);
   }
 
@@ -298,8 +300,8 @@ mod tests {
     assert!(result1.is_ok());
     let decoded_msgs1 = result1.unwrap();
     assert!(decoded_msgs1.is_empty()); // No full message yet
-    assert!(receiver.codec.prefix_bytes.is_some());
-    assert!(!receiver.codec.prefix_bytes.as_ref().unwrap().is_empty());
+    assert!(receiver.codec.prefix_bytes().is_some());
+    assert!(!receiver.codec.prefix_bytes().unwrap().is_empty());
     assert_eq!(receiver.available_buffers.len(), 1); // Buffer1 recycled
 
     // Simulate second completion
@@ -309,7 +311,7 @@ mod tests {
     assert_eq!(decoded_msgs2.len(), 1);
     assert_eq!(decoded_msgs2[0].data().unwrap(), payload);
     assert!(!decoded_msgs2[0].is_more());
-    assert!(receiver.codec.prefix_bytes.is_none() || receiver.codec.prefix_bytes.as_ref().unwrap().is_empty());
+    assert!(receiver.codec.prefix_bytes().is_none() || receiver.codec.prefix_bytes().as_ref().unwrap().is_empty());
     assert_eq!(receiver.available_buffers.len(), 2); // Buffer2 recycled
   }
 
@@ -332,9 +334,9 @@ mod tests {
     let decoded_msgs = result.unwrap();
     assert_eq!(decoded_msgs.len(), 1);
     assert_eq!(decoded_msgs[0].data().unwrap(), payload1);
-    assert!(receiver.codec.prefix_bytes.is_some());
+    assert!(receiver.codec.prefix_bytes().is_some());
     assert_eq!(
-      receiver.codec.prefix_bytes.as_ref().unwrap().as_ref(),
+      receiver.codec.prefix_bytes().unwrap().as_ref(),
       payload2_partial_data
     );
     assert_eq!(receiver.available_buffers.len(), 1);
@@ -351,7 +353,7 @@ mod tests {
     let result = receiver.process_completed_submission(0, bufs); // num_filled = 0
     assert!(result.is_ok());
     assert!(result.unwrap().is_empty());
-    assert!(receiver.codec.prefix_bytes.is_none());
+    assert!(receiver.codec.prefix_bytes().is_none());
     assert_eq!(receiver.available_buffers.len(), 3); // All buffers recycled
   }
 
@@ -388,7 +390,7 @@ mod tests {
     let msgs = result.unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].data().unwrap(), payload);
-    assert!(receiver.codec.prefix_bytes.is_none() || receiver.codec.prefix_bytes.as_ref().unwrap().is_empty());
+    assert!(receiver.codec.prefix_bytes().is_none() || receiver.codec.prefix_bytes().unwrap().is_empty());
     assert_eq!(receiver.available_buffers.len(), 2); // Both original buffers should be recycled.
   }
 }
