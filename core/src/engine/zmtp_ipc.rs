@@ -4,6 +4,7 @@
 
 use crate::runtime::{mailbox, MailboxSender};
 use crate::socket::options::{SocketOptions, ZmtpEngineConfig};
+#[cfg(feature = "io-uring")]
 use crate::socket::{DEFAULT_IO_URING_RECV_BUFFER_COUNT, DEFAULT_IO_URING_RECV_BUFFER_SIZE};
 use crate::Context;
 use std::sync::Arc;
