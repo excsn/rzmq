@@ -37,7 +37,7 @@ async fn setup_zc_pair(
       enable_zerocopy_on_sender, endpoint
     );
     #[cfg(target_os = "linux")]
-    sender.set_option(IO_URING_SNDZEROCOPY, &(1i32).to_ne_bytes()).await?;
+    sender.set_option_raw(IO_URING_SNDZEROCOPY, &(1i32).to_ne_bytes()).await?;
   }
 
   if enable_cork_on_sender {
@@ -45,7 +45,7 @@ async fn setup_zc_pair(
       "Setting TCP_CORK_OPT={} on SENDER for endpoint {}",
       enable_cork_on_sender, endpoint
     );
-    sender.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
+    sender.set_option_raw(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
   }
 
   receiver.bind(endpoint).await?;
@@ -224,9 +224,9 @@ async fn test_zerocopy_partial_send_is_error() -> Result<(), ZmqError> {
   // This test might be better as a conceptual one unless we can mock the stream behavior.
 
   let sender = ctx.socket(SocketType::Push)?;
-  sender.set_option(IO_URING_SNDZEROCOPY, &(1i32).to_ne_bytes()).await?;
+  sender.set_option_raw(IO_URING_SNDZEROCOPY, &(1i32).to_ne_bytes()).await?;
   // Set a very short SNDTIMEO so connect doesn't block forever if no listener
-  sender.set_option(SNDTIMEO, &(100i32).to_ne_bytes()).await?;
+  sender.set_option_raw(SNDTIMEO, &(100i32).to_ne_bytes()).await?;
 
   // Connect to an address where no one is listening to make the send eventually fail.
   // The goal isn't to test the partial send itself, but that *if* it happened,

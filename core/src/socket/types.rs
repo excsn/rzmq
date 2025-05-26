@@ -1,7 +1,7 @@
 // src/socket/types.rs
 
 use crate::error::ZmqError; // For Result types in API methods.
-use crate::message::Msg;    // For send/recv methods.
+use crate::message::Msg; // For send/recv methods.
 use crate::runtime::Command; // For UserMonitor command payload.
 use crate::runtime::MailboxSender; // For storing the SocketCore's command sender.
 use crate::socket::events::{MonitorReceiver, SocketEvent, DEFAULT_MONITOR_CAPACITY}; // For socket monitoring.
@@ -131,10 +131,20 @@ impl Socket {
   /// Sets a socket option asynchronously.
   /// Options control various aspects of the socket's behavior (e.g., high-water marks, timeouts).
   /// Refer to ZMQ documentation for standard option IDs and their meanings.
-  pub async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
+  pub async fn set_option<T: ToBytes>(
+    &self,
+    option: i32,
+    value: T,
+  ) -> Result<(), ZmqError> {
+    self.set_option_raw(option, &value.to_bytes()).await
+  }
+  
+  /// Sets a socket option asynchronously.
+  /// Options control various aspects of the socket's behavior (e.g., high-water marks, timeouts).
+  /// Refer to ZMQ documentation for standard option IDs and their meanings.
+  pub async fn set_option_raw(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     self.inner.set_option(option, value).await
   }
-
   /// Gets a socket option value asynchronously.
   pub async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     self.inner.get_option(option).await
@@ -200,5 +210,27 @@ impl fmt::Debug for Socket {
     f.debug_struct("Socket")
       // Example: .field("core_handle", &self.inner.core().handle) // If core().handle is accessible and cheap
       .finish_non_exhaustive() // Indicates that more fields might be added in the future.
+  }
+}
+
+pub trait ToBytes {
+  fn to_bytes(&self) -> Vec<u8>;
+}
+
+impl ToBytes for i32 {
+  fn to_bytes(&self) -> Vec<u8> {
+    self.to_ne_bytes().to_vec()
+  }
+}
+
+impl ToBytes for u32 {
+  fn to_bytes(&self) -> Vec<u8> {
+    self.to_ne_bytes().to_vec()
+  }
+}
+
+impl ToBytes for bool {
+  fn to_bytes(&self) -> Vec<u8> {
+    vec![*self as u8]
   }
 }

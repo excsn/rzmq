@@ -210,9 +210,9 @@ async fn test_push_pull_hwm_sndtimeo_0() -> Result<(), ZmqError> {
   let endpoint = "tcp://127.0.0.1:5630"; // Unique port
 
   println!("Setting HWM=1 on PUSH and PULL, SNDTIMEO=0 on PUSH...");
-  push.set_option(SNDHWM, &(1i32).to_ne_bytes()).await?;
-  pull.set_option(RCVHWM, &(1i32).to_ne_bytes()).await?;
-  push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
+  push.set_option_raw(SNDHWM, &(1i32).to_ne_bytes()).await?;
+  pull.set_option_raw(RCVHWM, &(1i32).to_ne_bytes()).await?;
+  push.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
   println!("Options set.");
 
   println!("Binding PULL to {}...", endpoint);
@@ -278,7 +278,7 @@ async fn test_push_sndtimeo_positive_no_peer() -> Result<(), ZmqError> {
   // Set a short positive send timeout on PUSH
   let snd_timeout_val = SEND_PEER_WAIT_TIMEOUT.as_millis() as i32;
   println!("Setting SNDTIMEO={}ms on PUSH...", snd_timeout_val);
-  push.set_option(SNDTIMEO, &snd_timeout_val.to_ne_bytes()).await?;
+  push.set_option_raw(SNDTIMEO, &snd_timeout_val.to_ne_bytes()).await?;
   println!("Option set.");
 
   // Connect PUSH - this setup succeeds asynchronously, but no listener exists yet
@@ -362,7 +362,7 @@ async fn test_pull_rcvtimeo() -> Result<(), ZmqError> {
   let rcv_timeout_ms = 150i32;
   println!("Setting RCVTIMEO={}ms on PULL...", rcv_timeout_ms);
   pull
-    .set_option(rzmq::socket::options::RCVTIMEO, &rcv_timeout_ms.to_ne_bytes())
+    .set_option_raw(rzmq::socket::options::RCVTIMEO, &rcv_timeout_ms.to_ne_bytes())
     .await?;
   println!("Option set.");
 

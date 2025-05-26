@@ -80,17 +80,17 @@ async fn test_context_term_closes_sockets() -> Result<(), ZmqError> {
   println!("Context terminated.");
 
   // Try using sockets after termination - should fail
-  println!("Attempting PUSH set_option after term (should fail)...");
+  println!("Attempting PUSH set_option_raw after term (should fail)...");
   let setopt_res = push
-    .set_option(rzmq::socket::options::SNDTIMEO, &(0i32).to_ne_bytes())
+    .set_option_raw(rzmq::socket::options::SNDTIMEO, &(0i32).to_ne_bytes())
     .await;
-  println!("PUSH set_option result: {:?}", setopt_res);
+  println!("PUSH set_option_raw result: {:?}", setopt_res);
   assert!(
     setopt_res.is_err(),
     "Expected error setting option after term, got {:?}",
     setopt_res
   );
-  println!("PUSH set_option correctly failed: {:?}", setopt_res.err().unwrap());
+  println!("PUSH set_option_raw correctly failed: {:?}", setopt_res.err().unwrap());
 
   println!("Attempting PUSH send after term (should fail)...");
   let send_res = push.send(Msg::from_static(b"After Term")).await;
@@ -151,7 +151,7 @@ async fn test_socket_close_stops_connection() -> Result<(), ZmqError> {
   println!("PUSH sending Message 2 (after PULL closed)...");
   // Use non-blocking send to check if peer is gone
   push
-    .set_option(rzmq::socket::options::SNDTIMEO, &(0i32).to_ne_bytes())
+    .set_option_raw(rzmq::socket::options::SNDTIMEO, &(0i32).to_ne_bytes())
     .await?;
   let send_res = push.send(Msg::from_static(b"Message 2")).await;
   println!("PUSH send result: {:?}", send_res);
@@ -251,7 +251,7 @@ async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Resul
   );
 
   println!("PUSH setting SNDTIMEO=0...");
-  push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
+  push.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
   println!("PUSH sending Message 2 (after PULL disconnected)...");
   let send_res = push.send(Msg::from_static(b"Message 2")).await;
   println!("PUSH send result: {:?}", send_res);

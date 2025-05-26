@@ -26,7 +26,7 @@ async fn test_tcp_connect_fail_no_listener() -> Result<(), ZmqError> {
   println!("REQ connect call returned Ok.");
 
   // Set SNDTIMEO=0 to make send non-blocking if no peer is ready
-  req.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
+  req.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
   println!("REQ set SNDTIMEO=0.");
 
   // Allow some time for background connection attempts to fail
@@ -72,7 +72,7 @@ async fn test_ipc_connect_fail_no_listener() -> Result<(), ZmqError> {
   println!("REQ connect call returned Ok.");
 
   // Set SNDTIMEO=0
-  req.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
+  req.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
   println!("REQ set SNDTIMEO=0.");
 
   // Allow time for background connection attempts to fail

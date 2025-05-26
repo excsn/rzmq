@@ -24,7 +24,7 @@ async fn setup_pair_with_cork(
       "Setting TCP_CORK_OPT={} on SENDER for endpoint {}",
       enable_cork_on_sender, endpoint
     );
-    sender.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
+    sender.set_option_raw(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
   }
 
   receiver.bind(endpoint).await?;
@@ -183,7 +183,7 @@ async fn test_tcp_cork_ping_pong_interaction() -> Result<(), ZmqError> {
   // with corking enabled.
 
   // Set a very short SNDTIMEO to make sends non-blocking if PINGs cause issues.
-  push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
+  push.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
 
   println!("SENDER: Sending initial message...");
   push.send(Msg::from_static(b"InitialData")).await?;
@@ -196,8 +196,8 @@ async fn test_tcp_cork_ping_pong_interaction() -> Result<(), ZmqError> {
   // To make this test more meaningful for PINGs, HEARTBEAT_IVL would need to be set
   // on the PUSH socket to a value smaller than this sleep, e.g., 200ms.
   // For now, this just tests if corking state is okay after a pause.
-  // Example: push.set_option(HEARTBEAT_IVL, &(200i32).to_ne_bytes()).await?;
-  //          push.set_option(HEARTBEAT_TIMEOUT, &(1000i32).to_ne_bytes()).await?;
+  // Example: push.set_option_raw(HEARTBEAT_IVL, &(200i32).to_ne_bytes()).await?;
+  //          push.set_option_raw(HEARTBEAT_TIMEOUT, &(1000i32).to_ne_bytes()).await?;
   tokio::time::sleep(Duration::from_millis(500)).await;
 
   println!("SENDER: Sending second message after pause...");

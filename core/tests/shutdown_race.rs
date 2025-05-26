@@ -51,8 +51,8 @@ async fn setup_push_pull_for_race_test(
   let push = ctx.socket(SocketType::Push)?;
   let pull = ctx.socket(SocketType::Pull)?;
 
-  push.set_option(SNDHWM, &TEST_HWM_RACE.to_ne_bytes()).await?;
-  pull.set_option(RCVHWM, &TEST_HWM_RACE.to_ne_bytes()).await?;
+  push.set_option_raw(SNDHWM, &TEST_HWM_RACE.to_ne_bytes()).await?;
+  pull.set_option_raw(RCVHWM, &TEST_HWM_RACE.to_ne_bytes()).await?;
   // println!("[Setup {}] HWM options set to {}.", endpoint, TEST_HWM_RACE); // Add endpoint to logs
 
   let pull_monitor = pull.monitor_default().await?;
@@ -288,7 +288,7 @@ async fn test_chaotic_shutdown() -> Result<(), ZmqError> {
   // --- Setup PULL Socket (The single receiver) ---
   println!("Creating 1 PULL socket, binding to {}...", CHAOS_ENDPOINT);
   let pull = ctx.socket(SocketType::Pull)?;
-  pull.set_option(RCVHWM, &CHAOS_HWM.to_ne_bytes()).await?;
+  pull.set_option_raw(RCVHWM, &CHAOS_HWM.to_ne_bytes()).await?;
   pull.bind(CHAOS_ENDPOINT).await.expect("Failed to bind PULL socket");
   let pull_socket = Arc::new(pull);
   pull_sockets.push(pull_socket.clone());
@@ -301,8 +301,8 @@ async fn test_chaotic_shutdown() -> Result<(), ZmqError> {
   );
   for i in 0..NUM_PUSHERS {
     let push = ctx.socket(SocketType::Push)?;
-    push.set_option(SNDHWM, &CHAOS_HWM.to_ne_bytes()).await?;
-    push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?; // Non-blocking send
+    push.set_option_raw(SNDHWM, &CHAOS_HWM.to_ne_bytes()).await?;
+    push.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?; // Non-blocking send
 
     // Connect directly - for inproc, connect() awaits confirmation
     match push.connect(CHAOS_ENDPOINT).await {
@@ -509,7 +509,7 @@ async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
   // --- Setup PULL Socket (The single receiver) ---
   println!("Creating 1 PULL socket, binding to {}...", TCP_CHAOS_ENDPOINT);
   let pull = ctx.socket(SocketType::Pull)?;
-  pull.set_option(RCVHWM, &TCP_CHAOS_HWM.to_ne_bytes()).await?;
+  pull.set_option_raw(RCVHWM, &TCP_CHAOS_HWM.to_ne_bytes()).await?;
 
   // Monitor the PULL socket to wait for connections
   let pull_monitor = pull.monitor_default().await?;
@@ -537,8 +537,8 @@ async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
 
   for i in 0..TCP_NUM_PUSHERS {
     let push = ctx.socket(SocketType::Push)?;
-    push.set_option(SNDHWM, &TCP_CHAOS_HWM.to_ne_bytes()).await?;
-    push.set_option(SNDTIMEO, &(0i32).to_ne_bytes()).await?; // Non-blocking send
+    push.set_option_raw(SNDHWM, &TCP_CHAOS_HWM.to_ne_bytes()).await?;
+    push.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?; // Non-blocking send
 
     // Spawn a task to connect
     let connect_endpoint = TCP_CHAOS_ENDPOINT.to_string();

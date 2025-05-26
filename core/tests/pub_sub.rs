@@ -28,7 +28,7 @@ async fn test_pub_sub_tcp_basic() -> Result<(), ZmqError> {
 
     sub_socket.connect(endpoint).await?;
     // Subscribe to all messages
-    sub_socket.set_option(SUBSCRIBE, b"").await?;
+    sub_socket.set_option_raw(SUBSCRIBE, b"").await?;
     tokio::time::sleep(Duration::from_millis(150)).await; // Allow connect + subscribe propagation
 
     // Send message
@@ -59,7 +59,7 @@ async fn test_pub_sub_tcp_topic_filter() -> Result<(), ZmqError> {
 
     sub_socket.connect(endpoint).await?;
     // Subscribe only to "TopicA"
-    sub_socket.set_option(SUBSCRIBE, b"TopicA").await?;
+    sub_socket.set_option_raw(SUBSCRIBE, b"TopicA").await?;
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Send messages on different topics
@@ -125,8 +125,8 @@ async fn test_pub_sub_tcp_multiple_subs() -> Result<(), ZmqError> {
     println!("PUB saw SUB2 connect");
 
     // Now that PUB has seen both connections, proceed with subscriptions
-    sub1.set_option(SUBSCRIBE, b"").await?;
-    sub2.set_option(SUBSCRIBE, b"").await?;
+    sub1.set_option_raw(SUBSCRIBE, b"").await?;
+    sub2.set_option_raw(SUBSCRIBE, b"").await?;
 
     // Allow a brief moment for SUBSCRIBE messages to be sent by SUBs and processed by PUB side
     // (though PUB doesn't strictly need to process them for basic fanout)
@@ -166,7 +166,7 @@ async fn test_pub_sub_ipc_basic() -> Result<(), ZmqError> {
     pub_socket.bind(&endpoint).await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     sub_socket.connect(&endpoint).await?;
-    sub_socket.set_option(SUBSCRIBE, b"IPC").await?;
+    sub_socket.set_option_raw(SUBSCRIBE, b"IPC").await?;
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     pub_socket.send(Msg::from_static(b"IPC Data")).await?;
@@ -191,7 +191,7 @@ async fn test_pub_sub_inproc_basic() -> Result<(), ZmqError> {
 
     pub_socket.bind(&endpoint).await?;
     sub_socket.connect(&endpoint).await?;
-    sub_socket.set_option(SUBSCRIBE, b"").await?;
+    sub_socket.set_option_raw(SUBSCRIBE, b"").await?;
     tokio::time::sleep(Duration::from_millis(20)).await; // Short delay
 
     pub_socket.send(Msg::from_static(b"Inproc Msg")).await?;
@@ -223,7 +223,7 @@ async fn test_pub_sub_unsubscribe() -> Result<(), ZmqError> {
   // Subscribe
   let topic = b"TopicToUnsub";
   println!("SUB subscribing to '{:?}'...", topic);
-  sub_socket.set_option(SUBSCRIBE, topic).await?;
+  sub_socket.set_option_raw(SUBSCRIBE, topic).await?;
   tokio::time::sleep(Duration::from_millis(150)).await; // Allow subscribe propagation
 
   // Send and receive first message
@@ -236,7 +236,7 @@ async fn test_pub_sub_unsubscribe() -> Result<(), ZmqError> {
 
   // Unsubscribe
   println!("SUB unsubscribing from '{:?}'...", topic);
-  sub_socket.set_option(UNSUBSCRIBE, topic).await?;
+  sub_socket.set_option_raw(UNSUBSCRIBE, topic).await?;
   tokio::time::sleep(Duration::from_millis(150)).await; // Allow unsubscribe propagation (if applicable)
 
   // Send second message
@@ -288,7 +288,7 @@ async fn test_pub_sub_late_subscriber() -> Result<(), ZmqError> {
 
   // SUB subscribes
   println!("Late SUB subscribing to all ('')...");
-  sub_socket.set_option(SUBSCRIBE, b"").await?;
+  sub_socket.set_option_raw(SUBSCRIBE, b"").await?;
   tokio::time::sleep(Duration::from_millis(150)).await; // Allow subscribe propagation
 
   // PUB sends second message
@@ -337,7 +337,7 @@ async fn test_pub_sub_subscriber_disconnects() -> Result<(), ZmqError> {
     println!("Connecting SUB to {}...", endpoint);
     sub_socket.connect(endpoint).await?;
     println!("SUB subscribing...");
-    sub_socket.set_option(SUBSCRIBE, b"").await?;
+    sub_socket.set_option_raw(SUBSCRIBE, b"").await?;
     tokio::time::sleep(Duration::from_millis(150)).await; // Connect and subscribe
 
     println!("PUB sending Message 1...");

@@ -248,7 +248,7 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_true() -> Result<(
   tokio::time::sleep(Duration::from_millis(50)).await;
 
   println!("Setting ROUTER_MANDATORY=true...");
-  router.set_option(ROUTER_MANDATORY, &(1i32).to_ne_bytes()).await?; // Set to true
+  router.set_option_raw(ROUTER_MANDATORY, &(1i32).to_ne_bytes()).await?; // Set to true
 
   println!("Connecting DEALER to {}...", endpoint);
   dealer.connect(endpoint).await?;
