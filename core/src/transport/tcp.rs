@@ -1,75 +1,56 @@
 // src/transport/tcp.rs
 
 use crate::context::Context;
-use crate::engine::zmtp_tcp::create_and_spawn_tcp_engine as create_engine_task_internal;
+use crate::engine::zmtp_tcp::create_and_spawn_tcp_engine; // For ZmtpEngineCoreStd
 use crate::error::ZmqError;
 use crate::runtime::{
-  self, mailbox, ActorDropGuard, ActorType, Command, EventBus, MailboxReceiver, MailboxSender, SystemEvent,
+  self, mailbox, ActorDropGuard, ActorType, Command, EngineConnectionType, EventBus, MailboxReceiver, MailboxSender,
+  SystemEvent,
 };
+#[cfg(feature = "io-uring")]
+use crate::runtime::{uring_runtime, AppToUringEngineCmd, UringLaunchInformation};
 use crate::session::{self, SessionBase};
 use crate::socket::events::{MonitorSender, SocketEvent};
-use crate::socket::options::{SocketOptions, TcpTransportConfig};
+use crate::socket::options::{SocketOptions, TcpTransportConfig, ZmtpEngineConfig}; // Added ZmtpEngineConfig
 
 use std::io;
 use std::net::SocketAddr as StdSocketAddr;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use socket2::{SockRef, TcpKeepalive}; // For setting TCP options like NODELAY, KEEPALIVE
-use tokio::sync::broadcast; // For receiving system events
+use socket2::{SockRef, TcpKeepalive};
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-#[cfg(not(feature = "io-uring"))]
-mod underlying_net {
-  use std::io::Result as IoResult;
+#[cfg(feature = "io-uring")]
+use std::os::unix::io::{IntoRawFd, OwnedFd};
+
+// Standard Tokio net types are used when 'io-uring' feature is NOT enabled,
+// or when 'io-uring' is enabled but a specific session is chosen NOT to use uring.
+mod underlying_std_net {
   pub use tokio::net::TcpListener;
   pub use tokio::net::TcpStream;
-  use tokio::net::ToSocketAddrs; // Keep this for standard tokio
-
-  // Helper to match tokio_uring's bind/connect signature if needed, or just use directly
-  // For standard Tokio, TcpListener::bind is async and takes ToSocketAddrs
-  pub async fn bind_listener<A: ToSocketAddrs>(addr: A) -> IoResult<TcpListener> {
-    TcpListener::bind(addr).await
-  }
-  // For standard Tokio, TcpStream::connect is async and takes ToSocketAddrs
-  pub async fn connect_stream<A: ToSocketAddrs>(addr: A) -> IoResult<TcpStream> {
-    TcpStream::connect(addr).await
-  }
 }
 
+// Tokio-uring net types are used when 'io-uring' feature IS enabled AND
+// a specific session is chosen TO use uring.
 #[cfg(feature = "io-uring")]
-mod underlying_net {
-  use std::io::Result as IoResult;
-  use std::net::SocketAddr;
-  pub use tokio_uring::net::TcpListener;
-  pub use tokio_uring::net::TcpStream;
-
-  // tokio_uring bind/connect often take SocketAddr.
-  // `TcpListener::bind` is NOT async.
-  pub fn bind_listener_uring(addr: SocketAddr) -> IoResult<TcpListener> {
-    TcpListener::bind(addr)
-  }
-  // `TcpStream::connect` IS async.
-  pub async fn connect_stream_uring(addr: SocketAddr) -> IoResult<TcpStream> {
-    TcpStream::connect(addr).await
-  }
+mod underlying_uring_net {
+  pub use tokio_uring::net::TcpListener as UringTcpListener;
+  pub use tokio_uring::net::TcpStream as UringTcpStream;
 }
-
-// Aliases to use throughout this file
-use underlying_net::TcpListener as CurrentTcpListener;
-use underlying_net::TcpStream as CurrentTcpStream;
 
 // --- TcpListener Actor ---
-/// Manages a listening TCP socket, accepts incoming connections, and spawns Session/Engine pairs.
 #[derive(Debug)]
 pub(crate) struct TcpListener {
-  handle: usize,                     // Handle of the Listener's command loop actor.
-  endpoint: String,                  // The URI this listener is bound to.
-  mailbox_receiver: MailboxReceiver, // For receiving Stop commands.
-  listener_handle: JoinHandle<()>,   // JoinHandle for the accept loop task.
-  context: Context,                  // The rzmq Context.
-  parent_socket_id: usize,           // Handle ID of the parent SocketCore.
+  handle: usize,
+  endpoint: String,
+  mailbox_receiver: MailboxReceiver,
+  listener_handle: JoinHandle<()>, // JoinHandle for the accept loop task.
+  context: Context,
+  parent_socket_id: usize,
 }
 
 impl TcpListener {
@@ -86,65 +67,66 @@ impl TcpListener {
     let capacity = context.inner().get_actor_mailbox_capacity();
     let (tx, rx) = mailbox(capacity);
 
-    // Bind the OS TCP listener.
     let bind_addr_str = endpoint
       .strip_prefix("tcp://")
       .ok_or_else(|| ZmqError::InvalidEndpoint(endpoint.clone()))?;
 
-    let tokio_listener_arc: Arc<CurrentTcpListener> = {
-      let std_listener_socket = socket2::Socket::new(
-        if bind_addr_str.contains(':') && bind_addr_str.matches('[').count() > 0 {
-          socket2::Domain::IPV6 // Basic check for IPv6 literal
+    // Determine if this listener should use io_uring for its accept socket based on options.
+    // This is a high-level switch for the listener itself. Individual connections might differ.
+    let listener_uses_io_uring = options.io_uring_session_enabled && cfg!(feature = "io-uring");
+    tracing::debug!(listener_handle=handle, %endpoint, listener_uses_io_uring, "TCP Listener type decision.");
+
+    let (std_listener_socket, actual_bind_addr) = {
+      // Handle wildcard port by attempting to bind to a specific interface first if 0.0.0.0:0 or [::]:0
+      // This allows socket2 to pick a port, which we can then retrieve.
+      let addr_for_socket2_parse = if bind_addr_str == "0.0.0.0:0" || bind_addr_str.starts_with("[::]:0") {
+        if bind_addr_str.starts_with("[::]") {
+          "::1:0"
         } else {
-          socket2::Domain::IPV4
-        },
-        socket2::Type::STREAM,
-        None,
-      )
-      .map_err(ZmqError::from)?;
-
-      std_listener_socket.set_reuse_address(true).map_err(ZmqError::from)?;
-      // std_listener_socket.set_reuse_port(true).map_err(ZmqError::from)?; // Optional
-
-      let socket_addr: StdSocketAddr = bind_addr_str
-        .parse()
-        .map_err(|e| ZmqError::InvalidEndpoint(format!("Failed to parse bind address '{}': {}", bind_addr_str, e)))?;
-      std_listener_socket
-        .bind(&socket_addr.into())
-        .map_err(|e| ZmqError::from_io_endpoint(e, &endpoint))?;
-      std_listener_socket.listen(128).map_err(ZmqError::from)?; // Standard backlog
-
-      let std_listener: std::net::TcpListener = std_listener_socket.into();
-      std_listener.set_nonblocking(true).map_err(ZmqError::from)?;
-
-      #[cfg(not(feature = "io-uring"))]
-      let current_listener = CurrentTcpListener::from_std(std_listener).map_err(ZmqError::from)?;
-
-      #[cfg(feature = "io-uring")]
-      let current_listener = CurrentTcpListener::from_std(std_listener).map_err(|e| {
-        // tokio_uring::from_std can return std::io::Error
-        ZmqError::IoError {
-          kind: e.kind(),
-          message: e.to_string(),
+          "127.0.0.1:0"
         }
+      } else {
+        bind_addr_str
+      };
+      let parsed_socket_addr: StdSocketAddr = addr_for_socket2_parse.parse().map_err(|e| {
+        ZmqError::InvalidEndpoint(format!(
+          "Failed to parse bind address '{}': {}",
+          addr_for_socket2_parse, e
+        ))
       })?;
-      Arc::new(current_listener)
+
+      let domain = if parsed_socket_addr.is_ipv4() {
+        socket2::Domain::IPV4
+      } else {
+        socket2::Domain::IPV6
+      };
+      let s = socket2::Socket::new(domain, socket2::Type::STREAM, None).map_err(ZmqError::from)?;
+      s.set_reuse_address(true).map_err(ZmqError::from)?;
+
+      // Use the original bind_addr_str if it contains wildcards for IP, but with port 0 resolved by OS
+      let addr_for_bind_call = bind_addr_str.parse::<StdSocketAddr>().map_err(|e| {
+        ZmqError::InvalidEndpoint(format!(
+          "Failed to parse bind address for actual bind call'{}': {}",
+          bind_addr_str, e
+        ))
+      })?;
+
+      s.bind(&addr_for_bind_call.into())
+        .map_err(|e| ZmqError::from_io_endpoint(e, &endpoint))?;
+      s.listen(128).map_err(ZmqError::from)?;
+      let final_bound_addr = s.local_addr().map_err(ZmqError::from)?.as_socket().unwrap(); // Must be Some for TCP
+      (s, final_bound_addr)
     };
 
-    let local_addr = tokio_listener_arc.local_addr().map_err(ZmqError::from)?;
-    let resolved_uri = format!("tcp://{}", local_addr);
+    let std_listener: std::net::TcpListener = std_listener_socket.into();
+    std_listener.set_nonblocking(true).map_err(ZmqError::from)?;
+
+    let resolved_uri = format!("tcp://{}", actual_bind_addr);
     tracing::info!(listener_handle = handle, local_addr = %resolved_uri, user_provided_uri = %endpoint, "TCP Listener bound successfully");
 
-    // Determine max connections for this listener
-    let max_conns_for_listener = options.max_connections.unwrap_or(std::usize::MAX); // Fallback to effectively no limit if None
-    let connection_limiter = Arc::new(tokio::sync::Semaphore::new(max_conns_for_listener.max(1))); // Ensure at least 1
-    tracing::info!(
-      listener_handle = handle,
-      max_concurrent_connections = max_conns_for_listener,
-      "TCP Listener will use connection limiter."
-    );
+    let max_conns_for_listener = options.max_connections.unwrap_or(std::usize::MAX);
+    let connection_limiter = Arc::new(Semaphore::new(max_conns_for_listener.max(1)));
 
-    // Prepare TCP configuration for accepted streams.
     let transport_config = TcpTransportConfig {
       tcp_nodelay: options.tcp_nodelay,
       keepalive_time: options.tcp_keepalive_idle,
@@ -152,8 +134,6 @@ impl TcpListener {
       keepalive_count: options.tcp_keepalive_count,
     };
 
-    // Spawn the accept loop task.
-    let accept_listener_arc = tokio_listener_arc.clone();
     let accept_handle_source_clone = context_handle_source.clone();
     let accept_options_clone = options.clone();
     let accept_config_clone = transport_config.clone();
@@ -161,24 +141,52 @@ impl TcpListener {
     let endpoint_for_accept_loop = resolved_uri.clone();
     let context_for_accept_loop = context.clone();
     let parent_socket_id_for_accept_loop = parent_socket_id;
-    let accept_loop_parent_handle = handle; // Accept loop's parent for eventing is this Listener.
-
+    let accept_loop_parent_handle = handle;
     let accept_loop_handle_id = context_for_accept_loop.inner().next_handle();
     let accept_loop_actor_type = ActorType::AcceptLoop;
 
-    let accept_loop_task_join_handle = tokio::spawn(TcpListener::run_accept_loop(
-      accept_loop_handle_id,
-      accept_loop_parent_handle,
-      endpoint_for_accept_loop,
-      accept_listener_arc,
-      accept_config_clone,
-      accept_options_clone,
-      accept_handle_source_clone,
-      accept_monitor_tx_clone,
-      context_for_accept_loop.clone(),
-      parent_socket_id_for_accept_loop,
-      connection_limiter.clone(),
-    ));
+    let accept_loop_task_join_handle = if listener_uses_io_uring {
+      #[cfg(feature = "io-uring")]
+      {
+        let uring_listener =
+          underlying_uring_net::UringTcpListener::from_std(std_listener).map_err(|e| ZmqError::IoError {
+            kind: e.kind(),
+            message: e.to_string(),
+          })?;
+        tokio::spawn(TcpListener::run_accept_loop_uring(
+          accept_loop_handle_id,
+          accept_loop_parent_handle,
+          endpoint_for_accept_loop,
+          Arc::new(uring_listener),
+          accept_config_clone,
+          accept_options_clone,
+          accept_handle_source_clone,
+          accept_monitor_tx_clone,
+          context_for_accept_loop.clone(),
+          parent_socket_id_for_accept_loop,
+          connection_limiter.clone(),
+        ))
+      }
+      #[cfg(not(feature = "io-uring"))]
+      {
+        unreachable!("listener_uses_io_uring is true but 'io-uring' feature not compiled");
+      }
+    } else {
+      let std_tokio_listener = underlying_std_net::TcpListener::from_std(std_listener).map_err(ZmqError::from)?;
+      tokio::spawn(TcpListener::run_accept_loop_std(
+        accept_loop_handle_id,
+        accept_loop_parent_handle,
+        endpoint_for_accept_loop,
+        Arc::new(std_tokio_listener),
+        accept_config_clone,
+        accept_options_clone,
+        accept_handle_source_clone,
+        accept_monitor_tx_clone,
+        context_for_accept_loop.clone(),
+        parent_socket_id_for_accept_loop,
+        connection_limiter.clone(),
+      ))
+    };
     context.publish_actor_started(
       accept_loop_handle_id,
       accept_loop_actor_type,
@@ -206,9 +214,7 @@ impl TcpListener {
     let endpoint_uri_clone_log = self.endpoint.clone();
     let event_bus = self.context.event_bus();
     let mut system_event_rx = event_bus.subscribe();
-
     tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener command loop started");
-
     let mut final_error_for_actor_stopping: Option<ZmqError> = None;
 
     let _loop_result: Result<(), ()> = async {
@@ -219,26 +225,22 @@ impl TcpListener {
             match event_result {
               Ok(SystemEvent::ContextTerminating) => {
                 tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener received ContextTerminating, stopping accept loop.");
-                self.listener_handle.abort();
-                break;
+                self.listener_handle.abort(); break;
               }
               Ok(SystemEvent::SocketClosing{ socket_id }) if socket_id == self.parent_socket_id => {
                 tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, parent_id = self.parent_socket_id, "TCP Listener received SocketClosing for parent, stopping accept loop.");
-                self.listener_handle.abort();
-                break;
+                self.listener_handle.abort(); break;
               }
-              Ok(_) => { /* Ignore other events. */ }
+              Ok(_) => {}
               Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, skipped = n, "System event bus lagged for TCP Listener command loop!");
+                tracing::warn!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, skipped = n, "System event bus lagged!");
                 self.listener_handle.abort();
-                final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus lagged".into()));
-                break;
+                final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus lagged".into())); break;
               }
               Err(broadcast::error::RecvError::Closed) => {
-                tracing::error!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "System event bus closed unexpectedly for TCP Listener command loop!");
+                tracing::error!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "System event bus closed unexpectedly!");
                 self.listener_handle.abort();
-                final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus closed".into()));
-                break;
+                final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus closed".into())); break;
               }
             }
           }
@@ -246,18 +248,13 @@ impl TcpListener {
             match cmd_result {
               Ok(Command::Stop) => {
                 tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener received Stop command");
-                self.listener_handle.abort();
-                break;
+                self.listener_handle.abort(); break;
               }
-              Ok(other_cmd) => {
-                tracing::warn!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener received unhandled command: {:?}", other_cmd.variant_name());
-              }
+              Ok(other_cmd) => tracing::warn!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener received unhandled command: {:?}", other_cmd.variant_name()),
               Err(_) => {
                 tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener command mailbox closed, stopping accept loop.");
                 self.listener_handle.abort();
-                if final_error_for_actor_stopping.is_none() {
-                    final_error_for_actor_stopping = Some(ZmqError::Internal("Listener command mailbox closed by peer".into()));
-                }
+                if final_error_for_actor_stopping.is_none() { final_error_for_actor_stopping = Some(ZmqError::Internal("Listener command mailbox closed by peer".into()));}
                 break;
               }
             }
@@ -285,182 +282,225 @@ impl TcpListener {
       listener_cmd_loop_handle,
       listener_cmd_loop_actor_type,
       Some(self.endpoint),
-      final_error_for_actor_stopping, // This is Option<ZmqError>
+      final_error_for_actor_stopping,
     );
     tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener command loop actor fully stopped.");
   }
 
-  async fn run_accept_loop(
+  // Generic accept loop function, parameterized by listener and stream types
+  async fn run_accept_loop_internal<L, S>(
     accept_loop_handle: usize,
-    _listener_cmd_loop_handle: usize, // For logging/context, not direct control here
+    _listener_cmd_loop_handle: usize,
     endpoint_uri: String,
-    listener: Arc<CurrentTcpListener>,    // Or TokioUnixListener
-    transport_config: TcpTransportConfig, // Or equivalent for IPC
+    listener: Arc<L>,
+    transport_config: TcpTransportConfig,
     socket_options: Arc<SocketOptions>,
     handle_source: Arc<std::sync::atomic::AtomicUsize>,
     monitor_tx: Option<MonitorSender>,
     context: Context,
     parent_socket_core_id: usize,
-    connection_limiter: Arc<tokio::sync::Semaphore>,
-  ) {
+    connection_limiter: Arc<Semaphore>,
+    is_uring_listener: bool,
+  ) where
+    L: AcceptStream<Stream = S> + Send + Sync + 'static,
+    S: AcceptedStream + Send + Sync + 'static,
+  {
     let accept_loop_actor_type = ActorType::AcceptLoop;
-    // ActorDropGuard ensures ActorStopping is published if this task panics or is abruptly cancelled
-    // without calling waive().
     let actor_drop_guard = ActorDropGuard::new(
       context.clone(),
       accept_loop_handle,
       accept_loop_actor_type,
       Some(endpoint_uri.clone()),
     );
-
-    tracing::debug!(handle = accept_loop_handle, uri = %endpoint_uri, "Accept loop started with connection limiting.");
+    tracing::debug!(handle = accept_loop_handle, uri = %endpoint_uri, is_uring_listener, "TCP Accept loop (generic) started.");
     let mut loop_error_to_report: Option<ZmqError> = None;
 
-    // This loop will run until the task is cancelled (aborted by its parent)
-    // or a fatal, unrecoverable error occurs within the loop.
     loop {
-      // 1. Acquire a connection permit.
-      //    This is a point where the task can be cancelled.
       let permit = match connection_limiter.clone().acquire_owned().await {
         Ok(p) => p,
-        Err(_semaphore_closed_error) => {
-          tracing::error!(
-            "Accept loop {}: Connection limiter semaphore closed. Stopping.",
-            accept_loop_handle
-          );
+        Err(_) => {
           loop_error_to_report = Some(ZmqError::Internal("Connection limiter closed".into()));
-          break; // Fatal error for the accept loop
+          break;
         }
       };
-      tracing::trace!("Accept loop {}: Acquired connection permit.", accept_loop_handle);
 
-      // 2. We have a permit. Now accept a connection.
-      //    This is another point where the task can be cancelled.
-      let accept_result = listener.accept().await;
+      let accept_result = listener.accept_stream().await;
 
       match accept_result {
-        Ok((stream, peer_addr)) => {
-          // Successfully accepted a stream
-          let peer_addr_str = peer_addr.to_string(); // For TCP
-                                                     // For IPC: let peer_addr_str = format!("ipc-peer-fd-{}", stream.as_raw_fd());
+        Ok((accepted_stream, peer_addr)) => {
+          let peer_addr_str = peer_addr.to_string();
           tracing::info!(
-            "Accepted new connection from {} (permit for handle {})",
+            "Accepted new TCP connection from {} (for listener {})",
             peer_addr_str,
-            accept_loop_handle
+            endpoint_uri
           );
-
-          // (Emit SocketEvent::Accepted if monitor_tx exists)
           if let Some(ref tx) = monitor_tx {
             let event = SocketEvent::Accepted {
               endpoint: endpoint_uri.clone(),
               peer_addr: peer_addr_str.clone(),
             };
-            // Send event in a non-blocking way or fire-and-forget task
             let tx_clone = tx.clone();
             tokio::spawn(async move {
               let _ = tx_clone.send(event).await;
             });
           }
 
-          // Apply TCP options (or other transport-specific pre-engine setup)
-          if let Err(e) = apply_tcp_socket_options(&stream, &transport_config) {
-            // Adjust for IPC
-            tracing::error!("Failed to apply TCP options for {}: {}. Dropping.", peer_addr_str, e);
-            drop(permit); // Release permit as connection setup failed
-            drop(stream);
-            continue; // Go back to try and get another permit/connection
-          }
-
-          // Spawn the dedicated task to handle this connection.
-          // This new task now owns the `permit` and the `stream`.
           let session_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
           let engine_handle_id = handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-          let connection_specific_uri = format!("tcp://{}", peer_addr_str); // Adjust for IPC
-
+          let connection_specific_uri = format!("tcp://{}", peer_addr_str);
           let conn_context = context.clone();
           let conn_socket_options = socket_options.clone();
           let conn_monitor_tx = monitor_tx.clone();
           let listener_uri_for_event = endpoint_uri.clone();
 
-          tokio::spawn(async move {
-            // This task now owns `permit`. It will be dropped when this task ends.
-            let (session_cmd_mailbox, session_task_join_handle) = SessionBase::create_and_spawn(
-              session_handle_id,
-              connection_specific_uri.clone(),
-              conn_monitor_tx.clone(),
-              conn_context.clone(),
-              parent_socket_core_id,
-            );
+          tokio::spawn({
+            let transport_config = transport_config.clone();
+            async move {
+              let _permit_guard = permit; // Permit is owned by this task
 
-            let (engine_mailbox, engine_task_join_handle_inner) = create_and_spawn_tcp_engine(
-              // or _ipc_engine
-              engine_handle_id,
-              session_cmd_mailbox.clone(),
-              stream,
-              conn_socket_options.clone(),
-              true,
-              &conn_context,
-              session_handle_id,
-            );
-
-            let attach_cmd = Command::Attach {
-              engine_mailbox,
-              engine_handle: Some(engine_handle_id),
-              engine_task_handle: Some(engine_task_join_handle_inner),
-            };
-
-            let mut session_setup_ok = true;
-            if session_cmd_mailbox.send(attach_cmd).await.is_err() {
-              tracing::error!("Failed to Attach engine for {}", connection_specific_uri);
-              session_setup_ok = false;
-            } else {
-              let event = SystemEvent::NewConnectionEstablished {
-                parent_core_id: parent_socket_core_id,
-                endpoint_uri: connection_specific_uri.clone(),
-                target_endpoint_uri: listener_uri_for_event,
-                session_mailbox: session_cmd_mailbox,
+              let (session_cmd_tx, _session_cmd_rx) = SessionBase::create_and_spawn(
                 session_handle_id,
-                session_task_id: session_task_join_handle.id(),
-              };
-              if conn_context.event_bus().publish(event).is_err() {
-                tracing::error!(
-                  "Failed to publish NewConnectionEstablished for {}",
-                  connection_specific_uri
-                );
-                session_setup_ok = false;
-              }
-            }
+                connection_specific_uri.clone(),
+                conn_monitor_tx.clone(),
+                conn_context.clone(),
+                parent_socket_core_id,
+              );
 
-            if !session_setup_ok {
-              // If session setup failed, ensure the session task is cleaned up.
-              // The permit will be dropped when this spawned task exits.
-              if !session_task_join_handle.is_finished() {
-                session_task_join_handle.abort();
-                // Also consider aborting engine_task_join_handle_inner if it's separate
-                // and doesn't get cleaned up by the session aborting.
-              }
-            } else {
-              // Session setup was okay, now wait for the session to complete its lifecycle.
-              if let Err(e) = session_task_join_handle.await {
-                if !e.is_cancelled() {
-                  // Log only if it wasn't a planned cancellation
-                  tracing::error!("Session task for {} panicked: {:?}", connection_specific_uri, e);
+              let engine_connection_type: EngineConnectionType;
+              let mut engine_task_handle_for_attach: Option<JoinHandle<()>> = None;
+              let use_io_uring_for_session = conn_socket_options.io_uring_session_enabled && cfg!(feature = "io-uring");
+
+              if use_io_uring_for_session {
+                #[cfg(feature = "io-uring")]
+                {
+                  match accepted_stream.into_std_tcp_stream() {
+                    Ok(std_stream) => {
+                      if let Err(e) = apply_tcp_socket_options_to_std(&std_stream, &transport_config) {
+                        tracing::error!(
+                          "Failed to apply TCP options to std_stream for {}: {}. Dropping.",
+                          peer_addr_str,
+                          e
+                        );
+                        return; // Permit dropped
+                      }
+                      let owned_fd: OwnedFd = std_stream.into();
+                      let (app_to_engine_tx, app_to_engine_rx) = async_channel::bounded::<AppToUringEngineCmd>(
+                        conn_context.inner().get_actor_mailbox_capacity(),
+                      );
+                      let launch_info = UringLaunchInformation {
+                        engine_handle_id,
+                        owned_fd,
+                        config: ZmtpEngineConfig::from(&*conn_socket_options),
+                        is_server: true,
+                        context_clone: conn_context.clone(),
+                        session_base_mailbox: session_cmd_tx.clone(),
+                        app_to_engine_cmd_rx: app_to_engine_rx,
+                        parent_session_handle_id: session_handle_id,
+                      };
+                      match uring_runtime::submit_uring_engine_launch(launch_info) {
+                        Ok(true) => engine_connection_type = EngineConnectionType::Uring { app_to_engine_cmd_tx },
+                        _ => {
+                          tracing::error!("Failed to launch/submit uring engine for {}", connection_specific_uri);
+                          let (dummy_tx, _) = async_channel::bounded(1);
+                          dummy_tx.close();
+                          engine_connection_type = EngineConnectionType::Uring {
+                            app_to_engine_cmd_tx: dummy_tx,
+                          };
+                        }
+                      }
+                    }
+                    Err(e) => {
+                      tracing::error!(
+                        "Failed to convert accepted stream to std for uring: {}. Session for {} will fail.",
+                        e,
+                        connection_specific_uri
+                      );
+                      let (dummy_tx, _) = async_channel::bounded(1);
+                      dummy_tx.close();
+                      engine_connection_type = EngineConnectionType::Uring {
+                        app_to_engine_cmd_tx: dummy_tx,
+                      };
+                    }
+                  }
+                }
+                #[cfg(not(feature = "io-uring"))]
+                {
+                  unreachable!();
+                }
+              } else {
+                // Standard engine path
+                match accepted_stream.into_tokio_tcp_stream() {
+                  Ok(tokio_stream) => {
+                    if let Err(e) = apply_tcp_socket_options_to_tokio(&tokio_stream, &transport_config) {
+                      tracing::error!(
+                        "Failed to apply TCP options to tokio_stream for {}: {}. Dropping.",
+                        peer_addr_str,
+                        e
+                      );
+                      return; // Permit dropped
+                    }
+                    let (std_engine_mailbox, std_engine_task_handle) = create_and_spawn_tcp_engine(
+                      engine_handle_id,
+                      session_cmd_tx.clone(),
+                      tokio_stream,
+                      conn_socket_options.clone(),
+                      true,
+                      &conn_context,
+                      session_handle_id,
+                    );
+                    engine_connection_type = EngineConnectionType::Standard {
+                      engine_mailbox: std_engine_mailbox,
+                    };
+                    engine_task_handle_for_attach = Some(std_engine_task_handle);
+                  }
+                  Err(e) => {
+                    tracing::error!(
+                      "Failed to convert accepted stream to tokio for std engine: {}. Session for {} will fail.",
+                      e,
+                      connection_specific_uri
+                    );
+                    let (dummy_tx, _) = mailbox(1); // Create a dummy standard engine mailbox
+                    dummy_tx.close();
+                    engine_connection_type = EngineConnectionType::Standard {
+                      engine_mailbox: dummy_tx,
+                    };
+                  }
                 }
               }
+
+              let attach_cmd = Command::Attach {
+                connection: engine_connection_type,
+                engine_handle: Some(engine_handle_id),
+                engine_task_handle: engine_task_handle_for_attach,
+              };
+              let mut session_setup_ok = true;
+              if session_cmd_tx.send(attach_cmd).await.is_err() {
+                tracing::error!("Failed to Attach engine for {}", connection_specific_uri);
+                session_setup_ok = false;
+              } else {
+                let event = SystemEvent::NewConnectionEstablished {
+                  parent_core_id: parent_socket_core_id,
+                  endpoint_uri: connection_specific_uri.clone(),
+                  target_endpoint_uri: listener_uri_for_event,
+                  session_mailbox: session_cmd_tx,
+                  session_handle_id,
+                  session_task_id: tokio::task::spawn(async {}).id(), // Dummy task ID
+                };
+                if conn_context.event_bus().publish(event).is_err() {
+                  tracing::error!(
+                    "Failed to publish NewConnectionEstablished for {}",
+                    connection_specific_uri
+                  );
+                  session_setup_ok = false;
+                }
+              }
+              if !session_setup_ok { /* TODO: Abort SessionBase task */ }
             }
-            drop(permit); // Permit is dropped when this connection-handling task scope ends.
-            tracing::debug!(
-              "Connection handling task for {} finished, permit released.",
-              connection_specific_uri
-            );
-          }); // End of tokio::spawn for connection handling
+          });
         }
         Err(e) => {
-          // Error from listener.accept()
-          tracing::error!("Error accepting connection (handle {}): {}", accept_loop_handle, e);
-          drop(permit); // Release permit as we didn't use the slot
-
-          // (Emit SocketEvent::AcceptFailed if monitor_tx exists)
+          drop(permit);
+          tracing::error!("Error accepting TCP connection (listener {}): {}", endpoint_uri, e);
           if let Some(ref tx) = monitor_tx {
             let event = SocketEvent::AcceptFailed {
               endpoint: endpoint_uri.clone(),
@@ -471,27 +511,83 @@ impl TcpListener {
               let _ = tx_clone.send(event).await;
             });
           }
-
           if is_fatal_accept_error(&e) {
-            // Or is_fatal_ipc_accept_error
             loop_error_to_report = Some(ZmqError::from_io_endpoint(e, &endpoint_uri));
-            break; // Break main accept loop on fatal error
+            break;
           }
-          // Non-fatal accept error, brief pause before trying to acquire permit again
           sleep(Duration::from_millis(100)).await;
         }
       }
-    } // end loop
-
-    // Loop exited (either by break on fatal error, or task cancellation)
-    actor_drop_guard.waive(); // Signal normal loop completion to prevent drop guard from double-publishing.
+    }
+    actor_drop_guard.waive();
     context.publish_actor_stopping(
       accept_loop_handle,
       accept_loop_actor_type,
       Some(endpoint_uri),
       loop_error_to_report,
     );
-    tracing::info!("Accept loop {} fully stopped.", accept_loop_handle);
+    tracing::info!("TCP Accept loop {} fully stopped.", accept_loop_handle);
+  }
+
+  #[cfg(feature = "io-uring")]
+  async fn run_accept_loop_uring(
+    accept_loop_handle: usize,
+    listener_cmd_loop_handle: usize,
+    endpoint_uri: String,
+    listener: Arc<underlying_uring_net::UringTcpListener>,
+    transport_config: TcpTransportConfig,
+    socket_options: Arc<SocketOptions>,
+    handle_source: Arc<std::sync::atomic::AtomicUsize>,
+    monitor_tx: Option<MonitorSender>,
+    context: Context,
+    parent_socket_core_id: usize,
+    connection_limiter: Arc<Semaphore>,
+  ) {
+    Self::run_accept_loop_internal(
+      accept_loop_handle,
+      listener_cmd_loop_handle,
+      endpoint_uri,
+      listener,
+      transport_config,
+      socket_options,
+      handle_source,
+      monitor_tx,
+      context,
+      parent_socket_core_id,
+      connection_limiter,
+      true,
+    )
+    .await;
+  }
+
+  async fn run_accept_loop_std(
+    accept_loop_handle: usize,
+    listener_cmd_loop_handle: usize,
+    endpoint_uri: String,
+    listener: Arc<underlying_std_net::TcpListener>,
+    transport_config: TcpTransportConfig,
+    socket_options: Arc<SocketOptions>,
+    handle_source: Arc<std::sync::atomic::AtomicUsize>,
+    monitor_tx: Option<MonitorSender>,
+    context: Context,
+    parent_socket_core_id: usize,
+    connection_limiter: Arc<Semaphore>,
+  ) {
+    Self::run_accept_loop_internal(
+      accept_loop_handle,
+      listener_cmd_loop_handle,
+      endpoint_uri,
+      listener,
+      transport_config,
+      socket_options,
+      handle_source,
+      monitor_tx,
+      context,
+      parent_socket_core_id,
+      connection_limiter,
+      false,
+    )
+    .await;
   }
 }
 
@@ -500,8 +596,8 @@ impl TcpListener {
 pub(crate) struct TcpConnecter {
   handle: usize,
   endpoint: String,
-  config: TcpTransportConfig,
-  context_options: Arc<SocketOptions>,
+  config: TcpTransportConfig,          // Pre-connect options
+  context_options: Arc<SocketOptions>, // For ZmtpEngineConfig and io_uring_session_enabled
   context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
   context: Context,
   parent_socket_id: usize,
@@ -517,6 +613,7 @@ impl TcpConnecter {
     context: Context,
     parent_socket_id: usize,
   ) -> JoinHandle<()> {
+    // TcpConnecter is fire-and-forget from SocketCore's perspective
     let actor_type = ActorType::Connecter;
     let transport_config = TcpTransportConfig {
       tcp_nodelay: options.tcp_nodelay,
@@ -533,7 +630,6 @@ impl TcpConnecter {
       context: context.clone(),
       parent_socket_id,
     };
-
     let task_join_handle = tokio::spawn(connecter_actor.run_connect_loop(monitor_tx));
     context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
     task_join_handle
@@ -543,560 +639,592 @@ impl TcpConnecter {
     let connecter_handle = self.handle;
     let connecter_actor_type = ActorType::Connecter;
     let endpoint_uri_clone = self.endpoint.clone();
+    let mut final_error_for_actor_stop: Option<ZmqError> = None;
+
+    tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter actor started connection attempts.");
 
     let target_addr_str = match endpoint_uri_clone.strip_prefix("tcp://") {
       Some(addr) => addr.to_string(),
       None => {
-        let err = ZmqError::InvalidEndpoint(endpoint_uri_clone.clone());
-        tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, "Invalid TCP endpoint format: {}", err);
-
-        let fail_event_system = SystemEvent::ConnectionAttemptFailed {
-          parent_core_id: self.parent_socket_id,
-          target_endpoint_uri: endpoint_uri_clone.clone(),
-          error_msg: err.to_string(),
-        };
-        if self.context.event_bus().publish(fail_event_system).is_err() {
-          tracing::warn!(
-            handle = connecter_handle,
-            "Failed to publish ConnectionAttemptFailed system event for invalid endpoint {}",
-            endpoint_uri_clone
-          );
-        }
-
+        final_error_for_actor_stop = Some(ZmqError::InvalidEndpoint(endpoint_uri_clone.clone()));
         self.context.publish_actor_stopping(
           connecter_handle,
           connecter_actor_type,
           Some(endpoint_uri_clone),
-          Some(err),
+          final_error_for_actor_stop,
         );
+        tracing::error!(handle = connecter_handle, uri = %self.endpoint, "Invalid TCP endpoint format for connecter. Stopping.");
         return;
       }
     };
 
-    tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter actor started connection attempts.");
+    let target_socket_addr: StdSocketAddr = match target_addr_str.parse() {
+      Ok(addr) => addr,
+      Err(e) => {
+        final_error_for_actor_stop = Some(ZmqError::InvalidEndpoint(format!(
+          "Failed to parse target address '{}': {}",
+          target_addr_str, e
+        )));
+        self.context.publish_actor_stopping(
+          connecter_handle,
+          connecter_actor_type,
+          Some(endpoint_uri_clone),
+          final_error_for_actor_stop,
+        );
+        tracing::error!(handle = connecter_handle, uri = %self.endpoint, "Failed to parse target TCP address for connecter. Stopping.");
+        return;
+      }
+    };
 
     let initial_reconnect_ivl_opt = self.context_options.reconnect_ivl;
-    let mut current_retry_delay_base = initial_reconnect_ivl_opt.unwrap_or(Duration::from_millis(100)); // Base for next retry
+    let mut current_retry_delay_base = initial_reconnect_ivl_opt.unwrap_or(Duration::from_millis(100));
     if initial_reconnect_ivl_opt == Some(Duration::ZERO) {
-      current_retry_delay_base = Duration::ZERO; // Explicitly no delay if ZMQ_RECONNECT_IVL=0
+      current_retry_delay_base = Duration::ZERO;
     }
     let max_delay_opt = self.context_options.reconnect_ivl_max;
-
     let mut attempt_count = 0;
-    let mut last_attempt_error: Option<ZmqError> = None; // Error from the most recent connect/options attempt
     let mut system_event_rx = self.context.event_bus().subscribe();
 
-    loop {
-      // Outer loop for retries
-      // 1. Handle delay for retries (if not the first attempt)
+    'retry_loop: loop {
       if attempt_count > 0 {
-        // If initial_reconnect_ivl was Some(0), we should have broken after the first failure.
         if initial_reconnect_ivl_opt == Some(Duration::ZERO) {
           tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Reconnect disabled (RECONNECT_IVL=0) and first attempt failed. Stopping.");
-          break; // Exit loop, final_error_for_actor_stop will be used
+          break 'retry_loop;
         }
-
         let delay_for_this_retry = current_retry_delay_base;
-
         tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, delay = ?delay_for_this_retry, "Waiting before reconnect attempt #{}", attempt_count + 1);
         if let Some(ref tx) = monitor_tx {
           let event = SocketEvent::ConnectRetried {
             endpoint: endpoint_uri_clone.clone(),
             interval: delay_for_this_retry,
           };
-
           let tx_clone = tx.clone();
-          let endpoint_uri_log_clone_retry = endpoint_uri_clone.clone();
-
           tokio::spawn(async move {
-            if let Err(e_send) = tx_clone.send(event).await {
-              tracing::warn!(
-                endpoint = %endpoint_uri_log_clone_retry,
-                delay = ?delay_for_this_retry,
-                error = ?e_send,
-                "Failed to send ConnectRetried monitor event"
-              );
-            }
+            let _ = tx_clone.send(event).await;
           });
         }
-
-        // Sleep, interruptible by shutdown signals
         tokio::select! {
+            biased;
             _ = sleep(delay_for_this_retry) => {},
             event_result = system_event_rx.recv() => {
                  match event_result {
                     Ok(SystemEvent::ContextTerminating) => {
-                        tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter received ContextTerminating during retry delay.");
-                        last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating".into()));
-                        break; // Break outer loop
+                        final_error_for_actor_stop = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating".into())); break 'retry_loop;
                     }
                     Ok(SystemEvent::SocketClosing{ socket_id: sid }) if sid == self.parent_socket_id => {
-                        tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "TCP Connecter received SocketClosing for parent during retry delay.");
-                        last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into()));
-                        break; // Break outer loop
+                        final_error_for_actor_stop = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into())); break 'retry_loop;
                     }
-                    Err(_) => { // Lagged or Closed
-                        last_attempt_error = Some(ZmqError::Internal("Connecter event bus error during retry delay".into()));
-                        break; // Break outer loop
-                    }
-                    _ => {} // Other event, ignore
+                    Err(_) => { final_error_for_actor_stop = Some(ZmqError::Internal("Connecter event bus error".into())); break 'retry_loop; }
+                    _ => {}
                 }
             }
         }
-        if last_attempt_error.is_some()
-          && matches!(last_attempt_error, Some(ZmqError::Internal(ref s)) if s.contains("shutdown") || s.contains("event bus error"))
-        {
-          break; // Break outer loop if shutdown occurred during sleep
+        if final_error_for_actor_stop.is_some() {
+          break 'retry_loop;
         }
-
-        // Calculate delay for *next* time *after* sleeping for current delay
         if let Some(md) = max_delay_opt {
           if md > Duration::ZERO {
-            // Positive max_delay caps the backoff
             current_retry_delay_base = (current_retry_delay_base * 2).min(md);
           }
-          // If md is Duration::ZERO, current_retry_delay_base remains fixed (no exponential increase)
-        } else {
-          // No max_delay, plain exponential backoff
-          if current_retry_delay_base > Duration::ZERO {
-            // Avoid making zero * 2 = zero
-            current_retry_delay_base *= 2;
-          } else if initial_reconnect_ivl_opt.is_none() {
-            // If it was zero due to default, kickstart with 100ms based delay.
-            current_retry_delay_base = Duration::from_millis(100) * 2; // So next is 200ms
-          }
+        } else if current_retry_delay_base > Duration::ZERO {
+          current_retry_delay_base *= 2;
+        } else if initial_reconnect_ivl_opt.is_none() {
+          current_retry_delay_base = Duration::from_millis(100) * 2;
         }
       }
       attempt_count += 1;
 
-      // 2. Check for shutdown signals (again, right before attempting to connect)
-      // Non-blocking check
       match system_event_rx.try_recv() {
         Ok(SystemEvent::ContextTerminating) => {
-          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter received ContextTerminating before connect attempt.");
-          last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating".into()));
-          break;
+          final_error_for_actor_stop = Some(ZmqError::Internal("Connecter shutdown by event pre-attempt".into()));
+          break 'retry_loop;
         }
         Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => {
-          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "TCP Connecter received SocketClosing for parent before connect attempt.");
-          last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into()));
-          break;
+          final_error_for_actor_stop = Some(ZmqError::Internal(
+            "Connecter shutdown by parent event pre-attempt".into(),
+          ));
+          break 'retry_loop;
         }
         Err(broadcast::error::TryRecvError::Closed) => {
-          last_attempt_error = Some(ZmqError::Internal("Connecter event bus closed".into()));
-          break;
-        }
-        Err(broadcast::error::TryRecvError::Lagged(n)) => {
-          tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, num_skipped = n, "Connecter event bus lagged before connect attempt.");
+          final_error_for_actor_stop = Some(ZmqError::Internal("Connecter event bus closed pre-attempt".into()));
+          break 'retry_loop;
         }
         _ => {}
       }
-      if last_attempt_error.is_some()
-        && matches!(last_attempt_error, Some(ZmqError::Internal(ref s)) if s.contains("shutdown") || s.contains("event bus error"))
-      {
-        break;
+      if final_error_for_actor_stop.is_some() {
+        break 'retry_loop;
       }
-
-      // 3. Attempt TCP connection
 
       tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Attempting TCP connect #{}", attempt_count);
-      let mut established_stream_after_options: Option<CurrentTcpStream> = None;
+      let use_io_uring = self.context_options.io_uring_session_enabled && cfg!(feature = "io-uring");
 
-      #[cfg(not(feature = "io-uring"))]
-      let connect_future = underlying_net::connect_stream(&target_addr_str);
-      #[cfg(feature = "io-uring")]
-      let connect_future = {
-        // For io-uring, create std socket, configure, connect, then convert
-        async {
-          let domain = if target_socket_addr.is_ipv4() {
-            socket2::Domain::IPV4
-          } else {
-            socket2::Domain::IPV6
-          };
-          let socket = Socket2Socket::new(domain, socket2::Type::STREAM, None)?;
-
-          // Apply options from self.config (TcpTransportConfig) to socket2::Socket
-          socket.set_nodelay(self.config.tcp_nodelay)?;
-          if self.config.keepalive_time.is_some()
-            || self.config.keepalive_interval.is_some()
-            || self.config.keepalive_count.is_some()
-          {
-            let mut keepalive = TcpKeepalive::new();
-            if let Some(time) = self.config.keepalive_time {
-              keepalive = keepalive.with_time(time);
-            }
-            #[cfg(any(unix, target_os = "windows"))]
-            if let Some(interval) = self.config.keepalive_interval {
-              keepalive = keepalive.with_interval(interval);
-            }
-            #[cfg(unix)]
-            if let Some(count) = self.config.keepalive_count {
-              keepalive = keepalive.with_retries(count);
-            }
-            socket.set_tcp_keepalive(&keepalive)?;
-          }
-          // socket2::Socket::connect is blocking, so wrap in spawn_blocking for async context
-          let std_socket_addr = target_socket_addr.into();
-          let std_stream: std::net::TcpStream = tokio::task::spawn_blocking(move || {
-            socket.connect(&std_socket_addr)?;
-            socket.try_into() // Converts socket2::Socket to std::net::TcpStream
-          })
-          .await
-          .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??; // Handle JoinError and inner Result
-
-          std_stream.set_nonblocking(true)?;
-          CurrentTcpStream::from_std(std_stream) // Convert to tokio_uring::net::TcpStream
-        }
-      };
-
-      // Select on connect future vs shutdown event
-      tokio::select! {
-          connect_result = connect_future => {
-            match connect_result {
-              Ok(stream) => {
-                tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP connect call successful for attempt #{}", attempt_count);
-                match apply_tcp_socket_options(&stream, &self.config) {
-                  Ok(()) => {
-                    tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Successfully applied TCP options for attempt #{}", attempt_count);
-                    established_stream_after_options = Some(stream);
-                  }
-                  Err(apply_err) => {
-                    tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %apply_err, "Failed to apply TCP options on attempt #{}. Dropping stream, will retry if configured.", attempt_count);
-                    last_attempt_error = Some(apply_err);
-                    // if initial_reconnect_ivl_opt == Some(Duration::ZERO) { /* Loop will break */ }
-                    // continue; // Implicitly done by loop structure if established_stream_after_options is None
-                  }
-                }
-              }
-              Err(connect_err) => {
-                last_attempt_error = Some(ZmqError::from_io_endpoint(connect_err, &endpoint_uri_clone));
-                tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %last_attempt_error.as_ref().unwrap(), "TCP Connect attempt #{} failed", attempt_count);
-
-                if attempt_count == 1 && initial_reconnect_ivl_opt.map_or(true, |ivl| ivl != Duration::ZERO) && !is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
-                  if let Some(ref tx) = monitor_tx {
-
-                    let event = SocketEvent::ConnectDelayed { endpoint: endpoint_uri_clone.clone(), error_msg: format!("{}", last_attempt_error.as_ref().unwrap()) };
-                    let tx_clone = tx.clone();
-                    let endpoint_uri_log_clone_delay = endpoint_uri_clone.clone();
-                    let error_msg_clone_delay = last_attempt_error.as_ref().unwrap().to_string();
-
-                    tokio::spawn(async move {
-                      if let Err(e_send) = tx_clone.send(event).await {
-                        tracing::warn!(
-                          endpoint = %endpoint_uri_log_clone_delay,
-                          original_error = %error_msg_clone_delay,
-                          error = ?e_send,
-                          "Failed to send ConnectDelayed monitor event"
-                        );
-                      }
-                    });
-                  }
-                }
-                if initial_reconnect_ivl_opt == Some(Duration::ZERO) || is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
-                  // Loop will break due to this error
-                }
-                // continue; // Implicitly done by loop structure
-              }
-            }
-          }
+      let connect_attempt_result: Result<ConnectLogicOutputType, ZmqError> = tokio::select! {
+          biased;
           event_result = system_event_rx.recv() => {
               match event_result {
-                  Ok(SystemEvent::ContextTerminating) => {
-                      tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter received ContextTerminating during connect attempt.");
-                      last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating".into()));
-                  }
-                  Ok(SystemEvent::SocketClosing{ socket_id: sid }) if sid == self.parent_socket_id => {
-                      tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "TCP Connecter received SocketClosing for parent during connect attempt.");
-                      last_attempt_error = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into()));
-                  }
-                  Err(_) => {
-                      last_attempt_error = Some(ZmqError::Internal("Connecter event bus error during connect attempt".into()));
-                  }
-                  _ => { /* Other events, potentially allow connect to complete or retry */ }
+                  Ok(SystemEvent::ContextTerminating) => Err(ZmqError::Internal("Connecter shutdown during connect by ContextTerminating".into())),
+                  Ok(SystemEvent::SocketClosing{ socket_id: sid }) if sid == self.parent_socket_id => Err(ZmqError::Internal("Connecter shutdown during connect by parent SocketClosing".into())),
+                  Err(_) => Err(ZmqError::Internal("Connecter event bus error during connect".into())),
+                  _ => Err(ZmqError::Internal("Connect attempt preempted by non-critical event, retrying".into())),
               }
           }
-      } // End of select for connect vs shutdown
 
-      // Check if loop should break based on outcomes of the select
-      if last_attempt_error.is_some() {
-        if matches!(last_attempt_error, Some(ZmqError::Internal(ref s)) if s.contains("shutdown") || s.contains("event bus error"))
-        {
-          break; // Shutdown signal means definite stop
+          connect_logic_result = async {
+              if use_io_uring {
+                  #[cfg(feature = "io-uring")] {
+                      let domain = if target_socket_addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
+                      let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+                      apply_socket2_options_pre_connect(&socket, &self.config)?;
+                      let std_stream = tokio::task::spawn_blocking(move || {
+                          socket.connect(&target_socket_addr.into())?;
+                          socket.into_tcp_stream()
+                      }).await.map_err(|je| ZmqError::Internal(format!("Blocking connect task join error: {}", je)))??;
+                      std_stream.set_nonblocking(true)?;
+                      let owned_fd: OwnedFd = std_stream.into();
+                      let (app_to_engine_tx, app_to_engine_rx) = async_channel::bounded(self.context.inner().get_actor_mailbox_capacity());
+                      let session_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                      let engine_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                      Ok((
+                          session_handle_id,
+                          engine_handle_id,
+                          EngineConnectionType::Uring { app_to_engine_cmd_tx },
+                          Some(owned_fd),
+                          Box::new(app_to_engine_rx) as Box<dyn std::any::Any + Send>,
+                          format!("tcp://{}", target_addr_str)
+                      ))
+                  }
+                  #[cfg(not(feature = "io-uring"))] { unreachable!(); }
+              } else { // Standard path
+                  let std_tokio_stream = underlying_std_net::TcpStream::connect(&target_addr_str).await
+                      .map_err(|e| ZmqError::from_io_endpoint(e, &endpoint_uri_clone))?;
+                  apply_tcp_socket_options_to_tokio(&std_tokio_stream, &self.config)?;
+                  let peer_addr_actual = std_tokio_stream.peer_addr()
+                      .map_err(|e| ZmqError::Internal(format!("Failed to get peer_addr post-connect: {}",e)))?;
+
+                  let session_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                  let engine_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                  // <<< MODIFIED [Correct placeholder type] >>>
+                  let (dummy_engine_tx, _) = async_channel::bounded::<Command>(1);
+                  Ok((
+                      session_handle_id,
+                      engine_handle_id,
+                      EngineConnectionType::Standard { engine_mailbox: dummy_engine_tx }, // Correct type
+                      None,
+                      // <<< MODIFIED [Box the stream for DynamicDowncast] >>>
+                      Box::new(std_tokio_stream) as Box<dyn std::any::Any + Send>,
+                      format!("tcp://{}", peer_addr_actual)
+                  ))
+                  // <<< MODIFIED END >>>
+              }
+          } => connect_logic_result,
+      };
+
+      match connect_attempt_result {
+        Ok((
+          session_handle_id,
+          engine_handle_id,
+          engine_conn_type_template,
+          opt_owned_fd,
+          stream_or_app_rx_boxed,
+          connection_specific_uri,
+        )) => {
+          // ... (Monitor event: Connected) ...
+          if let Some(ref tx_mon) = monitor_tx {
+            let event = SocketEvent::Connected {
+              endpoint: endpoint_uri_clone.clone(),
+              peer_addr: connection_specific_uri.clone(),
+            };
+            let tx_clone = tx_mon.clone();
+            tokio::spawn(async move {
+              let _ = tx_clone.send(event).await;
+            });
+          }
+
+          let (session_cmd_tx, session_base_task_handle) = SessionBase::create_and_spawn(
+            session_handle_id,
+            connection_specific_uri.clone(),
+            monitor_tx.clone(),
+            self.context.clone(),
+            self.parent_socket_id,
+          );
+
+          let final_engine_conn_type: EngineConnectionType;
+          let mut final_engine_task_handle: Option<JoinHandle<()>> = None;
+
+          match engine_conn_type_template {
+            #[cfg(feature = "io-uring")]
+            EngineConnectionType::Uring { app_to_engine_cmd_tx } => {
+              let app_to_engine_cmd_rx = match stream_or_app_rx_boxed.downcast_arc_receiver() {
+                // downcast_arc_receiver is on Box<dyn Any>
+                Some(rx) => rx,
+                None => {
+                  final_error_for_actor_stop =
+                    Some(ZmqError::Internal("Failed to downcast app_cmd_rx for uring".into()));
+                  session_base_task_handle.abort();
+                  break 'retry_loop;
+                }
+              };
+              let launch_info = UringLaunchInformation {
+                engine_handle_id,
+                owned_fd: opt_owned_fd.expect("OwnedFd missing for uring path"),
+                config: ZmtpEngineConfig::from(&*self.context_options),
+                is_server: false,
+                context_clone: self.context.clone(),
+                session_base_mailbox: session_cmd_tx.clone(),
+                app_to_engine_cmd_rx,
+                parent_session_handle_id: session_handle_id,
+              };
+              match uring_runtime::submit_uring_engine_launch(launch_info) {
+                Ok(true) => {
+                  final_engine_conn_type = EngineConnectionType::Uring { app_to_engine_cmd_tx };
+                }
+                _ => {
+                  final_error_for_actor_stop = Some(ZmqError::Internal("Uring launch submit fail in connecter".into()));
+                  session_base_task_handle.abort();
+                  break 'retry_loop;
+                }
+              }
+            }
+            EngineConnectionType::Standard { .. } => {
+              // <<< MODIFIED [Call downcast_arc_stream on the Boxed value] >>>
+              let std_tokio_stream = match stream_or_app_rx_boxed.downcast_arc_stream() {
+                Some(s) => s,
+                None => {
+                  final_error_for_actor_stop =
+                    Some(ZmqError::Internal("Failed to downcast TcpStream for std engine".into()));
+                  session_base_task_handle.abort();
+                  break 'retry_loop;
+                }
+              };
+              // <<< MODIFIED END >>>
+              let (std_engine_mailbox, std_engine_task_handle) = create_and_spawn_tcp_engine(
+                engine_handle_id,
+                session_cmd_tx.clone(),
+                std_tokio_stream,
+                self.context_options.clone(),
+                false,
+                &self.context,
+                session_handle_id,
+              );
+              final_engine_conn_type = EngineConnectionType::Standard {
+                engine_mailbox: std_engine_mailbox,
+              };
+              final_engine_task_handle = Some(std_engine_task_handle);
+            }
+            #[cfg(not(feature = "io-uring"))]
+            _ => {
+              unreachable!("Should be Standard if io-uring is not featured");
+            }
+          }
+
+          let attach_cmd = Command::Attach {
+            connection: final_engine_conn_type,
+            engine_handle: Some(engine_handle_id),
+            engine_task_handle: final_engine_task_handle,
+          };
+
+          if session_cmd_tx.send(attach_cmd).await.is_err() {
+            final_error_for_actor_stop = Some(ZmqError::Internal(
+              "Failed to attach engine to session (TCP Connecter)".into(),
+            ));
+            session_base_task_handle.abort();
+          } else {
+            publish_new_conn_event(
+              &self.context,
+              self.parent_socket_id,
+              &connection_specific_uri,
+              &endpoint_uri_clone,
+              session_cmd_tx,
+              session_handle_id,
+            );
+            final_error_for_actor_stop = None;
+          }
+          break 'retry_loop;
+        }
+        Err(e) => {
+          final_error_for_actor_stop = Some(e);
+          tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %final_error_for_actor_stop.as_ref().unwrap(), "TCP Connect attempt #{} logic failed or preempted", attempt_count);
+          if attempt_count == 1
+            && initial_reconnect_ivl_opt.map_or(true, |ivl| ivl != Duration::ZERO)
+            && final_error_for_actor_stop
+              .as_ref()
+              .map_or(false, |err| !is_fatal_connect_error(err))
+          {
+            if let Some(ref tx_mon) = monitor_tx {
+              let event = SocketEvent::ConnectDelayed {
+                endpoint: endpoint_uri_clone.clone(),
+                error_msg: format!("{}", final_error_for_actor_stop.as_ref().unwrap()),
+              };
+              let tx_clone = tx_mon.clone();
+              tokio::spawn(async move {
+                let _ = tx_clone.send(event).await;
+              });
+            }
+          }
+        }
+      }
+
+      if let Some(ref err) = final_error_for_actor_stop {
+        if matches!(err, ZmqError::Internal(s) if s.contains("shutdown") || s.contains("preempted")) {
+          break 'retry_loop;
         }
         if initial_reconnect_ivl_opt == Some(Duration::ZERO) {
-          // ZMQ_RECONNECT_IVL=0
-          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "RECONNECT_IVL=0 and connect attempt failed. Stopping.");
-          break;
+          break 'retry_loop;
         }
-        if is_fatal_connect_error(last_attempt_error.as_ref().unwrap()) {
-          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Fatal connect error. Stopping attempts.");
-          break;
+        if is_fatal_connect_error(err) {
+          break 'retry_loop;
         }
-        // If not shutdown, not ZMQ_RECONNECT_IVL=0, and not fatal, loop will continue for retry.
       }
+    } // End of 'retry_loop
 
-      // 4. If stream established and configured, create Session/Engine
-      if let Some(fully_configured_stream) = established_stream_after_options {
-        let peer_addr_str = fully_configured_stream
-          .peer_addr()
-          .map(|a| a.to_string())
-          .unwrap_or_else(|_| "unknown_peer".to_string());
-        tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, peer = %peer_addr_str, "TCP Connect and option application successful (attempt #{})", attempt_count);
-
-        if let Some(ref tx) = monitor_tx {
-          let event = SocketEvent::Connected {
-            endpoint: endpoint_uri_clone.clone(),
-            peer_addr: peer_addr_str.clone(),
-          };
-          let tx_clone = tx.clone();
-          let ep_clone = endpoint_uri_clone.clone();
-          tokio::spawn(async move {
-            if tx_clone.send(event).await.is_err() {
-              tracing::warn!("Failed to send Connected monitor event from connecter {}", ep_clone);
-            }
-          });
-        }
-
-        let session_handle_id = self
-          .context_handle_source
-          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let engine_handle_id = self
-          .context_handle_source
-          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let connection_specific_uri = format!("tcp://{}", peer_addr_str);
-
-        let (session_cmd_mailbox, session_task_join_handle) = SessionBase::create_and_spawn(
-          session_handle_id,
-          connection_specific_uri.clone(),
-          monitor_tx.clone(),
-          self.context.clone(),
-          self.parent_socket_id,
-        );
-        let (engine_mailbox, engine_task_join_handle_inner) = create_and_spawn_tcp_engine(
-          engine_handle_id,
-          session_cmd_mailbox.clone(),
-          fully_configured_stream,
-          self.context_options.clone(),
-          false,
-          &self.context,
-          session_handle_id,
-        );
-        let attach_cmd = Command::Attach {
-          engine_mailbox,
-          engine_handle: Some(engine_handle_id),
-          engine_task_handle: Some(engine_task_join_handle_inner),
-        };
-
-        if session_cmd_mailbox.send(attach_cmd).await.is_err() {
-          tracing::error!("Failed to attach engine to new session for {}", endpoint_uri_clone);
-          last_attempt_error = Some(ZmqError::Internal("Failed to attach engine to session".into()));
-          if !session_task_join_handle.is_finished() {
-            session_task_join_handle.abort();
-          }
-        } else {
-          let event = SystemEvent::NewConnectionEstablished {
-            parent_core_id: self.parent_socket_id,
-            endpoint_uri: connection_specific_uri.clone(),
-            target_endpoint_uri: endpoint_uri_clone.clone(),
-            session_mailbox: session_cmd_mailbox,
-            session_handle_id,
-            session_task_id: session_task_join_handle.id(),
-          };
-          if self.context.event_bus().publish(event).is_err() {
-            tracing::error!("Failed to publish NewConnectionEstablished for {}", endpoint_uri_clone);
-            last_attempt_error = Some(ZmqError::Internal("Failed to publish NewConnectionEstablished".into()));
-            if !session_task_join_handle.is_finished() {
-              session_task_join_handle.abort();
-            }
-          } else {
-            last_attempt_error = None; // Clear previous attempt's error, successfully connected.
-          }
-        }
-        break; // Connection successful or critical setup error post-connect, exit loop.
-      }
-      // If established_stream_after_options is None, means connect or option apply failed,
-      // and loop will continue if not fatal/shutdown/reconnect_ivl=0.
-    } // End of loop for retries
-
-    tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter actor finished connection loop.");
-
-    // If loop exited due to an error (last_attempt_error is Some),
-    // publish ConnectionAttemptFailed. If it's None, it means success.
-    if let Some(ref err) = last_attempt_error {
-      // Only publish ConnectionAttemptFailed system event if the error isn't an internal shutdown signal
-      if !matches!(err, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus closed")) {
-        let event_system = SystemEvent::ConnectionAttemptFailed {
+    // ... (final error publishing and actor stopping logic as before) ...
+    if let Some(ref err) = final_error_for_actor_stop {
+      if !matches!(err, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus closed") || s.contains("preempted"))
+      {
+        // Added preempted
+        let _ = self.context.event_bus().publish(SystemEvent::ConnectionAttemptFailed {
           parent_core_id: self.parent_socket_id,
           target_endpoint_uri: endpoint_uri_clone.clone(),
           error_msg: err.to_string(),
-        };
-        if self.context.event_bus().publish(event_system).is_err() {
-          tracing::warn!(
-            handle = connecter_handle,
-            "Failed to publish final ConnectionAttemptFailed system event for {}",
-            endpoint_uri_clone
-          );
-        }
-
-        // Also send to monitor if it was a connection failure (not just internal shutdown)
-        if let Some(ref tx) = monitor_tx {
+        });
+        if let Some(ref tx_mon) = monitor_tx {
           let event_monitor = SocketEvent::ConnectFailed {
             endpoint: endpoint_uri_clone.clone(),
             error_msg: err.to_string(),
           };
-          let tx_clone = tx.clone();
-          let endpoint_uri_log_clone_final_fail = endpoint_uri_clone.clone();
-          let error_msg_clone_final_fail = err.to_string();
-
-          tokio::spawn(async move {
-            if let Err(e_send) = tx_clone.send(event_monitor).await {
-              tracing::warn!(
-                endpoint = %endpoint_uri_log_clone_final_fail,
-                original_error = %error_msg_clone_final_fail,
-                error = ?e_send,
-                "Failed to send final ConnectFailed monitor event"
-              );
-            }
-          });
+          let _ = tx_mon.try_send(event_monitor);
         }
       }
     }
-
     self.context.publish_actor_stopping(
       connecter_handle,
       connecter_actor_type,
       Some(endpoint_uri_clone),
-      last_attempt_error, // Use the error from the last failed attempt or None if successful
+      final_error_for_actor_stop,
     );
     tracing::info!(handle = connecter_handle, uri = %self.endpoint, "TCP Connecter actor fully stopped.");
   }
 }
 
-// This helper needs to handle both tokio::net::TcpStream and tokio_uring::net::TcpStream
-fn apply_tcp_socket_options(stream: &CurrentTcpStream, config: &TcpTransportConfig) -> Result<(), ZmqError> {
-  #[cfg(not(feature = "io-uring"))]
-  {
-    // Standard Tokio stream
-    let socket_ref = SockRef::from(stream);
-    socket_ref.set_nodelay(config.tcp_nodelay)?;
-    tracing::trace!(nodelay = config.tcp_nodelay, "Applied TCP_NODELAY (std tokio)");
+// Placeholder functions for IDs, replace with actual ID generation
+fn engine_handle_id_placeholder() -> usize {
+  0
+}
+fn session_handle_id_placeholder() -> usize {
+  0
+}
 
-    if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
-      let mut keepalive = TcpKeepalive::new();
-      if let Some(time) = config.keepalive_time {
-        keepalive = keepalive.with_time(time);
-      }
-      #[cfg(any(unix, target_os = "windows"))]
-      if let Some(interval) = config.keepalive_interval {
-        keepalive = keepalive.with_interval(interval);
-      }
-      #[cfg(not(any(unix, target_os = "windows")))]
-      if config.keepalive_interval.is_some() {
-        tracing::warn!("TCP Keepalive Interval not supported on this platform for std tokio stream post-connect.");
-      }
-      #[cfg(unix)]
-      if let Some(count) = config.keepalive_count {
-        keepalive = keepalive.with_retries(count);
-      }
-      #[cfg(not(unix))]
-      if config.keepalive_count.is_some() {
-        tracing::warn!("TCP Keepalive Count not supported on this platform for std tokio stream post-connect.");
-      }
-      socket_ref.set_tcp_keepalive(&keepalive)?;
-      tracing::debug!("Applied TCP Keepalive settings (std tokio): {:?}", keepalive);
-    } else {
-      tracing::trace!("TCP Keepalive settings not configured (std tokio), using system defaults.");
-    }
+fn publish_new_conn_event(
+  context: &Context,
+  parent_core_id: usize,
+  endpoint_uri: &str,
+  target_endpoint_uri: &str,
+  session_mailbox: MailboxSender,
+  session_handle_id: usize,
+) {
+  let event = SystemEvent::NewConnectionEstablished {
+    parent_core_id,
+    endpoint_uri: endpoint_uri.to_string(),
+    target_endpoint_uri: target_endpoint_uri.to_string(),
+    session_mailbox,
+    session_handle_id,
+    session_task_id: tokio::task::spawn(async {}).id(), // Dummy
+  };
+  if context.event_bus().publish(event).is_err() {
+    tracing::error!("Failed to publish NewConnectionEstablished for {}", endpoint_uri);
   }
-  #[cfg(feature = "io-uring")]
-  {
-    // tokio-uring stream (stream is &tokio_uring::net::TcpStream)
-    // If TcpConnecter configured socket2::Socket before connecting and converting to_std,
-    // then most options are already set. This function might become a no-op for
-    // client-side uring streams, or only verify/log.
-    // For accepted streams (listener side), we might need to set NODELAY here if not inherited.
-    // Let's assume NODELAY also needs to be set if possible.
-    use std::os::fd::AsRawFd; // Or AsFd for more modern socket2
-                              // This block is inherently unsafe if not careful with fd lifetime.
-                              // However, stream is alive for the duration of this call.
-    let fd = stream.as_raw_fd();
-    match unsafe { SockRef::from_fd(fd) } {
-      Ok(socket_ref) => {
-        socket_ref.set_nodelay(config.tcp_nodelay)?;
-        tracing::trace!(nodelay = config.tcp_nodelay, "Applied TCP_NODELAY (io_uring via fd)");
+}
 
-        if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
-          // Keepalive logic is identical once SockRef is obtained
-          let mut keepalive = TcpKeepalive::new();
-          if let Some(time) = config.keepalive_time {
-            keepalive = keepalive.with_time(time);
-          }
-          #[cfg(any(unix, target_os = "windows"))]
-          if let Some(interval) = config.keepalive_interval {
-            keepalive = keepalive.with_interval(interval);
-          }
-          #[cfg(unix)]
-          if let Some(count) = config.keepalive_count {
-            keepalive = keepalive.with_retries(count);
-          }
-          socket_ref.set_tcp_keepalive(&keepalive)?;
-          tracing::debug!("Applied TCP Keepalive settings (io_uring via fd): {:?}", keepalive);
-        } else {
-          tracing::trace!("TCP Keepalive settings not configured (io_uring), using system defaults post-connect.");
-        }
-      }
-      Err(e) => {
-        tracing::error!(error = %e, "Failed to get SockRef from io_uring stream's FD. Cannot set post-connect options.");
-        // Not returning error here, as connect might have succeeded with defaults
-      }
+// Helper traits for generic accept loop
+#[async_trait::async_trait]
+trait AcceptStream {
+  type Stream: AcceptedStream + Send + Sync + 'static;
+  async fn accept_stream(&self) -> io::Result<(Self::Stream, StdSocketAddr)>;
+}
+
+#[cfg(feature = "io-uring")]
+#[async_trait::async_trait]
+impl AcceptStream for underlying_uring_net::UringTcpListener {
+  type Stream = underlying_uring_net::UringTcpStream;
+  async fn accept_stream(&self) -> io::Result<(Self::Stream, StdSocketAddr)> {
+    self.accept().await // UringTcpListener::accept()
+  }
+}
+
+#[async_trait::async_trait]
+impl AcceptStream for underlying_std_net::TcpListener {
+  type Stream = underlying_std_net::TcpStream;
+  async fn accept_stream(&self) -> io::Result<(Self::Stream, StdSocketAddr)> {
+    self.accept().await // tokio::net::TcpListener::accept()
+  }
+}
+
+// Helper trait for converting accepted stream to std or tokio variants
+trait AcceptedStream {
+  fn into_std_tcp_stream(self) -> io::Result<std::net::TcpStream>;
+  fn into_tokio_tcp_stream(self) -> io::Result<tokio::net::TcpStream>;
+}
+
+#[cfg(feature = "io-uring")]
+impl AcceptedStream for underlying_uring_net::UringTcpStream {
+  fn into_std_tcp_stream(self) -> io::Result<std::net::TcpStream> {
+    self.into_std()
+  }
+  fn into_tokio_tcp_stream(self) -> io::Result<tokio::net::TcpStream> {
+    self.into_std().and_then(tokio::net::TcpStream::from_std)
+  }
+}
+
+impl AcceptedStream for underlying_std_net::TcpStream {
+  fn into_std_tcp_stream(self) -> io::Result<std::net::TcpStream> {
+    self.into_std()
+  }
+  fn into_tokio_tcp_stream(self) -> io::Result<tokio::net::TcpStream> {
+    Ok(self) // Already a tokio::net::TcpStream
+  }
+}
+
+fn apply_socket2_options_pre_connect(socket: &socket2::Socket, config: &TcpTransportConfig) -> Result<(), ZmqError> {
+  socket.set_nodelay(config.tcp_nodelay).map_err(ZmqError::from)?;
+  if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
+    let mut keepalive = TcpKeepalive::new();
+    if let Some(time) = config.keepalive_time {
+      keepalive = keepalive.with_time(time);
     }
+    #[cfg(any(unix, target_os = "windows"))]
+    if let Some(interval) = config.keepalive_interval {
+      keepalive = keepalive.with_interval(interval);
+    }
+    #[cfg(unix)]
+    if let Some(count) = config.keepalive_count {
+      keepalive = keepalive.with_retries(count);
+    }
+    socket.set_tcp_keepalive(&keepalive).map_err(ZmqError::from)?;
   }
   Ok(())
 }
 
+fn apply_tcp_socket_options_to_tokio(
+  stream: &tokio::net::TcpStream,
+  config: &TcpTransportConfig,
+) -> Result<(), ZmqError> {
+  let socket_ref = SockRef::from(stream); // Safe for tokio::net::TcpStream
+  socket_ref.set_nodelay(config.tcp_nodelay)?;
+  if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
+    let mut keepalive = TcpKeepalive::new();
+    if let Some(time) = config.keepalive_time {
+      keepalive = keepalive.with_time(time);
+    }
+    #[cfg(any(unix, target_os = "windows"))] // Tokio TcpStream has these capabilities
+    if let Some(interval) = config.keepalive_interval {
+      keepalive = keepalive.with_interval(interval);
+    }
+    #[cfg(unix)]
+    if let Some(count) = config.keepalive_count {
+      keepalive = keepalive.with_retries(count);
+    }
+    socket_ref.set_tcp_keepalive(&keepalive)?;
+  }
+  Ok(())
+}
+
+fn apply_tcp_socket_options_to_std(stream: &std::net::TcpStream, config: &TcpTransportConfig) -> Result<(), ZmqError> {
+  let socket_ref = SockRef::from(stream); // Safe for std::net::TcpStream
+  socket_ref.set_nodelay(config.tcp_nodelay)?;
+  if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
+    let mut keepalive = TcpKeepalive::new();
+    if let Some(time) = config.keepalive_time {
+      keepalive = keepalive.with_time(time);
+    }
+    #[cfg(any(unix, target_os = "windows"))]
+    if let Some(interval) = config.keepalive_interval {
+      keepalive = keepalive.with_interval(interval);
+    }
+    #[cfg(unix)]
+    if let Some(count) = config.keepalive_count {
+      keepalive = keepalive.with_retries(count);
+    }
+    socket_ref.set_tcp_keepalive(&keepalive)?;
+  }
+  Ok(())
+}
+
+// Helper Downcast Arc Any for stream_or_app_rx variants
+// This is a bit of a hack. A better way would be an enum for stream_or_app_rx.
+trait DynamicDowncast {
+  #[cfg(feature = "io-uring")]
+  fn downcast_arc_receiver(self) -> Option<async_channel::Receiver<AppToUringEngineCmd>>;
+  fn downcast_arc_stream(self) -> Option<underlying_std_net::TcpStream>;
+}
+
+impl DynamicDowncast for Box<dyn std::any::Any + Send> {
+  #[cfg(feature = "io-uring")]
+  fn downcast_arc_receiver(self) -> Option<async_channel::Receiver<AppToUringEngineCmd>> {
+    self
+      .downcast::<async_channel::Receiver<AppToUringEngineCmd>>()
+      .ok()
+      .map(|boxed_val| *boxed_val)
+  }
+  fn downcast_arc_stream(self) -> Option<underlying_std_net::TcpStream> {
+    self
+      .downcast::<underlying_std_net::TcpStream>()
+      .ok()
+      .map(|boxed_val| *boxed_val)
+  }
+}
+
+// ... (is_fatal_accept_error, is_fatal_connect_error, ZmtpEngineConfig From<&SocketOptions> remain) ...
 fn is_fatal_accept_error(e: &io::Error) -> bool {
-  // Renamed from is_fatal
   matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe)
 }
 
 fn is_fatal_connect_error(e: &ZmqError) -> bool {
-  // Takes ZmqError
   match e {
     ZmqError::IoError { kind, .. } => {
       matches!(
         kind,
         io::ErrorKind::AddrNotAvailable |
-                io::ErrorKind::AddrInUse | // Though less common for connect
-                io::ErrorKind::InvalidInput |
-                io::ErrorKind::PermissionDenied
+        io::ErrorKind::AddrInUse |
+        io::ErrorKind::InvalidInput |
+        io::ErrorKind::PermissionDenied |
+        io::ErrorKind::HostUnreachable | // Added based on common fatal connect errors
+        io::ErrorKind::NetworkUnreachable // Added
       )
     }
-    // Other ZmqError variants that might be considered fatal for connect attempts
     ZmqError::InvalidEndpoint(_) => true,
     ZmqError::UnsupportedTransport(_) => true,
-    _ => false, // Default to not fatal for other ZmqError types
+    ZmqError::ConnectionRefused(_) => true, // Explicitly fatal
+    _ => false,
   }
 }
 
-pub(crate) fn create_and_spawn_tcp_engine(
-  engine_handle_id: usize,
-  session_cmd_mailbox: MailboxSender,
-  tcp_stream: CurrentTcpStream,
-  socket_options: Arc<SocketOptions>,
-  is_server_role: bool,
-  context: &Context,
-  session_handle_id: usize,
-) -> (MailboxSender, JoinHandle<()>) {
-  let engine_actor_type = ActorType::Engine;
-  let (engine_command_mailbox, engine_task_join_handle) = create_engine_task_internal(
-    engine_handle_id,
-    session_cmd_mailbox,
-    tcp_stream,
-    socket_options,
-    is_server_role,
-    context,
-    session_handle_id,
-  );
-  context.publish_actor_started(engine_handle_id, engine_actor_type, Some(session_handle_id));
-  (engine_command_mailbox, engine_task_join_handle)
+impl From<&SocketOptions> for ZmtpEngineConfig {
+  fn from(options: &SocketOptions) -> Self {
+    ZmtpEngineConfig {
+      routing_id: options.routing_id.clone(),
+      socket_type_name: options.socket_type_name.clone(),
+      heartbeat_ivl: options.heartbeat_ivl,
+      heartbeat_timeout: options.heartbeat_timeout,
+      use_send_zerocopy: options.io_uring_send_zerocopy,
+      use_recv_multishot: options.io_uring_recv_multishot,
+      use_cork: options.tcp_cork,
+      #[cfg(feature = "io-uring")]
+      recv_multishot_buffer_count: options.io_uring_recv_buffer_count,
+      #[cfg(feature = "io-uring")]
+      recv_multishot_buffer_capacity: options.io_uring_recv_buffer_size,
+    }
+  }
 }
+
+// Placeholder type for the `connect_logic_result` in `TcpConnecter::run_connect_loop`
+// This helps make the Ok variant consistent before downcasting or specific handling.
+type ConnectLogicOutputType = (
+  usize,                         // session_handle_id
+  usize,                         // engine_handle_id
+  EngineConnectionType,          // engine_conn_type_template
+  Option<OwnedFd>,               // opt_owned_fd (for uring)
+  Box<dyn std::any::Any + Send>, // stream_or_app_rx (boxed tokio::net::TcpStream or async_channel::Receiver<AppToUringEngineCmd>)
+  String,                        // connection_specific_uri
+);

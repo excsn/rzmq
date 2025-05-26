@@ -4,14 +4,12 @@
 
 use crate::runtime::{mailbox, MailboxSender};
 use crate::socket::options::{SocketOptions, ZmtpEngineConfig};
-#[cfg(feature = "io-uring")]
-use crate::socket::{DEFAULT_IO_URING_RECV_BUFFER_COUNT, DEFAULT_IO_URING_RECV_BUFFER_SIZE};
 use crate::Context;
 use std::sync::Arc;
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
-use super::core::ZmtpEngineCore;
+use super::core::ZmtpEngineCoreStd;
 
 /// Creates and spawns the ZMTP Engine actor task for an IPC stream.
 /// Returns the MailboxSender for the spawned engine task and its JoinHandle.
@@ -36,24 +34,16 @@ pub(crate) fn create_and_spawn_ipc_engine(
     use_recv_multishot: false,
     use_cork: false,
     #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_count: if options.io_uring_recv_multishot {
-      options.io_uring_recv_buffer_count // Use value from SocketOptions if toggle is on
-    } else {
-      DEFAULT_IO_URING_RECV_BUFFER_COUNT // Else, use default (won't be used by engine logic if toggle is off)
-    },
+    recv_multishot_buffer_count: options.io_uring_recv_buffer_count,
     #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_capacity: if options.io_uring_recv_multishot {
-      options.io_uring_recv_buffer_size // Use value from SocketOptions if toggle is on
-    } else {
-      DEFAULT_IO_URING_RECV_BUFFER_SIZE // Else, use default
-    },
+    recv_multishot_buffer_capacity: options.io_uring_recv_buffer_size,
   };
 
   eprintln!(
     "[DEBUG ENGINE {} PRE-NEW] Creating ZmtpEngineCore, is_server={}",
     handle, is_server
   );
-  let core = ZmtpEngineCore::<UnixStream>::new(
+  let core = ZmtpEngineCoreStd::<UnixStream>::new(
     handle,
     session_mailbox,
     rx, // Pass the receiving end of the engine's mailbox

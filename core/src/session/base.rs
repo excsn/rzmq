@@ -2,9 +2,12 @@
 
 use crate::context::Context;
 use crate::error::ZmqError;
-use crate::runtime::{mailbox, ActorType, Command, MailboxReceiver, MailboxSender, SystemEvent};
+use crate::runtime::{mailbox, ActorType, Command, EngineConnectionType, MailboxReceiver, MailboxSender, SystemEvent};
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::{Blob, Msg};
+
+#[cfg(feature = "io-uring")]
+use crate::runtime::AppToUringEngineCmd;
 
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use std::time::Duration;
@@ -15,7 +18,7 @@ use tokio::task::JoinHandle;
 pub(crate) struct SessionBase {
   handle: usize,
   endpoint_uri: String,
-  engine_mailbox: Option<MailboxSender>,
+  engine_connection: Option<EngineConnectionType>,
   engine_task_handle: Option<JoinHandle<()>>,
   mailbox_receiver: MailboxReceiver,
   rx_from_core: Option<AsyncReceiver<Msg>>,
@@ -43,7 +46,7 @@ impl SessionBase {
     let session = SessionBase {
       handle,
       endpoint_uri: endpoint_uri.clone(), // Clone here if original endpoint_uri is needed later
-      engine_mailbox: None,
+      engine_connection: None,
       engine_task_handle: None,
       mailbox_receiver: rx,
       rx_from_core: None,
@@ -114,9 +117,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
               Ok(SystemEvent::ContextTerminating) => {
                 tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Session received ContextTerminating event, stopping engine.");
                 if !received_shutdown_signal {
-                  if let Some(engine_mb) = self.engine_mailbox.take() {
-                    let _ = engine_mb.send(Command::Stop).await;
-                  }
+                  self.signal_engine_stop().await;
                   self.engine_task_handle = None;
                   received_shutdown_signal = true;
                 }
@@ -124,9 +125,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
               Ok(SystemEvent::SocketClosing{ socket_id }) if socket_id == self.parent_socket_id => {
                 tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, parent_id = self.parent_socket_id, "Session received SocketClosing for parent, stopping engine.");
                 if !received_shutdown_signal {
-                  if let Some(engine_mb) = self.engine_mailbox.take() {
-                    let _ = engine_mb.send(Command::Stop).await;
-                  }
+                  self.signal_engine_stop().await;
                   self.engine_task_handle = None;
                   received_shutdown_signal = true;
                 }
@@ -135,7 +134,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
               Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, skipped = n, "System event bus lagged for Session!");
                 if !received_shutdown_signal {
-                  if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                  self.signal_engine_stop().await;
                   self.engine_task_handle = None;
                   received_shutdown_signal = true;
                   error_to_report_on_stop = Some(ZmqError::Internal("Session event bus lagged".into()));
@@ -145,7 +144,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
               Err(broadcast::error::RecvError::Closed) => {
                 tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "System event bus closed unexpectedly for Session!");
                 if !received_shutdown_signal {
-                  if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                  self.signal_engine_stop().await;
                   self.engine_task_handle = None;
                   received_shutdown_signal = true;
                   error_to_report_on_stop = Some(ZmqError::Internal("Session event bus closed".into()));
@@ -161,9 +160,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
               Err(_) => {
                 tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Session command mailbox closed, initiating shutdown.");
                 if !received_shutdown_signal {
-                  if let Some(engine_mb) = self.engine_mailbox.take() {
-                    let _ = engine_mb.send(Command::Stop).await;
-                  }
+                  self.signal_engine_stop().await;
                   self.engine_task_handle = None;
                   received_shutdown_signal = true;
                   if error_to_report_on_stop.is_none() {
@@ -177,15 +174,19 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
             tracing::trace!(handle = session_handle, uri = %endpoint_uri_clone, command = ?command.variant_name(), "Session received command");
 
             match command {
-              Command::Attach { engine_mailbox, engine_handle: _, engine_task_handle } => {
+              Command::Attach { connection, engine_handle: _, engine_task_handle } => {
                 tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session received Attach (Engine)");
-                if self.engine_mailbox.is_some() {
+                if self.engine_connection.is_some() {
                   tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Session received Attach but engine already attached! Aborting new engine.");
                   if let Some(h) = engine_task_handle { h.abort(); }
                   continue;
                 }
-                self.engine_mailbox = Some(engine_mailbox);
-                self.engine_task_handle = engine_task_handle;
+                self.engine_connection = Some(connection);
+                if matches!(self.engine_connection, Some(EngineConnectionType::Standard { .. })) {
+                  self.engine_task_handle = engine_task_handle;
+                } else {
+                  self.engine_task_handle = None;
+                }
               }
               Command::AttachPipe { rx_from_core, tx_to_core, pipe_read_id, pipe_write_id } => {
                 tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, pipe_read_id, pipe_write_id, "Session received AttachPipe");
@@ -202,10 +203,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
               Command::Stop => {
                 tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Session received Stop command");
                 if !received_shutdown_signal {
-                  if let Some(engine_mb) = self.engine_mailbox.take() {
-                    tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session sending Stop to Engine");
-                    let _ = engine_mb.send(Command::Stop).await;
-                  }
+                  self.signal_engine_stop().await;
                   self.engine_task_handle = None;
                   received_shutdown_signal = true;
                 }
@@ -217,7 +215,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
                     if tx.send(msg).await.is_err() {
                       tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Error sending message to core pipe. Stopping session.");
                       if !received_shutdown_signal {
-                        if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                  self.signal_engine_stop().await;
                         self.engine_task_handle = None;
                         received_shutdown_signal = true;
                         error_to_report_on_stop = Some(ZmqError::Internal("Session failed to send to core pipe".into()));
@@ -227,7 +225,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
                   } else {
                     tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Core pipe sender (tx_to_core) is None when receiving EnginePushCmd! State inconsistency.");
                     if !received_shutdown_signal {
-                      if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                  self.signal_engine_stop().await;
                       self.engine_task_handle = None;
                       received_shutdown_signal = true;
                       error_to_report_on_stop = Some(ZmqError::Internal("Session missing core pipe sender".into()));
@@ -267,9 +265,11 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
               }
               Command::EngineStopped => {
                 tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session received EngineStopped signal");
+
                 _engine_stopped_cleanly = true;
                 self.engine_ready = false;
-                self.engine_mailbox = None;
+                self.engine_connection = None;
+
                 if received_shutdown_signal {
                   tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Engine stopped cleanly after session shutdown signal. Session will now stop.");
                   break;
@@ -294,7 +294,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
                 }
                 if !received_shutdown_signal {
                   if let Some(engine_handle) = self.engine_task_handle.take() { engine_handle.abort(); }
-                  self.engine_mailbox = None;
+                  self.engine_connection = None;
                   received_shutdown_signal = true;
                 }
                 break;
@@ -307,35 +307,23 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
             tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session polled rx_from_core branch.");
             match msg_result {
               Ok(msg) => {
-                if let Some(ref engine_mb) = self.engine_mailbox {
-                  if engine_mb.send(Command::SessionPushCmd { msg }).await.is_err() {
-                    tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Failed to send message to engine, stopping session.");
+                if let Err(e) = self.send_msg_to_engine(msg).await {
+                    tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Failed to send message to engine (error: {:?}), stopping session.", e);
                     if !received_shutdown_signal {
-                      self.engine_mailbox = None;
-                      if let Some(h) = self.engine_task_handle.take() { h.abort(); }
-                      received_shutdown_signal = true;
-                      if error_to_report_on_stop.is_none() {
-                        error_to_report_on_stop = Some(ZmqError::Internal("Session failed to send to engine".into()));
-                      }
+                        self.engine_connection = None;
+                        if let Some(h) = self.engine_task_handle.take() { h.abort(); } // Abort std engine task
+                        received_shutdown_signal = true;
+                        if error_to_report_on_stop.is_none() {
+                            error_to_report_on_stop = Some(ZmqError::Internal("Session failed to send to engine".into()));
+                        }
                     }
                     break;
-                  }
-                } else {
-                  tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Engine mailbox gone when message received from core pipe, dropping message. Initiating shutdown.");
-                  if !received_shutdown_signal {
-                    self.engine_task_handle = None;
-                    received_shutdown_signal = true;
-                    if error_to_report_on_stop.is_none() {
-                        error_to_report_on_stop = Some(ZmqError::Internal("Engine mailbox missing during core pipe read".into()));
-                    }
-                  }
-                  break;
                 }
               }
               Err(_) => {
                 tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Pipe from SocketCore closed, stopping session.");
                 if !received_shutdown_signal {
-                  if let Some(engine_mb) = self.engine_mailbox.take() { let _ = engine_mb.send(Command::Stop).await; }
+                  self.signal_engine_stop().await;
                   self.engine_task_handle = None;
                   received_shutdown_signal = true;
                   if error_to_report_on_stop.is_none() {
@@ -382,5 +370,47 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
       error_to_report_on_stop,
     );
     tracing::info!(handle = session_handle, uri = %self.endpoint_uri, "SessionBase actor fully stopped.");
+  }
+
+  async fn signal_engine_stop(&mut self) {
+    match self.engine_connection.take() {
+      // take() clears self.engine_connection
+      Some(EngineConnectionType::Standard { engine_mailbox }) => {
+        tracing::debug!(handle = self.handle, "Session signaling Stop to Standard Engine.");
+        let _ = engine_mailbox.send(Command::Stop).await;
+      }
+      #[cfg(feature = "io-uring")]
+      Some(EngineConnectionType::Uring { app_to_engine_cmd_tx }) => {
+        tracing::debug!(handle = self.handle, "Session signaling Stop to Uring Engine.");
+        let _ = app_to_engine_cmd_tx.send(AppToUringEngineCmd::Stop).await;
+      }
+      None => {
+        tracing::trace!(
+          handle = self.handle,
+          "Session signal_engine_stop: No engine connection to signal."
+        );
+      }
+    }
+  }
+
+  async fn send_msg_to_engine(&self, msg: Msg) -> Result<(), ZmqError> {
+    match &self.engine_connection {
+      Some(EngineConnectionType::Standard { engine_mailbox }) => engine_mailbox
+        .send(Command::SessionPushCmd { msg })
+        .await
+        .map_err(|_| ZmqError::Internal("Std Engine mailbox closed for SessionPushCmd".into())),
+      #[cfg(feature = "io-uring")]
+      Some(EngineConnectionType::Uring { app_to_engine_cmd_tx }) => app_to_engine_cmd_tx
+        .send(AppToUringEngineCmd::SendMsg(msg))
+        .await
+        .map_err(|_| ZmqError::Internal("Uring Engine channel closed for SendMsg".into())),
+      None => {
+        tracing::warn!(
+          handle = self.handle,
+          "send_msg_to_engine: No engine connection, dropping message."
+        );
+        Err(ZmqError::InvalidState("No engine connected".into()))
+      }
+    }
   }
 }

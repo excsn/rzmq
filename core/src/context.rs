@@ -1,14 +1,7 @@
-// src/context.rs
-
 use crate::error::ZmqError;
-use crate::runtime::{
-  ActorType,
-  EventBus,
-  MailboxSender, 
-  SystemEvent,
-  WaitGroup,
-  DEFAULT_MAILBOX_CAPACITY,
-};
+#[cfg(feature = "io-uring")]
+use crate::runtime::uring_runtime;
+use crate::runtime::{ActorType, EventBus, MailboxSender, SystemEvent, WaitGroup, DEFAULT_MAILBOX_CAPACITY};
 use crate::socket::{Socket, SocketType}; // For creating and managing Sockets
 
 use std::collections::HashMap;
@@ -248,7 +241,15 @@ impl Context {
     let capacity = actor_mailbox_capacity
       .map(|c| c.max(1)) // Ensure capacity is at least 1
       .unwrap_or(DEFAULT_MAILBOX_CAPACITY);
+
     tracing::debug!(target_capacity = capacity, "Creating new rzmq Context");
+
+    #[cfg(feature = "io-uring")]
+    {
+      tracing::debug!("io-uring feature enabled, ensuring UringRuntimeManager is started.");
+      uring_runtime::ensure_uring_runtime_manager_started();
+    }
+
     Ok(Self {
       inner: Arc::new(ContextInner::new(capacity)),
     })

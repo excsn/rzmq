@@ -1,27 +1,20 @@
-// src/engine/zmtp_tcp.rs
-
 use crate::runtime::{mailbox, MailboxSender};
 use crate::socket::options::{SocketOptions, ZmtpEngineConfig};
-#[cfg(feature = "io-uring")]
-use crate::socket::{DEFAULT_IO_URING_RECV_BUFFER_COUNT, DEFAULT_IO_URING_RECV_BUFFER_SIZE};
 use crate::Context;
 
 use std::sync::Arc;
 
-#[cfg(not(feature = "io-uring"))]
-use tokio::net::TcpStream as CurrentTcpStream;
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-#[cfg(feature = "io-uring")]
-use tokio_uring::net::TcpStream as CurrentTcpStream;
 
-use super::core::ZmtpEngineCore;
+use super::core::ZmtpEngineCoreStd;
 
 /// Creates and spawns the ZMTP Engine actor task for a TCP stream.
 /// Returns the MailboxSender for the spawned engine task and its JoinHandle.
 pub(crate) fn create_and_spawn_tcp_engine(
   handle: usize, // Engine's own handle ID
   session_mailbox: MailboxSender,
-  stream: CurrentTcpStream,
+  stream: TcpStream,
   options: Arc<SocketOptions>,
   is_server: bool,
   context: &Context, // Accept Context reference
@@ -41,21 +34,13 @@ pub(crate) fn create_and_spawn_tcp_engine(
     use_recv_multishot: options.io_uring_recv_multishot,
     use_cork: options.tcp_cork,
     #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_count: if options.io_uring_recv_multishot {
-      options.io_uring_recv_buffer_count // Use value from SocketOptions if toggle is on
-    } else {
-      DEFAULT_IO_URING_RECV_BUFFER_COUNT // Else, use default (won't be used by engine logic if toggle is off)
-    },
+    recv_multishot_buffer_count: options.io_uring_recv_buffer_count,
     #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_capacity: if options.io_uring_recv_multishot {
-      options.io_uring_recv_buffer_size // Use value from SocketOptions if toggle is on
-    } else {
-      DEFAULT_IO_URING_RECV_BUFFER_SIZE // Else, use default
-    },
+    recv_multishot_buffer_capacity: options.io_uring_recv_buffer_size,
   };
 
   // Create the generic core state with TcpStream as the type
-  let core = ZmtpEngineCore::<CurrentTcpStream>::new(
+  let core = ZmtpEngineCoreStd::<TcpStream>::new(
     handle,
     session_mailbox,
     rx, // Pass the receiving end of the engine's mailbox
@@ -65,8 +50,7 @@ pub(crate) fn create_and_spawn_tcp_engine(
     context.clone(), // Pass context clone to the engine core
   );
 
-  // Spawn the generic core loop task
-  let task_handle = tokio::spawn(core.run_loop()); // run_loop consumes core
+  let task_handle = tokio::spawn(core.run_loop());
 
   // Note: ActorStarted event is published by the caller (e.g., Listener/Connecter)
   // immediately after this function returns successfully and the task is known to be spawned.

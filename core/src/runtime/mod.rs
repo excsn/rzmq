@@ -21,6 +21,10 @@ pub use mailbox::DEFAULT_MAILBOX_CAPACITY;
 pub use event_bus::EventBus;
 pub use system_events::{ActorType, SystemEvent};
 
+pub use command::EngineConnectionType;
+#[cfg(feature = "io-uring")]
+pub use crate::engine::uring_core::{AppToUringEngineCmd, UringLaunchInformation};
+
 // Sync Primitives
 pub(crate) use latch::CountDownLatch;
 pub(crate) use waitgroup::WaitGroup;

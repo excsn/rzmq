@@ -6,15 +6,7 @@ use crate::context::Context;
 use crate::engine; // For engine::zmtp_ipc
 use crate::error::ZmqError;
 use crate::runtime::{
-  self,
-  mailbox,
-  ActorDropGuard,
-  ActorType,
-  Command,
-  EventBus,
-  MailboxReceiver,
-  MailboxSender,
-  SystemEvent, // System events for lifecycle management
+  self, mailbox, ActorDropGuard, ActorType, Command, EngineConnectionType, EventBus, MailboxReceiver, MailboxSender, SystemEvent // System events for lifecycle management
 };
 use crate::session::SessionBase; // For spawning Session actors
 use crate::socket::events::{MonitorSender, SocketEvent}; // For emitting monitor events
@@ -363,7 +355,7 @@ impl IpcListener {
 
               // Attach the engine to the session
               let attach_cmd = Command::Attach {
-                engine_mailbox,
+                connection: EngineConnectionType::Standard { engine_mailbox: engine_mailbox },
                 engine_handle: Some(engine_handle_id),
                 engine_task_handle: Some(engine_task_join_handle_inner),
               };
@@ -622,7 +614,8 @@ impl IpcConnecter {
                 false, &self.context, session_handle_id,
               );
               let attach_cmd = Command::Attach {
-                engine_mailbox, engine_handle: Some(engine_handle_id), engine_task_handle: Some(engine_task_join_handle_inner)
+                
+              connection: EngineConnectionType::Standard { engine_mailbox: engine_mailbox }, engine_handle: Some(engine_handle_id), engine_task_handle: Some(engine_task_join_handle_inner)
               };
 
               if session_cmd_mailbox.send(attach_cmd).await.is_err() {

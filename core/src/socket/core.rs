@@ -2242,6 +2242,16 @@ impl SocketCore {
 
     #[cfg(feature = "io-uring")]
     {
+      if option == IO_URING_SESSION_ENABLED {
+        state_g.options.io_uring_session_enabled = options::parse_bool_option(value)?;
+        tracing::debug!(
+          handle = core_arc.handle,
+          "IO_URING_SESSION_ENABLED set to {}",
+          state_g.options.io_uring_session_enabled
+        );
+        return Ok(());
+      }
+
       if option == IO_URING_SNDZEROCOPY {
         state_g.options.io_uring_send_zerocopy = options::parse_bool_option(value)?;
         // Note: This typically affects new engines. Existing engines won't change behavior.
@@ -2406,6 +2416,10 @@ impl SocketCore {
 
     #[cfg(feature = "io-uring")]
     {
+      if option == IO_URING_SESSION_ENABLED {
+        return Ok((state_g.options.io_uring_session_enabled as i32).to_ne_bytes().to_vec());
+      }
+      
       if option == options::IO_URING_SNDZEROCOPY {
         return Ok((state_g.options.io_uring_send_zerocopy as i32).to_ne_bytes().to_vec());
       } else if option == options::IO_URING_RCVMULTISHOT {

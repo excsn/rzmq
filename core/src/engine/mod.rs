@@ -1,9 +1,10 @@
-// src/engine/mod.rs
-
 pub(crate) mod core;
 pub mod zmtp_tcp;
 #[cfg(feature = "ipc")]
 pub mod zmtp_ipc;
+
+#[cfg(feature = "io-uring")]
+pub(crate) mod uring_core;
 #[cfg(feature = "io-uring")]
 mod uring_recv;
 
@@ -38,15 +39,8 @@ pub trait IEngine: Send + Sync + 'static {
 }
 
 /// Trait alias for streams usable by ZMTP engines.
-pub(crate) trait ZmtpStream: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug + 'static {}
+pub(crate) trait ZmtpStdStream: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug + 'static {}
 // Implement the marker trait for Tokio's streams
-impl ZmtpStream for tokio::net::TcpStream {}
+impl ZmtpStdStream for tokio::net::TcpStream {}
 #[cfg(feature = "ipc")]
-impl ZmtpStream for tokio::net::UnixStream {}
-
-#[cfg(feature = "io-uring")]
-impl ZmtpStream for tokio_uring::net::TcpStream {}
-
-// Optional: if you want io_uring for IPC as well (deferred for now)
-// #[cfg(all(feature = "ipc", feature = "io-uring"))]
-// impl ZmtpStream for tokio_uring::net::UnixStream {}
+impl ZmtpStdStream for tokio::net::UnixStream {}

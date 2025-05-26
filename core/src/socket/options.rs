@@ -63,6 +63,8 @@ pub const IO_URING_RECV_BUFFER_COUNT: i32 = 1173;
 #[cfg(feature = "io-uring")]
 pub const IO_URING_RECV_BUFFER_SIZE: i32 = 1174;
 
+pub const IO_URING_SESSION_ENABLED: i32 = 1175;
+
 #[cfg(feature = "io-uring")]
 pub const DEFAULT_IO_URING_RECV_BUFFER_COUNT: usize = 16;
 /// Default size (in bytes) for each buffer in the io_uring multishot receive pool.
@@ -133,6 +135,7 @@ pub(crate) struct SocketOptions {
   pub io_uring_recv_buffer_count: usize,
   #[cfg(feature = "io-uring")]
   pub io_uring_recv_buffer_size: usize,
+  pub io_uring_session_enabled: bool,
 }
 
 impl Default for SocketOptions {
@@ -176,6 +179,7 @@ impl Default for SocketOptions {
       io_uring_recv_buffer_count: DEFAULT_IO_URING_RECV_BUFFER_COUNT,
       #[cfg(feature = "io-uring")]
       io_uring_recv_buffer_size: DEFAULT_IO_URING_RECV_BUFFER_SIZE,
+      io_uring_session_enabled: false,
     }
   }
 }

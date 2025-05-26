@@ -4,10 +4,33 @@ use crate::message::Msg;
 use crate::socket::MonitorSender; // For UserMonitor command
 use crate::{error::ZmqError, Blob}; // Blob for EngineReady, ZmqError for replies
 
+#[cfg(feature = "io-uring")]
+use crate::engine::uring_core::AppToUringEngineCmd;
+use super::mailbox::MailboxSender as SessionBaseCommandSender;
+
 // Using tokio's oneshot for replies within commands.
 // async_channel is used for the mailboxes themselves and for inter-actor pipes.
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use tokio::sync::oneshot;
+
+/// Type alias for the mailbox sender used by actors to send `Command`s.
+/// This is typically cloned and passed around.
+pub type MailboxSender = async_channel::Sender<Command>;
+
+/// Describes how SessionBase connects to its engine.
+#[derive(Debug)]
+pub enum EngineConnectionType {
+  /// Connection to a standard engine running in the main Tokio runtime.
+  Standard {
+    engine_mailbox: SessionBaseCommandSender, // Mailbox to send SessionBaseCommand to std engine
+  },
+  /// Connection to an io_uring engine running in a dedicated runtime.
+  #[cfg(feature = "io-uring")]
+  Uring {
+    // Channel to send specific commands (like SendMsg) to the uring engine.
+    app_to_engine_cmd_tx: async_channel::Sender<AppToUringEngineCmd>,
+  },
+}
 
 /// Defines messages exchanged between actors (Sockets, Sessions, Engines, etc.).
 /// These are primarily for direct, targeted communication, often expecting a reply,
@@ -77,7 +100,7 @@ pub enum Command {
   // --- Session <-> Engine Interaction (Direct commands, not via event bus) ---
   /// Sent from Listener/Connecter (via SocketCore) -> Session to provide Engine details.
   Attach {
-    engine_mailbox: MailboxSender, // The command mailbox for the ZMTP Engine actor.
+    connection: EngineConnectionType,
     engine_handle: Option<usize>,  // Optional unique handle ID of the Engine actor.
     engine_task_handle: Option<tokio::task::JoinHandle<()>>, // Optional JoinHandle for the Engine's task.
   },
@@ -184,7 +207,3 @@ impl Command {
     }
   }
 }
-
-/// Type alias for the mailbox sender used by actors to send `Command`s.
-/// This is typically cloned and passed around.
-pub type MailboxSender = async_channel::Sender<Command>;
