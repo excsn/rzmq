@@ -1,5 +1,3 @@
-// src/engine/zmtp_ipc.rs
-
 #![cfg(feature = "ipc")] // Only compile this file if ipc feature is enabled
 
 use crate::runtime::{mailbox, MailboxSender};
@@ -14,12 +12,12 @@ use super::core::ZmtpEngineCoreStd;
 /// Creates and spawns the ZMTP Engine actor task for an IPC stream.
 /// Returns the MailboxSender for the spawned engine task and its JoinHandle.
 pub(crate) fn create_and_spawn_ipc_engine(
-  handle: usize, // Engine's own handle ID
+  handle: usize,
   session_mailbox: MailboxSender,
-  stream: UnixStream, // Takes UnixStream
+  stream: UnixStream,
   options: Arc<SocketOptions>,
   is_server: bool,
-  context: &Context, // Accept Context reference
+  context: &Context,
   _parent_id: usize, // ID of the parent Session actor
 ) -> (MailboxSender, JoinHandle<()>) {
   let capacity = context.inner().get_actor_mailbox_capacity();

@@ -635,355 +635,176 @@ impl TcpConnecter {
     task_join_handle
   }
 
-  async fn run_connect_loop(self, monitor_tx: Option<MonitorSender>) {
+  async fn run_connect_loop(mut self, monitor_tx: Option<MonitorSender>) { // Added mut self
     let connecter_handle = self.handle;
     let connecter_actor_type = ActorType::Connecter;
     let endpoint_uri_clone = self.endpoint.clone();
-    let mut final_error_for_actor_stop: Option<ZmqError> = None;
+    
+    // This will store the final error that causes the Connecter actor to stop *permanently*.
+    // It remains None if the connecter eventually succeeds or is shut down cleanly by a system event
+    // that is handled within a helper.
+    let mut final_actor_shutdown_reason: Option<ZmqError> = None;
 
     tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "TCP Connecter actor started connection attempts.");
 
+    // --- Start: Initial parameter parsing (target_addr_str, target_socket_addr) ---
     let target_addr_str = match endpoint_uri_clone.strip_prefix("tcp://") {
       Some(addr) => addr.to_string(),
       None => {
-        final_error_for_actor_stop = Some(ZmqError::InvalidEndpoint(endpoint_uri_clone.clone()));
+        final_actor_shutdown_reason = Some(ZmqError::InvalidEndpoint(endpoint_uri_clone.clone()));
+        // No retries possible if endpoint is invalid from the start.
+        // Publish stopping event and return.
         self.context.publish_actor_stopping(
-          connecter_handle,
-          connecter_actor_type,
-          Some(endpoint_uri_clone),
-          final_error_for_actor_stop,
+          connecter_handle, connecter_actor_type, Some(endpoint_uri_clone), final_actor_shutdown_reason.clone(),
         );
-        tracing::error!(handle = connecter_handle, uri = %self.endpoint, "Invalid TCP endpoint format for connecter. Stopping.");
+        tracing::error!(handle = connecter_handle, uri = %self.endpoint, "Invalid TCP endpoint format. Stopping.");
         return;
       }
     };
-
     let target_socket_addr: StdSocketAddr = match target_addr_str.parse() {
       Ok(addr) => addr,
       Err(e) => {
-        final_error_for_actor_stop = Some(ZmqError::InvalidEndpoint(format!(
-          "Failed to parse target address '{}': {}",
-          target_addr_str, e
-        )));
+        final_actor_shutdown_reason = Some(ZmqError::InvalidEndpoint(format!("Failed to parse target address '{}': {}", target_addr_str, e)));
         self.context.publish_actor_stopping(
-          connecter_handle,
-          connecter_actor_type,
-          Some(endpoint_uri_clone),
-          final_error_for_actor_stop,
+          connecter_handle, connecter_actor_type, Some(endpoint_uri_clone), final_actor_shutdown_reason.clone(),
         );
-        tracing::error!(handle = connecter_handle, uri = %self.endpoint, "Failed to parse target TCP address for connecter. Stopping.");
+        tracing::error!(handle = connecter_handle, uri = %self.endpoint, "Failed to parse target TCP address. Stopping.");
         return;
       }
     };
+    // --- End: Initial parameter parsing ---
 
     let initial_reconnect_ivl_opt = self.context_options.reconnect_ivl;
     let mut current_retry_delay_base = initial_reconnect_ivl_opt.unwrap_or(Duration::from_millis(100));
-    if initial_reconnect_ivl_opt == Some(Duration::ZERO) {
-      current_retry_delay_base = Duration::ZERO;
-    }
+    // Handle ZMQ_RECONNECT_IVL=0 correctly: first attempt occurs, then loop breaks if it failed.
+    // This is managed by the conditions at the end of the 'retry_loop'.
+    
     let max_delay_opt = self.context_options.reconnect_ivl_max;
     let mut attempt_count = 0;
     let mut system_event_rx = self.context.event_bus().subscribe();
 
     'retry_loop: loop {
+      // --- 1. Handle Retry Delay (if not the first attempt) ---
       if attempt_count > 0 {
-        if initial_reconnect_ivl_opt == Some(Duration::ZERO) {
-          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Reconnect disabled (RECONNECT_IVL=0) and first attempt failed. Stopping.");
-          break 'retry_loop;
-        }
-        let delay_for_this_retry = current_retry_delay_base;
-        tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, delay = ?delay_for_this_retry, "Waiting before reconnect attempt #{}", attempt_count + 1);
-        if let Some(ref tx) = monitor_tx {
-          let event = SocketEvent::ConnectRetried {
-            endpoint: endpoint_uri_clone.clone(),
-            interval: delay_for_this_retry,
-          };
-          let tx_clone = tx.clone();
-          tokio::spawn(async move {
-            let _ = tx_clone.send(event).await;
-          });
-        }
-        tokio::select! {
-            biased;
-            _ = sleep(delay_for_this_retry) => {},
-            event_result = system_event_rx.recv() => {
-                 match event_result {
-                    Ok(SystemEvent::ContextTerminating) => {
-                        final_error_for_actor_stop = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating".into())); break 'retry_loop;
-                    }
-                    Ok(SystemEvent::SocketClosing{ socket_id: sid }) if sid == self.parent_socket_id => {
-                        final_error_for_actor_stop = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into())); break 'retry_loop;
-                    }
-                    Err(_) => { final_error_for_actor_stop = Some(ZmqError::Internal("Connecter event bus error".into())); break 'retry_loop; }
-                    _ => {}
-                }
+        // If initial_reconnect_ivl_opt was Some(ZERO), this block is correctly skipped after the first failure
+        // because the break condition at the end of the loop would have been met.
+        match self.wait_for_retry_delay(
+            current_retry_delay_base, &mut system_event_rx, &monitor_tx,
+            attempt_count, &endpoint_uri_clone
+        ).await {
+            Ok(()) => { /* Delay completed or non-fatally interrupted */ }
+            Err(fatal_event_err) => { // Fatal system event occurred during delay
+                final_actor_shutdown_reason = Some(fatal_event_err);
+                break 'retry_loop;
             }
         }
-        if final_error_for_actor_stop.is_some() {
-          break 'retry_loop;
-        }
+        // Update delay for next potential retry (if this one fails and is retriable)
         if let Some(md) = max_delay_opt {
-          if md > Duration::ZERO {
-            current_retry_delay_base = (current_retry_delay_base * 2).min(md);
-          }
-        } else if current_retry_delay_base > Duration::ZERO {
-          current_retry_delay_base *= 2;
-        } else if initial_reconnect_ivl_opt.is_none() {
-          current_retry_delay_base = Duration::from_millis(100) * 2;
+          if md > Duration::ZERO { current_retry_delay_base = (current_retry_delay_base * 2).min(md); }
+        } else {
+          if current_retry_delay_base > Duration::ZERO { current_retry_delay_base *= 2; }
+          else if initial_reconnect_ivl_opt.is_none() { current_retry_delay_base = Duration::from_millis(100) * 2; }
         }
       }
       attempt_count += 1;
 
+      // --- 2. Pre-emptive check for fatal system events BEFORE this attempt ---
+      // This check is important if a fatal event arrived while not in an await point of the connecter.
       match system_event_rx.try_recv() {
-        Ok(SystemEvent::ContextTerminating) => {
-          final_error_for_actor_stop = Some(ZmqError::Internal("Connecter shutdown by event pre-attempt".into()));
-          break 'retry_loop;
-        }
-        Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => {
-          final_error_for_actor_stop = Some(ZmqError::Internal(
-            "Connecter shutdown by parent event pre-attempt".into(),
-          ));
-          break 'retry_loop;
-        }
-        Err(broadcast::error::TryRecvError::Closed) => {
-          final_error_for_actor_stop = Some(ZmqError::Internal("Connecter event bus closed pre-attempt".into()));
-          break 'retry_loop;
-        }
-        _ => {}
+          Ok(SystemEvent::ContextTerminating) => { final_actor_shutdown_reason = Some(ZmqError::Internal("Connecter shutdown by ContextTerminating (pre-attempt)".into())); }
+          Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => { final_actor_shutdown_reason = Some(ZmqError::Internal("Connecter shutdown by parent SocketClosing (pre-attempt)".into())); }
+          Err(broadcast::error::TryRecvError::Closed) => { final_actor_shutdown_reason = Some(ZmqError::Internal("Connecter event bus closed (pre-attempt)".into())); }
+          _ => {} // No fatal event, or event queue empty, or non-fatal event.
       }
-      if final_error_for_actor_stop.is_some() {
-        break 'retry_loop;
-      }
+      if final_actor_shutdown_reason.is_some() { break 'retry_loop; }
 
+
+      // --- 3. Perform a Single Connection Attempt ---
       tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Attempting TCP connect #{}", attempt_count);
-      let use_io_uring = self.context_options.io_uring_session_enabled && cfg!(feature = "io-uring");
+      
+      // `try_connect_once` itself handles fatal system events during the connection attempt.
+      let attempt_result = self.try_connect_once(
+          &target_socket_addr, &target_addr_str, &endpoint_uri_clone, &mut system_event_rx
+      ).await;
 
-      let connect_attempt_result: Result<ConnectLogicOutputType, ZmqError> = tokio::select! {
-          biased;
-          event_result = system_event_rx.recv() => {
-              match event_result {
-                  Ok(SystemEvent::ContextTerminating) => Err(ZmqError::Internal("Connecter shutdown during connect by ContextTerminating".into())),
-                  Ok(SystemEvent::SocketClosing{ socket_id: sid }) if sid == self.parent_socket_id => Err(ZmqError::Internal("Connecter shutdown during connect by parent SocketClosing".into())),
-                  Err(_) => Err(ZmqError::Internal("Connecter event bus error during connect".into())),
-                  _ => Err(ZmqError::Internal("Connect attempt preempted by non-critical event, retrying".into())),
-              }
-          }
+      // This variable holds the error specific to *this* connection attempt, if it failed.
+      let mut error_from_this_specific_attempt: Option<ZmqError> = None;
 
-          connect_logic_result = async {
-              if use_io_uring {
-                  #[cfg(feature = "io-uring")] {
-                      let domain = if target_socket_addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
-                      let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
-                      apply_socket2_options_pre_connect(&socket, &self.config)?;
-                      let std_stream = tokio::task::spawn_blocking(move || {
-                          socket.connect(&target_socket_addr.into())?;
-                          socket.into_tcp_stream()
-                      }).await.map_err(|je| ZmqError::Internal(format!("Blocking connect task join error: {}", je)))??;
-                      std_stream.set_nonblocking(true)?;
-                      let owned_fd: OwnedFd = std_stream.into();
-                      let (app_to_engine_tx, app_to_engine_rx) = async_channel::bounded(self.context.inner().get_actor_mailbox_capacity());
-                      let session_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                      let engine_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                      Ok((
-                          session_handle_id,
-                          engine_handle_id,
-                          EngineConnectionType::Uring { app_to_engine_cmd_tx },
-                          Some(owned_fd),
-                          Box::new(app_to_engine_rx) as Box<dyn std::any::Any + Send>,
-                          format!("tcp://{}", target_addr_str)
-                      ))
+      match attempt_result {
+          Ok(connect_output) => {
+              // TCP Connection was successful, now set up session and engine
+              match self.setup_session_and_engine(
+                  connect_output, &monitor_tx, &endpoint_uri_clone
+              ).await {
+                  Ok(()) => { // Full setup successful
+                      final_actor_shutdown_reason = None; // Mark overall success for connecter
                   }
-                  #[cfg(not(feature = "io-uring"))] { unreachable!(); }
-              } else { // Standard path
-                  let std_tokio_stream = underlying_std_net::TcpStream::connect(&target_addr_str).await
-                      .map_err(|e| ZmqError::from_io_endpoint(e, &endpoint_uri_clone))?;
-                  apply_tcp_socket_options_to_tokio(&std_tokio_stream, &self.config)?;
-                  let peer_addr_actual = std_tokio_stream.peer_addr()
-                      .map_err(|e| ZmqError::Internal(format!("Failed to get peer_addr post-connect: {}",e)))?;
-
-                  let session_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                  let engine_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                  // <<< MODIFIED [Correct placeholder type] >>>
-                  let (dummy_engine_tx, _) = async_channel::bounded::<Command>(1);
-                  Ok((
-                      session_handle_id,
-                      engine_handle_id,
-                      EngineConnectionType::Standard { engine_mailbox: dummy_engine_tx }, // Correct type
-                      None,
-                      // <<< MODIFIED [Box the stream for DynamicDowncast] >>>
-                      Box::new(std_tokio_stream) as Box<dyn std::any::Any + Send>,
-                      format!("tcp://{}", peer_addr_actual)
-                  ))
-                  // <<< MODIFIED END >>>
+                  Err(setup_err) => { // Setup after connect failed (e.g., attaching engine)
+                      final_actor_shutdown_reason = Some(setup_err);
+                  }
               }
-          } => connect_logic_result,
-      };
-
-      match connect_attempt_result {
-        Ok((
-          session_handle_id,
-          engine_handle_id,
-          engine_conn_type_template,
-          opt_owned_fd,
-          stream_or_app_rx_boxed,
-          connection_specific_uri,
-        )) => {
-          // ... (Monitor event: Connected) ...
-          if let Some(ref tx_mon) = monitor_tx {
-            let event = SocketEvent::Connected {
-              endpoint: endpoint_uri_clone.clone(),
-              peer_addr: connection_specific_uri.clone(),
-            };
-            let tx_clone = tx_mon.clone();
-            tokio::spawn(async move {
-              let _ = tx_clone.send(event).await;
-            });
+              break 'retry_loop; // Break whether setup succeeded or failed; setup failures are not retried by this loop.
           }
+          Err(attempt_err) => { // Single connection attempt failed
+              error_from_this_specific_attempt = Some(attempt_err.clone()); // Note: clone `attempt_err`
+              tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %attempt_err, "TCP Connect attempt #{} failed", attempt_count);
 
-          let (session_cmd_tx, session_base_task_handle) = SessionBase::create_and_spawn(
-            session_handle_id,
-            connection_specific_uri.clone(),
-            monitor_tx.clone(),
-            self.context.clone(),
-            self.parent_socket_id,
-          );
-
-          let final_engine_conn_type: EngineConnectionType;
-          let mut final_engine_task_handle: Option<JoinHandle<()>> = None;
-
-          match engine_conn_type_template {
-            #[cfg(feature = "io-uring")]
-            EngineConnectionType::Uring { app_to_engine_cmd_tx } => {
-              let app_to_engine_cmd_rx = match stream_or_app_rx_boxed.downcast_arc_receiver() {
-                // downcast_arc_receiver is on Box<dyn Any>
-                Some(rx) => rx,
-                None => {
-                  final_error_for_actor_stop =
-                    Some(ZmqError::Internal("Failed to downcast app_cmd_rx for uring".into()));
-                  session_base_task_handle.abort();
-                  break 'retry_loop;
-                }
-              };
-              let launch_info = UringLaunchInformation {
-                engine_handle_id,
-                owned_fd: opt_owned_fd.expect("OwnedFd missing for uring path"),
-                config: ZmtpEngineConfig::from(&*self.context_options),
-                is_server: false,
-                context_clone: self.context.clone(),
-                session_base_mailbox: session_cmd_tx.clone(),
-                app_to_engine_cmd_rx,
-                parent_session_handle_id: session_handle_id,
-              };
-              match uring_runtime::submit_uring_engine_launch(launch_info) {
-                Ok(true) => {
-                  final_engine_conn_type = EngineConnectionType::Uring { app_to_engine_cmd_tx };
-                }
-                _ => {
-                  final_error_for_actor_stop = Some(ZmqError::Internal("Uring launch submit fail in connecter".into()));
-                  session_base_task_handle.abort();
-                  break 'retry_loop;
-                }
+              // Emit ConnectDelayed only on first actual connection failure if retries are enabled
+              // and the error isn't one that inherently stops the connecter (like a shutdown event).
+              if attempt_count == 1 &&
+                 initial_reconnect_ivl_opt != Some(Duration::ZERO) && // Retries are enabled
+                 !is_fatal_connect_error(&attempt_err) && // Error is retriable
+                 !matches!(&attempt_err, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus error")) // Not a fatal system event
+              {
+                  if let Some(ref tx_mon) = monitor_tx {
+                      let event = SocketEvent::ConnectDelayed {
+                          endpoint: endpoint_uri_clone.clone(),
+                          error_msg: format!("{}", attempt_err),
+                      };
+                      let tx_clone = tx_mon.clone();
+                      tokio::spawn(async move { let _ = tx_clone.send(event).await; });
+                  }
               }
-            }
-            EngineConnectionType::Standard { .. } => {
-              // <<< MODIFIED [Call downcast_arc_stream on the Boxed value] >>>
-              let std_tokio_stream = match stream_or_app_rx_boxed.downcast_arc_stream() {
-                Some(s) => s,
-                None => {
-                  final_error_for_actor_stop =
-                    Some(ZmqError::Internal("Failed to downcast TcpStream for std engine".into()));
-                  session_base_task_handle.abort();
-                  break 'retry_loop;
-                }
-              };
-              // <<< MODIFIED END >>>
-              let (std_engine_mailbox, std_engine_task_handle) = create_and_spawn_tcp_engine(
-                engine_handle_id,
-                session_cmd_tx.clone(),
-                std_tokio_stream,
-                self.context_options.clone(),
-                false,
-                &self.context,
-                session_handle_id,
-              );
-              final_engine_conn_type = EngineConnectionType::Standard {
-                engine_mailbox: std_engine_mailbox,
-              };
-              final_engine_task_handle = Some(std_engine_task_handle);
-            }
-            #[cfg(not(feature = "io-uring"))]
-            _ => {
-              unreachable!("Should be Standard if io-uring is not featured");
-            }
           }
+      } // End match attempt_result
 
-          let attach_cmd = Command::Attach {
-            connection: final_engine_conn_type,
-            engine_handle: Some(engine_handle_id),
-            engine_task_handle: final_engine_task_handle,
-          };
-
-          if session_cmd_tx.send(attach_cmd).await.is_err() {
-            final_error_for_actor_stop = Some(ZmqError::Internal(
-              "Failed to attach engine to session (TCP Connecter)".into(),
-            ));
-            session_base_task_handle.abort();
-          } else {
-            publish_new_conn_event(
-              &self.context,
-              self.parent_socket_id,
-              &connection_specific_uri,
-              &endpoint_uri_clone,
-              session_cmd_tx,
-              session_handle_id,
-            );
-            final_error_for_actor_stop = None;
-          }
+      // --- Decide if the 'retry_loop' should break based on the outcome of this attempt ---
+      // If `final_actor_shutdown_reason` was set by a fatal system event *during this attempt* (inside try_connect_once),
+      // or by a setup failure, the loop will break here.
+      if final_actor_shutdown_reason.is_some() {
           break 'retry_loop;
-        }
-        Err(e) => {
-          final_error_for_actor_stop = Some(e);
-          tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %final_error_for_actor_stop.as_ref().unwrap(), "TCP Connect attempt #{} logic failed or preempted", attempt_count);
-          if attempt_count == 1
-            && initial_reconnect_ivl_opt.map_or(true, |ivl| ivl != Duration::ZERO)
-            && final_error_for_actor_stop
-              .as_ref()
-              .map_or(false, |err| !is_fatal_connect_error(err))
-          {
-            if let Some(ref tx_mon) = monitor_tx {
-              let event = SocketEvent::ConnectDelayed {
-                endpoint: endpoint_uri_clone.clone(),
-                error_msg: format!("{}", final_error_for_actor_stop.as_ref().unwrap()),
-              };
-              let tx_clone = tx_mon.clone();
-              tokio::spawn(async move {
-                let _ = tx_clone.send(event).await;
-              });
-            }
-          }
-        }
       }
 
-      if let Some(ref err) = final_error_for_actor_stop {
-        if matches!(err, ZmqError::Internal(s) if s.contains("shutdown") || s.contains("preempted")) {
+      // If we reached here, it means the `attempt_result` was `Err(attempt_err)`,
+      // and that `attempt_err` was not a fatal system event caught by `try_connect_once` directly.
+      // Now, check `error_from_this_specific_attempt`.
+      if let Some(ref current_attempt_err_ref) = error_from_this_specific_attempt {
+          // Check if this attempt's error means we should stop all retries for the connecter.
+          if initial_reconnect_ivl_opt == Some(Duration::ZERO) || // Configured to not retry after first failure
+             is_fatal_connect_error(current_attempt_err_ref) ||   // This attempt's error is fatal for further retries
+             matches!(current_attempt_err_ref, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus error")) // Should have been caught by try_connect_once, but check again
+          {
+            final_actor_shutdown_reason = error_from_this_specific_attempt; // Store this as the final reason
+            break 'retry_loop;
+          }
+          // Otherwise (error is retriable, and retries are enabled), the loop continues.
+          // `final_actor_shutdown_reason` remains None, allowing next iteration.
+      } else {
+          // `error_from_this_specific_attempt` is None. This means `attempt_result` was `Ok`.
+          // The `Ok` arm of `match attempt_result` should have set `final_actor_shutdown_reason` (to None or setup_err)
+          // and then `break 'retry_loop'`. So, this path should ideally not be reached.
+          tracing::error!(handle=connecter_handle, "Connecter retry loop in inconsistent state (attempt succeeded but didn't break and no error recorded).");
+          final_actor_shutdown_reason = Some(ZmqError::Internal("Connecter retry logic state error (success without break)".into()));
           break 'retry_loop;
-        }
-        if initial_reconnect_ivl_opt == Some(Duration::ZERO) {
-          break 'retry_loop;
-        }
-        if is_fatal_connect_error(err) {
-          break 'retry_loop;
-        }
       }
     } // End of 'retry_loop
 
-    // ... (final error publishing and actor stopping logic as before) ...
-    if let Some(ref err) = final_error_for_actor_stop {
-      if !matches!(err, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus closed") || s.contains("preempted"))
-      {
-        // Added preempted
+    // --- Post-Loop: Publish final status ---
+    if let Some(ref err) = final_actor_shutdown_reason {
+      // Only publish ConnectionAttemptFailed if the error was a genuine connection failure,
+      // not an internal shutdown signal for the connecter itself.
+      if !matches!(err, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus error") || s.contains("state error") || s.contains("launch submit failed")) {
+        tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %err, "All TCP connect attempts failed or connecter stopped due to error.");
         let _ = self.context.event_bus().publish(SystemEvent::ConnectionAttemptFailed {
           parent_core_id: self.parent_socket_id,
           target_endpoint_uri: endpoint_uri_clone.clone(),
@@ -994,17 +815,226 @@ impl TcpConnecter {
             endpoint: endpoint_uri_clone.clone(),
             error_msg: err.to_string(),
           };
+          // Use try_send as connecter is stopping, don't want to block on monitor if its channel is full.
           let _ = tx_mon.try_send(event_monitor);
         }
       }
     }
+
+    // Publish ActorStopping for the connecter itself.
+    // `final_actor_shutdown_reason` correctly reflects the reason for stopping (or None if it was a setup success that broke the loop).
     self.context.publish_actor_stopping(
       connecter_handle,
       connecter_actor_type,
       Some(endpoint_uri_clone),
-      final_error_for_actor_stop,
+      final_actor_shutdown_reason,
     );
     tracing::info!(handle = connecter_handle, uri = %self.endpoint, "TCP Connecter actor fully stopped.");
+  }
+
+  /// Helper function to handle the delay between retry attempts.
+  /// Returns Ok(()) if the delay completed, or Err(ZmqError) if a fatal system event occurred.
+  async fn wait_for_retry_delay(
+    &self, // Taking &self for access to handle, parent_socket_id etc. for logging/context
+    delay: Duration,
+    system_event_rx: &mut broadcast::Receiver<SystemEvent>, // Mutable ref to consume events
+    monitor_tx: &Option<MonitorSender>, // For ConnectRetried
+    attempt_count: usize, // For logging
+    endpoint_uri_clone: &str, // For logging
+  ) -> Result<(), ZmqError> {
+    if delay.is_zero() && attempt_count > 1 { // No delay if duration is zero, unless it's after the first attempt (RECONNECT_IVL=0 case)
+        return Ok(());
+    }
+
+    tracing::debug!(handle = self.handle, uri = %endpoint_uri_clone, ?delay, "Waiting before reconnect attempt #{}", attempt_count + 1);
+    if let Some(ref tx) = monitor_tx {
+        let event = SocketEvent::ConnectRetried {
+            endpoint: endpoint_uri_clone.to_string(),
+            interval: delay,
+        };
+        let tx_clone = tx.clone();
+        tokio::spawn(async move { let _ = tx_clone.send(event).await; });
+    }
+
+    tokio::select! {
+        biased;
+        _ = sleep(delay) => Ok(()),
+        event_result = system_event_rx.recv() => {
+             match event_result {
+                Ok(SystemEvent::ContextTerminating) => {
+                    tracing::info!(handle = self.handle, uri = %endpoint_uri_clone, "Connecter shutdown during retry delay by ContextTerminating.");
+                    Err(ZmqError::Internal("Connecter shutdown by ContextTerminating".into()))
+                }
+                Ok(SystemEvent::SocketClosing{ socket_id: sid }) if sid == self.parent_socket_id => {
+                    tracing::info!(handle = self.handle, uri = %endpoint_uri_clone, "Connecter shutdown during retry delay by parent SocketClosing.");
+                    Err(ZmqError::Internal("Connecter shutdown by parent SocketClosing".into()))
+                }
+                Err(e) => { // Lagged or Closed
+                    tracing::warn!(handle = self.handle, uri = %endpoint_uri_clone, "Connecter: Error receiving from system event bus during retry delay: {:?}. Aborting.", e);
+                    Err(ZmqError::Internal(format!("Connecter event bus error during retry delay: {:?}", e)))
+                 }
+                Ok(_) => {
+                    tracing::trace!(handle = self.handle, uri = %endpoint_uri_clone, "Non-fatal system event during retry delay. Proceeding with retry.");
+                    Ok(()) // Non-fatal event, delay is effectively over or can be considered completed.
+                }
+            }
+        }
+    }
+  }
+
+  /// Helper function to perform a single TCP connection attempt.
+  /// Monitors for fatal system events during the attempt.
+  /// Returns Ok(ConnectLogicOutputType) on successful connection,
+  /// or Err(ZmqError) if connection fails or a fatal event occurs.
+  async fn try_connect_once(
+    &self, // For access to self.config, self.context_options, etc.
+    target_socket_addr: &StdSocketAddr,
+    target_addr_str: &str, // String version of target for uring connect
+    endpoint_uri_clone: &str, // Original user endpoint for error context
+    system_event_rx: &mut broadcast::Receiver<SystemEvent>,
+  ) -> Result<ConnectLogicOutputType, ZmqError> {
+    let use_io_uring = self.context_options.io_uring_session_enabled && cfg!(feature = "io-uring");
+
+    let mut connect_future = Box::pin(async {
+        if use_io_uring {
+            #[cfg(feature = "io-uring")]
+            {
+                let domain = if target_socket_addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
+                let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+                apply_socket2_options_pre_connect(&socket, &self.config)?;
+                let std_stream = tokio::task::spawn_blocking(move || {
+                    socket.connect(&target_socket_addr.into())?; // Use already parsed target_socket_addr
+                    socket.into_tcp_stream()
+                }).await.map_err(|je| ZmqError::Internal(format!("Blocking connect task join error: {}", je)))??;
+                std_stream.set_nonblocking(true)?;
+                let owned_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(std_stream.into_raw_fd()) };
+                let (app_to_engine_tx, app_to_engine_rx) = async_channel::bounded::<AppToUringEngineCmd>(self.context.inner().get_actor_mailbox_capacity());
+                let session_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let engine_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok((
+                    session_handle_id, engine_handle_id,
+                    EngineConnectionType::Uring { app_to_engine_cmd_tx },
+                    Some(owned_fd), Box::new(app_to_engine_rx) as Box<dyn std::any::Any + Send>,
+                    format!("tcp://{}", target_addr_str) // Using target_addr_str for consistency
+                ))
+            }
+            #[cfg(not(feature = "io-uring"))] { unreachable!(); }
+        } else { // Standard Tokio path
+            let std_tokio_stream = underlying_std_net::TcpStream::connect(target_socket_addr).await // Use parsed target_socket_addr
+                .map_err(|e| ZmqError::from_io_endpoint(e, endpoint_uri_clone))?;
+            apply_tcp_socket_options_to_tokio(&std_tokio_stream, &self.config)?;
+            let peer_addr_actual = std_tokio_stream.peer_addr()
+                .map_err(|e| ZmqError::Internal(format!("Failed to get peer_addr post-connect: {}",e)))?;
+            let session_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let engine_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (dummy_engine_tx, _) = async_channel::bounded::<Command>(1);
+            Ok((
+                session_handle_id, engine_handle_id,
+                EngineConnectionType::Standard { engine_mailbox: dummy_engine_tx },
+                None, Box::new(std_tokio_stream) as Box<dyn std::any::Any + Send>,
+                format!("tcp://{}", peer_addr_actual)
+            ))
+        }
+    });
+
+    // Loop to poll connect_future and system_event_rx for this single attempt
+    loop {
+        tokio::select! {
+            biased;
+            event_res = system_event_rx.recv() => {
+                match event_res {
+                    Ok(SystemEvent::ContextTerminating) => return Err(ZmqError::Internal("Connect attempt aborted by ContextTerminating".into())),
+                    Ok(SystemEvent::SocketClosing{ socket_id: sid }) if sid == self.parent_socket_id => return Err(ZmqError::Internal("Connect attempt aborted by parent SocketClosing".into())),
+                    Ok(_) => { /* Non-fatal event, continue polling connect_future */ }
+                    Err(e) => return Err(ZmqError::Internal(format!("Event bus error during connect attempt: {:?}", e))),
+                }
+            }
+            connect_logic_output = &mut connect_future => {
+                return connect_logic_output; // Return the result of the connect_future
+            }
+        }
+    }
+  }
+
+  /// Helper function to set up Session and Engine after a successful TCP connection.
+  /// Returns Ok(()) if setup is successful, or Err(ZmqError) if setup fails (e.g., attaching engine).
+  async fn setup_session_and_engine(
+    &self, // For access to self.context, self.parent_socket_id, etc.
+    connect_output: ConnectLogicOutputType,
+    monitor_tx: &Option<MonitorSender>,
+    endpoint_uri_clone: &str, // Original user-provided endpoint URI for target_endpoint_uri in event
+  ) -> Result<(), ZmqError> {
+    let (
+      session_handle_id, engine_handle_id,
+      engine_conn_type_template, opt_owned_fd,
+      stream_or_app_rx_boxed, connection_specific_uri, // This is the actual peer URI
+    ) = connect_output;
+
+    if let Some(ref tx_mon) = monitor_tx {
+        let event = SocketEvent::Connected {
+            endpoint: endpoint_uri_clone.to_string(), // User's target
+            peer_addr: connection_specific_uri.clone(), // Actual connected peer
+        };
+        let tx_clone = tx_mon.clone();
+        tokio::spawn(async move { let _ = tx_clone.send(event).await; });
+    }
+
+    let (session_cmd_tx, session_base_task_handle) = SessionBase::create_and_spawn(
+      session_handle_id, connection_specific_uri.clone(),
+      monitor_tx.clone(), self.context.clone(), self.parent_socket_id,
+    );
+
+    let final_engine_conn_type: EngineConnectionType;
+    let mut final_engine_task_handle: Option<JoinHandle<()>> = None;
+
+    match engine_conn_type_template {
+      #[cfg(feature = "io-uring")]
+      EngineConnectionType::Uring { app_to_engine_cmd_tx } => {
+          let app_to_engine_cmd_rx = stream_or_app_rx_boxed.downcast_arc_receiver()
+              .ok_or_else(|| ZmqError::Internal("Logic error: Failed to downcast app_cmd_rx for uring setup".into()))?;
+          let launch_info = UringLaunchInformation {
+              engine_handle_id, owned_fd: opt_owned_fd.expect("OwnedFd must be Some for Uring path in setup"),
+              config: ZmtpEngineConfig::from(&*self.context_options), is_server: false,
+              context_clone: self.context.clone(), session_base_mailbox: session_cmd_tx.clone(),
+              app_to_engine_cmd_rx, parent_session_handle_id: session_handle_id,
+          };
+          uring_runtime::submit_uring_engine_launch(launch_info)
+              .map_err(|e| ZmqError::Internal(format!("Uring engine launch submit failed during setup: {:?}", e)))?
+              .then_some(()).ok_or_else(|| ZmqError::Internal("Uring runtime did not accept launch during setup".into()))?;
+          final_engine_conn_type = EngineConnectionType::Uring { app_to_engine_cmd_tx };
+      }
+      EngineConnectionType::Standard { .. } => {
+          let std_tokio_stream = stream_or_app_rx_boxed.downcast_arc_stream()
+              .ok_or_else(|| ZmqError::Internal("Logic error: Failed to downcast TcpStream for std engine setup".into()))?;
+          let (std_engine_mailbox, std_engine_task_handle) = create_and_spawn_tcp_engine(
+              engine_handle_id, session_cmd_tx.clone(), std_tokio_stream,
+              self.context_options.clone(), false, &self.context, session_handle_id,
+          );
+          final_engine_conn_type = EngineConnectionType::Standard { engine_mailbox: std_engine_mailbox };
+          final_engine_task_handle = Some(std_engine_task_handle);
+      }
+      #[cfg(not(feature = "io-uring"))]
+      _ => unreachable!("Invalid EngineConnectionType template when io-uring is not enabled during setup"),
+    }
+
+    let attach_cmd = Command::Attach {
+      connection: final_engine_conn_type,
+      engine_handle: Some(engine_handle_id),
+      engine_task_handle: final_engine_task_handle,
+    };
+
+    if session_cmd_tx.send(attach_cmd).await.is_err() {
+        session_base_task_handle.abort(); // Abort session if attach fails
+        return Err(ZmqError::Internal("Failed to attach engine to session post-connect".into()));
+    } else {
+        publish_new_conn_event(
+            &self.context, self.parent_socket_id,
+            &connection_specific_uri, endpoint_uri_clone,
+            session_cmd_tx, session_handle_id,
+            // session_base_task_handle.id() // Get task ID if needed by event
+        );
+        Ok(())
+    }
   }
 }
 
@@ -1175,7 +1205,6 @@ impl DynamicDowncast for Box<dyn std::any::Any + Send> {
   }
 }
 
-// ... (is_fatal_accept_error, is_fatal_connect_error, ZmtpEngineConfig From<&SocketOptions> remain) ...
 fn is_fatal_accept_error(e: &io::Error) -> bool {
   matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe)
 }
@@ -1188,14 +1217,11 @@ fn is_fatal_connect_error(e: &ZmqError) -> bool {
         io::ErrorKind::AddrNotAvailable |
         io::ErrorKind::AddrInUse |
         io::ErrorKind::InvalidInput |
-        io::ErrorKind::PermissionDenied |
-        io::ErrorKind::HostUnreachable | // Added based on common fatal connect errors
-        io::ErrorKind::NetworkUnreachable // Added
+        io::ErrorKind::PermissionDenied
       )
     }
     ZmqError::InvalidEndpoint(_) => true,
     ZmqError::UnsupportedTransport(_) => true,
-    ZmqError::ConnectionRefused(_) => true, // Explicitly fatal
     _ => false,
   }
 }
