@@ -10,8 +10,6 @@ use crate::protocol::zmtp::{
   greeting::{ZmtpGreeting, GREETING_LENGTH},
 };
 use crate::runtime::{ActorType, Command, MailboxReceiver, MailboxSender};
-#[cfg(feature = "curve")]
-use crate::security::CurveMechanism;
 use crate::security::{Mechanism, NullMechanism, PlainMechanism};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::{Blob, Context, MsgFlags};
@@ -143,17 +141,13 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
   async fn exchange_greetings(&mut self, stream: &mut S) -> Result<ZmtpGreeting, ZmqError> {
     let mut greeting_buffer_to_send = BytesMut::with_capacity(GREETING_LENGTH);
     // In a real scenario, the mechanism chosen by socket options might influence the greeting.
-    // For ZMTP 3.1, the greeting itself proposes a mechanism (often NULL or PLAIN/CURVE directly).
-    // Libzmq sends the configured socket mechanism in the greeting if it's PLAIN or CURVE.
+    // For ZMTP 3.1, the greeting itself proposes a mechanism (often NULL or PLAIN, etc. directly).
+    // Libzmq sends the configured socket mechanism in the greeting if it's PLAIN, etc..
     // For now, sending NULL and relying on negotiation.
     let own_greeting_mechanism_bytes = {
       let mut mechanism_name_to_send = NullMechanism::NAME_BYTES; // Default to NULL
 
-      #[cfg(feature = "curve")]
-      if self.config.socket_type_name == "CURVECLIENTTODO" {
-        // Example placeholder
-        mechanism_name_to_send = CurveMechanism::NAME_BYTES;
-      } else if self.config.socket_type_name == "PLAINCLIENTTODO" {
+      if self.config.socket_type_name == "PLAINCLIENTTODO" {
         // Example placeholder
         mechanism_name_to_send = PlainMechanism::NAME_BYTES;
       }
@@ -247,7 +241,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
     );
 
     // TODO: Actual mechanism selection should consider socket options (e.g., if this socket is PLAIN server,
-    // it might reject a NULL proposal or only accept PLAIN. If it's CURVE, it only accepts CURVE).
+    // it might reject a NULL proposal or only accept PLAIN.).
     // For now, this is a simple negotiation based on what peer proposed.
     let mut negotiated_mechanism: Box<dyn Mechanism> = match peer_proposed_mechanism_name {
       NullMechanism::NAME => Box::new(NullMechanism),
@@ -257,11 +251,6 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
         // For now, just instantiate based on our role.
         // TODO: Pass PLAIN options (username/password if client) from self.config or socket options.
         Box::new(PlainMechanism::new(self.is_server))
-      }
-      #[cfg(feature = "curve")]
-      CurveMechanism::NAME => {
-        // TODO: Pass CURVE keys (server key for client, client key list for server) from self.config or socket options.
-        Box::new(CurveMechanism::new(self.is_server))
       }
       unsupported_name => {
         let security_error_msg = format!("Unsupported security mechanism '{}' from peer.", unsupported_name);

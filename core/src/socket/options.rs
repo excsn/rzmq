@@ -30,15 +30,6 @@ pub const PLAIN_SERVER: i32 = 44;
 pub const PLAIN_USERNAME: i32 = 45;
 pub const PLAIN_PASSWORD: i32 = 46;
 
-#[cfg(feature = "curve")]
-pub const CURVE_SERVER: i32 = 47;
-#[cfg(feature = "curve")]
-pub const CURVE_PUBLICKEY: i32 = 48;
-#[cfg(feature = "curve")]
-pub const CURVE_SECRETKEY: i32 = 49;
-#[cfg(feature = "curve")]
-pub const CURVE_SERVERKEY: i32 = 50;
-
 pub const MAX_CONNECTIONS: i32 = 1000;
 
 // IO Uring Options
@@ -70,12 +61,6 @@ pub const DEFAULT_IO_URING_RECV_BUFFER_COUNT: usize = 16;
 /// Default size (in bytes) for each buffer in the io_uring multishot receive pool.
 #[cfg(feature = "io-uring")]
 pub const DEFAULT_IO_URING_RECV_BUFFER_SIZE: usize = 65536; // 64KB
-
-// Key Length Constants (from libsodium)
-#[cfg(feature = "curve")]
-pub const CURVE_KEY_LEN: usize = 32;
-
-// Add more constants as needed...
 
 /// Holds parsed and validated socket options.
 #[derive(Debug, Clone)]
@@ -118,15 +103,6 @@ pub(crate) struct SocketOptions {
   pub plain_server: Option<bool>,     // Role override
   pub plain_username: Option<String>, // Security options stored here?
   pub plain_password: Option<String>,
-  // Curve Auth
-  #[cfg(feature = "curve")]
-  pub curve_server: Option<bool>, // Role override
-  #[cfg(feature = "curve")]
-  pub curve_public_key: Option<[u8; CURVE_KEY_LEN]>,
-  #[cfg(feature = "curve")]
-  pub curve_secret_key: Option<[u8; CURVE_KEY_LEN]>, // Note: Store securely!
-  #[cfg(feature = "curve")]
-  pub curve_server_key: Option<[u8; CURVE_KEY_LEN]>, // Client uses this
   // pub heartbeat_ttl: Option<Duration>, // TTL often derived from timeout
   pub io_uring_send_zerocopy: bool,
   pub io_uring_recv_multishot: bool,
@@ -142,12 +118,12 @@ impl Default for SocketOptions {
   fn default() -> Self {
     Self {
       // ZMQ Defaults:
-      rcvhwm: 1000,
-      sndhwm: 1000,
+      rcvhwm: 256,
+      sndhwm: 256,
       rcvtimeo: None,                                  // -1 in ZMQ
       sndtimeo: None,                                  // -1 in ZMQ
       linger: Some(Duration::ZERO),                    // 0 in ZMQ (different from socket default!)
-      reconnect_ivl: Some(Duration::from_millis(100)), // ZMQ default is 100ms
+      reconnect_ivl: Some(Duration::from_millis(5000)),
       reconnect_ivl_max: Some(Duration::ZERO),         // ZMQ default is 0 (disable max/backoff)
       routing_id: None,
       socket_type_name: "UNKNOWN".to_string(), // Default, should be set on creation
@@ -164,14 +140,6 @@ impl Default for SocketOptions {
       plain_server: None,
       plain_username: None,
       plain_password: None,
-      #[cfg(feature = "curve")]
-      curve_server: None,
-      #[cfg(feature = "curve")]
-      curve_public_key: None,
-      #[cfg(feature = "curve")]
-      curve_secret_key: None,
-      #[cfg(feature = "curve")]
-      curve_server_key: None,
       io_uring_send_zerocopy: false,
       io_uring_recv_multishot: false,
       tcp_cork: false,
@@ -313,20 +281,6 @@ pub(crate) fn parse_heartbeat_option(value: &[u8], option_id: i32) -> Result<Opt
     1.. => Ok(Some(Duration::from_millis(val as u64))), // Positive timeout
     _ => Err(ZmqError::InvalidOptionValue(option_id)),  // Negative values invalid
   }
-}
-
-#[cfg(feature = "curve")]
-/// Parses a fixed-length binary key option.
-pub(crate) fn parse_key_option<const N: usize>(value: &[u8], option_id: i32) -> Result<[u8; N], ZmqError> {
-  value.try_into().map_err(|_| {
-    tracing::error!(
-      option = option_id,
-      expected_len = N,
-      actual_len = value.len(),
-      "Invalid key length"
-    );
-    ZmqError::InvalidOptionValue(option_id)
-  })
 }
 
 pub(crate) fn parse_reconnect_ivl_option(value: &[u8]) -> Result<Option<Duration>, ZmqError> {

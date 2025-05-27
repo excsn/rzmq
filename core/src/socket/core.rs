@@ -10,10 +10,6 @@ use crate::socket::options::{
   ROUTER_MANDATORY, ROUTING_ID, SNDHWM, SNDTIMEO, SUBSCRIBE, TCP_CORK_OPT, TCP_KEEPALIVE, TCP_KEEPALIVE_CNT,
   TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTVL, UNSUBSCRIBE, ZAP_DOMAIN,
 };
-#[cfg(feature = "curve")]
-use crate::socket::options::{
-  parse_key_option, CURVE_KEY_LEN, CURVE_PUBLICKEY, CURVE_SECRETKEY, CURVE_SERVER, CURVE_SERVERKEY,
-};
 #[cfg(feature = "io-uring")]
 use crate::socket::options::{
   DEFAULT_IO_URING_RECV_BUFFER_COUNT, DEFAULT_IO_URING_RECV_BUFFER_SIZE, IO_URING_RCVMULTISHOT,
@@ -2342,22 +2338,6 @@ impl SocketCore {
         state_g.options.plain_password =
           Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
       }
-      #[cfg(feature = "curve")]
-      CURVE_SERVER => {
-        state_g.options.curve_server = Some(parse_bool_option(value)?);
-      }
-      #[cfg(feature = "curve")]
-      CURVE_PUBLICKEY => {
-        state_g.options.curve_public_key = Some(parse_key_option::<CURVE_KEY_LEN>(value, option)?);
-      }
-      #[cfg(feature = "curve")]
-      CURVE_SECRETKEY => {
-        state_g.options.curve_secret_key = Some(parse_key_option::<CURVE_KEY_LEN>(value, option)?);
-      }
-      #[cfg(feature = "curve")]
-      CURVE_SERVERKEY => {
-        state_g.options.curve_server_key = Some(parse_key_option::<CURVE_KEY_LEN>(value, option)?);
-      }
       ROUTING_ID => {
         state_g.options.routing_id = Some(parse_blob_option(value)?);
       }
@@ -2457,9 +2437,6 @@ impl SocketCore {
       ZAP_DOMAIN => state_g.options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
       PLAIN_SERVER => state_g.options.plain_server.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
       PLAIN_USERNAME => state_g.options.plain_username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-      #[cfg(feature = "curve")] CURVE_SERVER => state_g.options.curve_server.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-      #[cfg(feature = "curve")] CURVE_PUBLICKEY => state_g.options.curve_public_key.map(|k| k.to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-      #[cfg(feature = "curve")] CURVE_SERVERKEY => state_g.options.curve_server_key.map(|k| k.to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
       ROUTING_ID => state_g.options.routing_id.as_ref().map(|b| b.to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
       RCVTIMEO => Ok(state_g.options.rcvtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
       SNDTIMEO => Ok(state_g.options.sndtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),

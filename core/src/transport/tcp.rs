@@ -675,7 +675,7 @@ impl TcpConnecter {
     // --- End: Initial parameter parsing ---
 
     let initial_reconnect_ivl_opt = self.context_options.reconnect_ivl;
-    let mut current_retry_delay_base = initial_reconnect_ivl_opt.unwrap_or(Duration::from_millis(100));
+    let mut current_retry_delay_base = initial_reconnect_ivl_opt.unwrap_or(Duration::from_millis(5000));
     // Handle ZMQ_RECONNECT_IVL=0 correctly: first attempt occurs, then loop breaks if it failed.
     // This is managed by the conditions at the end of the 'retry_loop'.
     

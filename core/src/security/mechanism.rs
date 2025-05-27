@@ -5,7 +5,7 @@ use crate::message::Metadata;
 use bytes::{Buf, BufMut, BytesMut};
 use std::fmt;
 
-/// Trait for security mechanisms (NULL, PLAIN, CURVE).
+/// Trait for security mechanisms (NULL, PLAIN, etc.).
 /// Drives the security handshake state machine.
 pub trait Mechanism: Send + Sync + fmt::Debug + 'static {
   // Needs to be Send + Sync if held by Engine actor
@@ -36,7 +36,7 @@ pub trait Mechanism: Send + Sync + fmt::Debug + 'static {
   }
 
   /// Returns the identity of the peer, if established by the mechanism.
-  /// For CURVE, this is the peer's public key. For PLAIN, potentially the User-Id.
+  /// For Non-PLAIN, this is the peer's public key. For PLAIN, potentially the User-Id.
   fn peer_identity(&self) -> Option<Vec<u8>>;
 
   /// Provides any additional metadata derived from the handshake (e.g., ZAP User-Id).
@@ -372,7 +372,7 @@ impl Mechanism for PlainMechanism {
   }
 
   fn peer_identity(&self) -> Option<Vec<u8>> {
-    // PLAIN doesn't inherently establish a cryptographic peer identity like CURVE.
+    // PLAIN doesn't inherently establish a cryptographic peer identity.
     // We could return the authenticated username if available.
     self.username.clone()
   }
@@ -433,127 +433,3 @@ impl Mechanism for PlainMechanism {
     }
   }
 }
-
-#[cfg(feature = "curve")]
-mod curve_impl {
-  use crate::{Metadata, ZmqError};
-
-  use super::{Mechanism, MechanismStatus};
-
-  use libsodium_rs::crypto_box::{self, Nonce, PrecomputedKey, PublicKey, SecretKey};
-  use libsodium_rs::random;
-
-  /// Internal state machine for the CURVE handshake.
-  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-  enum CurveState {
-    // Common Initial
-    Initializing,
-    // Client States
-    SendHello,     // Client -> Server: HELLO
-    ExpectWelcome, // Client waiting for WELCOME from Server
-    SendInitiate,  // Client -> Server: INITIATE
-    ExpectReady,   // Client waiting for READY from Server
-    // Server States
-    ExpectHello,    // Server waiting for HELLO from Client
-    SendWelcome,    // Server -> Client: WELCOME
-    ExpectInitiate, // Server waiting for INITIATE from Client
-    SendReady,      // Server -> Client: READY (after optional ZAP)
-    // Common End States
-    Ready, // Handshake complete and secure channel established
-    Error, // Handshake failed
-  }
-
-  /// Implements the ZMTP CURVE security mechanism.
-  /// See RFC 27: https://rfc.zeromq.org/spec/27/
-  #[derive(Debug)]
-  pub struct CurveMechanism {
-    is_server: bool,
-    // TODO: Add state machine enum
-    // TODO: Add keys (local static, local ephemeral, remote static, remote ephemeral)
-    // TODO: Add nonce management
-    // TODO: Add crypto boxes (e.g., using libsodiumoxide::crypto::box_)
-    error_reason: Option<String>,
-  }
-
-  impl CurveMechanism {
-    pub const NAME_BYTES: &'static [u8; 20] = b"CURVE\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; // Padded
-    pub const NAME: &'static str = "CURVE";
-    const CMD_HELLO: &'static [u8] = b"HELLO";
-    const CMD_WELCOME: &'static [u8] = b"WELCOME";
-    const CMD_INITIATE: &'static [u8] = b"INITIATE";
-    const CMD_READY: &'static [u8] = b"READY";
-    const CMD_ERROR: &'static [u8] = b"ERROR";
-
-    pub fn new(is_server: bool /* TODO: Add keys from options */) -> Self {
-      // TODO: Initialize state based on role and keys
-      Self {
-        is_server,
-        error_reason: None,
-      }
-    }
-
-    fn set_error_internal(&mut self, reason: String) {
-      tracing::error!(mechanism = Self::NAME, %reason, "Handshake error");
-      self.error_reason = Some(reason);
-      // TODO: Set state to Error
-    }
-  }
-
-  impl Mechanism for CurveMechanism {
-    fn name(&self) -> &'static str {
-      Self::NAME
-    }
-
-    fn process_token(&mut self, _token: &[u8]) -> Result<(), ZmqError> {
-      tracing::warn!("CurveMechanism::process_token not implemented");
-      // TODO: Implement CURVE state machine logic for processing HELLO/WELCOME/INITIATE/READY
-      unimplemented!("CURVE process_token")
-    }
-
-    fn produce_token(&mut self) -> Result<Option<Vec<u8>>, ZmqError> {
-      tracing::warn!("CurveMechanism::produce_token not implemented");
-      // TODO: Implement CURVE state machine logic for producing HELLO/WELCOME/INITIATE/READY
-      unimplemented!("CURVE produce_token")
-    }
-
-    fn status(&self) -> MechanismStatus {
-      tracing::warn!("CurveMechanism::status not implemented");
-      // TODO: Map internal state to MechanismStatus
-      MechanismStatus::Initializing // Placeholder
-    }
-
-    fn peer_identity(&self) -> Option<Vec<u8>> {
-      tracing::warn!("CurveMechanism::peer_identity not implemented");
-      // TODO: Return the validated remote static public key
-      None
-    }
-
-    fn metadata(&self) -> Option<Metadata> {
-      None // CURVE itself doesn't usually provide extra metadata besides identity
-    }
-
-    fn set_error(&mut self, reason: String) {
-      self.set_error_internal(reason);
-    }
-
-    fn error_reason(&self) -> Option<&str> {
-      self.error_reason.as_deref()
-    }
-
-    fn zap_request_needed(&mut self) -> Option<Vec<Vec<u8>>> {
-      // CURVE *can* involve ZAP for authentication based on the client key
-      tracing::warn!("CurveMechanism::zap_request_needed not implemented");
-      // TODO: Implement ZAP request generation if needed (server side)
-      None
-    }
-
-    fn process_zap_reply(&mut self, _reply_frames: &[Vec<u8>]) -> Result<(), ZmqError> {
-      tracing::warn!("CurveMechanism::process_zap_reply not implemented");
-      // TODO: Process ZAP reply and update state/error status
-      Ok(())
-    }
-  }
-}
-
-#[cfg(feature = "curve")]
-pub use curve_impl::CurveMechanism;

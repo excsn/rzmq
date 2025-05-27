@@ -20,7 +20,7 @@ pub mod message;
 pub mod protocol;
 /// Provides core asynchronous runtime primitives like mailboxes and events.
 pub mod runtime;
-/// Handles security mechanisms (NULL, PLAIN, CURVE) and ZAP.
+/// Handles security mechanisms (NULL, PLAIN, NOISE_XX) and ZAP.
 pub mod security;
 /// Manages individual connection sessions, bridging sockets and engines.
 pub mod session;

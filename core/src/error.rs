@@ -109,7 +109,7 @@ pub enum ZmqError {
   /// Authentication with the peer failed (e.g., ZAP failure, incorrect PLAIN credentials).
   #[error("Authentication failed: {0}")]
   AuthenticationFailure(String),
-  /// An error occurred during encryption or decryption of messages (e.g., with CURVE).
+  /// An error occurred during encryption or decryption of messages.
   #[error("Encryption/Decryption error: {0}")]
   EncryptionError(String),
 

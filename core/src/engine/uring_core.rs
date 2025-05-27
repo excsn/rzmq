@@ -11,9 +11,7 @@ use crate::protocol::zmtp::command::{
 use crate::protocol::zmtp::greeting::{ZmtpGreeting, GREETING_LENGTH, GREETING_VERSION_MAJOR, MECHANISM_LENGTH};
 use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
 use crate::runtime::{ActorType, Command as SessionBaseCommand, MailboxReceiver, MailboxSender};
-#[cfg(feature = "curve")]
-use crate::security::CurveMechanism;
-use crate::security::{CurveMechanism, Mechanism, MechanismStatus, NullMechanism, PlainMechanism};
+use crate::security::{Mechanism, MechanismStatus, NullMechanism, PlainMechanism};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::Blob;
 
@@ -244,8 +242,6 @@ impl ZmtpEngineCoreUring {
     let new_mechanism: Box<dyn Mechanism> = match peer_mech_name {
       NullMechanism::NAME => Box::new(NullMechanism),
       PlainMechanism::NAME => Box::new(PlainMechanism::new(self.is_server)),
-      #[cfg(feature = "curve")]
-      CurveMechanism::NAME => Box::new(CurveMechanism::new(self.is_server)),
       unsupported => {
         return Err(ZmqError::SecurityError(format!(
           "Unsupported mechanism: {}",

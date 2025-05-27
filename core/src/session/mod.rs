@@ -24,7 +24,7 @@ pub trait ISession: Send + Sync + 'static {
 
   // --- ZAP Interaction Callbacks (called by Engine) ---
 
-  /// Handles an authentication request from the Engine (e.g., PLAIN/CURVE).
+  /// Handles an authentication request from the Engine (e.g., PLAIN/etc.).
   /// The Session will use its ZapClient to communicate with the authenticator.
   async fn handle_zap_request(&self, request_frames: Vec<Vec<u8>>) -> Result<(), ZmqError>;
 

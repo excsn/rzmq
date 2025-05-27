@@ -38,7 +38,7 @@ thiserror = "^1.0"
 
 socket2 = "^0"
 
-libsodium-rs = { version = "^0", optional = true }
+snow = { version = "^0.9", optional = true }
 
 [dev-dependencies]
 # For benchmarks
@@ -53,6 +53,23 @@ tokio-test = "^0.4"
 # For fuzzing tests
 # cargo-fuzz = { version = "0.11", optional = true }
 tracing-subscriber = { version = "^0.3", features = ["env-filter"] } # Optional for easy logging setup
+
+[features]
+full = ["default", "ipc", "inproc"]
+default = ["ipc", "inproc"]
+
+io-uring = ["dep:tokio-uring"]
+noisexx = ["dep:snow"]
+ipc = []
+inproc = []
+# draft = [] # Enables DRAFT API sockets and options
+
+# tls = ["dep:rustls", "dep:tokio-rustls"] # Example for later WSS
+# gssapi = ["dep:libgssapi-sys"]
+# websocket = ["dep:tokio-tungstenite", "tls"] # WS depends on TLS feature for WSS
+# tipc = [] # Feature flag for TIPC transport
+
+bench_external_clients = []
 
 [[bench]]
 name = "pull_throughput"
@@ -83,21 +100,3 @@ harness = false
 name = "zerocopy_bench"
 harness = false
 required-features = ["io-uring"]
-
-[features]
-full = ["default", "ipc", "inproc", "curve"]
-default = ["ipc", "inproc"]
-
-io-uring = ["dep:tokio-uring"]
-
-ipc = []
-inproc = []
-# draft = [] # Enables DRAFT API sockets and options
-
-# tls = ["dep:rustls", "dep:tokio-rustls"] # Example for later WSS
-curve = ["dep:libsodium-rs"]
-# gssapi = ["dep:libgssapi-sys"]
-# websocket = ["dep:tokio-tungstenite", "tls"] # WS depends on TLS feature for WSS
-# tipc = [] # Feature flag for TIPC transport
-
-bench_external_clients = []

@@ -9,9 +9,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid clash
 use std::sync::Arc;
 
-#[cfg(feature = "curve")]
-use libsodium_rs as libsodium;
-use tracing::warn; // For CURVE security initialization
+use tracing::warn;
 
 use std::time::Duration;
 
@@ -54,17 +52,9 @@ pub(crate) struct ContextInner {
 }
 
 impl ContextInner {
-  /// Creates new shared context state, including initializing libsodium (if CURVE enabled)
+  /// Creates new shared context state
   /// and spawning the event listener task.
   fn new(actor_mailbox_capacity: usize) -> Self {
-    #[cfg(feature = "curve")]
-    {
-      if let Err(_) = libsodium::ensure_init() {
-        tracing::error!("Failed to initialize libsodium! CURVE security will not work.");
-      } else {
-        tracing::debug!("Libsodium initialized successfully.");
-      }
-    }
 
     let event_bus = Arc::new(EventBus::new());
     let actor_wait_group = WaitGroup::new();

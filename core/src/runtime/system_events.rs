@@ -106,7 +106,7 @@ pub enum SystemEvent {
     core_pipe_read_id: usize,
     /// The ZMTP identity of the peer, if established.
     /// This comes from `ZmtpEngineConfig::routing_id` of the peer, sent in its READY command,
-    /// or potentially from a security mechanism like CURVE.
+    /// or potentially from a security mechanism.
     peer_identity: Option<Blob>,
     /// The handle ID of the Session actor publishing this event, for correlation.
     session_handle_id: usize,
