@@ -1,0 +1,25 @@
+[package]
+name = "rzmq_cli"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+description = "Command Line Utility for RZMQ, an asynchronous, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, with optional io_uring acceleration on Linux."
+authors = ["Excerion Sun <dev@excsn.com>", "Norm O <normo.pub@gmail.com>"]
+readme = "README.md"
+repository = "https://github.com/excsn/rzmq"
+homepage = "https://github.com/excsn/rzmq"
+keywords = ["zeromq", "messaging", "async", "cli", "keygen"]
+categories = ["command-line-utilities", "network-programming", "cryptography"]
+
+[[bin]]
+name = "rzmq"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "^1.0"
+base64 = "^0.21"
+clap = { version = "^4.5", features = ["derive"] }
+hex = "^0.4"
+rand = { version = "^0.9" }
+x25519-dalek = { workspace = true }

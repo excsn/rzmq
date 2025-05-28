@@ -52,7 +52,7 @@ thiserror = "^1.0"
 
 # --- Security ---
 snow = { version = "^0.9", optional = true }
-x25519-dalek = { package = "xs_x25519-dalek", version = "^2.0", features = ["static_secrets"], optional = true }
+x25519-dalek = { workspace = true, optional = true }
 
 [dev-dependencies]
 # For benchmarks
