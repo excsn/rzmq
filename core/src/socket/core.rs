@@ -2239,11 +2239,11 @@ impl SocketCore {
     #[cfg(feature = "io-uring")]
     {
       if option == IO_URING_SESSION_ENABLED {
-        state_g.options.io_uring_session_enabled = options::parse_bool_option(value)?;
+        state_g.options.io_uring.session_enabled = options::parse_bool_option(value)?;
         tracing::debug!(
           handle = core_arc.handle,
           "IO_URING_SESSION_ENABLED set to {}",
-          state_g.options.io_uring_session_enabled
+          state_g.options.io_uring.session_enabled
         );
         return Ok(());
       }
@@ -2269,13 +2269,39 @@ impl SocketCore {
 
       if option == options::IO_URING_RECV_BUFFER_COUNT {
         let count = options::parse_i32_option(value)?.max(1) as usize; // Ensure at least 1
-        state_g.options.io_uring_recv_buffer_count = count;
+        state_g.options.recv_buffer_count = count;
         tracing::debug!(handle = core_arc.handle, "IO_URING_RECV_BUFFER_COUNT set to {}", count);
         return Ok(());
       } else if option == options::IO_URING_RECV_BUFFER_SIZE {
         let size = options::parse_i32_option(value)?.max(1024) as usize; // Ensure min size, e.g., 1KB
-        state_g.options.io_uring_recv_buffer_size = size;
+        state_g.options.recv_buffer_size = size;
         tracing::debug!(handle = core_arc.handle, "IO_URING_RECV_BUFFER_SIZE set to {}", size);
+        return Ok(());
+      }
+    }
+
+    #[cfg(feature = "noise_xx")]
+    {
+      // Ensure noise_xx_options is mutable if it wasn't already (though state_g is write guard)
+      // let noise_opts = &mut state_g.options.noise_xx_options; // if not using a RwLockWriteGuard already
+
+      if option == options::NOISE_XX_ENABLED {
+        state_g.options.noise_xx_options.enabled = options::parse_bool_option(value)?;
+        tracing::debug!(
+          handle = core_arc.handle,
+          "NOISE_XX_ENABLED set to {}",
+          state_g.options.noise_xx_options.enabled
+        );
+        return Ok(());
+      } else if option == options::NOISE_XX_STATIC_SECRET_KEY {
+        state_g.options.noise_xx_options.static_secret_key_bytes =
+          Some(options::parse_key_option::<32>(value, option)?);
+        tracing::debug!(handle = core_arc.handle, "NOISE_XX_STATIC_SECRET_KEY set.");
+        return Ok(());
+      } else if option == options::NOISE_XX_REMOTE_STATIC_PUBLIC_KEY {
+        state_g.options.noise_xx_options.remote_static_public_key_bytes =
+          Some(options::parse_key_option::<32>(value, option)?);
+        tracing::debug!(handle = core_arc.handle, "NOISE_XX_REMOTE_STATIC_PUBLIC_KEY set.");
         return Ok(());
       }
     }
@@ -2328,14 +2354,14 @@ impl SocketCore {
           Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
       }
       PLAIN_SERVER => {
-        state_g.options.plain_server = Some(parse_bool_option(value)?);
+        state_g.options.zap_plain.server = Some(parse_bool_option(value)?);
       }
       PLAIN_USERNAME => {
-        state_g.options.plain_username =
+        state_g.options.zap_plain.username =
           Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
       }
       PLAIN_PASSWORD => {
-        state_g.options.plain_password =
+        state_g.options.zap_plain.password =
           Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
       }
       ROUTING_ID => {
@@ -2397,9 +2423,9 @@ impl SocketCore {
     #[cfg(feature = "io-uring")]
     {
       if option == IO_URING_SESSION_ENABLED {
-        return Ok((state_g.options.io_uring_session_enabled as i32).to_ne_bytes().to_vec());
+        return Ok((state_g.options.io_uring.session_enabled as i32).to_ne_bytes().to_vec());
       }
-      
+
       if option == options::IO_URING_SNDZEROCOPY {
         return Ok((state_g.options.io_uring_send_zerocopy as i32).to_ne_bytes().to_vec());
       } else if option == options::IO_URING_RCVMULTISHOT {
@@ -2408,16 +2434,34 @@ impl SocketCore {
 
       if option == options::IO_URING_RECV_BUFFER_COUNT {
         return Ok(
-          (state_g.options.io_uring_recv_buffer_count as i32)
+          (state_g.options.recv_buffer_count as i32)
             .to_ne_bytes()
             .to_vec(),
         );
       } else if option == options::IO_URING_RECV_BUFFER_SIZE {
         return Ok(
-          (state_g.options.io_uring_recv_buffer_size as i32)
+          (state_g.options.recv_buffer_size as i32)
             .to_ne_bytes()
             .to_vec(),
         );
+      }
+    }
+
+    #[cfg(feature = "noise_xx")]
+    {
+      if option == options::NOISE_XX_ENABLED {
+        return Ok((state_g.options.noise_xx_options.enabled as i32).to_ne_bytes().to_vec());
+      } else if option == options::NOISE_XX_STATIC_SECRET_KEY {
+        return Err(ZmqError::PermissionDenied("Secret key option is write-only".into()));
+      } else if option == options::NOISE_XX_REMOTE_STATIC_PUBLIC_KEY {
+        return state_g
+          .options
+          .noise_xx_options
+          .remote_static_public_key_bytes
+          .map(|k| k.to_vec())
+          .ok_or(ZmqError::Internal(
+            "Option NOISE_XX_REMOTE_STATIC_PUBLIC_KEY not set".into(),
+          ));
       }
     }
 
@@ -2435,8 +2479,8 @@ impl SocketCore {
       HEARTBEAT_IVL => Ok(state_g.options.heartbeat_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
       HEARTBEAT_TIMEOUT => Ok(state_g.options.heartbeat_timeout.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
       ZAP_DOMAIN => state_g.options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-      PLAIN_SERVER => state_g.options.plain_server.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-      PLAIN_USERNAME => state_g.options.plain_username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
+      PLAIN_SERVER => state_g.options.zap_plain.server.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
+      PLAIN_USERNAME => state_g.options.zap_plain.username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
       ROUTING_ID => state_g.options.routing_id.as_ref().map(|b| b.to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
       RCVTIMEO => Ok(state_g.options.rcvtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
       SNDTIMEO => Ok(state_g.options.sndtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),

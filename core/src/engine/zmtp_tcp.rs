@@ -30,13 +30,19 @@ pub(crate) fn create_and_spawn_tcp_engine(
     heartbeat_ivl: options.heartbeat_ivl,
     heartbeat_timeout: options.heartbeat_timeout,
     // io_uring options need checking based on feature flag
-    use_send_zerocopy: options.io_uring_send_zerocopy,
-    use_recv_multishot: options.io_uring_recv_multishot,
+    use_send_zerocopy: options.io_uring.send_zerocopy,
+    use_recv_multishot: options.io_uring.recv_multishot,
     use_cork: options.tcp_cork,
     #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_count: options.io_uring_recv_buffer_count,
+    recv_multishot_buffer_count: options.io_uring.recv_buffer_count,
     #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_capacity: options.io_uring_recv_buffer_size,
+    recv_multishot_buffer_capacity: options.io_uring.recv_buffer_size,
+    #[cfg(feature = "noise_xx")]
+    use_noise_xx: options.noise_xx_options.enabled,
+    #[cfg(feature = "noise_xx")]
+    noise_xx_local_sk_bytes_for_engine: options.noise_xx_options.static_secret_key_bytes,
+    #[cfg(feature = "noise_xx")]
+    noise_xx_remote_pk_bytes_for_engine: options.noise_xx_options.remote_static_public_key_bytes,
   };
 
   // Create the generic core state with TcpStream as the type

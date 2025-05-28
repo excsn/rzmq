@@ -1064,6 +1064,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "xs_x25519-dalek",
 ]
 
 [[package]]
@@ -1684,6 +1685,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "xs_curve25519-dalek"
+version = "4.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba8e84ab7cbb329f93d0e8e96329ea99de483e13afc105b0200d8b5776aa77a6"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "curve25519-dalek-derive",
+ "fiat-crypto",
+ "rustc_version",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "xs_x25519-dalek"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1da6df10e32c936750446bbb165981b0215317d0b10974c97ed43b24848fa5f9"
+dependencies = [
+ "rand_core 0.9.3",
+ "serde",
+ "xs_curve25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1708,3 +1736,17 @@ name = "zeroize"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ced3678a2879b30306d323f4542626697a464a97c0a07c9aebf7ebca65cd4dde"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce36e65b0d2999d2aafac989fb249189a141aee1f53c612c1f37d72631959f69"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]

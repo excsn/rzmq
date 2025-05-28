@@ -3,6 +3,7 @@
 use crate::engine::ZmtpStdStream;
 use crate::error::ZmqError;
 use crate::message::Msg;
+use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
 use crate::protocol::zmtp::ZmtpReady;
 use crate::protocol::zmtp::{
   codec::ZmtpCodec,
@@ -10,7 +11,10 @@ use crate::protocol::zmtp::{
   greeting::{ZmtpGreeting, GREETING_LENGTH},
 };
 use crate::runtime::{ActorType, Command, MailboxReceiver, MailboxSender};
-use crate::security::{Mechanism, NullMechanism, PlainMechanism};
+use crate::security::IDataCipher;
+#[cfg(feature = "noise_xx")]
+use crate::security::NoiseXxMechanism;
+use crate::security::{null::NullMechanism, plain::PlainMechanism, Mechanism, MechanismStatus};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::{Blob, Context, MsgFlags};
 
@@ -19,13 +23,13 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use std::{fmt, marker::PhantomData};
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::interval;
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Encoder, Framed};
 
 /// Core ZMTP engine logic, generic over the underlying stream type `S`.
 /// This struct encapsulates the state and logic for handling the ZMTP protocol,
@@ -43,6 +47,7 @@ pub(crate) struct ZmtpEngineCoreStd<S: ZmtpStdStream> {
   config: ZmtpEngineConfig,
   /// The active security mechanism.
   mechanism: Box<dyn Mechanism>,
+  data_cipher: Option<Box<dyn IDataCipher>>,
   /// Indicates if this engine instance is operating in a server role.
   is_server: bool,
   /// Marker for the generic stream type `S`.
@@ -122,6 +127,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       stream: Some(stream),
       config,
       mechanism: Box::new(NullMechanism),
+      data_cipher: None,
       is_server,
       _marker: PhantomData,
       last_activity_time: Instant::now(),
@@ -212,7 +218,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
 
   async fn perform_security_and_ready_handshake(
     &mut self,
-    framed_stream: &mut Framed<S, ZmtpCodec>,
+    framed_handshake_stream: &mut Framed<S, ZmtpCodec>,
     peer_greeting: ZmtpGreeting,
   ) -> Result<(Box<dyn Mechanism>, Option<Blob>), ZmqError> {
     // --- Validate Peer's Greeting & Select Security Mechanism ---
@@ -252,6 +258,37 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
         // TODO: Pass PLAIN options (username/password if client) from self.config or socket options.
         Box::new(PlainMechanism::new(self.is_server))
       }
+
+      #[cfg(feature = "noise_xx")]
+      NoiseXxMechanism::NAME if self.config.use_noise_xx => {
+        // Peer proposed NOISE_XX AND our configuration enables/prefers it.
+        tracing::info!(
+          engine_handle = self.handle,
+          "Attempting to use NOISE_XX mechanism as proposed by peer and enabled in config."
+        );
+
+        // 1. Get the local static secret key bytes from engine config
+        let local_sk_bytes_arr: [u8; 32] = self.config.noise_xx_local_sk_bytes_for_engine.ok_or_else(|| {
+          let msg =
+            "NOISE_XX: Local static secret key not configured in engine config for selected mechanism.".to_string();
+          tracing::error!(engine_handle = self.handle, error = %msg);
+          ZmqError::SecurityError(msg)
+        })?;
+
+        // 3. Get the remote static public key bytes (for client role) from engine config
+        let remote_pk_config_opt_ref: Option<[u8; 32]> =
+          self.config.noise_xx_remote_pk_bytes_for_engine.as_ref().copied();
+
+        // 4. Instantiate NoiseXxMechanism
+        match NoiseXxMechanism::new(self.is_server, &local_sk_bytes_arr, remote_pk_config_opt_ref) {
+          Ok(noise_mech) => Box::new(noise_mech),
+          Err(e) => {
+            tracing::error!(engine_handle = self.handle, error = %e, "Failed to initialize NOISE_XX mechanism.");
+            // If Noise_XX was chosen but initialization fails, this is a security configuration error.
+            return Err(e);
+          }
+        }
+      }
       unsupported_name => {
         let security_error_msg = format!("Unsupported security mechanism '{}' from peer.", unsupported_name);
         tracing::error!(engine_handle = self.handle, error = %security_error_msg);
@@ -265,8 +302,10 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
     tracing::debug!(
       engine_handle = self.handle,
       mechanism = negotiated_mechanism.name(),
-      "Starting security token exchange (using framed stream)."
+      "Starting security token exchange."
     );
+
+    let handshake_timeout = Duration::from_secs(30); // Timeout for entire handshake token exchange phase
 
     while !negotiated_mechanism.is_complete() && !negotiated_mechanism.is_error() {
       // Produce a token if the mechanism has one to send.
@@ -279,51 +318,84 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
           token_size = command_msg.size(),
           "Sending security token."
         );
-        if let Err(e) = framed_stream.send(command_msg).await {
-          negotiated_mechanism.set_error(format!("Stream error sending token: {}", e));
-          tracing::error!(engine_handle = self.handle, error = %e, "Failed to send security token.");
-          return Err(e);
+        match tokio::time::timeout(handshake_timeout, framed_handshake_stream.send(command_msg)).await {
+          Ok(Ok(())) => { /* Sent successfully */ }
+          Ok(Err(e)) => {
+            // Error from framed_handshake_stream.send()
+            negotiated_mechanism.set_error(format!("Stream error sending token: {}", e));
+            tracing::error!(engine_handle = self.handle, error = %e, "Failed to send security token.");
+            return Err(e.into());
+          }
+          Err(_) => {
+            // Timeout
+            let err_msg = "Timeout sending security token".to_string();
+            negotiated_mechanism.set_error(err_msg.clone());
+            tracing::error!(engine_handle = self.handle, error = %err_msg);
+            return Err(ZmqError::Timeout);
+          }
         }
         self.last_activity_time = Instant::now();
       }
 
       // If mechanism is still not complete or in error, expect a token from peer.
       if !negotiated_mechanism.is_complete() && !negotiated_mechanism.is_error() {
-        match framed_stream.next().await {
-          Some(Ok(received_msg)) => {
-            self.last_activity_time = Instant::now();
-            if !received_msg.is_command() {
-              let protocol_err_msg = "Expected COMMAND frame during security handshake, got data frame.";
-              negotiated_mechanism.set_error(protocol_err_msg.to_string());
-              tracing::error!(engine_handle = self.handle, error = %protocol_err_msg);
-              return Err(ZmqError::SecurityError(protocol_err_msg.to_string()));
+        // Check if it's our turn or if we are expecting a message from peer
+        // (produce_token returning None might indicate we are waiting)
+        if negotiated_mechanism.status() == MechanismStatus::Handshaking {
+          // More general check
+          tracing::trace!(
+            engine_handle = self.handle,
+            mechanism = negotiated_mechanism.name(),
+            "Waiting for security token from peer."
+          );
+          match tokio::time::timeout(handshake_timeout, framed_handshake_stream.next()).await {
+            Ok(Some(Ok(received_msg))) => {
+              self.last_activity_time = Instant::now();
+              if !received_msg.is_command() {
+                let protocol_err_msg = "Expected COMMAND frame during security handshake, got data frame.";
+                negotiated_mechanism.set_error(protocol_err_msg.to_string());
+                tracing::error!(engine_handle = self.handle, error = %protocol_err_msg);
+                return Err(ZmqError::SecurityError(protocol_err_msg.to_string()));
+              }
+              let token_data = received_msg.data().unwrap_or(&[]);
+              tracing::trace!(
+                engine_handle = self.handle,
+                mechanism = negotiated_mechanism.name(),
+                token_size = token_data.len(),
+                "Received security token."
+              );
+              negotiated_mechanism.process_token(token_data)?;
             }
-            let token_data = received_msg.data().unwrap_or(&[]); // COMMAND body is the token
-            tracing::trace!(
-              engine_handle = self.handle,
-              mechanism = negotiated_mechanism.name(),
-              token_size = token_data.len(),
-              "Received security token."
-            );
-            if let Err(e) = negotiated_mechanism.process_token(token_data) {
-              // process_token itself might set_error internally, or return an error
-              tracing::error!(engine_handle = self.handle, error = %e, "Failed to process security token.");
-              return Err(e);
+            Ok(Some(Err(e))) => {
+              // Error from framed_handshake_stream.next() decoding
+              negotiated_mechanism.set_error(format!("Stream error receiving token: {}", e));
+              tracing::error!(engine_handle = self.handle, error = %e, "Stream error during security handshake.");
+              return Err(e.into());
+            }
+            Ok(None) => {
+              // Stream closed by peer
+              let err_msg = "Connection closed by peer during security handshake".to_string();
+              negotiated_mechanism.set_error(err_msg.clone());
+              tracing::error!(engine_handle = self.handle, error = %err_msg);
+              return Err(ZmqError::ConnectionClosed);
+            }
+            Err(_) => {
+              // Timeout waiting for peer's token
+              let err_msg = "Timeout waiting for security token from peer".to_string();
+              negotiated_mechanism.set_error(err_msg.clone());
+              tracing::error!(engine_handle = self.handle, error = %err_msg);
+              return Err(ZmqError::Timeout);
             }
           }
-          Some(Err(e)) => {
-            // Error decoding from framed stream
-            negotiated_mechanism.set_error(format!("Stream error receiving token: {}", e));
-            tracing::error!(engine_handle = self.handle, error = %e, "Stream error during security handshake.");
-            return Err(e);
-          }
-          None => {
-            // Stream closed by peer
-            let err_msg = "Connection closed by peer during security handshake".to_string();
-            negotiated_mechanism.set_error(err_msg.clone());
-            tracing::error!(engine_handle = self.handle, error = %err_msg);
-            return Err(ZmqError::ConnectionClosed);
-          }
+        } else if !negotiated_mechanism.is_complete() && !negotiated_mechanism.is_error() {
+          // produce_token was None, but we are not complete or error, implies we are waiting for peer.
+          // This case might be redundant if the above `if Handshaking` is sufficient.
+          // Or if mechanism state naturally leads to waiting in framed_handshake_stream.next()
+          tracing::trace!(
+            engine_handle = self.handle,
+            mechanism = negotiated_mechanism.name(),
+            "produce_token is None, handshake not complete. Assuming wait for peer."
+          );
         }
       }
 
@@ -352,6 +424,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       // TODO: Send ZMTP ERROR command back to peer?
       return Err(ZmqError::SecurityError(reason.to_string()));
     }
+
     tracing::info!(
       engine_handle = self.handle,
       mechanism = negotiated_mechanism.name(),
@@ -367,7 +440,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
     if !self.is_server {
       let mut client_ready_props = HashMap::new();
       client_ready_props.insert("Socket-Type".to_string(), local_socket_type_name.as_bytes().to_vec());
-      
+
       if let Some(id_blob) = local_routing_id {
         if !id_blob.is_empty() && id_blob.len() <= 255 {
           tracing::info!(
@@ -397,7 +470,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       }
       let client_ready_msg = ZmtpReady::create_msg(client_ready_props);
       tracing::debug!(engine_handle = self.handle, "Client sending ZMTP READY command.");
-      if let Err(e) = framed_stream.send(client_ready_msg).await {
+      if let Err(e) = framed_handshake_stream.send(client_ready_msg).await {
         tracing::error!(engine_handle=self.handle, error=%e, "Failed to send client READY command.");
         return Err(e);
       }
@@ -407,7 +480,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
     // Both client and server expect a READY command from the peer.
     tracing::debug!(engine_handle = self.handle, "Waiting for peer's ZMTP READY command.");
     let peer_ready_command_parsed = loop {
-      match framed_stream.next().await {
+      match framed_handshake_stream.next().await {
         Some(Ok(received_msg)) => {
           self.last_activity_time = Instant::now();
           if !received_msg.is_command() {
@@ -475,7 +548,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       // Libzmq server sockets (REP, ROUTER, PUB, PULL) do not send an Identity in their READY.
       let server_ready_msg = ZmtpReady::create_msg(server_ready_props);
       tracing::debug!(engine_handle = self.handle, "Server sending ZMTP READY command.");
-      if let Err(e) = framed_stream.send(server_ready_msg).await {
+      if let Err(e) = framed_handshake_stream.send(server_ready_msg).await {
         tracing::error!(engine_handle=self.handle, error=%e, "Failed to send server READY command.");
         return Err(e);
       }
@@ -542,13 +615,15 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       "ZmtpEngineCoreStd actor main loop starting."
     );
 
-    let mut raw_stream = match self.stream.take() {
+    // Buffer for raw network reads, used when a data_cipher is active.
+    let mut network_read_buffer = BytesMut::with_capacity(8192 * 2);
+    // Buffer to feed the ZmtpManualParser with plaintext ZMTP frames.
+    let mut zmtp_plaintext_feed_buffer = BytesMut::with_capacity(8192 * 2);
+    let mut zmtp_manual_parser = ZmtpManualParser::new(); // For parsing ZMTP frames in data phase
+
+    let mut initial_raw_stream = match self.stream.take() {
       Some(s) => s,
       None => {
-        tracing::error!(
-          engine_handle = engine_actor_handle,
-          "ZmtpEngineCoreStd started without a valid stream!"
-        );
         let error = ZmqError::Internal("EngineCore started without stream".into());
         let _ = self
           .session_mailbox
@@ -561,65 +636,81 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
 
     #[cfg(target_os = "linux")]
     if self.config.use_cork && self.stream_fd_for_cork.is_none() {
-      // Get the FD from the raw_stream before it's moved into Framed.
-      // This assumes S implements AsRawFd.
-      self.stream_fd_for_cork = Some(raw_stream.as_raw_fd());
-      tracing::debug!(engine_handle = self.handle, fd = ?self.stream_fd_for_cork, "TCP_CORK enabled, cached FD.");
+      self.stream_fd_for_cork = Some(initial_raw_stream.as_raw_fd());
+      tracing::debug!(engine_handle = self.handle, fd = ?self.stream_fd_for_cork, "TCP_CORK enabled, cached FD from initial_raw_stream.");
     }
 
     let mut final_error_for_actor_stop: Option<ZmqError> = None;
 
-    let peer_greeting = match self.exchange_greetings(&mut raw_stream).await {
+    // 1. ZMTP Greeting Exchange
+    let peer_greeting = match self.exchange_greetings(&mut initial_raw_stream).await {
       Ok(pg) => pg,
       Err(greeting_err) => {
-        tracing::error!(engine_handle = engine_actor_handle, error = %greeting_err, "ZMTP Greeting exchange failed.");
+        final_error_for_actor_stop = Some(greeting_err.clone());
         let _ = self
           .session_mailbox
-          .send(Command::EngineError {
-            error: greeting_err.clone(),
-          })
+          .send(Command::EngineError { error: greeting_err })
           .await;
-        final_error_for_actor_stop = Some(greeting_err);
         engine_context_clone.publish_actor_stopping(
           engine_actor_handle,
           engine_actor_type,
           None,
-          final_error_for_actor_stop,
+          final_error_for_actor_stop.clone(),
         );
         return;
       }
     };
 
-    let mut framed_transport_stream = Framed::new(raw_stream, ZmtpCodec::new());
+    // 2. Security Handshake & ZMTP READY Command Exchange (uses a temporary Framed stream)
+    let mut framed_for_handshake_and_ready = Framed::new(initial_raw_stream, ZmtpCodec::new());
 
-    // This assumes the FD obtained from the stream wrapped by Framed is the same
-    // as the initial raw stream. This should be true.
-    #[cfg(target_os = "linux")]
-    if self.config.use_cork && self.stream_fd_for_cork.is_none() {
-      self.stream_fd_for_cork = Some(framed_transport_stream.get_ref().as_raw_fd());
-      tracing::debug!(engine_handle = self.handle, fd = ?self.stream_fd_for_cork, "TCP_CORK enabled, cached FD from framed_stream in run_loop.");
-    }
-
-    match self
-      .perform_security_and_ready_handshake(&mut framed_transport_stream, peer_greeting)
+    let (negotiated_mechanism_box, final_peer_identity_for_session) = match self
+      .perform_security_and_ready_handshake(&mut framed_for_handshake_and_ready, peer_greeting)
       .await
     {
-      Ok((negotiated_mech, peer_id_opt)) => {
-        self.mechanism = negotiated_mech;
-        if self
+      Ok((mech, peer_id_opt)) => (mech, peer_id_opt),
+      Err(handshake_err) => {
+        final_error_for_actor_stop = Some(handshake_err.clone());
+        let _ = self
           .session_mailbox
-          .send(Command::EngineReady {
-            peer_identity: peer_id_opt,
-          })
-          .await
-          .is_err()
-        {
-          tracing::warn!(
-            engine_handle = engine_actor_handle,
-            "Session mailbox closed after successful handshake. Stopping engine."
+          .send(Command::EngineError { error: handshake_err })
+          .await;
+        let _ = framed_for_handshake_and_ready.close().await;
+        engine_context_clone.publish_actor_stopping(
+          engine_actor_handle,
+          engine_actor_type,
+          None,
+          final_error_for_actor_stop.clone(),
+        );
+        return;
+      }
+    };
+
+    self.mechanism = negotiated_mechanism_box; // Store the final chosen mechanism
+
+    // 3. Set up `self.data_cipher` based on the successfully negotiated mechanism
+    if self.mechanism.status() == MechanismStatus::Ready {
+      let mechanism_to_convert = std::mem::replace(&mut self.mechanism, Box::new(NullMechanism)); // Consume self.mechanism
+      match mechanism_to_convert.into_data_cipher_parts() {
+        Ok((cipher, _mechanism_peer_id)) => {
+          // _mechanism_peer_id already factored into final_peer_identity_for_session
+          tracing::info!(engine_handle = self.handle, "Data cipher obtained for data phase.");
+          self.data_cipher = Some(cipher);
+        }
+        Err(e) => {
+          tracing::error!(
+            engine_handle = self.handle,
+            "Failed to get data cipher from mechanism: {}",
+            e
           );
-          let _ = framed_transport_stream.close().await;
-          final_error_for_actor_stop = Some(ZmqError::Internal("Session closed post-handshake".into()));
+          final_error_for_actor_stop = Some(e);
+          let _ = self
+            .session_mailbox
+            .send(Command::EngineError {
+              error: final_error_for_actor_stop.clone().unwrap(),
+            })
+            .await;
+          let _ = framed_for_handshake_and_ready.close().await;
           engine_context_clone.publish_actor_stopping(
             engine_actor_handle,
             engine_actor_type,
@@ -629,282 +720,349 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
           return;
         }
       }
-      Err(handshake_err) => {
-        tracing::error!(engine_handle = engine_actor_handle, error = %handshake_err, "ZMTP Security/Ready Handshake failed.");
-        let _ = self
-          .session_mailbox
-          .send(Command::EngineError {
-            error: handshake_err.clone(),
-          })
-          .await;
-        let _ = framed_transport_stream.close().await;
-        final_error_for_actor_stop = Some(handshake_err.clone());
-        engine_context_clone.publish_actor_stopping(engine_actor_handle, engine_actor_type, None, Some(handshake_err));
-        return;
-      }
+    } else {
+      let err_msg = format!(
+        "Mechanism not Ready (status: {:?}) after handshake phase.",
+        self.mechanism.status()
+      );
+      tracing::error!(engine_handle = self.handle, "{}", err_msg);
+      final_error_for_actor_stop = Some(ZmqError::Internal(err_msg));
+      let _ = self
+        .session_mailbox
+        .send(Command::EngineError {
+          error: final_error_for_actor_stop.clone().unwrap(),
+        })
+        .await;
+      let _ = framed_for_handshake_and_ready.close().await;
+      engine_context_clone.publish_actor_stopping(
+        engine_actor_handle,
+        engine_actor_type,
+        None,
+        final_error_for_actor_stop.clone(),
+      );
+      return;
+    }
+
+    // 4. Send EngineReady to Session
+    if self
+      .session_mailbox
+      .send(Command::EngineReady {
+        peer_identity: final_peer_identity_for_session,
+      })
+      .await
+      .is_err()
+    {
+      tracing::warn!(
+        engine_handle = engine_actor_handle,
+        "Session mailbox closed before EngineReady. Stopping engine."
+      );
+      final_error_for_actor_stop = Some(ZmqError::Internal("Session closed before EngineReady".into()));
+      let _ = framed_for_handshake_and_ready.close().await;
+      engine_context_clone.publish_actor_stopping(
+        engine_actor_handle,
+        engine_actor_type,
+        None,
+        final_error_for_actor_stop.clone(),
+      );
+      return;
     }
     self.last_activity_time = Instant::now();
 
-    if final_error_for_actor_stop.is_none() {
-      tracing::debug!(
-        engine_handle = engine_actor_handle,
-        "ZmtpEngineCoreStd entering main message loop."
-      );
+    // 5. Get the raw underlying stream `S` back for the main data loop.
+    let mut current_underlying_stream: S = framed_for_handshake_and_ready.into_inner();
 
-      let keepalive_ping_enabled = self.heartbeat_ivl.map_or(false, |d| !d.is_zero());
-      let mut ping_check_timer = if keepalive_ping_enabled {
-        let configured_ivl = self.heartbeat_ivl.unwrap();
-        let check_frequency = configured_ivl
-          .checked_sub(Duration::from_millis(50))
-          .unwrap_or(configured_ivl);
-        let mut timer = interval(check_frequency.max(Duration::from_millis(100)));
-        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        Some(timer)
-      } else {
-        None
-      };
+    tracing::debug!(
+      engine_handle = engine_actor_handle,
+      "ZmtpEngineCoreStd entering main message loop."
+    );
 
-      let mut pong_timeout_timer = interval(self.heartbeat_timeout);
-      pong_timeout_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let keepalive_ping_enabled = self.heartbeat_ivl.map_or(false, |d| !d.is_zero());
+    let mut ping_check_timer = if keepalive_ping_enabled {
+      let configured_ivl = self.heartbeat_ivl.unwrap();
+      let check_frequency = configured_ivl
+        .checked_sub(Duration::from_millis(50))
+        .unwrap_or(configured_ivl);
+      let mut timer = interval(check_frequency.max(Duration::from_millis(100)));
+      timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+      Some(timer)
+    } else {
+      None
+    };
+    let mut pong_timeout_timer = interval(self.heartbeat_timeout);
+    pong_timeout_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-      let mut should_break_loop = false;
+    let mut should_break_loop = false;
 
-      while !should_break_loop {
-        tokio::select! {
-          biased;
+    while !should_break_loop {
+      tokio::select! {
+        biased;
 
-          session_command_result = self.mailbox_receiver.recv() => {
-            let command_from_session = match session_command_result {
-              Ok(cmd) => cmd,
-              Err(_) => {
-                tracing::info!(engine_handle = engine_actor_handle, "Engine command mailbox (from Session) closed. Stopping.");
-                should_break_loop = true;
-                if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed".into())); }
-                continue;
-              }
-            };
-            match command_from_session {
-              Command::SessionPushCmd { msg } => {
-                let is_last_frame_of_user_message = !msg.is_more();
-                let mut current_send_error: Option<ZmqError> = None;
-                let mut send_occurred_successfully = false;
-
-                #[cfg(target_os = "linux")]
-                if self.config.use_cork {
-                    if let Some(fd) = self.stream_fd_for_cork {
-                        if self.expecting_first_frame_of_msg && !self.is_corked {
-                            // This is the first frame of a new logical ZMQ message, and we are not yet corked. Cork it.
-                            Self::set_tcp_cork_rawfd(fd, true, self.handle).await;
-                            self.is_corked = true;
-                        }
-                    } else if self.expecting_first_frame_of_msg { // Log if cork enabled but FD missing
-                        tracing::warn!(engine_handle = self.handle, "TCP_CORK is enabled but stream FD is not available for setting cork.");
-                    }
-                }
-                
-                if let Err(e) = framed_transport_stream.send(msg).await {
-                  current_send_error = Some(e);
-                } else {
-                  send_occurred_successfully = true;
-                }
-
-                // Current plan: All sends go through framed_stream. Zerocopy path is deferred.
-                if let Some(e) = current_send_error {
-                  tracing::error!(engine_handle = self.handle, error = %e, "Engine failed to send message.");
-
-                  if !self.session_mailbox.is_closed() {
-                    let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await;
-                  }
-
-                  final_error_for_actor_stop = Some(e);
-                  should_break_loop = true;
-
-                  // If send fails, ensure cork is released if it was set for this message attempt
-                  #[cfg(target_os = "linux")]
-                  if self.is_corked {
-                    if let Some(fd) = self.stream_fd_for_cork {
-                      Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork on error
-                    }
-                    self.is_corked = false;
-                    self.expecting_first_frame_of_msg = true; // Reset for next attempt if any
-                  }
-                } else if send_occurred_successfully {
-                  self.last_activity_time = Instant::now();
-                  self.expecting_first_frame_of_msg = is_last_frame_of_user_message;
-
-                  #[cfg(target_os = "linux")]
-                  if self.is_corked && self.expecting_first_frame_of_msg && send_occurred_successfully {
-                    // This means the frame just sent was the last part of a logical ZMQ message,
-                    // and the cork was active. Uncork now.
-                    if let Some(fd) = self.stream_fd_for_cork {
-                        Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork
-                    }
-                    self.is_corked = false;
-                  }
-                }
-              }
-              Command::Stop => {
-                tracing::info!(engine_handle = engine_actor_handle, "Engine received Stop command.");
-                should_break_loop = true;
-              }
-              _ => { /* Unhandled command */ }
+        // --- ARM 1: Receive Command from Session ---
+        session_command_result = self.mailbox_receiver.recv() => {
+          let command_from_session = match session_command_result {
+            Ok(cmd) => cmd,
+            Err(_) => {
+              tracing::info!(engine_handle = engine_actor_handle, "Engine command mailbox (from Session) closed. Stopping.");
+              final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed".into()));
+              should_break_loop = true;
+              continue;
             }
-          }
+          };
 
-            // Arm 1: Standard Framed Receive
-          frame_decode_result = framed_transport_stream.next() => {
-            match frame_decode_result {
-              Some(Ok(decoded_msg)) => {
-                self.last_activity_time = Instant::now();
+          match command_from_session {
+            Command::SessionPushCmd { msg } => {
+              let original_msg_is_last_part = !msg.is_more(); // For TCP_CORK logic
 
-                // Any valid frame received from peer means peer is active.
-                // If we were corked waiting to send more, this implies the other side might expect a turn.
-                // Also, TCP ACKs might have flushed our send buffer.
-                // It's safer to reset cork state.
-                if self.expecting_first_frame_of_msg == false { // We were in the middle of sending a logical message
-                  tracing::trace!(engine_handle = self.handle, "Data received from peer mid-send; ZMQ message send interrupted by receive.");
-                }
-                self.expecting_first_frame_of_msg = true;
-                #[cfg(target_os = "linux")]
-                if self.is_corked {
-                  if let Some(fd) = self.stream_fd_for_cork {
-                    tracing::trace!(engine_handle = self.handle, "Data received from peer, ensuring TCP_CORK is off if it was on.");
-                    Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork on receiving data
-                  }
-                  self.is_corked = false;
-                }
+              // 1. ZMTP-frame the Msg
+              let mut temp_zmtp_encoder = ZmtpCodec::new();
+              let mut plaintext_zmtp_frame_buffer = BytesMut::new();
+              if let Err(e) = temp_zmtp_encoder.encode(msg, &mut plaintext_zmtp_frame_buffer) {
+                tracing::error!(engine_handle = self.handle, error = %e, "Failed to ZMTP-encode outgoing message.");
+                final_error_for_actor_stop = Some(e); should_break_loop = true; continue;
+              }
+              let plaintext_zmtp_frame_bytes = plaintext_zmtp_frame_buffer.freeze();
 
-                if decoded_msg.is_command() {
-                  if let Some(zmtp_cmd) = ZmtpCommand::parse(&decoded_msg) {
-                    match zmtp_cmd {
-                      ZmtpCommand::Ping(ping_context) => {
-                        let pong_reply = ZmtpCommand::create_pong(&ping_context);
-                        if let Err(e) = framed_transport_stream.send(pong_reply).await {
-                          if !self.session_mailbox.is_closed() { let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await; }
-                          should_break_loop = true; final_error_for_actor_stop = Some(e);
-                        } else { self.last_activity_time = Instant::now(); }
-                      }
-                      ZmtpCommand::Pong(_) => {
-                        if self.waiting_for_pong { self.waiting_for_pong = false; self.last_ping_sent_time = None; }
-                        else { tracing::warn!(engine_handle = engine_actor_handle, "Received unexpected PONG."); }
-                      }
-                      ZmtpCommand::Error => {
-                        if !self.session_mailbox.is_closed() { let _ = self.session_mailbox.send(Command::EngineError { error: ZmqError::ProtocolViolation("Received ZMTP ERROR".into()) }).await; }
-                        should_break_loop = true; final_error_for_actor_stop = Some(ZmqError::ProtocolViolation("Received ZMTP ERROR from peer".into()));
-                      }
-                      _ => { /* Ignore other commands like Ready, Unknown */ }
-                    }
-                  }
-                } else {
-                  if self.session_mailbox.send(Command::EnginePushCmd { msg: decoded_msg }).await.is_err() {
-                    should_break_loop = true;
-                    if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed on incoming data".into())); }
+              // 2. Encrypt if cipher is active
+              let wire_bytes_to_send = if let Some(cipher) = &mut self.data_cipher {
+                match cipher.encrypt_zmtp_frame(plaintext_zmtp_frame_bytes) {
+                  Ok(eb) => eb,
+                  Err(e) => {
+                    tracing::error!(engine_handle = self.handle, error = %e, "Failed to encrypt outgoing ZMTP frame.");
+                    final_error_for_actor_stop = Some(e); should_break_loop = true; continue;
                   }
                 }
-              }
-              Some(Err(e)) => {
-                if !self.session_mailbox.is_closed() { let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await; }
-                should_break_loop = true; final_error_for_actor_stop = Some(e);
-              }
-              None => {
-                should_break_loop = true;
-                if final_error_for_actor_stop.is_none() { final_error_for_actor_stop = Some(ZmqError::ConnectionClosed); }
-              }
-            }
-          }
+              } else {
+                plaintext_zmtp_frame_bytes
+              };
 
-          // --- Heartbeat PING Timer Arm ---
-          // This arm fires if keepalive is enabled, we are not already waiting for a PONG,
-          // and the ping_check_timer ticks.
-          _ = async { ping_check_timer.as_mut().unwrap().tick().await }, if keepalive_ping_enabled && !self.waiting_for_pong && ping_check_timer.is_some() => {
-            // Check if it's time to send a PING based on last_activity_time and heartbeat_ivl
-            let now = Instant::now();
-            if now.duration_since(self.last_activity_time) >= self.heartbeat_ivl.unwrap() {
-              tracing::trace!(engine_handle = self.handle, "Heartbeat interval elapsed. Sending PING.");
-              let ping_to_send = ZmtpCommand::create_ping(0, b""); // TTL and Context for PING
-              let mut ping_sent_successfully = false;
-
+              // 3. TCP_CORK logic
               #[cfg(target_os = "linux")]
               if self.config.use_cork {
                 if let Some(fd) = self.stream_fd_for_cork {
-                  // PING is a new logical message. If not already corked (e.g., from a previous send
-                  // that didn't complete with its last frame), cork now.
-                  if !self.is_corked {
+                  if self.expecting_first_frame_of_msg && !self.is_corked {
                     Self::set_tcp_cork_rawfd(fd, true, self.handle).await;
                     self.is_corked = true;
                   }
-                  // If it *was* already corked (e.g. user sent frame1, then PING timer fired),
-                  // we keep it corked, send the PING, then uncork because PING is a complete message.
-                } else {
-                  tracing::warn!(engine_handle = self.handle, "TCP_CORK enabled for PING but stream FD is not available.");
+                } else if self.expecting_first_frame_of_msg {
+                   tracing::warn!(engine_handle = self.handle, "TCP_CORK is enabled but stream FD is not available for setting cork.");
                 }
               }
 
-              match framed_transport_stream.send(ping_to_send).await {
-                Ok(()) => {
-                  self.last_activity_time = now;      // Update activity time after successful PING send
-                  self.last_ping_sent_time = Some(now);
-                  self.waiting_for_pong = true;
-                  pong_timeout_timer.reset(); // Reset the PONG timeout timer
-                  ping_sent_successfully = true;
-                  tracing::debug!(engine_handle = self.handle, "PING sent. Waiting for PONG.");
+              // 4. Send the bytes
+              if let Err(e) = current_underlying_stream.write_all(&wire_bytes_to_send).await {
+                final_error_for_actor_stop = Some(ZmqError::from(e));
+                should_break_loop = true;
+                #[cfg(target_os = "linux")]
+                if self.is_corked {
+                  if let Some(fd) = self.stream_fd_for_cork { Self::set_tcp_cork_rawfd(fd, false, self.handle).await; }
+                  self.is_corked = false;
+                  self.expecting_first_frame_of_msg = true;
                 }
-                Err(e) => {
-                  tracing::error!(engine_handle = self.handle, error = %e, "Engine failed to send PING.");
-                  if !self.session_mailbox.is_closed() {
-                    let _ = self.session_mailbox.send(Command::EngineError { error: e.clone() }).await;
-                  }
-                  final_error_for_actor_stop = Some(e);
-                  should_break_loop = true;
-                  // If PING send fails, ensure cork is released if it was set for this attempt
-                  #[cfg(target_os = "linux")]
-                  if self.is_corked {
-                    if let Some(fd) = self.stream_fd_for_cork {
-                      Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork on error
-                    }
-                    self.is_corked = false;
-                  }
-                }
+                continue;
               }
 
-              // PING is a self-contained, single-frame logical ZMTP message.
-              // So, if cork was active, it should be released after sending it.
+              self.last_activity_time = Instant::now();
+              self.expecting_first_frame_of_msg = original_msg_is_last_part;
+
               #[cfg(target_os = "linux")]
-              if self.is_corked && ping_sent_successfully {
+              if self.is_corked && self.expecting_first_frame_of_msg {
                 if let Some(fd) = self.stream_fd_for_cork {
-                  Self::set_tcp_cork_rawfd(fd, false, self.handle).await; // Uncork after PING
+                  Self::set_tcp_cork_rawfd(fd, false, self.handle).await;
                 }
                 self.is_corked = false;
               }
-              // After sending a PING, the next user data send will be the start of a new logical message.
-              self.expecting_first_frame_of_msg = true;
+            }
+            Command::Stop => {
+              tracing::info!(engine_handle = engine_actor_handle, "Engine received Stop command.");
+              should_break_loop = true;
+              continue;
+            }
+            _ => { /* Unhandled command */ }
+          }
+        }
+
+        // --- ARM 2: Read from Network Stream ---
+        // `read_buf` reads into `network_read_buffer`.
+        // Data is then decrypted (if cipher active) into `zmtp_plaintext_feed_buffer`.
+        // Then `zmtp_manual_parser` decodes ZMTP messages from `zmtp_plaintext_feed_buffer`.
+        read_result = current_underlying_stream.read_buf(&mut network_read_buffer) => {
+          match read_result {
+            Ok(0) => { // EOF
+              tracing::info!(engine_handle = engine_actor_handle, "Connection closed by peer (EOF).");
+              final_error_for_actor_stop = Some(ZmqError::ConnectionClosed);
+              should_break_loop = true;
+              continue;
+            }
+            Ok(_) => { // Some bytes read into network_read_buffer
+              self.last_activity_time = Instant::now();
+              self.expecting_first_frame_of_msg = true; // Activity from peer resets send cork expectation
+              #[cfg(target_os = "linux")]
+              if self.is_corked {
+                if let Some(fd) = self.stream_fd_for_cork { Self::set_tcp_cork_rawfd(fd, false, self.handle).await; }
+                self.is_corked = false;
+              }
+
+              if let Some(cipher) = &mut self.data_cipher {
+                // Decrypt loop: process all complete secure messages in network_read_buffer
+                'decrypt_loop: loop {
+                  match cipher.decrypt_wire_data_to_zmtp_frame(&mut network_read_buffer) {
+                    Ok(Some(plaintext_zmtp_bytes)) => {
+                      zmtp_plaintext_feed_buffer.put(plaintext_zmtp_bytes);
+                    }
+                    Ok(None) => break 'decrypt_loop, // Need more data in network_read_buffer
+                    Err(e) => {
+                      tracing::error!(engine_handle = self.handle, error = %e, "Decryption failed.");
+                      final_error_for_actor_stop = Some(e);
+                      should_break_loop = true;
+                      break 'decrypt_loop;
+                    }
+                  }
+                }
+                if should_break_loop { continue; }
+              } else {
+                // No cipher, move data directly from network_read_buffer to zmtp_plaintext_feed_buffer
+                zmtp_plaintext_feed_buffer.extend_from_slice(&network_read_buffer);
+                network_read_buffer.clear(); // All data moved
+              }
+
+              // ZMTP Parse loop: process all complete ZMTP frames in zmtp_plaintext_feed_buffer
+              'zmtp_parse_loop: loop {
+                match zmtp_manual_parser.decode_from_buffer(&mut zmtp_plaintext_feed_buffer) {
+                  Ok(Some(decoded_msg)) => {
+                    if decoded_msg.is_command() {
+                      if let Some(zmtp_cmd) = ZmtpCommand::parse(&decoded_msg) {
+                        match zmtp_cmd {
+                          ZmtpCommand::Ping(ping_context) => {
+                            let pong_reply_msg = ZmtpCommand::create_pong(&ping_context);
+                            let mut temp_zmtp_enc = ZmtpCodec::new();
+                            let mut ptxt_buf = BytesMut::new();
+                            if let Err(e) = temp_zmtp_enc.encode(pong_reply_msg, &mut ptxt_buf) {
+                              final_error_for_actor_stop = Some(e); should_break_loop = true; break 'zmtp_parse_loop;
+                            }
+                            let ptxt_bytes = ptxt_buf.freeze();
+                            let wire_bytes = if let Some(c) = &mut self.data_cipher {
+                              match c.encrypt_zmtp_frame(ptxt_bytes) {
+                                Ok(eb) => eb,
+                                Err(e) => { final_error_for_actor_stop = Some(e); should_break_loop = true; break 'zmtp_parse_loop; }
+                              }
+                            } else { ptxt_bytes };
+                            if let Err(e) = current_underlying_stream.write_all(&wire_bytes).await {
+                              final_error_for_actor_stop = Some(ZmqError::from(e)); should_break_loop = true; break 'zmtp_parse_loop;
+                            }
+                            self.last_activity_time = Instant::now();
+                          }
+                          ZmtpCommand::Pong(_) => {
+                            self.waiting_for_pong = false;
+                            self.last_ping_sent_time = None;
+                          }
+                          ZmtpCommand::Error => {
+                            final_error_for_actor_stop = Some(ZmqError::ProtocolViolation("Received ZMTP ERROR from peer".into()));
+                            should_break_loop = true; break 'zmtp_parse_loop;
+                          }
+                          _ => { /* Ignore other commands like Ready (already handled), Unknown */ }
+                        }
+                      }
+                    } else { // Data message
+                      if self.session_mailbox.send(Command::EnginePushCmd { msg: decoded_msg }).await.is_err() {
+                        final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed on incoming data".into()));
+                        should_break_loop = true; break 'zmtp_parse_loop;
+                      }
+                    }
+                  }
+                  Ok(None) => break 'zmtp_parse_loop, // Need more data in zmtp_plaintext_feed_buffer
+                  Err(e) => {
+                    final_error_for_actor_stop = Some(e);
+                    should_break_loop = true; break 'zmtp_parse_loop;
+                  }
+                }
+              } // End ZMTP parse loop
+              if should_break_loop { continue; }
+            }
+            Err(e) => { // IO error reading from stream
+              final_error_for_actor_stop = Some(ZmqError::from(e));
+              should_break_loop = true;
+              continue;
             }
           }
+        }
 
-          // --- PONG Timeout Arm ---
-          _ = pong_timeout_timer.tick(), if self.waiting_for_pong => {
-            tracing::warn!(engine_handle = self.handle, timeout = ?self.heartbeat_timeout, "Timed out waiting for PONG.");
-            if !self.session_mailbox.is_closed() {
-              let _ = self.session_mailbox.send(Command::EngineError { error: ZmqError::Timeout }).await;
+        // --- ARM 3: Heartbeat PING Timer ---
+        _ = async { ping_check_timer.as_mut().unwrap().tick().await }, if keepalive_ping_enabled && !self.waiting_for_pong && ping_check_timer.is_some() => {
+          let now = Instant::now();
+          if now.duration_since(self.last_activity_time) >= self.heartbeat_ivl.unwrap() {
+            tracing::trace!(engine_handle = self.handle, "Heartbeat interval elapsed. Sending PING.");
+            let ping_to_send_msg = ZmtpCommand::create_ping(0, b""); // TTL and Context for PING
+
+            let mut temp_zmtp_encoder = ZmtpCodec::new();
+            let mut plaintext_zmtp_frame_buffer = BytesMut::new();
+            if let Err(e) = temp_zmtp_encoder.encode(ping_to_send_msg, &mut plaintext_zmtp_frame_buffer) {
+              final_error_for_actor_stop = Some(e); should_break_loop = true; continue;
             }
-            final_error_for_actor_stop = Some(ZmqError::Timeout);
-            should_break_loop = true;
+            let plaintext_zmtp_frame_bytes = plaintext_zmtp_frame_buffer.freeze();
 
-            // If we timed out waiting for PONG, and we were corked (perhaps waiting to send more data
-            // that never happened because the PING failed to elicit a PONG), ensure we uncork.
+            let wire_bytes_to_send = if let Some(cipher) = &mut self.data_cipher {
+              match cipher.encrypt_zmtp_frame(plaintext_zmtp_frame_bytes) {
+                Ok(eb) => eb,
+                Err(e) => { final_error_for_actor_stop = Some(e); should_break_loop = true; continue; }
+              }
+            } else {
+              plaintext_zmtp_frame_bytes
+            };
+
             #[cfg(target_os = "linux")]
-            if self.is_corked {
+            if self.config.use_cork {
+              if let Some(fd) = self.stream_fd_for_cork {
+                if !self.is_corked {
+                  Self::set_tcp_cork_rawfd(fd, true, self.handle).await;
+                  self.is_corked = true;
+                }
+              }
+            }
+
+            match current_underlying_stream.write_all(&wire_bytes_to_send).await {
+              Ok(()) => {
+                self.last_activity_time = now;
+                self.last_ping_sent_time = Some(now);
+                self.waiting_for_pong = true;
+                pong_timeout_timer.reset();
+                tracing::debug!(engine_handle = self.handle, "PING sent. Waiting for PONG.");
+              }
+              Err(e) => {
+                final_error_for_actor_stop = Some(ZmqError::from(e));
+                should_break_loop = true;
+                #[cfg(target_os = "linux")] if self.is_corked { if let Some(fd) = self.stream_fd_for_cork { Self::set_tcp_cork_rawfd(fd, false, self.handle).await; } self.is_corked = false; }
+                continue;
+              }
+            }
+
+            #[cfg(target_os = "linux")]
+            if self.is_corked { // PING is a self-contained logical message
               if let Some(fd) = self.stream_fd_for_cork {
                 Self::set_tcp_cork_rawfd(fd, false, self.handle).await;
               }
               self.is_corked = false;
             }
-            self.expecting_first_frame_of_msg = true; // Reset for any future communication
+            self.expecting_first_frame_of_msg = true;
           }
         }
-      }
-    }
 
+        // --- ARM 4: PONG Timeout ---
+        _ = pong_timeout_timer.tick(), if self.waiting_for_pong => {
+          tracing::warn!(engine_handle = self.handle, timeout = ?self.heartbeat_timeout, "Timed out waiting for PONG.");
+          final_error_for_actor_stop = Some(ZmqError::Timeout);
+          should_break_loop = true;
+          #[cfg(target_os = "linux")]
+          if self.is_corked {
+            if let Some(fd) = self.stream_fd_for_cork { Self::set_tcp_cork_rawfd(fd, false, self.handle).await; }
+            self.is_corked = false;
+          }
+          self.expecting_first_frame_of_msg = true;
+          continue;
+        }
+      } // end select!
+    } // end while !should_break_loop
+
+    // --- Cleanup ---
     tracing::info!(
       engine_handle = engine_actor_handle,
       role = role_str,
@@ -914,35 +1072,33 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
     #[cfg(target_os = "linux")]
     if self.is_corked {
       if let Some(fd) = self.stream_fd_for_cork {
-        // Check if fd is likely valid, e.g. > 0, though this isn't foolproof.
-        // The primary safety is that SockRef::from_fd is unsafe and relies on fd being valid.
-        // If the stream was closed, fd might be -1 or reused.
-        // This cleanup is best-effort.
         if fd > 0 {
-          // Simple check, not a guarantee of validity
-          tracing::debug!(
-            engine_handle = self.handle,
-            fd,
-            "Ensuring TCP_CORK is unset during cleanup."
-          );
+          // Basic check
           Self::set_tcp_cork_rawfd(fd, false, self.handle).await;
         }
       }
-      self.is_corked = false; // Mark as uncorked anyway
+      self.is_corked = false;
     }
 
-    let _ = framed_transport_stream.close().await;
+    // Attempt to shutdown the stream gracefully.
+    // `current_underlying_stream` is the raw `S`.
+    if let Err(e) = current_underlying_stream.shutdown().await {
+      tracing::warn!(engine_handle = engine_actor_handle, error = %e, "Error during stream shutdown.");
+    }
+    drop(current_underlying_stream); // Ensure it's dropped.
 
+    // Notify Session that engine has stopped.
     if !self.session_mailbox.is_closed() {
       if let Err(e) = self.session_mailbox.send(Command::EngineStopped).await {
         tracing::warn!(engine_handle = engine_actor_handle, error = ?e, "Failed to send EngineStopped to Session.");
       }
     }
 
+    // Publish ActorStopping event.
     engine_context_clone.publish_actor_stopping(
       engine_actor_handle,
       engine_actor_type,
-      None,
+      None, // TODO: Could add peer URI from config if it's a client engine.
       final_error_for_actor_stop,
     );
     tracing::info!(

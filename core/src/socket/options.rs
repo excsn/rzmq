@@ -30,6 +30,13 @@ pub const PLAIN_SERVER: i32 = 44;
 pub const PLAIN_USERNAME: i32 = 45;
 pub const PLAIN_PASSWORD: i32 = 46;
 
+// Security/Noise XX
+pub const NOISE_XX_ENABLED: i32 = 1202; // Boolean (0 or 1)
+pub const NOISE_XX_STATIC_SECRET_KEY: i32 = 1200; // Expects 32-byte secret key
+pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201; // Client uses this for server's PK, expects 32-byte public key
+                                                         // Optional: For server, a list of allowed client public keys (if not using ZAP for this)
+                                                         // pub const NOISE_XX_ALLOWED_PEERS: i32 = 1203; // Would take a list of PKs
+
 pub const MAX_CONNECTIONS: i32 = 1000;
 
 // IO Uring Options
@@ -99,19 +106,13 @@ pub(crate) struct SocketOptions {
   pub router_mandatory: bool,
 
   pub zap_domain: Option<String>, // ZAP Domain
+  pub zap_plain: PlainMechanismSocketOptions,
   // Add other commonly used options as needed
-  pub plain_server: Option<bool>,     // Role override
-  pub plain_username: Option<String>, // Security options stored here?
-  pub plain_password: Option<String>,
   // pub heartbeat_ttl: Option<Duration>, // TTL often derived from timeout
-  pub io_uring_send_zerocopy: bool,
-  pub io_uring_recv_multishot: bool,
   pub tcp_cork: bool,
-  #[cfg(feature = "io-uring")]
-  pub io_uring_recv_buffer_count: usize,
-  #[cfg(feature = "io-uring")]
-  pub io_uring_recv_buffer_size: usize,
-  pub io_uring_session_enabled: bool,
+  pub io_uring: IOURingSocketOptions,
+  #[cfg(feature = "noise_xx")]
+  pub noise_xx_options: NoiseXxSocketOptions,
 }
 
 impl Default for SocketOptions {
@@ -120,11 +121,11 @@ impl Default for SocketOptions {
       // ZMQ Defaults:
       rcvhwm: 256,
       sndhwm: 256,
-      rcvtimeo: None,                                  // -1 in ZMQ
-      sndtimeo: None,                                  // -1 in ZMQ
-      linger: Some(Duration::ZERO),                    // 0 in ZMQ (different from socket default!)
+      rcvtimeo: None,               // -1 in ZMQ
+      sndtimeo: None,               // -1 in ZMQ
+      linger: Some(Duration::ZERO), // 0 in ZMQ (different from socket default!)
       reconnect_ivl: Some(Duration::from_millis(5000)),
-      reconnect_ivl_max: Some(Duration::ZERO),         // ZMQ default is 0 (disable max/backoff)
+      reconnect_ivl_max: Some(Duration::ZERO), // ZMQ default is 0 (disable max/backoff)
       routing_id: None,
       socket_type_name: "UNKNOWN".to_string(), // Default, should be set on creation
       tcp_keepalive_enabled: 0,                // 0 (use system default) in ZMQ
@@ -137,19 +138,47 @@ impl Default for SocketOptions {
       heartbeat_timeout: None,
       router_mandatory: false, // Default ZMQ behavior is to drop silently
       zap_domain: None,
-      plain_server: None,
-      plain_username: None,
-      plain_password: None,
-      io_uring_send_zerocopy: false,
-      io_uring_recv_multishot: false,
+      zap_plain: Default::default(),
       tcp_cork: false,
-      #[cfg(feature = "io-uring")]
-      io_uring_recv_buffer_count: DEFAULT_IO_URING_RECV_BUFFER_COUNT,
-      #[cfg(feature = "io-uring")]
-      io_uring_recv_buffer_size: DEFAULT_IO_URING_RECV_BUFFER_SIZE,
-      io_uring_session_enabled: false,
+      io_uring: Default::default(),
+      #[cfg(feature = "noise_xx")]
+      noise_xx_options: NoiseXxSocketOptions::default(),
     }
   }
+}
+
+#[derive(Debug, Clone)]
+pub struct IOURingSocketOptions {
+  pub send_zerocopy: bool,
+  pub recv_multishot: bool,
+  #[cfg(feature = "io-uring")]
+  pub recv_buffer_count: usize,
+  #[cfg(feature = "io-uring")]
+  pub recv_buffer_size: usize,
+  pub session_enabled: bool,
+}
+
+impl Default for IOURingSocketOptions {
+  fn default() -> Self {
+    Self {
+      send_zerocopy: false,
+      recv_multishot: false,
+      #[cfg(feature = "io-uring")]
+      recv_buffer_count: DEFAULT_IO_URING_RECV_BUFFER_COUNT,
+      #[cfg(feature = "io-uring")]
+      recv_buffer_size: DEFAULT_IO_URING_RECV_BUFFER_SIZE,
+      session_enabled: false,
+    }
+  }
+}
+
+#[cfg(feature = "noise_xx")]
+#[derive(Debug, Clone, Default)]
+pub struct NoiseXxSocketOptions {
+  pub enabled: bool,
+  pub static_secret_key_bytes: Option<[u8; 32]>,
+  pub remote_static_public_key_bytes: Option<[u8; 32]>,
+  // pub allowed_peers: Option<Vec<[u8; 32]>>, // If you add this later
 }
 
 /// Configuration passed to TCP Listener/Connecter for initial socket setup.
@@ -160,6 +189,13 @@ pub(crate) struct TcpTransportConfig {
   pub keepalive_interval: Option<Duration>,
   pub keepalive_count: Option<u32>,
   // Add other options settable BEFORE connect/accept if needed (e.g., SO_REUSEADDR?)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlainMechanismSocketOptions {
+  pub server: Option<bool>,     // Role override
+  pub username: Option<String>, // Security options stored here?
+  pub password: Option<String>,
 }
 
 // Config specific to TCP transport, potentially influenced by socket options
@@ -183,14 +219,20 @@ pub(crate) struct ZmtpEngineConfig {
   pub recv_multishot_buffer_count: usize,
   #[cfg(feature = "io-uring")]
   pub recv_multishot_buffer_capacity: usize,
+  #[cfg(feature = "noise_xx")]
+  pub use_noise_xx: bool, // Derived from noise_xx_options.enabled
+  #[cfg(feature = "noise_xx")]
+  pub noise_xx_local_sk_bytes_for_engine: Option<[u8; 32]>, // Renamed for clarity
+  #[cfg(feature = "noise_xx")]
+  pub noise_xx_remote_pk_bytes_for_engine: Option<[u8; 32]>,
 }
 
 // --- Helper functions for parsing option values ---
 /// Parses a byte slice representing an integer option (like HWM, linger).
 pub(crate) fn parse_i32_option(value: &[u8]) -> Result<i32, ZmqError> {
   let arr: [u8; 4] = value.try_into().map_err(|_| ZmqError::InvalidOptionValue(0))?; // Use generic error for now
-                                                                                     // Assuming native endianness for socket options based on ZMQ C API usage
-  Ok(i32::from_ne_bytes(arr))
+
+  Ok(i32::from_ne_bytes(arr)) // Assuming native endianness for socket options based on ZMQ C API usage
 }
 
 /// Parses a byte slice representing a boolean option (0 or 1).
@@ -310,4 +352,28 @@ pub(crate) fn parse_max_connections_option(value: &[u8], option_id: i32) -> Resu
     1.. => Ok(Some(val as usize)),
     _ => Err(ZmqError::InvalidOptionValue(option_id)),
   }
+}
+
+/// Parses a fixed-length binary key option from a byte slice.
+///
+/// # Arguments
+/// * `value`: The byte slice containing the key data.
+/// * `option_id`: The integer ID of the socket option being parsed (for error reporting).
+/// * `N`: A const generic representing the expected length of the key in bytes.
+///
+/// # Returns
+/// `Ok([u8; N])` if the value has the correct length.
+/// `Err(ZmqError::InvalidOptionValue)` if the value's length does not match `N`.
+pub(crate) fn parse_key_option<const N: usize>(value: &[u8], option_id: i32) -> Result<[u8; N], ZmqError> {
+  value.try_into().map_err(|_e| {
+    // The error from try_into (TryFromSliceError) doesn't carry much info itself,
+    // so we create our own ZmqError.
+    tracing::error!(
+      option_id = option_id,
+      expected_len = N,
+      actual_len = value.len(),
+      "Invalid key length provided for socket option."
+    );
+    ZmqError::InvalidOptionValue(option_id) // Indicate which option had the invalid value
+  })
 }

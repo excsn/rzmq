@@ -32,9 +32,15 @@ pub(crate) fn create_and_spawn_ipc_engine(
     use_recv_multishot: false,
     use_cork: false,
     #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_count: options.io_uring_recv_buffer_count,
+    recv_multishot_buffer_count: options.recv_buffer_count,
     #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_capacity: options.io_uring_recv_buffer_size,
+    recv_multishot_buffer_capacity: options.recv_buffer_size,
+    #[cfg(feature = "noise_xx")]
+    use_noise_xx: options.noise_xx_options.enabled,
+    #[cfg(feature = "noise_xx")]
+    noise_xx_local_sk_bytes_for_engine: options.noise_xx_options.static_secret_key_bytes,
+    #[cfg(feature = "noise_xx")]
+    noise_xx_remote_pk_bytes_for_engine: options.noise_xx_options.remote_static_public_key_bytes,
   };
 
   eprintln!(
