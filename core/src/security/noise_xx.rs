@@ -611,51 +611,26 @@ impl IDataCipher for NoiseDataCipher {
   fn decrypt_wire_data_to_zmtp_frame(&mut self, encrypted_wire_data: &mut BytesMut) -> Result<Option<Bytes>, ZmqError> {
     const NOISE_LEN_PREFIX_LEN: usize = 2;
     const MIN_NOISE_MSG_PAYLOAD_WITH_TAG: usize = 16; // Smallest possible encrypted payload is just the tag
-    tracing::trace!(
-        buffer_len = encrypted_wire_data.len(),
-        prefix_peek = ?encrypted_wire_data.get(..NOISE_LEN_PREFIX_LEN.min(encrypted_wire_data.len())), // Safe peek
-        "NoiseDataCipher::decrypt: Top of function. Encrypted wire data len: {}",
-        encrypted_wire_data.len()
-    );
 
     if encrypted_wire_data.len() < NOISE_LEN_PREFIX_LEN {
-      tracing::trace!(
-        "NoiseDataCipher::decrypt: Need more data for length prefix (got {}, need {}).",
-        encrypted_wire_data.len(),
-        NOISE_LEN_PREFIX_LEN
-      );
       return Ok(None); // Not enough data for length prefix
     }
 
     // Peek at the 2-byte big-endian length prefix.
     let length_bytes: [u8; 2] = encrypted_wire_data[0..NOISE_LEN_PREFIX_LEN].try_into().unwrap();
     let encrypted_payload_len_with_tag = u16::from_be_bytes(length_bytes) as usize;
-    tracing::trace!(
-        raw_len_bytes = ?length_bytes, %encrypted_payload_len_with_tag,
-        "NoiseDataCipher::decrypt: Parsed length prefix. Encrypted payload + tag should be: {} bytes.",
-        encrypted_payload_len_with_tag
-    );
+
     if encrypted_payload_len_with_tag == 0 {
       // A zero-length noise message is valid (e.g. for rekeying or empty transport data)
       // but doesn't contain a ZMTP frame. We should consume it and signal no ZMTP frame.
-      tracing::trace!("NoiseDataCipher::decrypt: Zero-length noise message payload indicated. Consuming prefix.");
+      tracing::trace!("Decrypted zero-length noise message, consuming.");
       encrypted_wire_data.advance(NOISE_LEN_PREFIX_LEN); // Consume the length prefix
       return Ok(None); // No ZMTP frame produced from an empty Noise payload
     }
 
     let total_noise_message_len = NOISE_LEN_PREFIX_LEN + encrypted_payload_len_with_tag;
-    tracing::trace!(
-        %total_noise_message_len,
-        current_buffer_len = encrypted_wire_data.len(),
-        "NoiseDataCipher::decrypt: Total expected Noise message length (prefix + payload_with_tag): {}.",
-        total_noise_message_len
-    );
+
     if encrypted_wire_data.len() < total_noise_message_len {
-      tracing::trace!(
-        "NoiseDataCipher::decrypt: Need more data for full Noise message (got {}, need {}).",
-        encrypted_wire_data.len(),
-        total_noise_message_len
-      );
       return Ok(None); // Not enough data for the full Noise message
     }
 
@@ -663,10 +638,7 @@ impl IDataCipher for NoiseDataCipher {
     // `split_to` consumes from `encrypted_wire_data`.
     let noise_message_bytes_frozen = encrypted_wire_data.split_to(total_noise_message_len).freeze();
     let encrypted_payload_with_tag_slice = &noise_message_bytes_frozen[NOISE_LEN_PREFIX_LEN..];
-    tracing::trace!(
-      actual_payload_plus_tag_len_to_decrypt = encrypted_payload_with_tag_slice.len(),
-      "NoiseDataCipher::decrypt: Extracted encrypted_payload_with_tag slice for snow.read_message."
-    );
+
     if encrypted_payload_len_with_tag < MIN_NOISE_MSG_PAYLOAD_WITH_TAG {
       tracing::error!(
         actual_len = encrypted_payload_len_with_tag,
@@ -678,16 +650,12 @@ impl IDataCipher for NoiseDataCipher {
     let max_plaintext_len = encrypted_payload_len_with_tag - MIN_NOISE_MSG_PAYLOAD_WITH_TAG;
     // If encrypted_payload_len_with_tag IS 16, max_plaintext_len is 0. A 0-len plaintext is valid.
     let mut decrypted_zmtp_frame_buf = vec![0u8; max_plaintext_len];
-    tracing::trace!(
-      max_plaintext_buffer_size = decrypted_zmtp_frame_buf.len(),
-      "NoiseDataCipher::decrypt: Calling snow's read_message."
-    );
+
     let len_decrypted = self.transport_state.read_message(
       encrypted_payload_with_tag_slice, // This is ciphertext + tag
       &mut decrypted_zmtp_frame_buf,
     )?; // SnowError converted to ZmqError
 
-    tracing::trace!(%len_decrypted, "NoiseDataCipher::decrypt: snow's read_message successful.");
     decrypted_zmtp_frame_buf.truncate(len_decrypted);
     Ok(Some(Bytes::from(decrypted_zmtp_frame_buf)))
   }
