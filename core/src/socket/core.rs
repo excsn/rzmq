@@ -16,7 +16,7 @@ use crate::socket::options::{
   IO_URING_RECV_BUFFER_COUNT, IO_URING_RECV_BUFFER_SIZE, IO_URING_SNDZEROCOPY,
 };
 use crate::socket::types::SocketType;
-use crate::socket::{ISocket, MAX_CONNECTIONS};
+use crate::socket::{parse_handshake_option, ISocket, HANDSHAKE_IVL, MAX_CONNECTIONS};
 use crate::transport::endpoint::{parse_endpoint, Endpoint};
 
 #[cfg(feature = "inproc")]
@@ -619,9 +619,8 @@ impl SocketCore {
                   Self::disconnect_inproc_connections(core_arc.clone()).await;
                 }
               }
-              Ok(SystemEvent::ActorStopping { handle_id: child_actor_id, actor_type: _child_type, endpoint_uri, error_msg }) => {
-                let child_error_opt = error_msg.map(ZmqError::Internal); // Convert String to simple ZmqError
-                Self::process_child_completion(core_arc.clone(), &socket_logic_strong, child_actor_id, endpoint_uri.as_deref(), "ActorStoppingEvent", child_error_opt.as_ref()).await;
+              Ok(SystemEvent::ActorStopping { handle_id: child_actor_id, actor_type: _child_type, endpoint_uri, error }) => {
+                Self::process_child_completion(core_arc.clone(), &socket_logic_strong, child_actor_id, endpoint_uri.as_deref(), "ActorStoppingEvent", error.as_ref()).await;
               }
               Ok(SystemEvent::NewConnectionEstablished { parent_core_id, endpoint_uri, target_endpoint_uri, session_mailbox, session_handle_id, session_task_id }) => {
                 if parent_core_id == core_handle {
@@ -1825,6 +1824,16 @@ impl SocketCore {
     let current_phase_val = coordinator_g.current_phase();
     let log_uri_val = endpoint_uri_opt.unwrap_or("<UnknownURI>");
 
+
+
+    // Log with Display of the original error
+    if let Some(err) = error_opt {
+        tracing::error!(handle=core_h, child_handle=child_handle, error_display=%err, command=command_name, "Received {} from child with error (Display)", command_name);
+    } else {
+        tracing::info!(handle=core_h, child_handle=child_handle, uri=%log_uri_val, command=command_name, "Processing {} from child (no error)", command_name);
+    }
+    // Log with Debug of the original error
+    tracing::debug!(handle=core_h, child_handle=child_handle, error_debug=?error_opt, "Received {} from child (Debug of error_opt)", command_name);
     // Log based on whether we are shutting down or running normally
     if matches!(
       current_phase_val,
@@ -2263,12 +2272,12 @@ impl SocketCore {
 
       if option == options::IO_URING_RECV_BUFFER_COUNT {
         let count = options::parse_i32_option(value)?.max(1) as usize; // Ensure at least 1
-        state_g.options.recv_buffer_count = count;
+        state_g.options.io_uring.recv_buffer_count = count;
         tracing::debug!(handle = core_arc.handle, "IO_URING_RECV_BUFFER_COUNT set to {}", count);
         return Ok(());
       } else if option == options::IO_URING_RECV_BUFFER_SIZE {
         let size = options::parse_i32_option(value)?.max(1024) as usize; // Ensure min size, e.g., 1KB
-        state_g.options.recv_buffer_size = size;
+        state_g.options.io_uring.recv_buffer_size = size;
         tracing::debug!(handle = core_arc.handle, "IO_URING_RECV_BUFFER_SIZE set to {}", size);
         return Ok(());
       }
@@ -2343,20 +2352,26 @@ impl SocketCore {
       HEARTBEAT_TIMEOUT => {
         state_g.options.heartbeat_timeout = parse_heartbeat_option(value, option)?;
       }
+      HANDSHAKE_IVL => {
+        state_g.options.handshake_ivl = parse_handshake_option(value, option)?;
+      }
       ZAP_DOMAIN => {
         state_g.options.zap_domain =
           Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
       }
       PLAIN_SERVER => {
-        state_g.options.zap_plain.server = Some(parse_bool_option(value)?);
+        state_g.options.plain_options.server_role = Some(parse_bool_option(value)?);
+        state_g.options.plain_options.enabled = true;
       }
       PLAIN_USERNAME => {
-        state_g.options.zap_plain.username =
+        state_g.options.plain_options.username =
           Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
+        state_g.options.plain_options.enabled = true;
       }
       PLAIN_PASSWORD => {
-        state_g.options.zap_plain.password =
+        state_g.options.plain_options.password =
           Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
+        state_g.options.plain_options.enabled = true;
       }
       ROUTING_ID => {
         state_g.options.routing_id = Some(parse_blob_option(value)?);
@@ -2464,9 +2479,10 @@ impl SocketCore {
       MAX_CONNECTIONS => Ok(state_g.options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
       HEARTBEAT_IVL => Ok(state_g.options.heartbeat_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
       HEARTBEAT_TIMEOUT => Ok(state_g.options.heartbeat_timeout.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
+      HANDSHAKE_IVL => Ok(state_g.options.handshake_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
       ZAP_DOMAIN => state_g.options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-      PLAIN_SERVER => state_g.options.zap_plain.server.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-      PLAIN_USERNAME => state_g.options.zap_plain.username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
+      PLAIN_SERVER => state_g.options.plain_options.server_role.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
+      PLAIN_USERNAME => state_g.options.plain_options.username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
       ROUTING_ID => state_g.options.routing_id.as_ref().map(|b| b.to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
       RCVTIMEO => Ok(state_g.options.rcvtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
       SNDTIMEO => Ok(state_g.options.sndtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),

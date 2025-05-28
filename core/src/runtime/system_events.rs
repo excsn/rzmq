@@ -71,8 +71,7 @@ pub enum SystemEvent {
     /// Optional URI associated with the actor, e.g., for a Session or Listener.
     endpoint_uri: Option<String>,
     /// Optional error message string if the actor stopped due to an error.
-    /// Using `String` here to keep `SystemEvent` easily `Clone`.
-    error_msg: Option<String>,
+    error: Option<ZmqError>, 
   },
 
   /// Published by a Listener's accept loop or a Connecter task when a new network

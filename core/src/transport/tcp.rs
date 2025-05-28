@@ -1319,20 +1319,28 @@ fn is_fatal_accept_error(e: &io::Error) -> bool {
 }
 
 pub(crate) fn is_fatal_connect_error(e: &ZmqError) -> bool {
+  // <<< ADDED [Debug Log inside is_fatal_connect_error] >>>
+  tracing::info!("[is_fatal_connect_error] Received error: {:?}", e);
+  // <<< ADDED END >>>
   match e {
     ZmqError::IoError { kind, .. } => {
-      matches!(
+      let fatal_kind = matches!(
         kind,
         io::ErrorKind::AddrNotAvailable
           | io::ErrorKind::AddrInUse
           | io::ErrorKind::InvalidInput
           | io::ErrorKind::PermissionDenied
-      )
+      );
+      // <<< ADDED [Debug Log inside is_fatal_connect_error] >>>
+      tracing::info!("[is_fatal_connect_error] IoError kind: {:?}, fatal_kind: {}", kind, fatal_kind);
+      // <<< ADDED END >>>
+      fatal_kind
     }
-    ZmqError::InvalidEndpoint(_) => true,
-    ZmqError::UnsupportedTransport(_) => true,
-    ZmqError::SecurityError(_) => true,
-    _ => false,
+    ZmqError::InvalidEndpoint(_) => { tracing::info!("[is_fatal_connect_error] Matched InvalidEndpoint (fatal)"); true },
+    ZmqError::UnsupportedTransport(_) => { tracing::info!("[is_fatal_connect_error] Matched UnsupportedTransport (fatal)"); true },
+    ZmqError::SecurityError(_) => { tracing::info!("[is_fatal_connect_error] Matched SecurityError (fatal)"); true },
+    ZmqError::AuthenticationFailure(_) => { tracing::info!("[is_fatal_connect_error] Matched AuthenticationFailure (fatal)"); true },
+    e_other => { tracing::info!("[is_fatal_connect_error] Matched other error (non-fatal): {:?}", e_other); false },
   }
 }
 
@@ -1343,6 +1351,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       socket_type_name: options.socket_type_name.clone(),
       heartbeat_ivl: options.heartbeat_ivl,
       heartbeat_timeout: options.heartbeat_timeout,
+      handshake_timeout: options.handshake_ivl,
       use_send_zerocopy: options.io_uring.send_zerocopy,
       use_recv_multishot: options.io_uring.recv_multishot,
       use_cork: options.tcp_cork,
@@ -1357,6 +1366,9 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       noise_xx_local_sk_bytes_for_engine: options.noise_xx_options.static_secret_key_bytes,
       #[cfg(feature = "noise_xx")]
       noise_xx_remote_pk_bytes_for_engine: options.noise_xx_options.remote_static_public_key_bytes,
+      use_plain: options.plain_options.enabled,
+      plain_username_for_engine: options.plain_options.username.clone(),
+      plain_password_for_engine: options.plain_options.password.clone(),
     }
   }
 }

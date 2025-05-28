@@ -321,12 +321,11 @@ impl Context {
     endpoint_uri: Option<String>,
     error: Option<ZmqError>,
   ) {
-    let error_msg_opt = error.map(|e| format!("{}", e));
     let event = SystemEvent::ActorStopping {
       handle_id,
       actor_type,
       endpoint_uri,
-      error_msg: error_msg_opt,
+      error,
     };
 
     // --- Attempt to publish the event (best effort) ---

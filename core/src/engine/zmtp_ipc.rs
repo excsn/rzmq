@@ -28,6 +28,7 @@ pub(crate) fn create_and_spawn_ipc_engine(
     socket_type_name: options.socket_type_name.clone(),
     heartbeat_ivl: options.heartbeat_ivl,
     heartbeat_timeout: options.heartbeat_timeout,
+    handshake_timeout: options.handshake_ivl,
     use_send_zerocopy: false,
     use_recv_multishot: false,
     use_cork: false,
@@ -41,12 +42,11 @@ pub(crate) fn create_and_spawn_ipc_engine(
     noise_xx_local_sk_bytes_for_engine: options.noise_xx_options.static_secret_key_bytes,
     #[cfg(feature = "noise_xx")]
     noise_xx_remote_pk_bytes_for_engine: options.noise_xx_options.remote_static_public_key_bytes,
+    use_plain: options.plain_options.enabled,
+    plain_username_for_engine: options.plain_options.username.clone(),
+    plain_password_for_engine: options.plain_options.password.clone(),
   };
 
-  eprintln!(
-    "[DEBUG ENGINE {} PRE-NEW] Creating ZmtpEngineCore, is_server={}",
-    handle, is_server
-  );
   let core = ZmtpEngineCoreStd::<UnixStream>::new(
     handle,
     session_mailbox,
@@ -57,14 +57,8 @@ pub(crate) fn create_and_spawn_ipc_engine(
     context.clone(), // Pass context clone to the engine core
   );
 
-  eprintln!(
-    "[DEBUG ENGINE {} POST-NEW] ZmtpEngineCore created. Spawning run_loop...",
-    handle
-  );
-
   // Spawn the generic core loop task
   let task_handle = tokio::spawn(core.run_loop()); // run_loop consumes core
-  eprintln!("[DEBUG ENGINE {} POST-SPAWN] ZmtpEngineCore run_loop spawned.", handle);
 
   // Note: ActorStarted event is published by the caller (e.g., Listener/Connecter)
   // immediately after this function returns successfully and the task is known to be spawned.

@@ -11,7 +11,7 @@ use crate::protocol::zmtp::{
   greeting::{ZmtpGreeting, GREETING_LENGTH},
 };
 use crate::runtime::{ActorType, Command, MailboxReceiver, MailboxSender};
-use crate::security::IDataCipher;
+use crate::security::{negotiate_security_mechanism, IDataCipher};
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
 use crate::security::{null::NullMechanism, plain::PlainMechanism, Mechanism, MechanismStatus};
@@ -147,7 +147,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
   async fn exchange_greetings(&mut self, stream: &mut S) -> Result<ZmtpGreeting, ZmqError> {
     let mut greeting_buffer_to_send = BytesMut::with_capacity(GREETING_LENGTH);
 
-    let own_greeting_mechanism_bytes = {
+    let own_greeting_mechanism_bytes: &'static [u8; 20] = {
       #[cfg(feature = "noise_xx")]
       if self.config.use_noise_xx {
         // If Noise is enabled in config, propose NOISE_XX.
@@ -167,18 +167,47 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
         } else {
           tracing::warn!(
             engine_handle = self.handle,
-            "Noise_XX configured but required keys missing for this role. Defaulting to NULL in greeting."
+            "Noise_XX configured but required keys missing for this role. Falling back.."
+          );
+          if self.config.use_plain {
+            tracing::debug!(
+              engine_handle = self.handle,
+              "Proposing PLAIN in own greeting (Noise fallback)."
+            );
+            PlainMechanism::NAME_BYTES
+          } else {
+            tracing::debug!(
+              engine_handle = self.handle,
+              "Proposing NULL in own greeting (Noise fallback, PLAIN disabled)."
+            );
+            NullMechanism::NAME_BYTES
+          }
+        }
+      } else if self.config.use_plain {
+        // NOISE_XX not enabled, but PLAIN is.
+        tracing::debug!(engine_handle = self.handle, "Proposing PLAIN in own greeting.");
+        PlainMechanism::NAME_BYTES
+      } else {
+        // Neither NOISE_XX nor PLAIN enabled, propose NULL.
+        tracing::debug!(engine_handle = self.handle, "Proposing NULL in own greeting.");
+        NullMechanism::NAME_BYTES
+      }
+      #[cfg(not(feature = "noise_xx"))] // If noise_xx feature is NOT compiled
+      {
+        // This block will execute if noise_xx is not a feature, overriding the above if block.
+        if self.config.use_plain {
+          tracing::debug!(
+            engine_handle = self.handle,
+            "Proposing PLAIN in own greeting (NOISE_XX feature disabled)."
+          );
+          PlainMechanism::NAME_BYTES
+        } else {
+          tracing::debug!(
+            engine_handle = self.handle,
+            "Proposing NULL in own greeting (NOISE_XX feature disabled, PLAIN disabled)."
           );
           NullMechanism::NAME_BYTES
         }
-      } else {
-        // Noise not enabled in config, propose NULL.
-        NullMechanism::NAME_BYTES
-      }
-      #[cfg(not(feature = "noise_xx"))]
-      {
-        // Noise feature not compiled, always propose NULL.
-        NullMechanism::NAME_BYTES
       }
     };
 
@@ -263,52 +292,20 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       return Err(ZmqError::ProtocolViolation(role_error_msg));
     }
 
-    let peer_proposed_mechanism_name = peer_greeting.mechanism_name();
-    tracing::info!(
-      engine_handle = self.handle,
-      peer_mechanism_proposal = peer_proposed_mechanism_name,
-      "Selecting security mechanism based on peer greeting."
-    );
-
-    let mut negotiated_mechanism: Box<dyn Mechanism> = match peer_proposed_mechanism_name {
-      NullMechanism::NAME => Box::new(NullMechanism),
-      PlainMechanism::NAME => Box::new(PlainMechanism::new(self.is_server)),
-      #[cfg(feature = "noise_xx")]
-      NoiseXxMechanism::NAME if self.config.use_noise_xx => {
-        tracing::info!(
-          engine_handle = self.handle,
-          "Attempting to use NOISE_XX mechanism as proposed by peer and enabled in config."
-        );
-        let local_sk_bytes_arr: [u8; 32] = self.config.noise_xx_local_sk_bytes_for_engine.ok_or_else(|| {
-          let msg =
-            "NOISE_XX: Local static secret key not configured in engine config for selected mechanism.".to_string();
-          tracing::error!(engine_handle = self.handle, error = %msg);
-          ZmqError::SecurityError(msg)
-        })?;
-        let remote_pk_config_opt_ref: Option<[u8; 32]> =
-          self.config.noise_xx_remote_pk_bytes_for_engine.as_ref().copied();
-        match NoiseXxMechanism::new(self.is_server, &local_sk_bytes_arr, remote_pk_config_opt_ref) {
-          Ok(noise_mech) => Box::new(noise_mech),
-          Err(e) => {
-            tracing::error!(engine_handle = self.handle, error = %e, "Failed to initialize NOISE_XX mechanism.");
-            return Err(e);
-          }
-        }
-      }
-      unsupported_name => {
-        let security_error_msg = format!("Unsupported security mechanism '{}' from peer.", unsupported_name);
-        tracing::error!(engine_handle = self.handle, error = %security_error_msg);
-        return Err(ZmqError::SecurityError(security_error_msg));
-      }
-    };
+    let mut negotiated_mechanism = negotiate_security_mechanism(
+      self.is_server,
+      &self.config, 
+      &peer_greeting,
+      self.handle, 
+    )?;
 
     // --- Security Handshake (Token Exchange using Framed stream) ---
     tracing::debug!(
       engine_handle = self.handle,
-      mechanism = negotiated_mechanism.name(),
+      mechanism = negotiated_mechanism.name(), 
       "Starting security token exchange."
     );
-    let handshake_timeout = Duration::from_secs(30);
+    let handshake_timeout = self.config.handshake_timeout.unwrap_or(Duration::from_secs(30));
 
     // Refined loop for security token exchange
     loop {
@@ -813,7 +810,6 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
             Command::SessionPushCmd { msg } => {
               let original_msg_is_last_part = !msg.is_more(); // For TCP_CORK logic
 
-    tracing::trace!(engine_handle = self.handle, msg_size = msg.size(), "Processing SessionPushCmd");
               // 1. ZMTP-frame the Msg
               let mut temp_zmtp_encoder = ZmtpCodec::new();
               let mut plaintext_zmtp_frame_buffer = BytesMut::new();
@@ -826,17 +822,13 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
               // 2. Encrypt if cipher is active
               let wire_bytes_to_send = if let Some(cipher) = &mut self.data_cipher {
                 match cipher.encrypt_zmtp_frame(plaintext_zmtp_frame_bytes) {
-                  Ok(eb) => {
-                tracing::trace!(engine_handle = self.handle, encrypted_len = eb.len(), "Encryption successful");
-                eb
-            },
+                  Ok(eb) => eb,
                   Err(e) => {
                     tracing::error!(engine_handle = self.handle, error = %e, "Failed to encrypt outgoing ZMTP frame.");
                     final_error_for_actor_stop = Some(e); should_break_loop = true; continue;
                   }
                 }
               } else {
-        tracing::trace!(engine_handle = self.handle, "No cipher, sending plaintext ZMTP frame");
                 plaintext_zmtp_frame_bytes
               };
 
@@ -854,7 +846,6 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
               }
 
               // 4. Send the bytes
-    tracing::trace!(engine_handle = self.handle, wire_bytes_len = wire_bytes_to_send.len(), "Attempting to write to stream");
               if let Err(e) = current_underlying_stream.write_all(&wire_bytes_to_send).await {
                 final_error_for_actor_stop = Some(ZmqError::from(e));
                 should_break_loop = true;
@@ -867,7 +858,6 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
                 continue;
               }
 
-    tracing::trace!(engine_handle = self.handle, "Successfully wrote to stream");
               self.last_activity_time = Instant::now();
               self.expecting_first_frame_of_msg = original_msg_is_last_part;
 

@@ -21,6 +21,7 @@ pub const TCP_KEEPALIVE_INTVL: i32 = 37;
 pub const HEARTBEAT_IVL: i32 = 38; // ZMQ_HEARTBEAT_IVL
 pub const HEARTBEAT_TIMEOUT: i32 = 39; // ZMQ_HEARTBEAT_TIMEOUT
 pub const HEARTBEAT_TTL: i32 = 40; // ZMQ_HEARTBEAT_TTL (Often derived from TIMEOUT)
+pub const HANDSHAKE_IVL: i32 = 41; // ZMQ_HANDSHAKE_IVL
 
 pub const ROUTER_MANDATORY: i32 = 33;
 
@@ -100,17 +101,17 @@ pub(crate) struct SocketOptions {
   /// Time to wait for PONG reply before considering connection dead.
   /// `None` uses a default derived from `heartbeat_ivl`.
   pub heartbeat_timeout: Option<Duration>,
+  pub handshake_ivl: Option<Duration>,
 
   /// ROUTER behavior when routing ID is unknown.
   /// Default false (drop message). True = return EHOSTUNREACH.
   pub router_mandatory: bool,
-
-  pub zap_domain: Option<String>, // ZAP Domain
-  pub zap_plain: PlainMechanismSocketOptions,
   // Add other commonly used options as needed
   // pub heartbeat_ttl: Option<Duration>, // TTL often derived from timeout
   pub tcp_cork: bool,
   pub io_uring: IOURingSocketOptions,
+  pub zap_domain: Option<String>, // ZAP Domain
+  pub plain_options: PlainMechanismSocketOptions,
   #[cfg(feature = "noise_xx")]
   pub noise_xx_options: NoiseXxSocketOptions,
 }
@@ -136,11 +137,12 @@ impl Default for SocketOptions {
       max_connections: Some(1024),
       heartbeat_ivl: None, // Disabled by default
       heartbeat_timeout: None,
+      handshake_ivl: None,
       router_mandatory: false, // Default ZMQ behavior is to drop silently
-      zap_domain: None,
-      zap_plain: Default::default(),
       tcp_cork: false,
       io_uring: Default::default(),
+      zap_domain: None,
+      plain_options: Default::default(),
       #[cfg(feature = "noise_xx")]
       noise_xx_options: NoiseXxSocketOptions::default(),
     }
@@ -193,7 +195,8 @@ pub(crate) struct TcpTransportConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct PlainMechanismSocketOptions {
-  pub server: Option<bool>,     // Role override
+  pub enabled: bool,
+  pub server_role: Option<bool>,     // Role override
   pub username: Option<String>, // Security options stored here?
   pub password: Option<String>,
 }
@@ -207,6 +210,7 @@ pub(crate) struct ZmtpEngineConfig {
   pub socket_type_name: String,
   pub heartbeat_ivl: Option<Duration>,
   pub heartbeat_timeout: Option<Duration>,
+  pub handshake_timeout: Option<Duration>,
   // Add security mechanism choice later if needed
   // pub security_mechanism: PlannedMechanismEnum,
 
@@ -225,6 +229,9 @@ pub(crate) struct ZmtpEngineConfig {
   pub noise_xx_local_sk_bytes_for_engine: Option<[u8; 32]>, // Renamed for clarity
   #[cfg(feature = "noise_xx")]
   pub noise_xx_remote_pk_bytes_for_engine: Option<[u8; 32]>,
+  pub use_plain: bool,
+  pub plain_username_for_engine: Option<String>,
+  pub plain_password_for_engine: Option<String>,
 }
 
 // --- Helper functions for parsing option values ---
@@ -325,6 +332,15 @@ pub(crate) fn parse_heartbeat_option(value: &[u8], option_id: i32) -> Result<Opt
   }
 }
 
+pub(crate) fn parse_handshake_option(value: &[u8], option_id: i32) -> Result<Option<Duration>, ZmqError> {
+  let val = parse_i32_option(value).map_err(|_| ZmqError::InvalidOptionValue(option_id))?;
+  match val {
+    0 => Ok(None),
+    1.. => Ok(Some(Duration::from_millis(val as u64))), // Positive timeout
+    _ => Err(ZmqError::InvalidOptionValue(option_id)),  // Negative values invalid
+  }
+}
+
 pub(crate) fn parse_reconnect_ivl_option(value: &[u8]) -> Result<Option<Duration>, ZmqError> {
   let val = parse_i32_option(value)?;
   match val {
@@ -376,4 +392,8 @@ pub(crate) fn parse_key_option<const N: usize>(value: &[u8], option_id: i32) -> 
     );
     ZmqError::InvalidOptionValue(option_id) // Indicate which option had the invalid value
   })
+}
+
+pub(crate) fn parse_string_option(value: &[u8], option_id: i32) -> Result<String, ZmqError> {
+  String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option_id))
 }

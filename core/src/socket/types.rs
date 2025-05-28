@@ -131,14 +131,10 @@ impl Socket {
   /// Sets a socket option asynchronously.
   /// Options control various aspects of the socket's behavior (e.g., high-water marks, timeouts).
   /// Refer to ZMQ documentation for standard option IDs and their meanings.
-  pub async fn set_option<T: ToBytes>(
-    &self,
-    option: i32,
-    value: T,
-  ) -> Result<(), ZmqError> {
+  pub async fn set_option<T: ToBytes>(&self, option: i32, value: T) -> Result<(), ZmqError> {
     self.set_option_raw(option, &value.to_bytes()).await
   }
-  
+
   /// Sets a socket option asynchronously.
   /// Options control various aspects of the socket's behavior (e.g., high-water marks, timeouts).
   /// Refer to ZMQ documentation for standard option IDs and their meanings.
@@ -231,6 +227,21 @@ impl ToBytes for u32 {
 
 impl ToBytes for bool {
   fn to_bytes(&self) -> Vec<u8> {
-    vec![*self as u8]
+    // Represent boolean as i32 (0 or 1) and then convert to bytes,
+    // consistent with how integer options are typically handled.
+    let int_val = if *self { 1i32 } else { 0i32 };
+    int_val.to_ne_bytes().to_vec()
+  }
+}
+
+impl ToBytes for String {
+  fn to_bytes(&self) -> Vec<u8> {
+    self.as_bytes().to_vec()
+  }
+}
+
+impl ToBytes for &str {
+  fn to_bytes(&self) -> Vec<u8> {
+    self.as_bytes().to_vec()
   }
 }

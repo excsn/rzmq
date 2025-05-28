@@ -11,7 +11,9 @@ use crate::protocol::zmtp::command::{
 use crate::protocol::zmtp::greeting::{ZmtpGreeting, GREETING_LENGTH, GREETING_VERSION_MAJOR, MECHANISM_LENGTH};
 use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
 use crate::runtime::{ActorType, Command as SessionBaseCommand, MailboxReceiver, MailboxSender};
-use crate::security::{Mechanism, MechanismStatus, NullMechanism, PlainMechanism};
+#[cfg(feature = "noise_xx")]
+use crate::security::NoiseXxMechanism;
+use crate::security::{null::NullMechanism, plain::PlainMechanism, IDataCipher, Mechanism, MechanismStatus, negotiate_security_mechanism};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::Blob;
 
@@ -210,7 +212,67 @@ impl ZmtpEngineCoreUring {
 
   async fn send_greeting_uring(&mut self) -> Result<(), ZmqError> {
     let mut greeting_buf = BytesMut::with_capacity(GREETING_LENGTH);
-    let own_greeting_mechanism_bytes = NullMechanism::NAME_BYTES;
+
+    let own_greeting_mechanism_bytes = {
+      if self.config.use_noise_xx {
+        let can_propose_noise = if self.is_server {
+          self.config.noise_xx_local_sk_bytes_for_engine.is_some()
+        } else {
+          // Client
+          self.config.noise_xx_local_sk_bytes_for_engine.is_some()
+            && self.config.noise_xx_remote_pk_bytes_for_engine.is_some()
+        };
+
+        if can_propose_noise {
+          tracing::debug!(
+            engine_handle = self.handle,
+            "Uring: Proposing NOISE_XX in own greeting."
+          );
+          NoiseXxMechanism::NAME_BYTES
+        } else {
+          tracing::warn!(
+            engine_handle = self.handle,
+            "Uring: Noise_XX configured but required keys missing. Falling back."
+          );
+          if self.config.use_plain {
+            tracing::debug!(
+              engine_handle = self.handle,
+              "Uring: Proposing PLAIN in own greeting (Noise fallback)."
+            );
+            PlainMechanism::NAME_BYTES
+          } else {
+            tracing::debug!(
+              engine_handle = self.handle,
+              "Uring: Proposing NULL in own greeting (Noise fallback, PLAIN disabled)."
+            );
+            NullMechanism::NAME_BYTES
+          }
+        }
+      } else if self.config.use_plain {
+        tracing::debug!(engine_handle = self.handle, "Uring: Proposing PLAIN in own greeting.");
+        PlainMechanism::NAME_BYTES
+      } else {
+        tracing::debug!(engine_handle = self.handle, "Uring: Proposing NULL in own greeting.");
+        NullMechanism::NAME_BYTES
+      }
+      #[cfg(not(feature = "noise_xx"))] // If noise_xx feature is NOT compiled
+      {
+        if self.config.use_plain {
+          tracing::debug!(
+            engine_handle = self.handle,
+            "Uring: Proposing PLAIN in own greeting (NOISE_XX feature disabled)."
+          );
+          PlainMechanism::NAME_BYTES
+        } else {
+          tracing::debug!(
+            engine_handle = self.handle,
+            "Uring: Proposing NULL in own greeting (NOISE_XX feature disabled, PLAIN disabled)."
+          );
+          NullMechanism::NAME_BYTES
+        }
+      }
+    };
+
     ZmtpGreeting::encode(&own_greeting_mechanism_bytes, self.is_server, &mut greeting_buf);
     self.stream.write_all(&greeting_buf).await?;
     // No explicit flush needed for uring after write_all if not corked.
@@ -240,32 +302,17 @@ impl ZmtpEngineCoreUring {
         peer_greeting.version.0, peer_greeting.version.1
       )));
     }
+
     if self.is_server == peer_greeting.as_server {
       return Err(ZmqError::ProtocolViolation("Role mismatch".into()));
     }
 
-    let peer_mech_name = peer_greeting.mechanism_name();
-    let new_mechanism: Box<dyn Mechanism> = match peer_mech_name {
-      NullMechanism::NAME => Box::new(NullMechanism),
-      PlainMechanism::NAME => Box::new(PlainMechanism::new(self.is_server)),
-      #[cfg(feature = "noise_xx")]
-      NoiseXxMechanism::NAME if self.config.use_noise_xx => {
-        // Placeholder for brevity
-        let local_sk = self
-          .config
-          .noise_xx_local_sk_bytes_for_engine
-          .ok_or(ZmqError::Internal("todo".into()))?;
-        let remote_pk = self.config.noise_xx_remote_pk_bytes_for_engine;
-        Box::new(NoiseXxMechanism::new(self.is_server, &local_sk, remote_pk)?)
-      }
-      unsupported => {
-        return Err(ZmqError::SecurityError(format!(
-          "Unsupported mechanism: {}",
-          unsupported
-        )))
-      }
-    };
-    self.mechanism = new_mechanism;
+    self.mechanism = negotiate_security_mechanism(
+      self.is_server,
+      &self.config,
+      &peer_greeting,
+      self.handle,
+    )?;
 
     tracing::info!(
       engine_handle = self.handle,
@@ -902,25 +949,45 @@ impl ZmtpEngineCoreUring {
         match cmd {
           ZmtpCommand::Ping(ping_context) => {
             let pong_reply = ZmtpCommand::create_pong(&ping_context);
-            // <<< MODIFIED [Corrected PONG send logic] >>>
             let send_pong_op_result: Result<(), ZmqError> = async {
               let encoded = self.encode_msg_for_send(&pong_reply)?;
-              match encoded {
-                EncodedMsgParts::ForWriteAll(bytes) => self.stream.write_all(&bytes).await.map_err(ZmqError::from),
-                EncodedMsgParts::ForSendZc(hdr, opt_body) => {
-                  self.stream.write_all(&hdr).await.map_err(ZmqError::from)?;
-                  if let Some(body) = opt_body {
-                    if !body.is_empty() {
-                      let (res, _) = self.stream.send_zc(&body).await;
-                      res.map_err(ZmqError::from)?;
-                    }
+              let plaintext_pong_bytes = match encoded {
+                EncodedMsgParts::ForWriteAll(b) => b,
+                EncodedMsgParts::ForSendZc(h, p_opt) => {
+                  let mut temp = BytesMut::new();
+                  temp.put(h);
+                  if let Some(p) = p_opt {
+                    temp.put(p);
                   }
-                  Ok(())
+                  temp.freeze()
                 }
+              };
+
+              let wire_bytes_pong = if let Some(cipher) = &mut self.data_cipher {
+                cipher
+                  .encrypt_zmtp_frame(plaintext_pong_bytes)
+                  .map_err(|e| ZmqError::SecurityError(format!("PONG encrypt failed: {}", e)))?
+              } else {
+                plaintext_pong_bytes
+              };
+
+              // Send potentially encrypted PONG
+              if self.data_cipher.is_some() && self.config.use_send_zerocopy && wire_bytes_pong.len() > 2 {
+                let (len_prefix, main_blob) = wire_bytes_pong.split_at(2);
+                self.stream.write_all(len_prefix).await.map_err(ZmqError::from)?;
+                if !main_blob.is_empty() {
+                  self
+                    .stream
+                    .send_zc(&Bytes::copy_from_slice(main_blob))
+                    .await
+                    .0
+                    .map_err(ZmqError::from)?;
+                }
+              } else {
+                self.stream.write_all(&wire_bytes_pong).await.map_err(ZmqError::from)?;
               }
             }
             .await;
-            // <<< MODIFIED END >>>
             if let Err(e) = send_pong_op_result {
               tracing::error!(engine_handle = self.handle, error = %e, "Failed to send PONG (uring).");
               *final_error = Some(e);

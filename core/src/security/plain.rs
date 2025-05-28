@@ -7,15 +7,15 @@ use super::{cipher::PassThroughDataCipher, IDataCipher, Mechanism, MechanismStat
 /// State for the PLAIN security mechanism handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlainState {
-  Initializing, // Start state
+  Initializing, // Start state (not strictly used as we set initial state in new())
   // Client states
-  SendHello,     // Client -> Server: HELLO containing PLAIN details
-  ExpectWelcome, // Client waiting for WELCOME from server
+  ClientSendHello,     // Client -> Server: HELLO containing PLAIN details
+  ClientExpectWelcome, // Client waiting for WELCOME from server
   // Server states
-  ExpectHello, // Server waiting for HELLO from client
-  SendWelcome, // Server -> Client: WELCOME confirming PLAIN
-  // ZAP states (Placeholder)
-  Authenticating, // Waiting for ZAP reply (both client/server might need this)
+  ServerExpectHello, // Server waiting for HELLO from client
+  // <<< MODIFIED START [Simplified server state for non-ZAP flow] >>>
+  ServerSendWelcome, // Server -> Client: WELCOME confirming PLAIN (after HELLO or ZAP)
+  // <<< MODIFIED END >>>
   // End states
   Ready, // Handshake successful
   Error, // Handshake failed
@@ -27,12 +27,11 @@ enum PlainState {
 pub struct PlainMechanism {
   is_server: bool,
   state: PlainState,
-  // Store credentials (client only) or received credentials (server)
-  // For simplicity, storing as Vec<u8> for now. Real impl needs secure handling.
+  // Store credentials (client uses its own, server stores received from client)
   username: Option<Vec<u8>>,
   password: Option<Vec<u8>>,
-  // Optional ZAP metadata received
-  zap_metadata: Option<Metadata>, // Placeholder for metadata from ZAP
+  // Optional ZAP metadata received (placeholder for future ZAP impl)
+  _zap_metadata: Option<Metadata>, // <<< MODIFIED [Renamed to avoid unused warning for now] >>>
   error_reason: Option<String>,
 }
 
@@ -41,24 +40,36 @@ impl PlainMechanism {
   pub const NAME: &'static str = "PLAIN";
   const CMD_HELLO: &'static [u8] = b"HELLO";
   const CMD_WELCOME: &'static [u8] = b"WELCOME";
-  const CMD_INITIATE: &'static [u8] = b"INITIATE"; // PLAIN doesn't use INITIATE
+  // const CMD_INITIATE: &'static [u8] = b"INITIATE"; // PLAIN doesn't use INITIATE
   const CMD_ERROR: &'static [u8] = b"ERROR";
-  const CMD_READY: &'static [u8] = b"READY"; // READY is part of handshake too
+  // const CMD_READY: &'static [u8] = b"READY"; // READY is part of handshake too
 
-  pub fn new(is_server: bool /* TODO: Add credentials if client */) -> Self {
+  pub fn new(is_server: bool) -> Self {
     Self {
       is_server,
       state: if is_server {
-        PlainState::ExpectHello
+        PlainState::ServerExpectHello
       } else {
-        PlainState::SendHello
+        PlainState::ClientSendHello
       },
-      username: None, // TODO: Client should get from options
-      password: None, // TODO: Client should get from options
-      zap_metadata: None,
+      username: None,
+      password: None,
+      _zap_metadata: None,
       error_reason: None,
     }
   }
+
+  // <<< ADDED [Method for client to set its credentials] >>>
+  /// Called by the client-side engine to set credentials before handshake starts.
+  pub fn set_client_credentials(&mut self, username: Option<Vec<u8>>, password: Option<Vec<u8>>) {
+    if !self.is_server {
+      self.username = username;
+      self.password = password;
+    } else {
+      tracing::warn!("set_client_credentials called on a server-side PLAIN mechanism. Ignoring.");
+    }
+  }
+  // <<< ADDED END >>>
 
   /// Parses the HELLO command body (client -> server).
   /// Body format: <username-len(1)><username><password-len(1)><password>
@@ -87,15 +98,11 @@ impl PlainMechanism {
     let mut password = vec![0u8; pass_len];
     cursor.copy_to_slice(&mut password);
 
-    // Ensure no trailing data? ZMQ spec doesn't forbid it, but maybe good practice.
-    // if cursor.has_remaining() { Err(...) }
-
     Ok((username, password))
   }
 
   /// Creates the HELLO command body.
   fn create_hello_body(username: &[u8], password: &[u8]) -> Vec<u8> {
-    // Limit lengths? ZMQ limits usually 255.
     let user_len = username.len().min(255) as u8;
     let pass_len = password.len().min(255) as u8;
 
@@ -107,9 +114,7 @@ impl PlainMechanism {
     body.to_vec()
   }
 
-  /// Sets the mechanism state to Error. (Already existed, keep it)
   fn set_error_internal(&mut self, reason: String) {
-    // Rename to avoid conflict
     tracing::error!(mechanism = Self::NAME, %reason, "Handshake error");
     self.error_reason = Some(reason);
     self.state = PlainState::Error;
@@ -122,7 +127,6 @@ impl Mechanism for PlainMechanism {
   }
 
   fn process_token(&mut self, token: &[u8]) -> Result<(), ZmqError> {
-    // Token is the body of a ZMTP COMMAND frame
     if token.is_empty() {
       self.set_error_internal("Received empty security token".into());
       return Err(ZmqError::SecurityError("Empty token".into()));
@@ -138,17 +142,16 @@ impl Mechanism for PlainMechanism {
 
     if self.is_server {
       match self.state {
-        PlainState::ExpectHello => {
+        PlainState::ServerExpectHello => {
           if command_name == Self::CMD_HELLO {
             tracing::debug!(mechanism = Self::NAME, "Server received HELLO");
             match Self::parse_hello_body(body) {
               Ok((username, password)) => {
                 self.username = Some(username);
                 self.password = Some(password);
-                // TODO: Trigger ZAP request here!
-                // For now, assume success and move to SendWelcome
-                tracing::warn!("PLAIN: Skipping ZAP authentication check (TODO)");
-                self.state = PlainState::SendWelcome; // Move state *before* produce_token is called
+                // Simplified: Directly move to SendWelcome, bypassing ZAP.
+                tracing::debug!("PLAIN Server: Auto-accepting HELLO (ZAP bypassed for now).");
+                self.state = PlainState::ServerSendWelcome;
                 Ok(())
               }
               Err(e) => {
@@ -161,27 +164,24 @@ impl Mechanism for PlainMechanism {
             Err(ZmqError::SecurityError("Unexpected command".into()))
           }
         }
-        // Server should not receive other commands during PLAIN handshake
         _ => {
           self.set_error_internal(format!(
             "Unexpected command received by server in state {:?}: {}",
             self.state,
             String::from_utf8_lossy(command_name)
           ));
-          Err(ZmqError::SecurityError("Unexpected command".into()))
+          Err(ZmqError::SecurityError("Unexpected command in server state".into()))
         }
       }
     } else {
       // Client side
       match self.state {
-        PlainState::ExpectWelcome => {
+        PlainState::ClientExpectWelcome => {
           if command_name == Self::CMD_WELCOME {
             tracing::debug!(mechanism = Self::NAME, "Client received WELCOME");
-            // Handshake successful
             self.state = PlainState::Ready;
             Ok(())
           } else if command_name == Self::CMD_ERROR {
-            // TODO: Parse reason string from body
             let reason = String::from_utf8_lossy(body).to_string();
             self.set_error_internal(format!("Received ERROR from server: {}", reason));
             Err(ZmqError::AuthenticationFailure(reason))
@@ -190,17 +190,16 @@ impl Mechanism for PlainMechanism {
               "Expected WELCOME or ERROR, got {}",
               String::from_utf8_lossy(command_name)
             ));
-            Err(ZmqError::SecurityError("Unexpected command".into()))
+            Err(ZmqError::SecurityError("Unexpected command from server".into()))
           }
         }
-        // Client should not receive other commands during PLAIN handshake
         _ => {
           self.set_error_internal(format!(
             "Unexpected command received by client in state {:?}: {}",
             self.state,
             String::from_utf8_lossy(command_name)
           ));
-          Err(ZmqError::SecurityError("Unexpected command".into()))
+          Err(ZmqError::SecurityError("Unexpected command in client state".into()))
         }
       }
     }
@@ -208,11 +207,10 @@ impl Mechanism for PlainMechanism {
 
   fn produce_token(&mut self) -> Result<Option<Vec<u8>>, ZmqError> {
     match self.state {
-      // Client sends HELLO initially
-      PlainState::SendHello => {
-        let username = self.username.as_deref().unwrap_or(b""); // TODO: Get from actual config
-        let password = self.password.as_deref().unwrap_or(b""); // TODO: Get from actual config
-        let body = Self::create_hello_body(username, password);
+      PlainState::ClientSendHello => {
+        let username_bytes = self.username.as_deref().unwrap_or(b"");
+        let password_bytes = self.password.as_deref().unwrap_or(b"");
+        let body = Self::create_hello_body(username_bytes, password_bytes);
 
         let mut frame = BytesMut::new();
         let cmd_name = Self::CMD_HELLO;
@@ -220,109 +218,79 @@ impl Mechanism for PlainMechanism {
         frame.put_slice(cmd_name);
         frame.put_slice(&body);
 
-        self.state = PlainState::ExpectWelcome; // Move state
+        self.state = PlainState::ClientExpectWelcome;
         tracing::debug!(mechanism = Self::NAME, "Client sending HELLO");
         Ok(Some(frame.to_vec()))
       }
-      // Server sends WELCOME after validating HELLO (and ZAP)
-      PlainState::SendWelcome => {
+      PlainState::ServerSendWelcome => {
         let mut frame = BytesMut::new();
         let cmd_name = Self::CMD_WELCOME;
         frame.put_u8(cmd_name.len() as u8);
         frame.put_slice(cmd_name);
         // WELCOME body is empty for PLAIN
 
-        self.state = PlainState::Ready; // Move state
+        self.state = PlainState::Ready;
         tracing::debug!(mechanism = Self::NAME, "Server sending WELCOME");
         Ok(Some(frame.to_vec()))
       }
-      // No tokens produced in other states
-      PlainState::Initializing
-      | PlainState::ExpectWelcome
-      | PlainState::ExpectHello
-      | PlainState::Authenticating
-      | PlainState::Ready
-      | PlainState::Error => Ok(None),
+      _ => Ok(None), // No tokens produced in other states
     }
   }
 
   fn status(&self) -> MechanismStatus {
     match self.state {
-      PlainState::Initializing
-      | PlainState::SendHello
-      | PlainState::ExpectWelcome
-      | PlainState::ExpectHello
-      | PlainState::SendWelcome => MechanismStatus::Handshaking,
-      PlainState::Authenticating => MechanismStatus::Authenticating,
+      PlainState::Initializing // Should not typically be in this observable state from outside
+      | PlainState::ClientSendHello
+      | PlainState::ClientExpectWelcome
+      | PlainState::ServerExpectHello
+      | PlainState::ServerSendWelcome => MechanismStatus::Handshaking,
+      // <<< MODIFIED START [Removed ServerAuthenticating from direct mapping for now] >>>
+      // PlainState::ServerAuthenticating => MechanismStatus::Authenticating,
+      // <<< MODIFIED END >>>
       PlainState::Ready => MechanismStatus::Ready,
       PlainState::Error => MechanismStatus::Error,
     }
   }
 
   fn peer_identity(&self) -> Option<Vec<u8>> {
-    // PLAIN doesn't inherently establish a cryptographic peer identity.
-    // We could return the authenticated username if available.
+    // For PLAIN, the 'identity' is the username.
+    // Server gets it from HELLO, client has it from config.
     self.username.clone()
   }
 
   fn metadata(&self) -> Option<Metadata> {
-    // Return ZAP metadata if authentication provided any
-    self.zap_metadata.clone()
+    // Return ZAP metadata if authentication provided any (future ZAP impl)
+    self._zap_metadata.clone()
   }
 
   fn as_any(&self) -> &dyn std::any::Any {
     self
   }
 
-  /// Sets the mechanism's internal state to Error.
   fn set_error(&mut self, reason: String) {
-    // Call the internal helper method
     self.set_error_internal(reason);
   }
 
-  /// Returns the reason for the error state, if available.
   fn error_reason(&self) -> Option<&str> {
-    self.error_reason.as_deref() // Return borrow from Option<String>
+    self.error_reason.as_deref()
   }
 
-  // --- ZAP Related Methods (Placeholders) ---
+  // --- ZAP Related Methods (Simplified for now) ---
   fn zap_request_needed(&mut self) -> Option<Vec<Vec<u8>>> {
-    if self.is_server && self.state == PlainState::SendWelcome {
-      // If we just received HELLO and moved to SendWelcome, we *should* check ZAP
-      // Before sending WELCOME. Change state to Authenticating.
-      tracing::info!("PLAIN: ZAP request needed (TODO: Implement)");
-      // self.state = PlainState::Authenticating;
-      // Construct ZAP request frames here based on self.username/password
-      // Example: vec![ b"Version", b"Request-Id", b"Domain", b"Address", b"Identity",
-      //                b"Mechanism", b"Credentials" ]
-      // return Some(zap_frames);
-      None // Placeholder: Return None until ZAP implemented
-    } else {
-      None
-    }
+    // For now, PLAIN server will not use ZAP explicitly via this mechanism.
+    // It transitions directly to ServerSendWelcome after HELLO.
+    // If ZAP were used, this would be called when state is ServerAuthenticating.
+    None
   }
 
   fn process_zap_reply(&mut self, _reply_frames: &[Vec<u8>]) -> Result<(), ZmqError> {
-    if self.is_server && self.state == PlainState::Authenticating {
-      tracing::info!("PLAIN: Processing ZAP reply (TODO: Implement)");
-      // Parse ZAP reply (Status-Code, Status-Text, User-Id, Metadata)
-      // Based on Status-Code:
-      // If "200": move state to SendWelcome, store User-Id/Metadata
-      // If "300": Transient error? Maybe retry? For PLAIN likely fail. Set error.
-      // If "400": Auth failed. Set error with Status-Text.
-      // If "500": Server error. Set error.
-      // Example (Success Case):
-      // self.zap_metadata = Some(parsed_metadata);
-      // self.state = PlainState::SendWelcome;
-      // Example (Failure Case):
-      // self.set_error(format!("ZAP authentication failed: {}", status_text));
-      // return Err(ZmqError::AuthenticationFailure(status_text));
-      Ok(()) // Placeholder: Assume success for now
-    } else {
-      // Should not happen
-      tracing::warn!("process_zap_reply called in unexpected state: {:?}", self.state);
-      Ok(())
-    }
+    // If ZAP were used, this would parse the reply and transition state.
+    // Since we are bypassing ZAP for now, this method will not be called
+    // if zap_request_needed() returns None.
+    // If it were called, and state was ServerAuthenticating:
+    //   Parse reply -> if OK, self.state = ServerSendWelcome;
+    //   else -> self.set_error_internal("ZAP auth failed"); return Err(...)
+    Ok(())
   }
 
   fn into_data_cipher_parts(self: Box<Self>) -> Result<(Box<dyn IDataCipher>, Option<Vec<u8>>), ZmqError> {

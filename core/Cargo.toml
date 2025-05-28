@@ -15,6 +15,7 @@ categories = ["asynchronous", "network-programming", "concurrency"]
 
 [features]
 full = ["default", "ipc", "inproc", "noise_xx"]
+full-linux = ["full", "io-uring"]
 default = ["ipc", "inproc"]
 
 io-uring = ["dep:tokio-uring"]
@@ -97,3 +98,12 @@ harness = false
 name = "zerocopy_bench"
 harness = false
 required-features = ["io-uring"]
+
+[[example]]
+name = "plain_req_rep"
+path = "examples/plain_req_rep.rs"
+
+[[example]]
+name = "noise_xx_push_pull"
+path = "examples/noise_xx_push_pull.rs"
+required-features = ["noise_xx"]
