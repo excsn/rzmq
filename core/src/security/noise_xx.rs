@@ -2,7 +2,7 @@
 
 use crate::error::ZmqError;
 use crate::security::{Mechanism, MechanismStatus, Metadata};
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use snow::error::{Prerequisite, StateProblem};
 // Use your existing types
 use snow::params::NoiseParams;
@@ -108,6 +108,7 @@ impl std::fmt::Debug for NoiseXxMechanism {
 
 impl NoiseXxMechanism {
   pub const NAME: &'static str = "NOISE_XX";
+  pub const NAME_BYTES: &'static [u8; 20] = b"NOISE_XX\0\0\0\0\0\0\0\0\0\0\0\0";
   const NOISE_PARAMS_STR: &'static str = "Noise_XX_25519_ChaChaPoly_BLAKE2s"; // Standard Noise pattern
 
   pub fn new(
@@ -345,42 +346,81 @@ impl Mechanism for NoiseXxMechanism {
   }
 
   fn produce_token(&mut self) -> Result<Option<Vec<u8>>, ZmqError> {
-    if self.current_status == MechanismStatus::Error || self.current_status == MechanismStatus::Ready {
-      return Ok(None);
-    }
-    if self.current_status == MechanismStatus::Initializing && self.is_server_role {
-      self.current_status = MechanismStatus::Handshaking;
-      return Ok(None);
-    }
-    self.current_status = MechanismStatus::Handshaking;
+    // If there's a message prepared by a previous process_token() call, prioritize sending it.
+    if let Some(msg_to_send) = self.pending_outgoing_handshake_msg.take() {
+      tracing::debug!(
+        "NOISE_XX produce_token: Sending pending msg (len {}) from previous process_token.",
+        msg_to_send.len()
+      );
 
-    if let Some(msg) = self.pending_outgoing_handshake_msg.take() {
-      tracing::debug!("NOISE_XX produce_token: Sending pending msg (len {})", msg.len());
-      return Ok(Some(msg));
+      // If this pending message is the initiator's final one (s,ss for XX):
+      // The snow::HandshakeState became "finished" when this msg was *prepared* in process_token.
+      // Now that we are *producing* it for the engine to send, perform final verification and transition.
+      if !self.is_server_role {
+        // Client/Initiator
+        if let Some(state) = self.state.as_ref() {
+          // Check without consuming
+          if state.is_handshake_finished() {
+            tracing::debug!(
+              "NOISE_XX produce_token (Initiator): Final message produced. Transitioning state (verifies peer PK)."
+            );
+            // transition_to_final_state will set self.current_status to Ready or Error.
+            // If it errors (e.g. PK mismatch), the error is propagated from this produce_token call.
+            self.transition_to_final_state()?;
+          }
+        }
+      }
+      return Ok(Some(msg_to_send));
+    }
+
+    // If no pending message, check if we should generate a new one.
+    // Do not proceed if already Ready or in Error.
+    if self.current_status == MechanismStatus::Ready || self.current_status == MechanismStatus::Error {
+      return Ok(None);
+    }
+
+    // Ensure we are in Handshaking state if we are about to produce a token.
+    if self.current_status == MechanismStatus::Initializing {
+      self.current_status = MechanismStatus::Handshaking;
+      // For server/responder, it waits for client's first message, so produce_token is None initially.
+      if self.is_server_role {
+        return Ok(None);
+      }
     }
 
     let handshake_state = self
       .state
       .as_mut()
-      .ok_or_else(|| ZmqError::InvalidState("Noise HandshakeState missing before produce_token".into()))?;
+      .ok_or_else(|| ZmqError::InvalidState("Noise HandshakeState missing when trying to produce new token.".into()))?;
 
     if handshake_state.is_my_turn() {
       let mut msg_buf = vec![0u8; 1024];
       let len = handshake_state.write_message(&[], &mut msg_buf)?;
       msg_buf.truncate(len);
       tracing::debug!(
-        "NOISE_XX Client (Initiator) produce_token: Generated first handshake message (len {})",
+        "NOISE_XX produce_token (is_server={}): Generated NEW handshake message (len {}).",
+        self.is_server_role,
         len
       );
+
+      // If *this current write* finished the snow::HandshakeState (e.g. for responder, or other patterns).
+      // For XX Initiator, its first write (->e) does NOT finish snow::HandshakeState.
+      // For XX Responder, its first write (->e,es) does NOT finish snow::HandshakeState.
+      // This block is thus more for the responder completing its part if its write is final for the pattern.
+      if handshake_state.is_handshake_finished() {
+        tracing::debug!(
+          "NOISE_XX produce_token: snow::HandshakeState became finished *after this write*. Transitioning state."
+        );
+        if self.is_server_role {
+          // Only responder should transition to Ready based on its own write completing the pattern.
+          self.transition_to_final_state()?;
+        }
+        // If initiator, its transition to Ready happens when its *final pending* message is produced (handled above).
+      }
       Ok(Some(msg_buf))
     } else {
-      tracing::trace!(
-        "NOISE_XX produce_token: No message to produce now (is_server={}, is_initiator={}, sending_next_message={})",
-        self.is_server_role,
-        handshake_state.is_initiator(),
-        handshake_state.is_my_turn()
-      );
-      Ok(None)
+      tracing::trace!("NOISE_XX produce_token: Not my turn and no pending message. Waiting for peer.");
+      Ok(None) // Not our turn to send.
     }
   }
 
@@ -393,8 +433,10 @@ impl Mechanism for NoiseXxMechanism {
     if self.current_status == MechanismStatus::Initializing {
       self.current_status = MechanismStatus::Handshaking;
     }
+
     tracing::debug!(
-      "NOISE_XX process_token: Received handshake message (len {})",
+      "NOISE_XX process_token (is_server={}): Received handshake message (len {})",
+      self.is_server_role,
       token.len()
     );
 
@@ -407,21 +449,38 @@ impl Mechanism for NoiseXxMechanism {
     let _payload_len = handshake_state.read_message(token, &mut read_payload_buf)?;
 
     if handshake_state.is_handshake_finished() {
-      tracing::debug!("NOISE_XX process_token: Handshake finished after processing token.");
-      self.transition_to_final_state()?;
+      // This is true if peer's message was the last one in the pattern (e.g. server processing client's s,ss).
+      tracing::debug!(
+        "NOISE_XX process_token (is_server={}): snow::HandshakeState finished after read_message. Transitioning state.",
+        self.is_server_role
+      );
+      self.transition_to_final_state()?; // Sets self.current_status to Ready or Error
       self.pending_outgoing_handshake_msg = None;
     } else if handshake_state.is_my_turn() {
+      // It's now our turn to write. Prepare the message.
       let mut msg_buf = vec![0u8; 1024];
       let len = handshake_state.write_message(&[], &mut msg_buf)?;
       msg_buf.truncate(len);
-
       tracing::debug!(
-        "NOISE_XX process_token: Generated next handshake message (len {}) for pending send.",
+        "NOISE_XX process_token (is_server={}): Generated next handshake message (len {}) for pending send.",
+        self.is_server_role,
         len
       );
       self.pending_outgoing_handshake_msg = Some(msg_buf);
+
+      // Client (Initiator) specific:
+      // If this write_message *would have been* the initiator's last (s,ss),
+      // its snow::HandshakeState is now finished. However, we DO NOT transition to Ready here.
+      // The transition to Ready (including PK verification) will happen when this pending message
+      // is actually *produced* by produce_token().
+      if !self.is_server_role && handshake_state.is_handshake_finished() {
+        tracing::debug!("NOISE_XX process_token (Initiator): snow::HandshakeState finished after preparing final message. Mechanism status remains Handshaking. Verification will happen in produce_token().");
+      }
     } else {
-      tracing::trace!("NOISE_XX process_token: Processed token, awaiting peer's next or handshake done by peer.");
+      tracing::trace!(
+        "NOISE_XX process_token (is_server={}): Processed token, awaiting peer's next. No pending message generated.",
+        self.is_server_role
+      );
       self.pending_outgoing_handshake_msg = None;
     }
     Ok(())
@@ -496,57 +555,107 @@ impl IDataCipher for NoiseDataCipher {
     const NOISE_TAG_LEN: usize = 16;
     const NOISE_LEN_PREFIX_LEN: usize = 2;
 
-    if plaintext_zmtp_frame.len() > MAX_NOISE_PAYLOAD_LEN {
-      tracing::error!(
-        plaintext_len = plaintext_zmtp_frame.len(),
-        max_len = MAX_NOISE_PAYLOAD_LEN,
-        "ZMTP frame too large for a single Noise message. Chunking not yet implemented."
-      );
+    if plaintext_zmtp_frame.len() > (u16::MAX as usize - NOISE_TAG_LEN) {
+      // Max ZMTP frame size
       return Err(ZmqError::InvalidMessage(
-        "ZMTP frame too large for a single Noise message.".into(),
+        "ZMTP frame too large for Noise message.".into(),
       ));
     }
 
-    // Buffer for [2-byte len][encrypted_zmtp_frame][16-byte tag]
-    let required_buf_len = NOISE_LEN_PREFIX_LEN + plaintext_zmtp_frame.len() + NOISE_TAG_LEN;
-    let mut noise_message_buf = vec![0u8; required_buf_len];
+    // Buffer for [2-byte len_prefix][ciphertext][16-byte tag]
+    // The ciphertext will be the same length as plaintext_zmtp_frame for ChaChaPoly.
+    let ciphertext_len = plaintext_zmtp_frame.len();
+    let payload_with_tag_len = ciphertext_len + NOISE_TAG_LEN; // This is the length that goes into the prefix
 
-    // `write_message` encrypts `plaintext_zmtp_frame`, adds the tag, prepends the 2-byte length
-    // of (encrypted_zmtp_frame + tag), and writes it all into `noise_message_buf`.
-    // The buffer passed to `write_message` must be large enough for all of this.
-    // `snow` expects the output buffer to be `payload.len() + TAGLEN + 2`
-    let len_written_to_noise_buf = self.transport_state.write_message(
+    let mut output_buffer = BytesMut::with_capacity(NOISE_LEN_PREFIX_LEN + payload_with_tag_len);
+    output_buffer.put_u16(payload_with_tag_len as u16); // Write length prefix (BIG ENDIAN default for put_u16)
+
+    // Prepare a buffer for snow to write ciphertext + tag into
+    // This buffer does not include the prefix space.
+    let mut snow_output_buf = vec![0u8; payload_with_tag_len];
+
+    tracing::trace!(
+      plaintext_len = plaintext_zmtp_frame.len(),
+      snow_output_buffer_capacity = snow_output_buf.len(),
+      "NoiseDataCipher::encrypt: Calling snow's write_message."
+    );
+
+    // snow.write_message writes ciphertext + tag into snow_output_buf
+    let bytes_written_by_snow = self.transport_state.write_message(
       &plaintext_zmtp_frame, // This is the "payload" for the Noise message
-      &mut noise_message_buf,
-    )?; // SnowError converted to ZmqError by From impl
+      &mut snow_output_buf,  // snow writes ciphertext+tag here
+    )?;
 
-    noise_message_buf.truncate(len_written_to_noise_buf);
-    Ok(Bytes::from(noise_message_buf))
+    // bytes_written_by_snow should be equal to payload_with_tag_len
+    if bytes_written_by_snow != payload_with_tag_len {
+      tracing::error!(
+        expected_snow_write = payload_with_tag_len,
+        actual_snow_write = bytes_written_by_snow,
+        "Mismatch in expected bytes written by snow."
+      );
+      return Err(ZmqError::EncryptionError("Snow write_message length mismatch".into()));
+    }
+
+    output_buffer.put_slice(&snow_output_buf[..bytes_written_by_snow]); // Append ciphertext+tag
+
+    tracing::trace!(
+        total_noise_msg_len = output_buffer.len(), // Should be 2 + payload_with_tag_len
+        prefix_val = payload_with_tag_len,
+        actual_len_prefix_bytes = ?output_buffer.get(..2),
+        "NoiseDataCipher::encrypt: Encryption successful."
+    );
+
+    Ok(output_buffer.freeze())
   }
 
   fn decrypt_wire_data_to_zmtp_frame(&mut self, encrypted_wire_data: &mut BytesMut) -> Result<Option<Bytes>, ZmqError> {
     const NOISE_LEN_PREFIX_LEN: usize = 2;
     const MIN_NOISE_MSG_PAYLOAD_WITH_TAG: usize = 16; // Smallest possible encrypted payload is just the tag
+    tracing::trace!(
+        buffer_len = encrypted_wire_data.len(),
+        prefix_peek = ?encrypted_wire_data.get(..NOISE_LEN_PREFIX_LEN.min(encrypted_wire_data.len())), // Safe peek
+        "NoiseDataCipher::decrypt: Top of function. Encrypted wire data len: {}",
+        encrypted_wire_data.len()
+    );
 
     if encrypted_wire_data.len() < NOISE_LEN_PREFIX_LEN {
+      tracing::trace!(
+        "NoiseDataCipher::decrypt: Need more data for length prefix (got {}, need {}).",
+        encrypted_wire_data.len(),
+        NOISE_LEN_PREFIX_LEN
+      );
       return Ok(None); // Not enough data for length prefix
     }
 
     // Peek at the 2-byte big-endian length prefix.
     let length_bytes: [u8; 2] = encrypted_wire_data[0..NOISE_LEN_PREFIX_LEN].try_into().unwrap();
     let encrypted_payload_len_with_tag = u16::from_be_bytes(length_bytes) as usize;
-
+    tracing::trace!(
+        raw_len_bytes = ?length_bytes, %encrypted_payload_len_with_tag,
+        "NoiseDataCipher::decrypt: Parsed length prefix. Encrypted payload + tag should be: {} bytes.",
+        encrypted_payload_len_with_tag
+    );
     if encrypted_payload_len_with_tag == 0 {
       // A zero-length noise message is valid (e.g. for rekeying or empty transport data)
       // but doesn't contain a ZMTP frame. We should consume it and signal no ZMTP frame.
-      tracing::trace!("Decrypted zero-length noise message, consuming.");
+      tracing::trace!("NoiseDataCipher::decrypt: Zero-length noise message payload indicated. Consuming prefix.");
       encrypted_wire_data.advance(NOISE_LEN_PREFIX_LEN); // Consume the length prefix
       return Ok(None); // No ZMTP frame produced from an empty Noise payload
     }
 
     let total_noise_message_len = NOISE_LEN_PREFIX_LEN + encrypted_payload_len_with_tag;
-
+    tracing::trace!(
+        %total_noise_message_len,
+        current_buffer_len = encrypted_wire_data.len(),
+        "NoiseDataCipher::decrypt: Total expected Noise message length (prefix + payload_with_tag): {}.",
+        total_noise_message_len
+    );
     if encrypted_wire_data.len() < total_noise_message_len {
+      tracing::trace!(
+        "NoiseDataCipher::decrypt: Need more data for full Noise message (got {}, need {}).",
+        encrypted_wire_data.len(),
+        total_noise_message_len
+      );
       return Ok(None); // Not enough data for the full Noise message
     }
 
@@ -554,7 +663,10 @@ impl IDataCipher for NoiseDataCipher {
     // `split_to` consumes from `encrypted_wire_data`.
     let noise_message_bytes_frozen = encrypted_wire_data.split_to(total_noise_message_len).freeze();
     let encrypted_payload_with_tag_slice = &noise_message_bytes_frozen[NOISE_LEN_PREFIX_LEN..];
-
+    tracing::trace!(
+      actual_payload_plus_tag_len_to_decrypt = encrypted_payload_with_tag_slice.len(),
+      "NoiseDataCipher::decrypt: Extracted encrypted_payload_with_tag slice for snow.read_message."
+    );
     if encrypted_payload_len_with_tag < MIN_NOISE_MSG_PAYLOAD_WITH_TAG {
       tracing::error!(
         actual_len = encrypted_payload_len_with_tag,
@@ -566,12 +678,16 @@ impl IDataCipher for NoiseDataCipher {
     let max_plaintext_len = encrypted_payload_len_with_tag - MIN_NOISE_MSG_PAYLOAD_WITH_TAG;
     // If encrypted_payload_len_with_tag IS 16, max_plaintext_len is 0. A 0-len plaintext is valid.
     let mut decrypted_zmtp_frame_buf = vec![0u8; max_plaintext_len];
-
+    tracing::trace!(
+      max_plaintext_buffer_size = decrypted_zmtp_frame_buf.len(),
+      "NoiseDataCipher::decrypt: Calling snow's read_message."
+    );
     let len_decrypted = self.transport_state.read_message(
       encrypted_payload_with_tag_slice, // This is ciphertext + tag
       &mut decrypted_zmtp_frame_buf,
     )?; // SnowError converted to ZmqError
 
+    tracing::trace!(%len_decrypted, "NoiseDataCipher::decrypt: snow's read_message successful.");
     decrypted_zmtp_frame_buf.truncate(len_decrypted);
     Ok(Some(Bytes::from(decrypted_zmtp_frame_buf)))
   }

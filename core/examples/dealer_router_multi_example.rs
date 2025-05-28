@@ -1,5 +1,3 @@
-// examples/dealer_router_multi_example.rs
-
 use futures::future::join_all;
 use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
 use std::time::Duration;
@@ -21,10 +19,10 @@ async fn setup_dealer_router_example(
   println!("[Setup] Creating ROUTER socket...");
   let router = ctx.socket(SocketType::Router)?;
   router
-    .set_option(rzmq::socket::options::SNDHWM, &HWM_EXAMPLE.to_ne_bytes())
+    .set_option_raw(rzmq::socket::options::SNDHWM, &HWM_EXAMPLE.to_ne_bytes())
     .await?;
   router
-    .set_option(rzmq::socket::options::RCVHWM, &HWM_EXAMPLE.to_ne_bytes())
+    .set_option_raw(rzmq::socket::options::RCVHWM, &HWM_EXAMPLE.to_ne_bytes())
     .await?;
 
   println!("[Setup] ROUTER binding to {}...", BIND_ADDR_EXAMPLE);
@@ -37,16 +35,16 @@ async fn setup_dealer_router_example(
   for i in 0..num_dealers {
     let dealer = ctx.socket(SocketType::Dealer)?;
     dealer
-      .set_option(rzmq::socket::options::ROUTING_ID, format!("dealer_{}", i).as_bytes())
+      .set_option_raw(rzmq::socket::options::ROUTING_ID, format!("dealer_{}", i).as_bytes())
       .await?;
     dealer
-      .set_option(rzmq::socket::options::SNDHWM, &HWM_EXAMPLE.to_ne_bytes())
+      .set_option_raw(rzmq::socket::options::SNDHWM, &HWM_EXAMPLE.to_ne_bytes())
       .await?;
     dealer
-      .set_option(rzmq::socket::options::RCVHWM, &HWM_EXAMPLE.to_ne_bytes())
+      .set_option_raw(rzmq::socket::options::RCVHWM, &HWM_EXAMPLE.to_ne_bytes())
       .await?;
     // dealer
-    //   .set_option(rzmq::socket::options::RECONNECT_IVL, &(-1i32).to_ne_bytes())
+    //   .set_option_raw(rzmq::socket::options::RECONNECT_IVL, &(-1i32).to_ne_bytes())
     //   .await?;
     println!("[Setup] DEALER {} connecting to {}...", i, BIND_ADDR_EXAMPLE);
     dealer.connect(BIND_ADDR_EXAMPLE).await?;

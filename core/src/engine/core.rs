@@ -146,19 +146,40 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
 
   async fn exchange_greetings(&mut self, stream: &mut S) -> Result<ZmtpGreeting, ZmqError> {
     let mut greeting_buffer_to_send = BytesMut::with_capacity(GREETING_LENGTH);
-    // In a real scenario, the mechanism chosen by socket options might influence the greeting.
-    // For ZMTP 3.1, the greeting itself proposes a mechanism (often NULL or PLAIN, etc. directly).
-    // Libzmq sends the configured socket mechanism in the greeting if it's PLAIN, etc..
-    // For now, sending NULL and relying on negotiation.
-    let own_greeting_mechanism_bytes = {
-      let mut mechanism_name_to_send = NullMechanism::NAME_BYTES; // Default to NULL
 
-      if self.config.socket_type_name == "PLAINCLIENTTODO" {
-        // Example placeholder
-        mechanism_name_to_send = PlainMechanism::NAME_BYTES;
+    let own_greeting_mechanism_bytes = {
+      #[cfg(feature = "noise_xx")]
+      if self.config.use_noise_xx {
+        // If Noise is enabled in config, propose NOISE_XX.
+        // Also, ensure necessary keys are present for this role.
+        // Client needs remote_pk, Server just needs its own sk.
+        let can_propose_noise = if self.is_server {
+          self.config.noise_xx_local_sk_bytes_for_engine.is_some()
+        } else {
+          // Client
+          self.config.noise_xx_local_sk_bytes_for_engine.is_some()
+            && self.config.noise_xx_remote_pk_bytes_for_engine.is_some()
+        };
+
+        if can_propose_noise {
+          tracing::debug!(engine_handle = self.handle, "Proposing NOISE_XX in own greeting.");
+          NoiseXxMechanism::NAME_BYTES // This should be the 20-byte padded version
+        } else {
+          tracing::warn!(
+            engine_handle = self.handle,
+            "Noise_XX configured but required keys missing for this role. Defaulting to NULL in greeting."
+          );
+          NullMechanism::NAME_BYTES
+        }
+      } else {
+        // Noise not enabled in config, propose NULL.
+        NullMechanism::NAME_BYTES
       }
-      // If no specific mechanism is forced by config for the initial greeting, NullMechanism::NAME_BYTES is used.
-      mechanism_name_to_send
+      #[cfg(not(feature = "noise_xx"))]
+      {
+        // Noise feature not compiled, always propose NULL.
+        NullMechanism::NAME_BYTES
+      }
     };
 
     ZmtpGreeting::encode(
@@ -172,7 +193,10 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
     tracing::debug!(
       engine_handle = self.handle,
       role = if self.is_server { "Server" } else { "Client" },
-      "Sent own ZMTP greeting (raw)."
+      "Sent own ZMTP greeting (proposing: {}).",
+      std::str::from_utf8(own_greeting_mechanism_bytes)
+        .unwrap_or("")
+        .trim_end_matches('\0')
     );
     self.last_activity_time = Instant::now();
 
@@ -218,7 +242,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
 
   async fn perform_security_and_ready_handshake(
     &mut self,
-    framed_handshake_stream: &mut Framed<S, ZmtpCodec>,
+    framed_handshake_stream: &mut Framed<S, ZmtpCodec>, // S is the ZmtpStdStream
     peer_greeting: ZmtpGreeting,
   ) -> Result<(Box<dyn Mechanism>, Option<Blob>), ZmqError> {
     // --- Validate Peer's Greeting & Select Security Mechanism ---
@@ -246,45 +270,27 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       "Selecting security mechanism based on peer greeting."
     );
 
-    // TODO: Actual mechanism selection should consider socket options (e.g., if this socket is PLAIN server,
-    // it might reject a NULL proposal or only accept PLAIN.).
-    // For now, this is a simple negotiation based on what peer proposed.
     let mut negotiated_mechanism: Box<dyn Mechanism> = match peer_proposed_mechanism_name {
       NullMechanism::NAME => Box::new(NullMechanism),
-      PlainMechanism::NAME => {
-        // If we are server, and peer proposes PLAIN, we expect username/password.
-        // If we are client, and peer proposes PLAIN, this is unusual (server usually dictates PLAIN).
-        // For now, just instantiate based on our role.
-        // TODO: Pass PLAIN options (username/password if client) from self.config or socket options.
-        Box::new(PlainMechanism::new(self.is_server))
-      }
-
+      PlainMechanism::NAME => Box::new(PlainMechanism::new(self.is_server)),
       #[cfg(feature = "noise_xx")]
       NoiseXxMechanism::NAME if self.config.use_noise_xx => {
-        // Peer proposed NOISE_XX AND our configuration enables/prefers it.
         tracing::info!(
           engine_handle = self.handle,
           "Attempting to use NOISE_XX mechanism as proposed by peer and enabled in config."
         );
-
-        // 1. Get the local static secret key bytes from engine config
         let local_sk_bytes_arr: [u8; 32] = self.config.noise_xx_local_sk_bytes_for_engine.ok_or_else(|| {
           let msg =
             "NOISE_XX: Local static secret key not configured in engine config for selected mechanism.".to_string();
           tracing::error!(engine_handle = self.handle, error = %msg);
           ZmqError::SecurityError(msg)
         })?;
-
-        // 3. Get the remote static public key bytes (for client role) from engine config
         let remote_pk_config_opt_ref: Option<[u8; 32]> =
           self.config.noise_xx_remote_pk_bytes_for_engine.as_ref().copied();
-
-        // 4. Instantiate NoiseXxMechanism
         match NoiseXxMechanism::new(self.is_server, &local_sk_bytes_arr, remote_pk_config_opt_ref) {
           Ok(noise_mech) => Box::new(noise_mech),
           Err(e) => {
             tracing::error!(engine_handle = self.handle, error = %e, "Failed to initialize NOISE_XX mechanism.");
-            // If Noise_XX was chosen but initialization fails, this is a security configuration error.
             return Err(e);
           }
         }
@@ -292,11 +298,9 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       unsupported_name => {
         let security_error_msg = format!("Unsupported security mechanism '{}' from peer.", unsupported_name);
         tracing::error!(engine_handle = self.handle, error = %security_error_msg);
-        // TODO: Send ZMTP ERROR command back to peer with reason?
         return Err(ZmqError::SecurityError(security_error_msg));
       }
     };
-    // The `self.mechanism` field in ZmtpEngineCoreStd will be updated by run_loop after this function returns.
 
     // --- Security Handshake (Token Exchange using Framed stream) ---
     tracing::debug!(
@@ -304,14 +308,14 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       mechanism = negotiated_mechanism.name(),
       "Starting security token exchange."
     );
+    let handshake_timeout = Duration::from_secs(30);
 
-    let handshake_timeout = Duration::from_secs(30); // Timeout for entire handshake token exchange phase
-
-    while !negotiated_mechanism.is_complete() && !negotiated_mechanism.is_error() {
-      // Produce a token if the mechanism has one to send.
+    // Refined loop for security token exchange
+    loop {
+      // 1. Produce and send any token our mechanism needs to send.
       if let Some(token_to_send_vec) = negotiated_mechanism.produce_token()? {
         let mut command_msg = Msg::from_vec(token_to_send_vec);
-        command_msg.set_flags(MsgFlags::COMMAND); // Security tokens are ZMTP commands.
+        command_msg.set_flags(MsgFlags::COMMAND);
         tracing::trace!(
           engine_handle = self.handle,
           mechanism = negotiated_mechanism.name(),
@@ -321,95 +325,85 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
         match tokio::time::timeout(handshake_timeout, framed_handshake_stream.send(command_msg)).await {
           Ok(Ok(())) => { /* Sent successfully */ }
           Ok(Err(e)) => {
-            // Error from framed_handshake_stream.send()
             negotiated_mechanism.set_error(format!("Stream error sending token: {}", e));
             tracing::error!(engine_handle = self.handle, error = %e, "Failed to send security token.");
-            return Err(e.into());
+            // No need to break here, error state will be caught by next check
           }
           Err(_) => {
-            // Timeout
             let err_msg = "Timeout sending security token".to_string();
             negotiated_mechanism.set_error(err_msg.clone());
             tracing::error!(engine_handle = self.handle, error = %err_msg);
-            return Err(ZmqError::Timeout);
+            // No need to break here, error state will be caught by next check
           }
         }
         self.last_activity_time = Instant::now();
       }
 
-      // If mechanism is still not complete or in error, expect a token from peer.
-      if !negotiated_mechanism.is_complete() && !negotiated_mechanism.is_error() {
-        // Check if it's our turn or if we are expecting a message from peer
-        // (produce_token returning None might indicate we are waiting)
-        if negotiated_mechanism.status() == MechanismStatus::Handshaking {
-          // More general check
-          tracing::trace!(
-            engine_handle = self.handle,
-            mechanism = negotiated_mechanism.name(),
-            "Waiting for security token from peer."
-          );
-          match tokio::time::timeout(handshake_timeout, framed_handshake_stream.next()).await {
-            Ok(Some(Ok(received_msg))) => {
-              self.last_activity_time = Instant::now();
-              if !received_msg.is_command() {
-                let protocol_err_msg = "Expected COMMAND frame during security handshake, got data frame.";
-                negotiated_mechanism.set_error(protocol_err_msg.to_string());
-                tracing::error!(engine_handle = self.handle, error = %protocol_err_msg);
-                return Err(ZmqError::SecurityError(protocol_err_msg.to_string()));
-              }
-              let token_data = received_msg.data().unwrap_or(&[]);
-              tracing::trace!(
-                engine_handle = self.handle,
-                mechanism = negotiated_mechanism.name(),
-                token_size = token_data.len(),
-                "Received security token."
-              );
-              negotiated_mechanism.process_token(token_data)?;
-            }
-            Ok(Some(Err(e))) => {
-              // Error from framed_handshake_stream.next() decoding
-              negotiated_mechanism.set_error(format!("Stream error receiving token: {}", e));
-              tracing::error!(engine_handle = self.handle, error = %e, "Stream error during security handshake.");
-              return Err(e.into());
-            }
-            Ok(None) => {
-              // Stream closed by peer
-              let err_msg = "Connection closed by peer during security handshake".to_string();
-              negotiated_mechanism.set_error(err_msg.clone());
-              tracing::error!(engine_handle = self.handle, error = %err_msg);
-              return Err(ZmqError::ConnectionClosed);
-            }
-            Err(_) => {
-              // Timeout waiting for peer's token
-              let err_msg = "Timeout waiting for security token from peer".to_string();
-              negotiated_mechanism.set_error(err_msg.clone());
-              tracing::error!(engine_handle = self.handle, error = %err_msg);
-              return Err(ZmqError::Timeout);
+      // 2. Check if the handshake is complete or an error occurred.
+      //    This check is important after our send attempt or if we had nothing to send.
+      if negotiated_mechanism.is_complete() || negotiated_mechanism.is_error() {
+        tracing::debug!(engine_handle=self.handle, mechanism=negotiated_mechanism.name(), status=?negotiated_mechanism.status(), "Security token loop: Breaking due to completion or error.");
+        break;
+      }
+
+      // 3. If handshake is not done, we must be waiting for the peer's next message.
+      tracing::trace!(
+        engine_handle = self.handle,
+        mechanism = negotiated_mechanism.name(),
+        "Waiting for security token from peer."
+      );
+      match tokio::time::timeout(handshake_timeout, framed_handshake_stream.next()).await {
+        Ok(Some(Ok(received_msg))) => {
+          self.last_activity_time = Instant::now();
+          if !received_msg.is_command() {
+            let protocol_err_msg = "Expected COMMAND frame during security handshake, got data frame.";
+            negotiated_mechanism.set_error(protocol_err_msg.to_string());
+            tracing::error!(engine_handle = self.handle, error = %protocol_err_msg);
+            // Error state set, next loop iteration will break.
+          } else {
+            let token_data = received_msg.data().unwrap_or(&[]);
+            tracing::trace!(
+              engine_handle = self.handle,
+              mechanism = negotiated_mechanism.name(),
+              token_size = token_data.len(),
+              "Received security token."
+            );
+            // Process token. This might generate a response to be sent in the next iteration's produce_token().
+            // Or it might complete the handshake (e.g., server processing client's last message).
+            // Or it might result in an error.
+            if let Err(e) = negotiated_mechanism.process_token(token_data) {
+              negotiated_mechanism.set_error(format!("Error processing token: {}", e)); // Ensure error state is set in mechanism
+              tracing::error!(engine_handle = self.handle, error=%e, "Error processing received security token.");
+              // Error state set, next loop iteration will break.
             }
           }
-        } else if !negotiated_mechanism.is_complete() && !negotiated_mechanism.is_error() {
-          // produce_token was None, but we are not complete or error, implies we are waiting for peer.
-          // This case might be redundant if the above `if Handshaking` is sufficient.
-          // Or if mechanism state naturally leads to waiting in framed_handshake_stream.next()
-          tracing::trace!(
-            engine_handle = self.handle,
-            mechanism = negotiated_mechanism.name(),
-            "produce_token is None, handshake not complete. Assuming wait for peer."
-          );
+        }
+        Ok(Some(Err(e))) => {
+          negotiated_mechanism.set_error(format!("Stream error receiving token: {}", e));
+          tracing::error!(engine_handle = self.handle, error = %e, "Stream error during security handshake.");
+        }
+        Ok(None) => {
+          let err_msg = "Connection closed by peer during security handshake".to_string();
+          negotiated_mechanism.set_error(err_msg.clone());
+          tracing::error!(engine_handle = self.handle, error = %err_msg);
+        }
+        Err(_) => {
+          let err_msg = "Timeout waiting for security token from peer".to_string();
+          negotiated_mechanism.set_error(err_msg.clone());
+          tracing::error!(engine_handle = self.handle, error = %err_msg);
         }
       }
 
-      // Placeholder for ZAP (ZeroMQ Authentication Protocol) interaction
-      // If mechanism requires ZAP, it will indicate so. Session would then interact with ZAP server.
-      if let Some(_zap_req_frames) = negotiated_mechanism.zap_request_needed() {
-        // In a full implementation, this would signal back to Session to perform ZAP.
-        // For now, we'll assume ZAP is not implemented or not required by the chosen mechanism.
-        let zap_err_msg = "ZAP authentication required but not implemented in this engine core".to_string();
-        negotiated_mechanism.set_error(zap_err_msg.clone());
-        tracing::warn!(engine_handle = self.handle, %zap_err_msg);
-        // This typically means the handshake fails if ZAP was mandatory.
+      // ZAP check, if it's still relevant after processing a token
+      if !negotiated_mechanism.is_complete() && !negotiated_mechanism.is_error() {
+        if let Some(_zap_req_frames) = negotiated_mechanism.zap_request_needed() {
+          let zap_err_msg = "ZAP authentication required but not implemented in this engine core".to_string();
+          negotiated_mechanism.set_error(zap_err_msg.clone()); // This will cause loop to break on next iteration
+          tracing::warn!(engine_handle = self.handle, %zap_err_msg);
+        }
       }
-    } // End while loop for token exchange
+      // Loop again. The is_complete() || is_error() check at the top will handle termination.
+    }
 
     if negotiated_mechanism.is_error() {
       let reason = negotiated_mechanism
@@ -421,10 +415,10 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
         reason = reason,
         "Security handshake failed."
       );
-      // TODO: Send ZMTP ERROR command back to peer?
       return Err(ZmqError::SecurityError(reason.to_string()));
     }
 
+    // If we break the loop because is_complete() is true, but not is_error(), then handshake is successful.
     tracing::info!(
       engine_handle = self.handle,
       mechanism = negotiated_mechanism.name(),
@@ -434,19 +428,17 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
     // --- ZMTP READY Command Exchange ---
     let mut identity_from_ready_command: Option<Blob> = None;
     let local_socket_type_name = self.config.socket_type_name.clone();
-    let local_routing_id = self.config.routing_id.clone(); // From ZmtpEngineConfig
+    let local_routing_id = self.config.routing_id.clone();
 
-    // Client sends READY first
     if !self.is_server {
       let mut client_ready_props = HashMap::new();
       client_ready_props.insert("Socket-Type".to_string(), local_socket_type_name.as_bytes().to_vec());
-
       if let Some(id_blob) = local_routing_id {
         if !id_blob.is_empty() && id_blob.len() <= 255 {
           tracing::info!(
             engine_handle = self.handle,
-            role = "Client", // General client role
-            socket_type = %local_socket_type_name, // e.g., "DEALER"
+            role = "Client",
+            socket_type = %local_socket_type_name,
             ready_identity_payload = ?String::from_utf8_lossy(id_blob.as_ref()),
             "Client engine constructing READY: Adding 'Identity' property."
           );
@@ -465,8 +457,6 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
             socket_type = %local_socket_type_name,
             "Client engine constructing READY: No local ROUTING_ID set, 'Identity' property will not be sent."
         );
-        // If no ROUTING_ID is set, we simply don't add the "Identity" property.
-        // Libzmq ROUTER receiving this will typically auto-assign a ZMTP-level identity.
       }
       let client_ready_msg = ZmtpReady::create_msg(client_ready_props);
       tracing::debug!(engine_handle = self.handle, "Client sending ZMTP READY command.");
@@ -477,21 +467,20 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       self.last_activity_time = Instant::now();
     }
 
-    // Both client and server expect a READY command from the peer.
     tracing::debug!(engine_handle = self.handle, "Waiting for peer's ZMTP READY command.");
     let peer_ready_command_parsed = loop {
-      match framed_handshake_stream.next().await {
-        Some(Ok(received_msg)) => {
+      match tokio::time::timeout(handshake_timeout, framed_handshake_stream.next()).await {
+        // Added timeout
+        Ok(Some(Ok(received_msg))) => {
           self.last_activity_time = Instant::now();
           if !received_msg.is_command() {
             let err_msg = "Expected ZMTP READY command, but received a data frame.";
             tracing::error!(engine_handle = self.handle, %err_msg);
             return Err(ZmqError::ProtocolViolation(err_msg.to_string()));
           }
-          // Try to parse as ZmtpCommand, then check if it's Ready
           match ZmtpCommand::parse(&received_msg) {
             Some(ZmtpCommand::Ready(ready_cmd_data)) => {
-              break ready_cmd_data; // Successfully got and parsed READY
+              break ready_cmd_data;
             }
             Some(other_cmd) => {
               let err_msg = format!(
@@ -502,29 +491,33 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
               return Err(ZmqError::ProtocolViolation(err_msg));
             }
             None => {
-              // Could not parse as any known ZMTP command
               let err_msg = "Received unparseable ZMTP command when expecting READY.";
               tracing::error!(engine_handle = self.handle, %err_msg);
               return Err(ZmqError::ProtocolViolation(err_msg.to_string()));
             }
           }
         }
-        Some(Err(e)) => {
-          // Error decoding from framed stream
+        Ok(Some(Err(e))) => {
           tracing::error!(engine_handle = self.handle, error=%e, "Stream error while waiting for peer's READY command.");
           return Err(e);
         }
-        None => {
-          // Stream closed by peer
+        Ok(None) => {
           let err_msg = "Connection closed by peer while waiting for READY command.";
           tracing::error!(engine_handle = self.handle, %err_msg);
           return Err(ZmqError::ConnectionClosed);
+        }
+        Err(_) => {
+          // Timeout for READY
+          tracing::error!(
+            engine_handle = self.handle,
+            "Timeout waiting for peer's ZMTP READY command."
+          );
+          return Err(ZmqError::Timeout);
         }
       }
     };
     tracing::debug!(engine_handle = self.handle, peer_ready_cmd = ?peer_ready_command_parsed, "Received peer's ZMTP READY command.");
 
-    // Extract Identity from peer's READY command if present
     if let Some(id_bytes_vec) = peer_ready_command_parsed.properties.get("Identity") {
       if !id_bytes_vec.is_empty() && id_bytes_vec.len() <= 255 {
         let id_blob = Blob::from(id_bytes_vec.clone());
@@ -540,22 +533,29 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       }
     }
 
-    // Server sends READY second (after receiving client's READY)
     if self.is_server {
       let mut server_ready_props = HashMap::new();
       server_ready_props.insert("Socket-Type".to_string(), local_socket_type_name.as_bytes().to_vec());
-      // Server does not send Identity in its READY typically, unless ZMQ_ROUTING_ID is set on it and it's a client-facing socket?
-      // Libzmq server sockets (REP, ROUTER, PUB, PULL) do not send an Identity in their READY.
       let server_ready_msg = ZmtpReady::create_msg(server_ready_props);
       tracing::debug!(engine_handle = self.handle, "Server sending ZMTP READY command.");
-      if let Err(e) = framed_handshake_stream.send(server_ready_msg).await {
-        tracing::error!(engine_handle=self.handle, error=%e, "Failed to send server READY command.");
-        return Err(e);
+
+      // Corrected timeout handling for server's READY send
+      match tokio::time::timeout(handshake_timeout, framed_handshake_stream.send(server_ready_msg)).await {
+        Ok(Ok(())) => { /* Successfully sent server's READY */ }
+        Ok(Err(send_err)) => {
+          // Inner future (send) resulted in an error
+          tracing::error!(engine_handle=self.handle, error=%send_err, "Failed to send server READY command.");
+          return Err(send_err); // Propagate the ZmqError from send
+        }
+        Err(_timeout_elapsed) => {
+          // Outer timeout occurred
+          tracing::error!(engine_handle = self.handle, "Timeout sending server READY command.");
+          return Err(ZmqError::Timeout);
+        }
       }
       self.last_activity_time = Instant::now();
     }
 
-    // Determine final peer identity: mechanism's identity takes precedence over READY's identity.
     let identity_from_mechanism = negotiated_mechanism.peer_identity().map(Blob::from);
     let final_peer_identity = identity_from_mechanism.or(identity_from_ready_command);
 
@@ -813,6 +813,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
             Command::SessionPushCmd { msg } => {
               let original_msg_is_last_part = !msg.is_more(); // For TCP_CORK logic
 
+    tracing::trace!(engine_handle = self.handle, msg_size = msg.size(), "Processing SessionPushCmd");
               // 1. ZMTP-frame the Msg
               let mut temp_zmtp_encoder = ZmtpCodec::new();
               let mut plaintext_zmtp_frame_buffer = BytesMut::new();
@@ -825,13 +826,17 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
               // 2. Encrypt if cipher is active
               let wire_bytes_to_send = if let Some(cipher) = &mut self.data_cipher {
                 match cipher.encrypt_zmtp_frame(plaintext_zmtp_frame_bytes) {
-                  Ok(eb) => eb,
+                  Ok(eb) => {
+                tracing::trace!(engine_handle = self.handle, encrypted_len = eb.len(), "Encryption successful");
+                eb
+            },
                   Err(e) => {
                     tracing::error!(engine_handle = self.handle, error = %e, "Failed to encrypt outgoing ZMTP frame.");
                     final_error_for_actor_stop = Some(e); should_break_loop = true; continue;
                   }
                 }
               } else {
+        tracing::trace!(engine_handle = self.handle, "No cipher, sending plaintext ZMTP frame");
                 plaintext_zmtp_frame_bytes
               };
 
@@ -849,6 +854,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
               }
 
               // 4. Send the bytes
+    tracing::trace!(engine_handle = self.handle, wire_bytes_len = wire_bytes_to_send.len(), "Attempting to write to stream");
               if let Err(e) = current_underlying_stream.write_all(&wire_bytes_to_send).await {
                 final_error_for_actor_stop = Some(ZmqError::from(e));
                 should_break_loop = true;
@@ -861,6 +867,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
                 continue;
               }
 
+    tracing::trace!(engine_handle = self.handle, "Successfully wrote to stream");
               self.last_activity_time = Instant::now();
               self.expecting_first_frame_of_msg = original_msg_is_last_part;
 

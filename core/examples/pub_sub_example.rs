@@ -46,7 +46,7 @@ async fn run_subscriber(ctx: Context, identity: &str, topic_to_subscribe: &str) 
   // Subscribe to the specified topic prefix
   println!("[SUB {}] Subscribing to topic: '{}'", identity, topic_to_subscribe);
   sub_socket
-    .set_option(rzmq_options::SUBSCRIBE, topic_to_subscribe.as_bytes())
+    .set_option_raw(rzmq_options::SUBSCRIBE, topic_to_subscribe.as_bytes())
     .await?;
   // To subscribe to all messages, use an empty byte slice: b""
 

@@ -1941,21 +1941,15 @@ impl SocketCore {
                 cs_guard.options.reconnect_ivl.map_or(false, |d| !d.is_zero())
               };
 
-              if reconnect_enabled {
-                tracing::info!(
-                    handle = core_h,
-                    target_uri = %target_uri_to_reconnect,
-                    child_handle = child_handle,
-                    "Unexpected session stop for an 'is_outbound_connection=true' session. Initiating reconnect."
-                );
+              // `error_opt` is the Option<&ZmqError> for the dying child (the Session)
+              let is_child_error_fatal_for_reconnect =
+                error_opt.map_or(false, |e_ref| crate::transport::tcp::is_fatal_connect_error(e_ref)); // Use the helper from tcp.rs
+
+              if reconnect_enabled && !is_child_error_fatal_for_reconnect {
+                tracing::info!(handle = core_h, target_uri=%target_uri_to_reconnect, child_handle=child_handle, error=?error_opt, "Unexpected session stop (non-fatal session error). Initiating reconnect.");
                 Self::respawn_connecter(core_arc.clone(), target_uri_to_reconnect.clone()).await;
               } else {
-                tracing::debug!(
-                    handle = core_h,
-                    target_uri = %target_uri_to_reconnect,
-                    child_handle = child_handle,
-                    "Reconnect disabled for unexpectedly stopped outbound session child."
-                );
+                tracing::warn!(handle = core_h, target_uri=%target_uri_to_reconnect, child_handle=child_handle, error=?error_opt, reconnect_enabled, is_child_error_fatal_for_reconnect, "Reconnect SKIPPED for unexpectedly stopped session (reconnect_enabled={}, is_child_error_fatal_for_reconnect={})", reconnect_enabled, is_child_error_fatal_for_reconnect);
               }
             }
           } else {
@@ -2433,17 +2427,9 @@ impl SocketCore {
       }
 
       if option == options::IO_URING_RECV_BUFFER_COUNT {
-        return Ok(
-          (state_g.options.recv_buffer_count as i32)
-            .to_ne_bytes()
-            .to_vec(),
-        );
+        return Ok((state_g.options.recv_buffer_count as i32).to_ne_bytes().to_vec());
       } else if option == options::IO_URING_RECV_BUFFER_SIZE {
-        return Ok(
-          (state_g.options.recv_buffer_size as i32)
-            .to_ne_bytes()
-            .to_vec(),
-        );
+        return Ok((state_g.options.recv_buffer_size as i32).to_ne_bytes().to_vec());
       }
     }
 

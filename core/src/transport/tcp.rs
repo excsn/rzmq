@@ -1318,7 +1318,7 @@ fn is_fatal_accept_error(e: &io::Error) -> bool {
   matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe)
 }
 
-fn is_fatal_connect_error(e: &ZmqError) -> bool {
+pub(crate) fn is_fatal_connect_error(e: &ZmqError) -> bool {
   match e {
     ZmqError::IoError { kind, .. } => {
       matches!(
@@ -1331,6 +1331,7 @@ fn is_fatal_connect_error(e: &ZmqError) -> bool {
     }
     ZmqError::InvalidEndpoint(_) => true,
     ZmqError::UnsupportedTransport(_) => true,
+    ZmqError::SecurityError(_) => true,
     _ => false,
   }
 }

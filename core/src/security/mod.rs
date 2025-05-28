@@ -14,8 +14,6 @@ use crate::message::Metadata;
 
 #[cfg(feature = "noise_xx")]
 mod noise_xx;
-#[cfg(feature = "noise_xx")]
-mod noise_stream;
 
 #[cfg(feature = "noise_xx")]
 pub use noise_xx::NoiseXxMechanism;
