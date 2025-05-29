@@ -37,9 +37,9 @@ impl PullSocket {
   /// # Arguments
   /// * `core` - An `Arc` to the `SocketCore` managing this socket.
   /// * `options` - Initial socket options, used here to determine queue capacity (RCVHWM).
-  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
+  pub fn new(core: Arc<SocketCore>) -> Self {
     // Capacity for the incoming message queue, based on RCVHWM.
-    let queue_capacity = options.rcvhwm.max(1); // Ensure capacity is at least 1.
+    let queue_capacity = core.core_state.read().options.rcvhwm.max(1); // Ensure capacity is at least 1.
     Self {
       core,
       fair_queue: FairQueue::new(queue_capacity),

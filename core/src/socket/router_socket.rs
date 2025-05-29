@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock, RwLockReadGuard};
-use tokio::sync::{Mutex as TokioMutex, MutexGuard, OwnedSemaphorePermit};
+use parking_lot::{RwLock as ParkingLotRwLock, RwLockReadGuard};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit};
 
 use super::patterns::WritePipeCoordinator;
 
@@ -49,12 +49,11 @@ pub(crate) struct RouterSocket {
 }
 
 impl RouterSocket {
-  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
+  pub fn new(core: Arc<SocketCore>) -> Self {
     let shared_pipe_to_identity_map = Arc::new(ParkingLotRwLock::new(HashMap::new()));
 
     let orchestrator = IncomingMessageOrchestrator::new(
-      core.handle,
-      options.rcvhwm, // Pass RCVHWM for FairQueue inside orchestrator
+      &core,
     );
 
     Self {

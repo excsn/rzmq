@@ -24,7 +24,7 @@ pub(crate) struct FairQueue {
 impl FairQueue {
   /// Creates a new fair queue with a specific capacity (RCVHWM).
   pub fn new(capacity: usize) -> Self {
-    let (sender, receiver) = async_channel::bounded(capacity.max(1)); // Ensure capacity > 0
+    let (sender, receiver) = async_channel::bounded(capacity.max(1));
     Self {
       receiver,
       sender,

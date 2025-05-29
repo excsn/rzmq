@@ -224,6 +224,24 @@ pub trait ToBytes {
   fn to_bytes(&self) -> Vec<u8>;
 }
 
+impl ToBytes for Vec<u8> {
+  fn to_bytes(&self) -> Vec<u8> {
+    self.to_vec()
+  }
+}
+
+impl ToBytes for &[u8] {
+  fn to_bytes(&self) -> Vec<u8> {
+    self.to_vec()
+  }
+}
+
+impl<const N: usize> ToBytes for &[u8; N] {
+  fn to_bytes(&self) -> Vec<u8> {
+    self.to_vec()
+  }
+}
+
 impl ToBytes for i32 {
   fn to_bytes(&self) -> Vec<u8> {
     self.to_ne_bytes().to_vec()

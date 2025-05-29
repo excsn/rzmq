@@ -2,13 +2,13 @@
 
 use crate::error::ZmqError;
 use crate::message::Msg; // For recv method and subscription commands.
-use crate::protocol::zmtp::command::{ZMTP_CMD_CANCEL_NAME, ZMTP_CMD_SUBSCRIBE_NAME}; // ZMTP command names for subscribe/cancel.
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{CoreState, SocketCore}; // Core components.
 use crate::socket::options::{SocketOptions, SUBSCRIBE, UNSUBSCRIBE}; // Option constants.
-use crate::socket::patterns::{FairQueue, SubscriptionTrie}; // SUB uses SubscriptionTrie and FairQueue.
+use crate::socket::patterns::SubscriptionTrie; // SUB uses SubscriptionTrie and FairQueue.
 use crate::socket::ISocket;
 use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to SocketCore. // The trait this struct implements.
+use super::patterns::IncomingMessageOrchestrator; 
 
 use async_channel::Sender as AsyncSender; // For sending commands over pipes.
 use async_trait::async_trait;
@@ -16,10 +16,7 @@ use parking_lot::RwLockReadGuard;
 use std::collections::HashMap; // For pipe_read_to_write_id map.
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex, MutexGuard}; // Mutex for internal state, oneshot for API replies.
-use tokio::time::timeout;
-
-use super::patterns::IncomingMessageOrchestrator; // For recv timeout.
+use tokio::sync::Mutex;
 
 /// Implements the SUB (Subscribe) socket pattern.
 /// SUB sockets receive messages published by PUB (Publish) sockets.
@@ -45,10 +42,9 @@ impl SubSocket {
   /// # Arguments
   /// * `core` - An `Arc` to the `SocketCore` managing this socket.
   /// * `options` - Initial socket options, used here to determine queue capacity (RCVHWM).
-  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
+  pub fn new(core: Arc<SocketCore>) -> Self {
     let orchestrator = IncomingMessageOrchestrator::new(
-      core.handle,
-      options.rcvhwm, // Use RCVHWM for orchestrator's internal FairQueue capacity
+      &core,
     );
 
     Self {

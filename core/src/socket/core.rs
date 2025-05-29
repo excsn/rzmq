@@ -433,13 +433,13 @@ impl SocketCore {
 
     let socket_logic_arc_impl: Arc<dyn ISocket> = match socket_type {
       SocketType::Pub => Arc::new(PubSocket::new(socket_core_arc.clone())),
-      SocketType::Sub => Arc::new(SubSocket::new(socket_core_arc.clone(), initial_options_for_isocket)),
-      SocketType::Req => Arc::new(ReqSocket::new(socket_core_arc.clone(), initial_options_for_isocket)),
-      SocketType::Rep => Arc::new(RepSocket::new(socket_core_arc.clone(), initial_options_for_isocket)),
-      SocketType::Dealer => Arc::new(DealerSocket::new(socket_core_arc.clone(), initial_options_for_isocket)),
-      SocketType::Router => Arc::new(RouterSocket::new(socket_core_arc.clone(), initial_options_for_isocket)),
+      SocketType::Sub => Arc::new(SubSocket::new(socket_core_arc.clone())),
+      SocketType::Req => Arc::new(ReqSocket::new(socket_core_arc.clone())),
+      SocketType::Rep => Arc::new(RepSocket::new(socket_core_arc.clone())),
+      SocketType::Dealer => Arc::new(DealerSocket::new(socket_core_arc.clone())),
+      SocketType::Router => Arc::new(RouterSocket::new(socket_core_arc.clone())),
       SocketType::Push => Arc::new(PushSocket::new(socket_core_arc.clone())),
-      SocketType::Pull => Arc::new(PullSocket::new(socket_core_arc.clone(), initial_options_for_isocket)),
+      SocketType::Pull => Arc::new(PullSocket::new(socket_core_arc.clone())),
     };
 
     if let Ok(mut socket_logic_weak_ref_guard) = socket_core_arc.socket_logic.try_lock() {
@@ -503,6 +503,7 @@ impl SocketCore {
     context: Context,
     core_handle: usize,
     core_command_mailbox: MailboxSender,
+    socket_logic: Arc<dyn ISocket>,
     pipe_read_id: usize,
     pipe_receiver: AsyncReceiver<Msg>,
   ) {
@@ -522,30 +523,69 @@ impl SocketCore {
 
     let _loop_result: Result<(),()> = async {
       loop {
+        // Shutdown Check: Before receiving, check if SocketCore's command mailbox is closed.
+        // This acts as a proxy for SocketCore's liveness.
+        if core_command_mailbox.is_closed() {
+          tracing::info!(
+            parent_core_handle = core_handle, // Clarify this is the parent
+            pipe_reader_task_handle = pipe_reader_handle,
+            pipe_read_id = pipe_read_id,
+            "PipeReaderTask: Parent SocketCore command mailbox is closed. Stopping."
+          );
+          final_error_for_stopping = Some(ZmqError::Internal("PipeReaderTask: Parent SocketCore terminated".into()));
+          break;
+        }
+
         tokio::select! {
+          biased;
+          // Potentially add a branch here for a more explicit shutdown signal from SocketCore in the future.
+          // For now, relies on core_command_mailbox.is_closed() and pipe_receiver closing.
+
           msg_result = pipe_receiver.recv() => {
             match msg_result {
               Ok(msg) => {
-                let cmd = Command::PipeMessageReceived { pipe_id: pipe_read_id, msg };
-                if core_command_mailbox.send(cmd).await.is_err() {
-                  tracing::warn!(core_handle=core_handle, pipe_read_id=pipe_read_id, pipe_reader_task_handle = pipe_reader_handle, "PipeReaderTask: Core command mailbox closed. Stopping.");
-                  final_error_for_stopping = Some(ZmqError::Internal("PipeReaderTask: Core mailbox closed".into()));
-                  break;
+                // Construct the Command::PipeMessageReceived variant
+                let cmd = Command::PipeMessageReceived { pipe_id: pipe_read_id, msg }; // msg is moved here
+
+                // Directly call ISocket::handle_pipe_event
+                if let Err(e) = socket_logic.handle_pipe_event(pipe_read_id, cmd).await {
+                  tracing::error!(
+                    parent_core_handle = core_handle,
+                    pipe_reader_task_handle = pipe_reader_handle,
+                    pipe_read_id = pipe_read_id,
+                    "PipeReaderTask: Error from ISocket::handle_pipe_event: {}. Stopping this reader task.", e
+                  );
+                  final_error_for_stopping = Some(e);
+                  break; // Stop this PipeReaderTask on ISocket error
                 }
+                // Message processed successfully by ISocket logic.
               }
-              Err(_) => {
-                tracing::debug!(core_handle=core_handle, pipe_read_id=pipe_read_id, pipe_reader_task_handle = pipe_reader_handle, "PipeReaderTask: Data pipe closed by peer. Sending PipeClosedByPeer.");
-                let cmd = Command::PipeClosedByPeer { pipe_id: pipe_read_id };
-                if core_command_mailbox.send(cmd).await.is_err() {
-                  tracing::warn!(core_handle=core_handle, pipe_read_id=pipe_read_id, pipe_reader_task_handle = pipe_reader_handle, "PipeReaderTask: Core command mailbox closed sending PipeClosedByPeer.");
+              Err(_) => { // Pipe closed by Session (writer end)
+                tracing::debug!(
+                  parent_core_handle = core_handle,
+                  pipe_reader_task_handle = pipe_reader_handle,
+                  pipe_read_id = pipe_read_id,
+                  "PipeReaderTask: Data pipe closed by peer (Session). Sending PipeClosedByPeer to SocketCore."
+                );
+                // Still send PipeClosedByPeer to SocketCore for lifecycle management.
+                let cmd_closed = Command::PipeClosedByPeer { pipe_id: pipe_read_id };
+                if core_command_mailbox.send(cmd_closed).await.is_err() {
+                  tracing::warn!(
+                    parent_core_handle = core_handle,
+                    pipe_reader_task_handle = pipe_reader_handle,
+                    pipe_read_id = pipe_read_id,
+                    "PipeReaderTask: Core command mailbox closed while sending PipeClosedByPeer."
+                  );
                    if final_error_for_stopping.is_none() {
                      final_error_for_stopping = Some(ZmqError::Internal("PipeReaderTask: Core mailbox closed on PipeClosedByPeer".into()));
                   }
                 }
-                break;
+                break; // Stop this PipeReaderTask as its input pipe is closed.
               }
             }
           }
+          // No explicit shutdown signal branch for now, relying on the checks above
+          // and the pipe_receiver closing when the SocketCore/Session close their ends.
         }
       }
       Ok(())
@@ -829,20 +869,12 @@ impl SocketCore {
                       if let Some(uri)=target_uri_opt {
                         tracing::debug!(handle = core_handle, target_uri=%uri, "Pipe closed, skipping reconnect (shutting down).");
                       }
-                  }
-                  }
-                  Command::PipeMessageReceived { pipe_id, msg } => {tracing::debug!(
-                    "[SocketCore {}] Received PipeMessageReceived from pipe_id {} (msg size {}B, more: {}). Delegating to ISocket::handle_pipe_event.",
-                    core_handle, pipe_id, msg.size(), msg.is_more()
-                );
-                    if current_shutdown_phase == ShutdownPhase::Running {
-                      Self::handle_pipe_message(core_arc.clone(), &socket_logic_strong, pipe_id, msg).await;
-                    } else { tracing::trace!(handle=core_handle, pipe_id=pipe_id, "SocketCore dropping pipe message during shutdown."); }
+                    }
                   }
                   // These commands are not expected directly on SocketCore's mailbox anymore.
                   Command::Attach {..} | Command::SessionPushCmd {..} | Command::EnginePushCmd {..} |
                   Command::EngineReady {..} | Command::EngineError {..} | Command::EngineStopped {..} |
-                  Command::RequestZapAuth {..} | Command::ProcessZapReply {..} | Command::AttachPipe {..} => {
+                  Command::RequestZapAuth {..} | Command::ProcessZapReply {..} | Command::AttachPipe {..} | Command::PipeMessageReceived {..} => {
                     tracing::error!(handle = core_handle, cmd = command_name_for_log, "SocketCore received UNEXPECTED command type on its mailbox!");
                   }
                 }
@@ -1595,6 +1627,7 @@ impl SocketCore {
       context_c.clone(),
       core_handle,
       core_arc.command_sender(),
+      socket_logic.clone(),
       pipe_id_core_r,
       rx_s_c,
     ));
@@ -1674,25 +1707,6 @@ impl SocketCore {
     // or if the Connecter itself manages retries. Here, we just log and emit monitor event.
   }
 
-  async fn handle_pipe_message(core_arc: Arc<SocketCore>, socket_logic: &Arc<dyn ISocket>, pipe_id: usize, msg: Msg) {
-    let core_handle = core_arc.handle;
-    tracing::trace!(
-      handle = core_handle,
-      pipe_read_id = pipe_id,
-      msg_size = msg.size(),
-      "Handling PipeMessageReceived"
-    );
-    let event_cmd = Command::PipeMessageReceived { pipe_id, msg };
-    if let Err(e) = socket_logic.handle_pipe_event(pipe_id, event_cmd).await {
-      tracing::error!(
-        handle = core_handle,
-        pipe_read_id = pipe_id,
-        "Error handling PipeMessageReceived in ISocket: {}",
-        e
-      );
-    }
-  }
-
   /// Processes an `InprocBindingRequest` received via the system event bus.
   /// This logic was previously in `handle_inproc_connect` which took a `Command`.
   #[cfg(feature = "inproc")]
@@ -1726,9 +1740,10 @@ impl SocketCore {
       // The PipeReaderTask will send `PipeMessageReceived` or `PipeClosedByPeer` commands
       // to this binder's `SocketCore` command mailbox.
       let pipe_reader_task = tokio::spawn(Self::run_pipe_reader_task(
-        context_for_pipe_reader,                      // Context.
-        binder_core_handle,                           // Parent core handle (this binder).
-        core_arc.command_sender(),                    // Binder's command mailbox.
+        context_for_pipe_reader,   // Context.
+        binder_core_handle,        // Parent core handle (this binder).
+        core_arc.command_sender(), // Binder's command mailbox.
+        socket_logic.clone(),
         connector_pipe_read_id,                       // ID binder uses to read from this pipe.
         pipe_rx_for_binder_to_receive_from_connector, // Channel binder receives on.
       ));
@@ -1824,13 +1839,11 @@ impl SocketCore {
     let current_phase_val = coordinator_g.current_phase();
     let log_uri_val = endpoint_uri_opt.unwrap_or("<UnknownURI>");
 
-
-
     // Log with Display of the original error
     if let Some(err) = error_opt {
-        tracing::error!(handle=core_h, child_handle=child_handle, error_display=%err, command=command_name, "Received {} from child with error (Display)", command_name);
+      tracing::error!(handle=core_h, child_handle=child_handle, error_display=%err, command=command_name, "Received {} from child with error (Display)", command_name);
     } else {
-        tracing::info!(handle=core_h, child_handle=child_handle, uri=%log_uri_val, command=command_name, "Processing {} from child (no error)", command_name);
+      tracing::info!(handle=core_h, child_handle=child_handle, uri=%log_uri_val, command=command_name, "Processing {} from child (no error)", command_name);
     }
     // Log with Debug of the original error
     tracing::debug!(handle=core_h, child_handle=child_handle, error_debug=?error_opt, "Received {} from child (Debug of error_opt)", command_name);

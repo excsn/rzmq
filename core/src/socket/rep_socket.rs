@@ -36,8 +36,8 @@ pub(crate) struct RepSocket {
 }
 
 impl RepSocket {
-  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
-    let queue_capacity = options.rcvhwm.max(1);
+  pub fn new(core: Arc<SocketCore>) -> Self {
+    let queue_capacity = core.core_state.read().options.rcvhwm.max(1);
     Self {
       core,
       incoming_request_queue: FairQueue::new(queue_capacity),

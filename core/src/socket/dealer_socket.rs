@@ -6,8 +6,8 @@ use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
 use crate::socket::options::SocketOptions;
-use crate::socket::patterns::{FairQueue, LoadBalancer};
-use crate::socket::{ISocket, SourcePipeReadId};
+use crate::socket::patterns::LoadBalancer;
+use crate::socket::ISocket;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -242,8 +242,7 @@ pub(crate) struct DealerSocket {
 }
 
 impl DealerSocket {
-  pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
-    let queue_capacity = options.rcvhwm.max(1);
+  pub fn new(core: Arc<SocketCore>) -> Self {
     let pending_queue_arc = Arc::new(Mutex::new(VecDeque::new()));
     let lb_arc = Arc::new(LoadBalancer::new());
     let queue_notifier_arc = Arc::new(Notify::new());
@@ -264,7 +263,7 @@ impl DealerSocket {
 
     let processor_jh = tokio::spawn(processor.run());
 
-    let orchestrator = IncomingMessageOrchestrator::new(core.handle, options.rcvhwm);
+    let orchestrator = IncomingMessageOrchestrator::new(&core);
 
     Self {
       core,
@@ -584,10 +583,7 @@ impl ISocket for DealerSocket {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
         // 1. Accumulate frame. If a full ZMTP message is ready, orchestrator returns it.
-        match self
-          .incoming_orchestrator
-          .accumulate_pipe_frame(pipe_read_id, msg)
-        {
+        match self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg) {
           // Now calling sync version
           Ok(Some(raw_zmtp_message_vec)) => {
             // A full ZMTP message is assembled
@@ -774,7 +770,6 @@ impl DealerSocket {
         return Ok(());
       }
       drop(queue_guard);
-      // ... (timeout logic for waiting on queue_activity_notifier as before) ...
       match global_sndtimeo {
         Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
         Some(duration) => {

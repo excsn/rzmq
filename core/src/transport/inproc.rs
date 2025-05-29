@@ -6,7 +6,7 @@ use crate::context::Context; // For accessing the inproc registry and event bus.
                              // use crate::context::InprocBinding; // Not directly used here, but ContextInner uses it.
 use crate::error::ZmqError;
 use crate::message::Msg; // For the data type exchanged over inproc pipes.
-use crate::runtime::{Command, OneShotSender, SystemEvent}; // Command for reconstructing InprocConnectRequest if needed by SocketCore.
+use crate::runtime::{OneShotSender, SystemEvent}; // Command for reconstructing InprocConnectRequest if needed by SocketCore.
 use crate::socket::core::{EndpointInfo, EndpointType, SocketCore}; // For managing endpoint state.
 use crate::socket::SocketEvent; // For emitting monitor events.
 
@@ -102,6 +102,36 @@ pub(crate) async fn connect_inproc(
     .max(connector_core_state.options.sndhwm)
     .max(1)
   };
+
+  // Get the ISocket logic from the connector's SocketCore.
+  // This needs to be done carefully as get_socket_logic is async.
+  // It's better if the SocketCore instance (`core_arc`) itself can provide its `ISocket` logic
+  // synchronously if it's already resolved, or this part needs to be structured to await it.
+  // For now, let's assume we can get it. `core_arc.get_socket_logic().await` is the way.
+  
+  let socket_logic = match core_arc.get_socket_logic().await {
+    Some(logic) => logic,
+    None => {
+      // This is a critical failure state if the ISocket logic isn't available.
+      tracing::error!(
+        connector_core_handle = connector_core_handle,
+        inproc_name = %name,
+        "connect_inproc: Failed to get ISocket logic for PipeReaderTask spawning. Aborting connect."
+      );
+      let err = ZmqError::Internal("ISocket logic unavailable for inproc connector's PipeReaderTask".into());
+      // Cleanup any partial state? (e.g., pipes_tx entry) - this is tricky here.
+      // Best to ensure get_socket_logic doesn't fail typically post-initialization.
+      let _ = reply_tx_user.send(Err(err.clone()));
+      // Also publish ConnectionAttemptFailed
+      let event_failed = SystemEvent::ConnectionAttemptFailed {
+        parent_core_id: connector_core_handle, // Parent is self for a connector's direct action
+        target_endpoint_uri: format!("inproc://{}", name),
+        error_msg: err.to_string(),
+      };
+      let _ = core_arc.context.event_bus().publish(event_failed);
+      return;
+    }
+  };
   
   // Generate unique IDs for the connector's perspective of the pipes.
   let pipe_id_connector_writes_to_binder = core_arc.context.inner().next_handle();
@@ -125,6 +155,7 @@ pub(crate) async fn connect_inproc(
     connector_context_clone,
     connector_core_handle,
     connector_command_sender_clone,
+    socket_logic,
     pipe_id_connector_reads_from_binder,
     rx_connector_from_binder.clone(), // Pass clone to reader task
   ));

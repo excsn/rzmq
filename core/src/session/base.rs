@@ -147,8 +147,9 @@ impl SessionBase {
       loop {
         let should_read_core_pipe = self.pipe_attached && self.engine_ready && self.rx_from_core.is_some();
         let core_pipe_receiver_ref = self.rx_from_core.as_ref();
-tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loop iteration. engine_ready={}, pipe_attached={}, shutdown_signal={}", self.engine_ready, self.pipe_attached, received_shutdown_signal);
+          tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loop iteration. engine_ready={}, pipe_attached={}, shutdown_signal={}", self.engine_ready, self.pipe_attached, received_shutdown_signal);
         tokio::select! {
+
           biased;
 
           event_result = system_event_rx.recv(), if !received_shutdown_signal => {
@@ -187,6 +188,39 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
                   self.engine_task_handle = None;
                   received_shutdown_signal = true;
                   error_to_report_on_stop = Some(ZmqError::Internal("Session event bus closed".into()));
+                }
+                break;
+              }
+            }
+          }
+
+          // IMPORTANT: We are prioritizing THIS outgoing arm to keep a moving and robust server. THIS SHOULD NEVER BE BELOW THE INCOMING ARM!!!!
+          msg_result = async { core_pipe_receiver_ref.unwrap().recv().await }, if should_read_core_pipe && !received_shutdown_signal => {
+            tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session polled rx_from_core branch.");
+            match msg_result {
+              Ok(msg) => {
+                if let Err(e) = self.send_msg_to_engine(msg).await {
+                    tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Failed to send message to engine (error: {:?}), stopping session.", e);
+                    if !received_shutdown_signal {
+                        self.engine_connection = None;
+                        if let Some(h) = self.engine_task_handle.take() { h.abort(); } // Abort std engine task
+                        received_shutdown_signal = true;
+                        if error_to_report_on_stop.is_none() {
+                            error_to_report_on_stop = Some(ZmqError::Internal("Session failed to send to engine".into()));
+                        }
+                    }
+                    break;
+                }
+              }
+              Err(_) => {
+                tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Pipe from SocketCore closed, stopping session.");
+                if !received_shutdown_signal {
+                  self.signal_engine_stop().await;
+                  self.engine_task_handle = None;
+                  received_shutdown_signal = true;
+                  if error_to_report_on_stop.is_none() {
+                    error_to_report_on_stop = Some(ZmqError::ConnectionClosed);
+                  }
                 }
                 break;
               }
@@ -253,10 +287,11 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
                 if self.engine_ready {
                   tracing::trace!(handle = session_handle, uri = %endpoint_uri_clone, msg_size = msg.size(), "Session forwarding push from Engine to Core Pipe");
                   if let Some(ref tx) = self.tx_to_core {
+
                     if tx.send(msg).await.is_err() {
                       tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Error sending message to core pipe. Stopping session.");
                       if !received_shutdown_signal {
-                  self.signal_engine_stop().await;
+                        self.signal_engine_stop().await;
                         self.engine_task_handle = None;
                         received_shutdown_signal = true;
                         error_to_report_on_stop = Some(ZmqError::Internal("Session failed to send to core pipe".into()));
@@ -323,38 +358,6 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
                 break;
               }
               cmd => tracing::warn!(handle = session_handle, uri = %endpoint_uri_clone, "Session received unhandled command via Mailbox: {:?}", cmd.variant_name()),
-            }
-          }
-
-          msg_result = async { core_pipe_receiver_ref.unwrap().recv().await }, if should_read_core_pipe && !received_shutdown_signal => {
-            tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session polled rx_from_core branch.");
-            match msg_result {
-              Ok(msg) => {
-                if let Err(e) = self.send_msg_to_engine(msg).await {
-                    tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Failed to send message to engine (error: {:?}), stopping session.", e);
-                    if !received_shutdown_signal {
-                        self.engine_connection = None;
-                        if let Some(h) = self.engine_task_handle.take() { h.abort(); } // Abort std engine task
-                        received_shutdown_signal = true;
-                        if error_to_report_on_stop.is_none() {
-                            error_to_report_on_stop = Some(ZmqError::Internal("Session failed to send to engine".into()));
-                        }
-                    }
-                    break;
-                }
-              }
-              Err(_) => {
-                tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Pipe from SocketCore closed, stopping session.");
-                if !received_shutdown_signal {
-                  self.signal_engine_stop().await;
-                  self.engine_task_handle = None;
-                  received_shutdown_signal = true;
-                  if error_to_report_on_stop.is_none() {
-                    error_to_report_on_stop = Some(ZmqError::ConnectionClosed);
-                  }
-                }
-                break;
-              }
             }
           }
         } // end select!

@@ -65,7 +65,7 @@ impl ReqSocket {
   /// # Arguments
   /// * `core` - An `Arc` to the `SocketCore` managing this socket.
   /// * `_options` - Initial socket options. `RCVHWM` is implicitly used for the reply queue capacity (set to 1).
-  pub fn new(core: Arc<SocketCore>, _options: SocketOptions) -> Self {
+  pub fn new(core: Arc<SocketCore>) -> Self {
     // The reply queue for REQ only ever needs to hold one logical reply (which might be multi-part).
     // A capacity of 1 for the FairQueue is sufficient.
     let reply_queue_capacity = 1;
