@@ -283,14 +283,6 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       tracing::error!(engine_handle = self.handle, error = %version_error_msg);
       return Err(ZmqError::ProtocolViolation(version_error_msg));
     }
-    if self.is_server == peer_greeting.as_server {
-      let role_error_msg = format!(
-        "Role mismatch: we_are_server={}, peer_is_server={}.",
-        self.is_server, peer_greeting.as_server
-      );
-      tracing::error!(engine_handle = self.handle, error = %role_error_msg);
-      return Err(ZmqError::ProtocolViolation(role_error_msg));
-    }
 
     let mut negotiated_mechanism = negotiate_security_mechanism(
       self.is_server,

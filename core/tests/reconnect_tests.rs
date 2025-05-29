@@ -286,9 +286,6 @@ async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), 
         let mut id_frame_reply = Msg::from_bytes(router_recv_id.data_bytes().unwrap());
         id_frame_reply.set_flags(MsgFlags::MORE);
         router_socket.send(id_frame_reply).await?;
-        let mut delim_frame_reply = Msg::new();
-        delim_frame_reply.set_flags(MsgFlags::MORE);
-        router_socket.send(delim_frame_reply).await?;
         router_socket.send(Msg::from_vec(reply_to_send.as_bytes().to_vec())).await?;
         println!("[ROUTER {}] Cycle {}: Sent reply.", endpoint, cycle);
 

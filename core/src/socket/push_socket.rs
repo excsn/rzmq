@@ -217,6 +217,10 @@ impl ISocket for PushSocket {
     unimplemented!("Not Implemented yet")
   }
 
+  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+    unimplemented!("Not implemented yet")
+  }
+
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     // Delegate to SocketCore for common options like SNDHWM, SNDTIMEO.
     delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec())

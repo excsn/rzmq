@@ -90,6 +90,45 @@ impl SessionBase {
     }
   }
 
+  async fn try_publish_peer_identity_established_if_ready(&mut self, session_handle: usize, endpoint_uri_clone: &str, pending_peer_identity: &mut Option<Blob>,) {
+    // Check general readiness flags and if specific data is available (and not yet consumed for publication)
+    if self.engine_ready &&
+       self.pipe_attached &&
+       pending_peer_identity.is_some() && // Identity is present and not yet taken for publishing
+       self.pipe_write_id.is_some()
+    {
+      // Pipe ID is present for the event
+
+      // Take the identity, consuming it. This ensures we only publish once for this identity setup.
+      let identity_to_publish = pending_peer_identity.take(); // Safe due to .is_some()
+      let core_pipe_read_id_for_event = self.pipe_write_id.unwrap(); // Safe due to .is_some()
+
+      let event = SystemEvent::PeerIdentityEstablished {
+        parent_core_id: self.parent_socket_id,
+        core_pipe_read_id: core_pipe_read_id_for_event, // This is Session's pipe_write_id
+        peer_identity: identity_to_publish,             // This is the Blob itself
+        session_handle_id: session_handle,
+      };
+
+      if self.context.event_bus().publish(event).is_err() {
+        tracing::warn!(
+          handle = session_handle,
+          uri = %endpoint_uri_clone,
+          "Failed to publish PeerIdentityEstablished event after conditions met. Identity was consumed."
+        );
+        // Note: If publish fails, pending_peer_identity is now None.
+        // Further EngineReady events would be needed to set a new pending_peer_identity.
+      } else {
+        tracing::trace!(
+          handle = session_handle,
+          uri = %endpoint_uri_clone,
+          "Published PeerIdentityEstablished event successfully. Identity consumed."
+        );
+      }
+    }
+    // If conditions are not met (e.g., identity already taken, or flags not set), do nothing.
+  }
+
   async fn run_loop(mut self) {
     let session_handle = self.handle;
     let actor_type = ActorType::Session;
@@ -199,6 +238,8 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
                 self.pipe_read_id = Some(pipe_read_id);
                 self.pipe_write_id = Some(pipe_write_id);
                 self.pipe_attached = true;
+
+                self.try_publish_peer_identity_established_if_ready(session_handle, &endpoint_uri_clone, &mut peer_identity_from_engine).await;
               }
               Command::Stop => {
                 tracing::info!(handle = session_handle, uri = %endpoint_uri_clone, "Session received Stop command");
@@ -241,25 +282,7 @@ tracing::debug!(handle = session_handle, uri = %endpoint_uri_clone, "Session loo
                 self.engine_ready = true;
                 peer_identity_from_engine = received_identity.clone();
 
-                if let Some(core_reads_from_this_pipe_id) = self.pipe_write_id { // Session's write_id is Core's read_id
-                  let identity_event = SystemEvent::PeerIdentityEstablished {
-                    parent_core_id: self.parent_socket_id,
-                    core_pipe_read_id: core_reads_from_this_pipe_id,
-                    peer_identity: received_identity, // This is Option<Blob>
-                    session_handle_id: session_handle,
-                  };
-                  if let Err(e) = self.context.event_bus().publish(identity_event) {
-                    tracing::warn!(
-                      handle = session_handle,
-                      uri = %endpoint_uri_clone,
-                      "Failed to publish PeerIdentityEstablished event: {}", e
-                    );
-                  } else {
-                     tracing::trace!(handle = session_handle, uri = %endpoint_uri_clone, "Published PeerIdentityEstablished event.");
-                  }
-                } else {
-                  tracing::error!(handle = session_handle, uri = %endpoint_uri_clone, "Cannot publish PeerIdentityEstablished: Session's pipe_write_id is None.");
-                }
+                self.try_publish_peer_identity_established_if_ready(session_handle, &endpoint_uri_clone, &mut peer_identity_from_engine).await;
 
                 self.send_monitor_event(SocketEvent::HandshakeSucceeded { endpoint: endpoint_uri_clone.clone() }).await;
               }

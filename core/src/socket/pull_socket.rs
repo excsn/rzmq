@@ -154,6 +154,10 @@ impl ISocket for PullSocket {
     Err(ZmqError::InvalidState("PULL sockets cannot send messages"))
   }
 
+  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+    unimplemented!("Not implemented yet")
+  }
+
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     // Most options are handled by SocketCore. RCVHWM might affect FairQueue capacity,
     // but changing HWM on an active queue is complex and often not supported directly

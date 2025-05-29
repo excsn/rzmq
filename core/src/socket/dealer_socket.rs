@@ -19,10 +19,10 @@ use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tokio::time::timeout as tokio_timeout;
 
-use super::patterns::WritePipeCoordinator;
+use super::patterns::{IncomingMessageOrchestrator, WritePipeCoordinator};
 
 // Maximum number of parts that can be buffered by send()
-const MAX_DEALER_SEND_BUFFER_PARTS: usize = 64; // Example
+const MAX_DEALER_SEND_BUFFER_PARTS: usize = 128;
 
 #[derive(Debug)]
 enum DealerSendTransaction {
@@ -34,14 +34,6 @@ enum DealerSendTransaction {
     parts: Vec<Msg>,
     completion_notifier: Arc<Notify>, // Tasks can wait on this
   },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IncomingPipeState {
-  Idle,
-  StrippedIdentityExpectDelimiterOrPayload,
-  StrippedDelimiterExpectPayload,
-  ExpectingMorePayload,
 }
 
 #[derive(Debug)]
@@ -237,9 +229,8 @@ impl DealerSocketOutgoingProcessor {
 pub(crate) struct DealerSocket {
   core: Arc<SocketCore>,
   load_balancer: Arc<LoadBalancer>, // Arc for sharing with processor
-  incoming_queue: FairQueue,
+  incoming_orchestrator: IncomingMessageOrchestrator,
   pipe_read_to_write_id: Mutex<HashMap<usize, usize>>,
-  pipe_state: Mutex<HashMap<usize, IncomingPipeState>>,
   pending_outgoing_queue: Arc<Mutex<VecDeque<Vec<Msg>>>>, // Arc for sharing
   outgoing_queue_activity_notifier: Arc<Notify>,          // Notifies processor of new msgs or available pipes
   peer_availability_notifier: Arc<Notify>,                // Notifies senders/processor of peer changes
@@ -273,12 +264,13 @@ impl DealerSocket {
 
     let processor_jh = tokio::spawn(processor.run());
 
+    let orchestrator = IncomingMessageOrchestrator::new(core.handle, options.rcvhwm);
+
     Self {
       core,
       load_balancer: lb_arc,
-      incoming_queue: FairQueue::new(queue_capacity),
+      incoming_orchestrator: orchestrator,
       pipe_read_to_write_id: Mutex::new(HashMap::new()),
-      pipe_state: Mutex::new(HashMap::new()),
       pending_outgoing_queue: pending_queue_arc,
       outgoing_queue_activity_notifier: queue_notifier_arc,
       peer_availability_notifier: peer_notifier_arc,
@@ -291,6 +283,39 @@ impl DealerSocket {
 
   fn core_state(&self) -> RwLockReadGuard<'_, CoreState> {
     self.core.core_state.read()
+  }
+
+  // Static processing function for DEALER messages
+  // This function is "without self" and takes any necessary context.
+  // For DEALER stripping a ROUTER envelope, it doesn't need extra context beyond the message itself.
+  fn process_raw_message_for_dealer(
+    _pipe_read_id: usize,           // May be unused for pure envelope stripping
+    mut raw_zmtp_message: Vec<Msg>, // e.g., [ID_MORE, (opt_IDs_MORE)?, EMPTY_DELIM_MORE, PAYLOAD_FRAMES...]
+    _ctx: (),                       // Context parameter (unused for now for dealer stripping)
+  ) -> Result<Vec<Msg>, ZmqError> {
+    // Find the first empty delimiter. This marks the end of the routing envelope.
+    if let Some(delimiter_pos) = raw_zmtp_message.iter().position(|frame| frame.size() == 0) {
+      // The application payload consists of all frames *after* this empty delimiter.
+      // Drain consumes the original vector.
+      let app_payload: Vec<Msg> = raw_zmtp_message.drain(delimiter_pos + 1..).collect();
+
+      // As per Step 3, orchestrator.queue_application_message_frames will handle
+      // the case where app_payload is empty by queueing vec![Msg::new()].
+      // So, this function can just return an empty Vec if stripping leads to no payload.
+      Ok(app_payload)
+    } else {
+      // No empty delimiter was found. This could happen if:
+      // 1. The DEALER is connected to another DEALER (not a ROUTER).
+      // 2. The message from the ROUTER is malformed (missing delimiter).
+      // Standard ZMQ DEALER behavior when talking to non-ROUTER or receiving non-enveloped messages
+      // is to treat the entire message as payload.
+      tracing::warn!(
+        // handle = ??? (cannot access self.core.handle in static fn easily, needs context)
+        // pipe_id = _pipe_read_id, // Available
+        "Dealer processing: Raw ZMTP message received without an empty delimiter. Passing all frames as application payload."
+      );
+      Ok(raw_zmtp_message)
+    }
   }
 
   fn prepare_full_multipart_send_sequence(&self, user_frames: Vec<Msg>) -> Vec<Msg> {
@@ -456,7 +481,7 @@ impl ISocket for DealerSocket {
     let sndtimeo_opt: Option<Duration> = { self.core_state().options.sndtimeo };
 
     loop {
-      let mut transaction_guard = self.current_send_transaction.lock().await;
+      let transaction_guard = self.current_send_transaction.lock().await;
       match &*transaction_guard {
         DealerSendTransaction::Idle => {
           drop(transaction_guard);
@@ -530,29 +555,18 @@ impl ISocket for DealerSocket {
     }
   }
 
-  // recv, set_pattern_option, get_pattern_option, process_command, handle_pipe_event, pipe_attached, update_peer_identity, pipe_detached
-  // remain largely the same as your previous correct DealerSocket version,
-  // but pipe_attached and pipe_detached need to notify peer_availability_notifier.
-
   async fn recv(&self) -> Result<Msg, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
-    let pop_future = self.incoming_queue.pop_message();
-    let received_msg_frame = match rcvtimeo_opt {
-      Some(duration) if !duration.is_zero() => match tokio_timeout(duration, pop_future).await {
-        Ok(Ok(Some(msg))) => msg,
-        Ok(Ok(None)) => return Err(ZmqError::Internal("Receive queue closed".into())),
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(ZmqError::Timeout),
-      },
-      _ => match pop_future.await? {
-        Some(msg) => msg,
-        None => return Err(ZmqError::Internal("Receive queue closed".into())),
-      },
-    };
-    Ok(received_msg_frame)
+    return self.incoming_orchestrator.recv_message(rcvtimeo_opt).await;
+  }
+
+  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
+
+    return self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await;
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
@@ -569,78 +583,45 @@ impl ISocket for DealerSocket {
   async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
-        let mut state_map_guard = self.pipe_state.lock().await;
-        let current_pipe_state = state_map_guard.entry(pipe_read_id).or_insert(IncomingPipeState::Idle);
-        let is_last_part_of_transport_msg = !msg.is_more();
+        // 1. Accumulate frame. If a full ZMTP message is ready, orchestrator returns it.
+        match self
+          .incoming_orchestrator
+          .accumulate_pipe_frame(pipe_read_id, msg)
+        {
+          // Now calling sync version
+          Ok(Some(raw_zmtp_message_vec)) => {
+            // A full ZMTP message is assembled
+            let dealer_ctx = (); // Create context (empty for dealer)
 
-        tracing::trace!(
-            handle = self.core.handle, pipe_id = pipe_read_id, state = ?*current_pipe_state,
-            size = msg.size(), more = msg.is_more(), "DEALER handle_pipe_event received ZMTP frame"
-        );
-        match *current_pipe_state {
-          IncomingPipeState::Idle => {
-            if msg.size() > 0 && msg.is_more() {
-              tracing::trace!(
-                "[Dealer {}] Stripped identity-like frame from pipe {}.",
-                self.core.handle,
-                pipe_read_id
-              );
-              *current_pipe_state = IncomingPipeState::StrippedIdentityExpectDelimiterOrPayload;
-            } else if msg.size() == 0 && msg.is_more() {
-              tracing::trace!(
-                "[Dealer {}] Stripped initial empty delimiter from pipe {}.",
-                self.core.handle,
-                pipe_read_id
-              );
-              *current_pipe_state = IncomingPipeState::StrippedDelimiterExpectPayload;
-            } else {
-              let mut payload_msg = msg;
-              payload_msg
-                .metadata_mut()
-                .insert_typed(SourcePipeReadId(pipe_read_id))
-                .await;
-              self.incoming_queue.push_message(payload_msg).await?;
-              if is_last_part_of_transport_msg {
-                *current_pipe_state = IncomingPipeState::Idle;
-              } else {
-                *current_pipe_state = IncomingPipeState::ExpectingMorePayload;
+            // 2. Process the raw ZMTP message using DEALER's specific logic
+            match Self::process_raw_message_for_dealer(pipe_read_id, raw_zmtp_message_vec, dealer_ctx) {
+              Ok(app_logical_message) => {
+                // 3. Queue the processed application-level message frames
+                self
+                  .incoming_orchestrator
+                  .queue_application_message_frames(pipe_read_id, app_logical_message)
+                  .await?;
+              }
+              Err(e) => {
+                tracing::error!(
+                  handle = self.core.handle,
+                  pipe_id = pipe_read_id,
+                  "DEALER: Error processing raw ZMTP message: {}. Message dropped.",
+                  e
+                );
+                // Optionally, close the problematic pipe or take other error actions.
               }
             }
           }
-          IncomingPipeState::StrippedIdentityExpectDelimiterOrPayload => {
-            if msg.size() == 0 && msg.is_more() {
-              tracing::trace!(
-                "[Dealer {}] Stripped empty delimiter after identity from pipe {}.",
-                self.core.handle,
-                pipe_read_id
-              );
-              *current_pipe_state = IncomingPipeState::ExpectingMorePayload;
-            } else {
-              let mut payload_msg = msg;
-              payload_msg
-                .metadata_mut()
-                .insert_typed(SourcePipeReadId(pipe_read_id))
-                .await;
-              self.incoming_queue.push_message(payload_msg).await?;
-              if is_last_part_of_transport_msg {
-                *current_pipe_state = IncomingPipeState::Idle;
-              } else {
-                *current_pipe_state = IncomingPipeState::ExpectingMorePayload;
-              }
-            }
-          }
-          IncomingPipeState::StrippedDelimiterExpectPayload | IncomingPipeState::ExpectingMorePayload => {
-            let mut payload_msg = msg;
-            payload_msg
-              .metadata_mut()
-              .insert_typed(SourcePipeReadId(pipe_read_id))
-              .await;
-            self.incoming_queue.push_message(payload_msg).await?;
-            if is_last_part_of_transport_msg {
-              *current_pipe_state = IncomingPipeState::Idle;
-            } else {
-              *current_pipe_state = IncomingPipeState::ExpectingMorePayload;
-            }
+          Ok(None) => { /* More frames needed for this pipe */ }
+          Err(e) => {
+            tracing::error!(
+              handle = self.core.handle,
+              pipe_id = pipe_read_id,
+              "DEALER: Error accumulating pipe frame: {}",
+              e
+            );
+            return Err(e);
           }
         }
       }
@@ -663,12 +644,6 @@ impl ISocket for DealerSocket {
       .insert(pipe_read_id, pipe_write_id);
     self.load_balancer.add_pipe(pipe_write_id).await;
     self.pipe_send_coordinator.add_pipe(pipe_write_id).await;
-    self.incoming_queue.pipe_attached(pipe_read_id);
-    self
-      .pipe_state
-      .lock()
-      .await
-      .insert(pipe_read_id, IncomingPipeState::Idle);
 
     self.peer_availability_notifier.notify_one(); // A peer became available
     self.outgoing_queue_activity_notifier.notify_one(); // Might be messages to send
@@ -694,8 +669,7 @@ impl ISocket for DealerSocket {
         semaphore.close();
       }
     }
-    self.incoming_queue.pipe_detached(pipe_read_id);
-    self.pipe_state.lock().await.remove(&pipe_read_id);
+    self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await;
     self.peer_availability_notifier.notify_waiters(); // A peer was removed
   }
 }

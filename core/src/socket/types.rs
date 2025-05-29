@@ -128,6 +128,17 @@ impl Socket {
     self.inner.send_multipart(frames).await
   }
 
+  /// Receives a complete multipart message from the socket.
+  ///
+  /// This method will read frames from the socket until a frame without
+  /// the MORE flag is encountered, collecting them into a `Vec<Msg>`.
+  /// It respects the `RCVTIMEO` socket option for the overall operation of
+  /// receiving all parts of the message. If a timeout occurs mid-message,
+  /// an error is returned and partial data is discarded.
+  pub async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+    self.inner.recv_multipart().await
+  }
+  
   /// Sets a socket option asynchronously.
   /// Options control various aspects of the socket's behavior (e.g., high-water marks, timeouts).
   /// Refer to ZMQ documentation for standard option IDs and their meanings.

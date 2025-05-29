@@ -17,7 +17,9 @@ use std::collections::HashMap; // For pipe_read_to_write_id map.
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex, MutexGuard}; // Mutex for internal state, oneshot for API replies.
-use tokio::time::timeout; // For recv timeout.
+use tokio::time::timeout;
+
+use super::patterns::IncomingMessageOrchestrator; // For recv timeout.
 
 /// Implements the SUB (Subscribe) socket pattern.
 /// SUB sockets receive messages published by PUB (Publish) sockets.
@@ -31,9 +33,7 @@ pub(crate) struct SubSocket {
   core: Arc<SocketCore>,
   /// `SubscriptionTrie` to manage topic subscriptions and efficiently match incoming messages.
   subscriptions: SubscriptionTrie,
-  /// `FairQueue` to buffer incoming messages that match subscriptions, from all connected pipes.
-  /// `recv()` calls will pop messages from this queue.
-  fair_queue: FairQueue,
+  incoming_orchestrator: IncomingMessageOrchestrator,
   /// Maps a pipe's read ID (from SocketCore's perspective) to its corresponding write ID.
   /// This is needed to send SUBSCRIBE/CANCEL command messages upstream to the correct PUB peer.
   pipe_read_to_write_id: Mutex<HashMap<usize, usize>>,
@@ -46,12 +46,15 @@ impl SubSocket {
   /// * `core` - An `Arc` to the `SocketCore` managing this socket.
   /// * `options` - Initial socket options, used here to determine queue capacity (RCVHWM).
   pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
-    // Capacity for the incoming message queue, based on RCVHWM.
-    let queue_capacity = options.rcvhwm.max(1); // Ensure capacity is at least 1.
+    let orchestrator = IncomingMessageOrchestrator::new(
+      core.handle,
+      options.rcvhwm, // Use RCVHWM for orchestrator's internal FairQueue capacity
+    );
+
     Self {
       core,
       subscriptions: SubscriptionTrie::new(),
-      fair_queue: FairQueue::new(queue_capacity),
+      incoming_orchestrator: orchestrator,
       pipe_read_to_write_id: Mutex::new(HashMap::new()),
     }
   }
@@ -213,28 +216,7 @@ impl ISocket for SubSocket {
     // Get RCVTIMEO from options.
     let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
 
-    // Attempt to pop a message from the fair queue (which only contains matched messages).
-    let pop_future = self.fair_queue.pop_message();
-
-    match rcvtimeo_opt {
-      Some(duration) if !duration.is_zero() => {
-        // Apply timeout if RCVTIMEO is set to a positive value.
-        tracing::trace!(handle = self.core.handle, ?duration, "Applying RCVTIMEO to SUB recv");
-        match timeout(duration, pop_future).await {
-          Ok(Ok(Some(msg))) => Ok(msg), // Matched message received within timeout.
-          Ok(Ok(None)) => Err(ZmqError::Internal("Receive queue closed unexpectedly".into())),
-          Ok(Err(e)) => Err(e), // Propagate internal errors from pop_message.
-          Err(_timeout_elapsed) => Err(ZmqError::Timeout), // Timeout occurred.
-        }
-      }
-      _ => {
-        // No timeout or RCVTIMEO = 0. (See note in PullSocket::recv regarding RCVTIMEO=0).
-        match pop_future.await? {
-          Some(msg) => Ok(msg),
-          None => Err(ZmqError::Internal("Receive queue closed unexpectedly".into())),
-        }
-      }
-    }
+    return self.incoming_orchestrator.recv_message(rcvtimeo_opt).await;
   }
 
   /// Sets a socket option.
@@ -254,6 +236,11 @@ impl ISocket for SubSocket {
     Err(ZmqError::InvalidState("SUB sockets cannot send data messages"))
   }
 
+  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
+    return self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await;
+  }
+
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     // SUB sockets do not have specific readable pattern options beyond what SocketCore provides.
     delegate_to_core!(self, UserGetOpt, option: option)
@@ -270,9 +257,7 @@ impl ISocket for SubSocket {
         tracing::debug!(handle=self.core.handle, topic=?String::from_utf8_lossy(value), "Subscribing to topic");
         self.subscriptions.subscribe(value).await; // Add to local trie.
                                                    // Send SUBSCRIBE command message upstream to all connected PUB peers.
-        self
-          .send_subscription_command_to_all(true, value)
-          .await;
+        self.send_subscription_command_to_all(true, value).await;
         Ok(())
       }
       UNSUBSCRIBE => {
@@ -305,36 +290,39 @@ impl ISocket for SubSocket {
   /// Handles messages received from a pipe by the `SocketCore`.
   /// For SUB sockets, this means a message part has arrived from a PUB peer.
   /// The message is checked against active subscriptions before being queued.
-  async fn handle_pipe_event(&self, pipe_id: usize, event: Command) -> Result<(), ZmqError> {
+  async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
-        // The "topic" for ZMQ SUB is typically the first part of the message.
-        // If messages are multi-part, only the first part is used for filtering.
-        // For simplicity here, we assume the entire `msg.data()` is the topic,
-        // or that PUB sends single-part messages where data is the topic+payload.
-        // A more sophisticated implementation might handle multi-part messages
-        // and extract the topic from the first frame only.
-        let topic_data = msg.data().unwrap_or(&[]); // Use message data as topic.
+        // 1. Accumulate frame.
+        if let Some(raw_zmtp_message_vec) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
+          // accumulate is sync
 
-        if self.subscriptions.matches(topic_data).await {
-          // Message matches an active subscription.
-          tracing::trace!(
-            handle = self.core.handle,
-            pipe_id = pipe_id,
-            msg_size = msg.size(),
-            topic_preview = ?String::from_utf8_lossy(&topic_data.iter().take(20).copied().collect::<Vec<u8>>()),
-            "SUB pushing matched message to FairQueue"
-          );
-          self.fair_queue.push_message(msg).await?; // Push to internal queue.
-        } else {
-          // Message does not match any subscription, so it's dropped.
-          tracing::trace!(
-            handle = self.core.handle,
-            pipe_id = pipe_id,
-            msg_size = msg.size(),
-            topic_preview = ?String::from_utf8_lossy(&topic_data.iter().take(20).copied().collect::<Vec<u8>>()),
-            "SUB dropping unmatched message"
-          );
+          // 2. Perform Subscription Filtering (on the first frame of the raw ZMTP message)
+          let topic_data = raw_zmtp_message_vec
+            .get(0)
+            .and_then(|frame| frame.data())
+            .unwrap_or_default(); // Default to empty topic if no data/frame
+
+          if self.subscriptions.matches(topic_data).await {
+            tracing::trace!(
+                handle = self.core.handle, pipe_id = pipe_read_id,
+                topic = ?String::from_utf8_lossy(topic_data),
+                "SUB: Message matched subscription. Queueing via orchestrator."
+            );
+            // 3. If matched, the raw_zmtp_message_vec IS the application logical message.
+            //    No further transformation is needed by a static "processing function".
+            self
+              .incoming_orchestrator
+              .queue_application_message_frames(pipe_read_id, raw_zmtp_message_vec)
+              .await?;
+          } else {
+            tracing::trace!(
+                handle = self.core.handle, pipe_id = pipe_read_id,
+                topic = ?String::from_utf8_lossy(topic_data),
+                "SUB: Message dropped (no subscription match)."
+            );
+            // Message is dropped, not queued.
+          }
         }
       }
       _ => { /* SUB sockets typically ignore other direct pipe events from SocketCore. */ }
@@ -362,9 +350,6 @@ impl ISocket for SubSocket {
       .lock()
       .await
       .insert(pipe_read_id, pipe_write_id);
-
-    // Notify the FairQueue that a new pipe is contributing messages.
-    self.fair_queue.pipe_attached(pipe_read_id);
 
     // --- FIX: Send existing subscriptions to the newly attached peer ---
     let current_topics = self.subscriptions.get_all_topics().await;
@@ -425,7 +410,8 @@ impl ISocket for SubSocket {
     );
     // Remove the read ID -> write ID mapping.
     self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
-    // Notify the FairQueue that the pipe is no longer contributing.
-    self.fair_queue.pipe_detached(pipe_read_id);
+
+    // ADD: Clear any state the orchestrator might hold for this pipe.
+    self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await;
   }
 }

@@ -6,7 +6,7 @@ use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
 use crate::socket::options::{SocketOptions, ROUTER_MANDATORY};
-use crate::socket::patterns::{FairQueue, RouterMap}; // Use RouterMap and FairQueue
+use crate::socket::patterns::{incoming_orchestrator::IncomingMessageOrchestrator, RouterMap}; // Use RouterMap and FairQueue
 use crate::socket::ISocket;
 
 use std::collections::HashMap;
@@ -14,9 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use parking_lot::RwLockReadGuard;
-use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit};
-use tokio::time::timeout;
+use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock, RwLockReadGuard};
+use tokio::sync::{Mutex as TokioMutex, MutexGuard, OwnedSemaphorePermit};
 
 use super::patterns::WritePipeCoordinator;
 
@@ -26,33 +25,45 @@ struct ActiveFragmentedSend {
   _permit: OwnedSemaphorePermit,
 }
 
+// Context for Router's static processing function
+struct RouterMessageProcessCtx<'a> {
+  // Provides synchronous read access to the identity map needed by the processor.
+  identity_map_guard: RwLockReadGuard<'a, HashMap<usize, Blob>>,
+  // Optional: Could pass core_handle for logging if the static fn needs it.
+  // socket_core_handle: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct RouterSocket {
   core: Arc<SocketCore>,
-  router_map: RouterMap,     // Maps Identity -> Write Pipe ID
-  incoming_queue: FairQueue, // Buffers incoming messages (already prefixed with ID)
-  // Store partial incoming messages per pipe if needed for multi-part identity prepending
-  // Key: pipe_read_id
-  partial_incoming: Mutex<HashMap<usize, Vec<Msg>>>,
-  /// Set when the Identity frame is sent, cleared when the last payload frame is sent.
-  current_send_target: Mutex<Option<ActiveFragmentedSend>>,
-  pipe_send_coordinator: WritePipeCoordinator,
+  router_map_for_send: RouterMap, // Maps Identity -> Write Pipe ID
+  // The orchestrator handles all incoming logic: partial assembly, staging, main queue
+  incoming_orchestrator: IncomingMessageOrchestrator,
+
   // Map Pipe Read ID -> Identity (needed for prepending on receive)
   // Duplicates RouterMap's reverse map but might be convenient here
-  pipe_to_identity: Mutex<HashMap<usize, Blob>>,
+  pipe_to_identity_shared_map: Arc<ParkingLotRwLock<HashMap<usize, Blob>>>,
+  /// Set when the Identity frame is sent, cleared when the last payload frame is sent.
+  current_send_target: TokioMutex<Option<ActiveFragmentedSend>>,
+  pipe_send_coordinator: WritePipeCoordinator,
 }
 
 impl RouterSocket {
   pub fn new(core: Arc<SocketCore>, options: SocketOptions) -> Self {
-    let queue_capacity = options.rcvhwm.max(1);
+    let shared_pipe_to_identity_map = Arc::new(ParkingLotRwLock::new(HashMap::new()));
+
+    let orchestrator = IncomingMessageOrchestrator::new(
+      core.handle,
+      options.rcvhwm, // Pass RCVHWM for FairQueue inside orchestrator
+    );
+
     Self {
       core,
-      router_map: RouterMap::new(),
-      incoming_queue: FairQueue::new(queue_capacity),
-      partial_incoming: Mutex::new(HashMap::new()),
-      current_send_target: Mutex::new(None),
+      router_map_for_send: RouterMap::new(), // This is for SENDING by identity
+      incoming_orchestrator: orchestrator,
+      pipe_to_identity_shared_map: shared_pipe_to_identity_map,
+      current_send_target: TokioMutex::new(None),
       pipe_send_coordinator: WritePipeCoordinator::new(),
-      pipe_to_identity: Mutex::new(HashMap::new()),
     }
   }
 
@@ -64,6 +75,41 @@ impl RouterSocket {
   /// TODO: Replace this with real identity management later.
   fn pipe_id_to_placeholder_identity(pipe_read_id: usize) -> Blob {
     Blob::from(pipe_read_id.to_be_bytes().to_vec())
+  }
+
+  // Static processing function for ROUTER messages
+  fn process_raw_message_for_router(
+    pipe_read_id: usize,
+    mut raw_zmtp_message: Vec<Msg>, // e.g., [EMPTY_DELIM_MORE, PAYLOAD_NOMORE] from DEALER
+    ctx: RouterMessageProcessCtx<'_>,
+  ) -> Result<Vec<Msg>, ZmqError> {
+    let identity_blob = ctx.identity_map_guard.get(&pipe_read_id).cloned().unwrap_or_else(|| {
+      tracing::warn!(
+        // handle = ctx.socket_core_handle, // If passed in ctx
+        "Router transform: Identity for pipe {} not found in map, using placeholder.",
+        pipe_read_id
+      );
+      Self::pipe_id_to_placeholder_identity(pipe_read_id)
+    });
+
+    let id_msg = Msg::from_vec(identity_blob.to_vec());
+    // MORE flag for id_msg will be set by orchestrator.queue_application_message_frames later.
+
+    // Strip leading empty delimiter if present (typical from DEALER)
+    if !raw_zmtp_message.is_empty() && raw_zmtp_message[0].size() == 0 {
+      tracing::trace!(
+        // handle = ctx.socket_core_handle,
+        "Router transform: Stripped empty ZMTP delimiter from pipe {}.",
+        pipe_read_id
+      );
+      raw_zmtp_message.remove(0);
+    }
+
+    let mut application_message = Vec::with_capacity(1 + raw_zmtp_message.len());
+    application_message.push(id_msg);
+    application_message.extend(raw_zmtp_message);
+
+    Ok(application_message) // Returns [IDENTITY, (stripped_delimiter_payload_frames)...]
   }
 }
 
@@ -123,7 +169,7 @@ impl ISocket for RouterSocket {
       }
 
       // Find target pipe write ID
-      let pipe_write_id = match self.router_map.get_pipe(&destination_id).await {
+      let pipe_write_id = match self.router_map_for_send.get_pipe(&destination_id).await {
         Some(id) => id,
         None => {
           // Identity not found. Behavior depends on ROUTER_MANDATORY.
@@ -178,17 +224,43 @@ impl ISocket for RouterSocket {
 
       match send_msg_with_timeout(&pipe_tx, msg, timeout_opt, self.core.handle, pipe_write_id).await {
         Ok(()) => {
-          *current_target_guard = Some(ActiveFragmentedSend {
-            target_pipe_id: pipe_write_id,
-            _permit: permit,
-          });
+          // Identity sent. Now send the empty delimiter.
+          let mut delimiter_frame = Msg::new();
+          delimiter_frame.set_flags(MsgFlags::MORE); // Delimiter always has MORE before payload.
           tracing::trace!(
             handle = self.core.handle,
-            ?destination_id,
+            // destination_id is still in scope from outer block
+            // ?destination_id, 
             pipe_id = pipe_write_id,
-            "ROUTER send target locked"
+            "ROUTER sending empty delimiter after identity"
           );
-          Ok(())
+          match send_msg_with_timeout(&pipe_tx, delimiter_frame, timeout_opt, self.core.handle, pipe_write_id).await {
+            Ok(()) => {
+              // Both identity and delimiter sent successfully.
+              *current_target_guard = Some(ActiveFragmentedSend {
+                target_pipe_id: pipe_write_id,
+                _permit: permit, // Permit is moved here and will be held by current_target_guard
+              });
+              tracing::trace!(
+                handle = self.core.handle,
+                // ?destination_id, 
+                pipe_id = pipe_write_id,
+                "ROUTER send target locked (identity and delimiter sent)"
+              );
+              Ok(())
+            }
+            Err(e) => {
+              tracing::warn!(handle = self.core.handle, pipe_id = pipe_write_id, "ROUTER send (delimiter) failed: {}", e);
+              // Permit is dropped here implicitly as it's not moved into ActiveFragmentedSend.
+              // current_target_guard remains None.
+              if router_mandatory_opt {
+                if matches!(e, ZmqError::ConnectionClosed) { Err(ZmqError::HostUnreachable("Peer disconnected during delimiter send".into())) } else { Err(e) }
+              } else {
+                // If not mandatory, and it failed (e.g. pipe gone), it's a silent drop for this message.
+                Ok(())
+              }
+            }
+          }
         }
         Err(e @ ZmqError::ConnectionClosed) => {
           tracing::warn!(
@@ -300,32 +372,12 @@ impl ISocket for RouterSocket {
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
     let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
 
-    // Pop message frame (could be Identity or Payload part) from the fair queue
-    let pop_future = self.incoming_queue.pop_message();
-
-    let result = match rcvtimeo_opt {
-      Some(duration) if !duration.is_zero() => {
-        tracing::trace!(handle = self.core.handle, ?duration, "Applying RCVTIMEO to ROUTER recv");
-        match timeout(duration, pop_future).await {
-          Ok(Ok(Some(msg))) => Ok(msg), // Got a frame
-          Ok(Ok(None)) => Err(ZmqError::Internal("Receive queue closed".into())),
-          Ok(Err(e)) => Err(e),
-          Err(_timeout_elapsed) => Err(ZmqError::Timeout),
-        }
-      }
-      _ => {
-        // No timeout
-        match pop_future.await? {
-          Some(msg) => Ok(msg),
-          None => Err(ZmqError::Internal("Receive queue closed".into())),
-        }
-      }
-    };
-    // User is responsible for reading frames (Identity first) and checking MORE flag.
-
-    result
+    return self.incoming_orchestrator.recv_message(rcvtimeo_opt).await;
   }
 
   async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError> {
@@ -345,7 +397,7 @@ impl ISocket for RouterSocket {
     let router_mandatory_opt: bool = core_opts.router_mandatory;
 
     // Find target pipe write ID
-    let pipe_write_id = match self.router_map.get_pipe(&destination_id_blob).await {
+    let pipe_write_id = match self.router_map_for_send.get_pipe(&destination_id_blob).await {
       Some(id) => id,
       None => {
         return if router_mandatory_opt {
@@ -461,6 +513,17 @@ impl ISocket for RouterSocket {
     Ok(())
   }
 
+  /// Receives all frames of a complete logical ZMQ message.
+  /// Delegates to IncomingMessageOrchestrator.
+  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
+    // Call the new method on the orchestrator that handles multipart logic.
+    self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await
+  }
+
   // --- Pattern Specific Options ---
   async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     if option == ROUTER_MANDATORY {
@@ -489,137 +552,29 @@ impl ISocket for RouterSocket {
   async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
-        let mut partial_guard = self.partial_incoming.lock().await;
-        let buffer = partial_guard.entry(pipe_read_id).or_insert_with(Vec::new);
+        // 1. Accumulate frame.
+        if let Some(raw_zmtp_message_vec) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
+          // accumulate is sync now
 
-        let is_first_part_for_peer = buffer.is_empty();
-        let current_msg = msg; // Shadow msg
-        let is_last_part = !current_msg.is_more();
+          // 2. Process the raw ZMTP message using ROUTER's specific logic
+          let app_logical_message = {
+            // Scope for read guard
+            let identity_map_guard = self.pipe_to_identity_shared_map.read(); // parking_lot read guard
+            let router_ctx = RouterMessageProcessCtx {
+              identity_map_guard,
+              // socket_core_handle: self.core.handle, // If needed
+            };
+            Self::process_raw_message_for_router(pipe_read_id, raw_zmtp_message_vec, router_ctx)?
+          }; // Guard dropped here
 
-        if is_first_part_for_peer {
-          // Handling the very first frame for this peer connection
-          if current_msg.size() == 0 && current_msg.is_more() {
-            // Consume the optional initial empty delimiter from DEALER
-            tracing::trace!(
-              handle = self.core.handle,
-              pipe_id = pipe_read_id,
-              "ROUTER consumed initial empty delimiter from DEALER"
-            );
-            // Do not add to buffer, do not change state, just return
-            drop(partial_guard);
-            return Ok(());
-          } else {
-            // First frame is actual data (e.g., identity or first payload part if no delimiter)
-            buffer.push(current_msg);
-          }
-        } else {
-          // Handling subsequent frames for this peer
-          if current_msg.size() == 0 && current_msg.is_more() {
-            // Consume subsequent empty delimiters from DEALER
-            tracing::trace!(
-              handle = self.core.handle,
-              pipe_id = pipe_read_id,
-              "ROUTER consumed subsequent empty delimiter from DEALER"
-            );
-            // Do not add to buffer, just return
-            drop(partial_guard);
-            return Ok(());
-          } else {
-            // It's a payload part
-            buffer.push(current_msg);
-          }
-        }
-
-        if is_last_part {
-          // Message complete, process it
-          let complete_message_parts = partial_guard.remove(&pipe_read_id).unwrap_or_default();
-          drop(partial_guard); // Release lock
-
-          // Get identity associated with this pipe
-
-          let identity_blob = {
-            let map_guard = self.pipe_to_identity.lock().await;
-            map_guard.get(&pipe_read_id).cloned() // Clone the Blob
-          };
-
-          let identity_blob = match identity_blob {
-            Some(id) => id,
-            None => {
-              // This case should ideally not happen if pipe_attached worked correctly,
-              // but handle it defensively.
-              tracing::error!(
-                handle = self.core.handle,
-                pipe_id = pipe_read_id,
-                "ROUTER handle_pipe_event: Identity not found for pipe! Using placeholder."
-              );
-              // Maybe return error instead of using placeholder? Depends on desired strictness.
-              // For now, use placeholder to avoid breaking receive loop.
-              Self::pipe_id_to_placeholder_identity(pipe_read_id)
-            }
-          };
-
-          // Construct the logical message to queue for user recv(): Identity + Payload(s)
-
-          // 1. Create Identity Frame
-          let mut id_msg = Msg::from_vec(identity_blob.to_vec());
-          // Must set MORE flag if payload follows
-          if !complete_message_parts.is_empty() {
-            id_msg.set_flags(MsgFlags::MORE);
-          }
-
-          // Push identity frame FIRST
-          if let Err(e) = self.incoming_queue.push_message(id_msg).await {
-            tracing::error!(
-                handle=self.core.handle,
-                pipe_id=pipe_read_id,
-                error=?e,
-                "ROUTER failed to push Identity frame to queue. Dropping message."
-            );
-            // If we can't queue the identity, don't queue the payload either.
-            // Return the error? Or just log and drop? Log and drop for now.
-            return Ok(()); // Or return Err(e)? Decide on error propagation strategy.
-          }
-
-          // 2. Push Original Payload Frame(s)
-          let num_payload_parts = complete_message_parts.len();
-          for (i, mut part) in complete_message_parts.into_iter().enumerate() {
-            // Ensure MORE flag is correct for the logical message being queued
-            if i < num_payload_parts - 1 {
-              part.set_flags(part.flags() | MsgFlags::MORE); // Set MORE on intermediate parts
-            } else {
-              part.set_flags(part.flags() & !MsgFlags::MORE); // Ensure MORE is unset on the very last part
-            }
-
-            if let Err(e) = self.incoming_queue.push_message(part).await {
-              tracing::error!(
-                  handle=self.core.handle,
-                  pipe_id=pipe_read_id,
-                  error=?e,
-                  part_index=i+1, // 1-based index for logging
-                  "ROUTER failed to push Payload frame to queue. Message incomplete."
-              );
-              // Message is now incomplete in the queue. This is problematic.
-              // Maybe try to clear the queue for this peer? Complex.
-              // For now, just log the error. User might get partial message if they recv before error.
-              return Ok(()); // Or return Err(e)?
-            }
-          }
-
-          tracing::trace!(
-            handle = self.core.handle,
-            pipe_id = pipe_read_id,
-            "ROUTER pushed Identity + Payload parts to FairQueue"
-          );
-        } else {
-          // More parts coming, keep buffered
-          tracing::trace!(
-            handle = self.core.handle,
-            pipe_id = pipe_read_id,
-            "ROUTER buffering partial message part"
-          );
+          // 3. Queue the processed application-level message frames
+          self
+            .incoming_orchestrator
+            .queue_application_message_frames(pipe_read_id, app_logical_message)
+            .await?;
         }
       }
-      _ => { /* ROUTER ignores other pipe events */ }
+      _ => { /* ROUTER ignores other direct pipe events */ }
     }
     Ok(())
   }
@@ -654,19 +609,23 @@ impl ISocket for RouterSocket {
     );
 
     self
-      .router_map
+      .router_map_for_send
       .add_peer(initial_identity_to_use.clone(), pipe_read_id, pipe_write_id)
       .await;
-    
+
+    // Add to router_map_for_send (for sending)
     self
-      .pipe_to_identity
-      .lock()
-      .await
+      .router_map_for_send
+      .add_peer(initial_identity_to_use.clone(), pipe_read_id, pipe_write_id)
+      .await;
+
+    // Add to shared pipe_to_identity_shared_map (for orchestrator's receive path)
+    self
+      .pipe_to_identity_shared_map
+      .write()
       .insert(pipe_read_id, initial_identity_to_use);
 
     self.pipe_send_coordinator.add_pipe(pipe_write_id).await;
-
-    self.incoming_queue.pipe_attached(pipe_read_id);
   }
 
   async fn update_peer_identity(&self, pipe_read_id: usize, new_identity_opt: Option<Blob>) {
@@ -683,122 +642,80 @@ impl ISocket for RouterSocket {
     };
 
     tracing::debug!(
-        handle = self.core.handle,
-        pipe_read_id = pipe_read_id,
-        new_identity = ?new_identity,
-        "ROUTER updating peer identity"
+      handle = self.core.handle,
+      pipe_read_id = pipe_read_id,
+      new_identity = ?new_identity,
+      "ROUTER updating peer identity"
     );
 
-    let mut p_to_id_guard = self.pipe_to_identity.lock().await;
-    let old_identity_opt = p_to_id_guard.get(&pipe_read_id).cloned(); // Get current/old identity
+    tracing::debug!(handle = self.core.handle, pipe_read_id, new_identity = ?new_identity, "ROUTER updating peer identity");
 
-    if old_identity_opt.as_ref() == Some(&new_identity) {
-      tracing::trace!(handle = self.core.handle, pipe_read_id, "Identity already up-to-date.");
-      return;
+    let old_identity_opt;
+    {
+      let p_to_id_guard = self.pipe_to_identity_shared_map.write(); // parking_lot RwLock write guard
+      old_identity_opt = p_to_id_guard.get(&pipe_read_id).cloned();
+
+      if old_identity_opt.as_ref() == Some(&new_identity) {
+        return; // No change
+      }
     }
 
-    // Get the write_id associated with this pipe_read_id
-    // This requires looking up the old_identity in router_map
     let pipe_write_id_opt = if let Some(ref old_id) = old_identity_opt {
-      self.router_map.get_pipe(old_id).await
+      self.router_map_for_send.get_pipe(old_id).await
     } else {
-      // If there was no old identity, it means this pipe was not fully in router_map yet
-      // or pipe_to_identity was somehow inconsistent.
-      // We need a write_id to update router_map. If we don't have one, we can't update router_map correctly.
-      // This implies pipe_attached might not have found a write_id, which is problematic.
-      // For now, we'll try to find it via a reverse lookup in core_state if this is a real issue.
-      // However, pipe_attached *should* have received a valid pipe_write_id.
-      // Let's assume pipe_attached always sets a valid write_id for the initial placeholder.
-      tracing::warn!(
-        handle = self.core.handle,
-        pipe_read_id,
-        "No old identity found in pipe_to_identity map for update. Cannot find write_id via old identity."
-      );
       None
     };
 
     if let Some(pipe_write_id) = pipe_write_id_opt {
-      // If there was an old identity, remove its mapping from router_map
-      if let Some(old_id) = old_identity_opt {
-        // We can't directly call remove_peer_by_read_pipe as it also removes from pipe_to_identity
-        // which we are currently holding a lock on (implicitly).
-        // Let's refine this: RouterMap should probably handle updates more gracefully.
-        // For now:
-        let mut id_to_pipe_guard = self.router_map.identity_to_pipe.lock().await;
-        id_to_pipe_guard.remove(&old_id);
-        drop(id_to_pipe_guard);
-        tracing::trace!(
-          handle = self.core.handle,
-          pipe_read_id,
-          ?old_id,
-          "Removed old identity from router_map."
-        );
+      if let Some(old_id) = old_identity_opt.as_ref() {
+        let mut id_to_pipe_w_guard = self.router_map_for_send.identity_to_pipe.lock().await; // TokioMutex
+        id_to_pipe_w_guard.remove(old_id);
+        // drop(id_to_pipe_w_guard) happens implicitly
       }
-
-      // Add the new identity to router_map, pointing to the same pipe_write_id
-      let mut id_to_pipe_guard = self.router_map.identity_to_pipe.lock().await;
-      id_to_pipe_guard.insert(new_identity.clone(), pipe_write_id);
-      drop(id_to_pipe_guard);
-      tracing::trace!(
-        handle = self.core.handle,
-        pipe_read_id,
-        ?new_identity,
-        pipe_write_id,
-        "Added new identity to router_map."
-      );
+      let mut id_to_pipe_w_guard = self.router_map_for_send.identity_to_pipe.lock().await; // TokioMutex
+      id_to_pipe_w_guard.insert(new_identity.clone(), pipe_write_id);
     } else {
       tracing::error!(
         handle = self.core.handle,
         pipe_read_id,
-        "Could not find pipe_write_id for update_peer_identity. RouterMap may be inconsistent."
+        "Could not find pipe_write_id for update_peer_identity in router_map_for_send. Map may be inconsistent."
       );
-      // If we don't have pipe_write_id, we cannot update router_map.
-      // This is a significant issue.
     }
 
-    // Update the pipe_to_identity map last
-    p_to_id_guard.insert(pipe_read_id, new_identity);
+    // Re-acquire lock to update the shared map
+    self
+      .pipe_to_identity_shared_map
+      .write()
+      .insert(pipe_read_id, new_identity);
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
     tracing::debug!("ROUTER detaching pipe_read_id: {}", pipe_read_id);
 
-    let removed_identity = self.pipe_to_identity.lock().await.remove(&pipe_read_id);
-    let pipe_write_id_to_clean = if let Some(ref identity) = removed_identity {
-      // Get the write_id associated with this identity BEFORE removing from router_map
-      self.router_map.get_pipe(identity).await
+    let removed_identity_from_shared_map = self.pipe_to_identity_shared_map.write().remove(&pipe_read_id);
+
+    let pipe_write_id_to_clean = if let Some(ref identity) = removed_identity_from_shared_map {
+      self.router_map_for_send.get_pipe(identity).await // Read lock on router_map_for_send.identity_to_pipe
     } else {
       None
     };
 
-    // Remove from main RouterMap (this also handles its internal reverse map)
-    self.router_map.remove_peer_by_read_pipe(pipe_read_id).await;
+    // This will remove from both maps inside router_map_for_send
+    self.router_map_for_send.remove_peer_by_read_pipe(pipe_read_id).await;
 
-    // Remove from send coordinator
     if let Some(write_id) = pipe_write_id_to_clean {
       if let Some(semaphore) = self.pipe_send_coordinator.remove_pipe(write_id).await {
-        semaphore.close(); // Close the semaphore to wake up any waiters with an error
+        semaphore.close();
       }
-
-      // Clean up active_fragmented_send if it was for the detached pipe
-      let mut active_frag_guard = self.current_send_target.lock().await;
+      let mut active_frag_guard = self.current_send_target.lock().await; // TokioMutex
       if let Some(active_info) = &*active_frag_guard {
         if active_info.target_pipe_id == write_id {
-          *active_frag_guard = None; // Drops the permit, releases the lock
-          tracing::warn!(
-            "Fragmented send was active on detached pipe {}. Cleared state.",
-            write_id
-          );
+          *active_frag_guard = None;
         }
       }
-    } else {
-      tracing::warn!(
-        "Could not find write_id for detached read_pipe_id {} to clean send coordinator/fragmented_send state",
-        pipe_read_id
-      );
     }
 
-    self.incoming_queue.pipe_detached(pipe_read_id);
-    self.partial_incoming.lock().await.remove(&pipe_read_id);
+    // Inform orchestrator to clear any partial messages for this pipe
+    self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await;
   }
 } // end impl ISocket for RouterSocket

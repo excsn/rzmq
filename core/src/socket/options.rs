@@ -70,6 +70,8 @@ pub const DEFAULT_IO_URING_RECV_BUFFER_COUNT: usize = 16;
 #[cfg(feature = "io-uring")]
 pub const DEFAULT_IO_URING_RECV_BUFFER_SIZE: usize = 65536; // 64KB
 
+pub const DEFAULT_RECONNECT_IVL_MS: u64 = 1000;
+
 /// Holds parsed and validated socket options.
 #[derive(Debug, Clone)]
 pub(crate) struct SocketOptions {
@@ -125,7 +127,7 @@ impl Default for SocketOptions {
       rcvtimeo: None,               // -1 in ZMQ
       sndtimeo: None,               // -1 in ZMQ
       linger: Some(Duration::ZERO), // 0 in ZMQ (different from socket default!)
-      reconnect_ivl: Some(Duration::from_millis(5000)),
+      reconnect_ivl: Some(Duration::from_millis(DEFAULT_RECONNECT_IVL_MS)),
       reconnect_ivl_max: Some(Duration::ZERO), // ZMQ default is 0 (disable max/backoff)
       routing_id: None,
       socket_type_name: "UNKNOWN".to_string(), // Default, should be set on creation

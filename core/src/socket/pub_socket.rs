@@ -130,6 +130,10 @@ impl ISocket for PubSocket {
     unimplemented!("Not Implemented yet")
   }
 
+  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+    unimplemented!("Not implemented yet")
+  }
+
   // --- Pattern-Specific Option Handling ---
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
     // PUB sockets typically ignore options like SUBSCRIBE or UNSUBSCRIBE,
