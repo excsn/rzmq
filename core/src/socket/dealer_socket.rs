@@ -76,7 +76,7 @@ impl DealerSocketOutgoingProcessor {
           }
         } => {
           let mut queue_guard = self.pending_queue.lock().await;
-          if !queue_guard.is_empty() && self.load_balancer.has_pipes().await {
+          if !queue_guard.is_empty() && self.load_balancer.has_pipes() {
             popped_message_parts_to_send = queue_guard.pop_front();
           }
         }
@@ -90,7 +90,7 @@ impl DealerSocketOutgoingProcessor {
           current_message_to_send.len()
         );
 
-        if let Some(pipe_write_id) = self.load_balancer.get_next_pipe().await {
+        if let Some(pipe_write_id) = self.load_balancer.get_next_pipe() {
           let snd_timeout_opt: Option<Duration>;
           let pipe_tx_opt;
           {
@@ -119,7 +119,7 @@ impl DealerSocketOutgoingProcessor {
                   e
                 );
                 if matches!(e, ZmqError::HostUnreachable(_)) {
-                  self.load_balancer.remove_pipe(pipe_write_id).await;
+                  self.load_balancer.remove_pipe(pipe_write_id);
                   self.peer_availability_notifier.notify_waiters();
                 }
                 let mut qg = self.pending_queue.lock().await;
@@ -150,7 +150,7 @@ impl DealerSocketOutgoingProcessor {
                     "[DealerProc {}] Pipe {} closed/error for queued msg part {}: {}. Removing pipe, re-queuing entire message.",
                     self.core_handle, pipe_write_id, idx, e
                   );
-                  self.load_balancer.remove_pipe(pipe_write_id).await;
+                  self.load_balancer.remove_pipe(pipe_write_id);
                   if let Some(sem) = self.pipe_send_coordinator.remove_pipe(pipe_write_id).await {
                     sem.close();
                   }
@@ -187,7 +187,7 @@ impl DealerSocketOutgoingProcessor {
               self.core_handle,
               pipe_write_id
             );
-            self.load_balancer.remove_pipe(pipe_write_id).await;
+            self.load_balancer.remove_pipe(pipe_write_id);
             if let Some(sem) = self.pipe_send_coordinator.remove_pipe(pipe_write_id).await {
               sem.close();
             }
@@ -469,6 +469,14 @@ impl ISocket for DealerSocket {
     }
   }
 
+  async fn recv(&self) -> Result<Msg, ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
+    return self.incoming_orchestrator.recv_message(rcvtimeo_opt).await;
+  }
+
   async fn send_multipart(&self, user_frames: Vec<Msg>) -> Result<(), ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
@@ -551,15 +559,10 @@ impl ISocket for DealerSocket {
     }
   }
 
-  async fn recv(&self) -> Result<Msg, ZmqError> {
+  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
-    return self.incoming_orchestrator.recv_message(rcvtimeo_opt).await;
-  }
-
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
 
     return self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await;
@@ -635,7 +638,7 @@ impl ISocket for DealerSocket {
       .write()
       .await
       .insert(pipe_read_id, pipe_write_id);
-    self.load_balancer.add_pipe(pipe_write_id).await;
+    self.load_balancer.add_pipe(pipe_write_id);
     self.pipe_send_coordinator.add_pipe(pipe_write_id).await;
 
     self.peer_availability_notifier.notify_one(); // A peer became available
@@ -656,7 +659,7 @@ impl ISocket for DealerSocket {
     tracing::debug!("[Dealer {}] Detaching pipe_read_id: {}", self.core.handle, pipe_read_id);
     let maybe_write_id = self.pipe_read_to_write_id.write().await.remove(&pipe_read_id);
     if let Some(write_id) = maybe_write_id {
-      self.load_balancer.remove_pipe(write_id).await;
+      self.load_balancer.remove_pipe(write_id);
 
       if let Some(semaphore) = self.pipe_send_coordinator.remove_pipe(write_id).await {
         semaphore.close();
@@ -673,7 +676,7 @@ impl DealerSocket {
     let global_sndtimeo: Option<Duration> = core_opts.sndtimeo;
     let global_sndhwm: usize = core_opts.sndhwm.max(1);
 
-    if let Some(pipe_write_id) = self.load_balancer.get_next_pipe().await {
+    if let Some(pipe_write_id) = self.load_balancer.get_next_pipe() {
       // Acquire permit for this pipe BEFORE getting pipe_tx and sending
       let _send_permit = match self
         .pipe_send_coordinator
@@ -692,7 +695,7 @@ impl DealerSocket {
           // Fall through to queuing logic, do NOT try to send directly.
           // If acquire_send_permit itself returns HostUnreachable, it means the pipe was removed from coordinator.
           if matches!(e, ZmqError::HostUnreachable(_)) {
-            self.load_balancer.remove_pipe(pipe_write_id).await; // Ensure LB is also updated
+            self.load_balancer.remove_pipe(pipe_write_id); // Ensure LB is also updated
             self.peer_availability_notifier.notify_waiters();
           }
           // Force queuing by simulating direct send failure
@@ -715,7 +718,7 @@ impl DealerSocket {
               break;
             }
             Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::Internal(_)) => {
-              self.load_balancer.remove_pipe(pipe_write_id).await;
+              self.load_balancer.remove_pipe(pipe_write_id);
               self.peer_availability_notifier.notify_waiters();
               // Also remove from coordinator as pipe is dead
               if let Some(sem) = self.pipe_send_coordinator.remove_pipe(pipe_write_id).await {
@@ -732,7 +735,7 @@ impl DealerSocket {
         }
         // If critically failed, fall through to queue
       } else {
-        self.load_balancer.remove_pipe(pipe_write_id).await;
+        self.load_balancer.remove_pipe(pipe_write_id);
         self.peer_availability_notifier.notify_waiters();
         if let Some(sem) = self.pipe_send_coordinator.remove_pipe(pipe_write_id).await {
           sem.close();

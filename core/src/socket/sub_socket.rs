@@ -206,6 +206,9 @@ impl ISocket for SubSocket {
   /// This call will block (asynchronously) if no matching messages are available,
   /// unless a `RCVTIMEO` is set.
   async fn recv(&self) -> Result<Msg, ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
     // Get RCVTIMEO from options.
     let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
 
@@ -230,6 +233,9 @@ impl ISocket for SubSocket {
   }
 
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
     let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
     return self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await;
   }

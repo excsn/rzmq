@@ -14,7 +14,7 @@ use futures::future::Either;
 use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::HashMap; // For pipe_read_to_write_id map.
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, MutexGuard, Notify}; // Mutex for state, oneshot for API replies.
 use tokio::time::timeout; // For send/recv timeouts.
 
@@ -129,6 +129,10 @@ impl ISocket for ReqSocket {
   /// it transitions to `ExpectingReply`.
   /// Outgoing messages are load-balanced to one available peer.
   async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
+    
     // ZMQ REQ sockets typically send only the first part of a multi-part message
     // if the MORE flag is set on it, and ignore subsequent parts for that send operation.
     // We'll mimic this by clearing the MORE flag on the message being sent.
@@ -158,7 +162,7 @@ impl ISocket for ReqSocket {
 
     // Select a peer pipe using the load balancer, waiting if necessary based on SNDTIMEO.
     let pipe_write_id = loop {
-      if let Some(id) = self.load_balancer.get_next_pipe().await {
+      if let Some(id) = self.load_balancer.get_next_pipe() {
         break id; // Found an available peer pipe.
       }
       // No peer currently available, behavior depends on timeout settings.
@@ -259,8 +263,8 @@ impl ISocket for ReqSocket {
           pipe_id = pipe_write_id,
           "REQ send failed: Pipe channel closed"
         );
-        self.load_balancer.remove_pipe(pipe_write_id).await; // Clean up load balancer.
-                                                             // State remains ReadyToSend as the transition to ExpectingReply didn't happen.
+        self.load_balancer.remove_pipe(pipe_write_id); // Clean up load balancer.
+                                                       // State remains ReadyToSend as the transition to ExpectingReply didn't happen.
         Err(e)
       }
       // Other errors (ResourceLimitReached, Timeout, Internal) are propagated.
@@ -273,6 +277,9 @@ impl ISocket for ReqSocket {
   /// The socket must be in the `ExpectingReply` state. After a successful receive,
   /// it transitions back to `ReadyToSend`.
   async fn recv(&self) -> Result<Msg, ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
     // Check current state. Must be ExpectingReply.
     // The target_pipe_write_id stored in state isn't strictly used for filtering incoming replies here,
     // as REQ only expects one reply from the peer it sent to. The FairQueue (capacity 1) ensures this.
@@ -399,11 +406,218 @@ impl ISocket for ReqSocket {
   }
 
   async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
-    unimplemented!("Not Implemented yet")
+    tracing::warn!(
+      handle = self.core.handle,
+      "REQ socket: send_multipart() called. REQ sockets should use send() for single-part requests. Use DEALER for general multipart messaging."
+    );
+    Err(ZmqError::UnsupportedFeature(
+      "REQ sockets use send() for single-part requests. Use DEALER for general multipart messaging.".into(),
+    ))
   }
 
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    unimplemented!("Not implemented yet")
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
+    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
+    let overall_deadline = rcvtimeo_opt.map(|d| Instant::now() + d);
+
+    // Check initial state
+    let initial_notifier_clone = {
+      let op_state_guard = self.state.lock().await;
+      match op_state_guard.state {
+        ReqState::ExpectingReply { .. } => op_state_guard.reply_or_error_notifier.clone(),
+        ReqState::ReadyToSend => {
+          return Err(ZmqError::InvalidState(
+            "REQ socket must call send() before receiving reply",
+          ));
+        }
+      }
+    };
+
+    let mut reply_frames: Vec<Msg> = Vec::new();
+
+    loop {
+      // Loop to collect all frames of a multipart message
+      // Calculate remaining time for this frame, if overall RCVTIMEO is set
+      let current_frame_timeout = if let Some(deadline) = overall_deadline {
+        deadline.checked_duration_since(Instant::now())
+      } else {
+        None // Infinite
+      };
+
+      // If RCVTIMEO is set and has expired for this frame
+      if let Some(timeout_val) = current_frame_timeout {
+        if timeout_val.is_zero() {
+          // Effectively means deadline has passed or is now
+          if reply_frames.is_empty() {
+            return Err(ZmqError::Timeout); // Timeout before even first frame
+          } else {
+            // Timeout mid-message. This is a protocol error for REQ if it expects a complete reply.
+            tracing::warn!(
+              handle = self.core.handle,
+              "REQ recv_multipart: Timeout receiving subsequent part. Discarding partial reply."
+            );
+            // We need to reset state because we consumed parts of a reply.
+            let mut op_state_guard = self.state.lock().await;
+            op_state_guard.state = ReqState::ReadyToSend;
+            op_state_guard.reply_or_error_notifier.notify_waiters();
+            return Err(ZmqError::ProtocolViolation("Timeout during multi-part reply".into()));
+          }
+        }
+      } else if rcvtimeo_opt.is_some() && current_frame_timeout.is_none() {
+        // RCVTIMEO was set, but deadline has passed (current_frame_timeout is None because now > deadline)
+        if reply_frames.is_empty() {
+          return Err(ZmqError::Timeout);
+        } else {
+          /* ... reset state and return ProtocolViolation ... */
+          let mut op_state_guard = self.state.lock().await;
+          op_state_guard.state = ReqState::ReadyToSend;
+          op_state_guard.reply_or_error_notifier.notify_waiters();
+          return Err(ZmqError::ProtocolViolation(
+            "Timeout during multi-part reply (deadline passed)".into(),
+          ));
+        }
+      }
+
+      // We need to select between getting a message from the queue and waiting on the notifier.
+      // The notifier tells us if data *might* be available OR if state changed (e.g. peer detach).
+      let pop_future = self.incoming_reply_queue.pop_message();
+      let notified_future = initial_notifier_clone.notified(); // Use the initially cloned notifier
+
+      enum FrameRecvOutcome {
+        Frame(Msg),
+        QueueClosedOrError(ZmqError),
+        NotifierFired,             // Notifier fired, need to re-check state / queue
+        TimeoutWaitingForNotifier, // Timed out specifically on notifier wait
+      }
+
+      let frame_outcome_result = match current_frame_timeout {
+        Some(duration_for_this_frame) if !duration_for_this_frame.is_zero() => {
+          tokio::select! {
+              biased; // Prioritize data if available
+              pop_res = pop_future => {
+                  match pop_res {
+                      Ok(Some(msg)) => FrameRecvOutcome::Frame(msg),
+                      Ok(None) => FrameRecvOutcome::QueueClosedOrError(ZmqError::Internal("REQ: Reply queue closed".into())),
+                      Err(e) => FrameRecvOutcome::QueueClosedOrError(e),
+                  }
+              },
+              notify_res = tokio::time::timeout(duration_for_this_frame, notified_future) => {
+                  match notify_res {
+                      Ok(()) => FrameRecvOutcome::NotifierFired,
+                      Err(_) => FrameRecvOutcome::TimeoutWaitingForNotifier,
+                  }
+              }
+          }
+        }
+        _ => {
+          // Infinite or zero RCVTIMEO remaining for this frame
+          if rcvtimeo_opt == Some(Duration::ZERO) && reply_frames.is_empty() {
+            // Special handling for RCVTIMEO=0 initial try
+            match self.incoming_reply_queue.try_pop_message() {
+              Ok(Some(msg)) => FrameRecvOutcome::Frame(msg),
+              Ok(None) => return Err(ZmqError::ResourceLimitReached),
+              Err(e) => FrameRecvOutcome::QueueClosedOrError(e),
+            }
+          } else {
+            // Infinite wait
+            tokio::select! {
+                biased;
+                pop_res = pop_future => {
+                    match pop_res {
+                        Ok(Some(msg)) => FrameRecvOutcome::Frame(msg),
+                        Ok(None) => FrameRecvOutcome::QueueClosedOrError(ZmqError::Internal("REQ: Reply queue closed".into())),
+                        Err(e) => FrameRecvOutcome::QueueClosedOrError(e),
+                    }
+                },
+                _ = notified_future => FrameRecvOutcome::NotifierFired,
+            }
+          }
+        }
+      };
+
+      match frame_outcome_result {
+        FrameRecvOutcome::Frame(current_frame) => {
+          let is_last_part = !current_frame.is_more();
+          reply_frames.push(current_frame);
+          if is_last_part {
+            // This is the complete logical reply.
+            let mut op_state_guard = self.state.lock().await;
+            // Re-check state. It could have changed if notifier fired concurrently and was processed by another loop iteration.
+            if matches!(op_state_guard.state, ReqState::ExpectingReply { .. }) {
+              op_state_guard.state = ReqState::ReadyToSend;
+              op_state_guard.reply_or_error_notifier.notify_waiters();
+              return Ok(reply_frames);
+            } else {
+              // State changed (e.g. by peer detach). This reply is stale.
+              tracing::warn!(
+                handle = self.core.handle,
+                "REQ recv_multipart: State changed while reply was being assembled. Discarding."
+              );
+              // The lock will be released, and the outer loop will re-check state (and likely error).
+              // We don't need to explicitly `continue` here if the next iteration's state check handles it.
+              // However, to be safe and prevent using stale `initial_notifier_clone` if state changed drastically:
+              return Err(ZmqError::InvalidState(
+                "REQ state changed mid-multipart receive, request likely cancelled.".into(),
+              ));
+            }
+          }
+          // More parts expected, continue loop.
+        }
+        FrameRecvOutcome::NotifierFired => {
+          // Notifier fired. State might have changed (e.g. peer detached).
+          // Re-lock and check state at the beginning of the next loop iteration.
+          let mut op_state_guard = self.state.lock().await;
+          if !matches!(op_state_guard.state, ReqState::ExpectingReply { .. }) {
+            // State is no longer ExpectingReply (e.g. reset by pipe_detached).
+            // If we have partial frames, this is an error. If no frames, the main loop condition will catch it.
+            if !reply_frames.is_empty() {
+              tracing::warn!(
+                handle = self.core.handle,
+                "REQ recv_multipart: State changed (notifier) with partial reply. Discarding."
+              );
+              op_state_guard.state = ReqState::ReadyToSend; // Ensure reset
+              op_state_guard.reply_or_error_notifier.notify_waiters();
+              return Err(ZmqError::ProtocolViolation(
+                "Request cancelled mid-multipart reply due to state change.".into(),
+              ));
+            }
+            // If no frames yet, main loop's state check will handle erroring out.
+          }
+          // else, still expecting reply, continue loop to try pop_message again.
+          tracing::trace!(
+            handle = self.core.handle,
+            "REQ recv_multipart: Notifier fired. Re-evaluating."
+          );
+          continue;
+        }
+        FrameRecvOutcome::TimeoutWaitingForNotifier => {
+          // This means overall RCVTIMEO expired
+          if reply_frames.is_empty() {
+            return Err(ZmqError::Timeout);
+          } else {
+            tracing::warn!(
+              handle = self.core.handle,
+              "REQ recv_multipart: Timeout waiting for subsequent part. Discarding partial reply."
+            );
+            let mut op_state_guard = self.state.lock().await;
+            op_state_guard.state = ReqState::ReadyToSend;
+            op_state_guard.reply_or_error_notifier.notify_waiters();
+            return Err(ZmqError::ProtocolViolation(
+              "Timeout during multi-part reply (notifier path)".into(),
+            ));
+          }
+        }
+        FrameRecvOutcome::QueueClosedOrError(e) => {
+          // FairQueue closed or errored. This is fatal for the REQ socket's ability to receive.
+          let mut op_state_guard = self.state.lock().await;
+          op_state_guard.state = ReqState::ReadyToSend; // Reset state
+          op_state_guard.reply_or_error_notifier.notify_waiters();
+          return Err(e);
+        }
+      }
+    }
   }
 
   // --- Pattern-Specific Option Handling ---
@@ -514,12 +728,9 @@ impl ISocket for ReqSocket {
       "REQ attaching pipe"
     );
     // Store the mapping from read ID to write ID for state management on detachment.
-    self
-      .pipe_read_to_write_id
-      .write()
-      .insert(pipe_read_id, pipe_write_id);
+    self.pipe_read_to_write_id.write().insert(pipe_read_id, pipe_write_id);
     // Add the pipe's write ID to the load balancer for sending requests.
-    self.load_balancer.add_pipe(pipe_write_id).await;
+    self.load_balancer.add_pipe(pipe_write_id);
     // Notify the incoming reply queue (FairQueue) that a pipe is attached.
     self.incoming_reply_queue.pipe_attached(pipe_read_id);
   }
@@ -546,7 +757,7 @@ impl ISocket for ReqSocket {
 
     if let Some(write_id) = maybe_write_id {
       // Remove the detached pipe's write ID from the load balancer.
-      self.load_balancer.remove_pipe(write_id).await;
+      self.load_balancer.remove_pipe(write_id);
 
       // Critical: If the detached pipe was the one we were expecting a reply from,
       // reset the state machine to ReadyToSend to allow sending a new request.

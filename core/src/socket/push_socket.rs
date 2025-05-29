@@ -18,7 +18,7 @@ use tokio::sync::{oneshot, Mutex, MutexGuard}; // oneshot for API replies.
 use tokio::time::timeout as tokio_timeout; // For send timeout on peer wait.
 
 // Import the delegate_to_core macro.
-use crate::{delegate_to_core, Blob};
+use crate::{delegate_to_core, Blob, MsgFlags};
 
 /// Implements the PUSH socket pattern.
 /// PUSH sockets are used to distribute messages to a pool of PULL workers.
@@ -102,7 +102,7 @@ impl ISocket for PushSocket {
 
     // Select a peer pipe using the load balancer, waiting if necessary based on SNDTIMEO.
     let pipe_write_id = loop {
-      if let Some(id) = self.load_balancer.get_next_pipe().await {
+      if let Some(id) = self.load_balancer.get_next_pipe() {
         break id; // Found an available peer pipe.
       }
 
@@ -180,7 +180,7 @@ impl ISocket for PushSocket {
           pipe_id = pipe_write_id,
           "PUSH send failed: Pipe channel closed"
         );
-        self.load_balancer.remove_pipe(pipe_write_id).await; // Remove from load balancer.
+        self.load_balancer.remove_pipe(pipe_write_id); // Remove from load balancer.
                                                              // PUSH sockets typically don't return ConnectionClosed on send unless SNDTIMEO behavior dictates it.
                                                              // The helper `send_msg_with_timeout` might return this.
                                                              // For PUSH, it might be more idiomatic to retry or drop, but for now, propagate.
@@ -210,15 +210,177 @@ impl ISocket for PushSocket {
 
   /// PUSH sockets cannot receive messages. This method will always return an error.
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    Err(ZmqError::InvalidState("PUSH sockets cannot receive messages"))
+    Err(ZmqError::UnsupportedFeature("PUSH sockets cannot receive messages"))
   }
 
-  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
-    unimplemented!("Not Implemented yet")
+  async fn send_multipart(&self, mut frames: Vec<Msg>) -> Result<(), ZmqError> {
+    if !self.core.is_running().await {
+      // Consistent with send(), return ResourceLimitReached if not running,
+      // as if no peer could be reached.
+      return Err(ZmqError::ResourceLimitReached);
+    }
+
+    if frames.is_empty() {
+      // ZMQ typically allows sending an empty message (which is distinct from no message).
+      // If frames is empty, it means sending a zero-part message, which is not standard.
+      // Option 1: Error
+      // return Err(ZmqError::InvalidMessage("Cannot send an empty set of frames.".into()));
+      // Option 2: Do nothing (treat as success, no frames sent)
+      tracing::debug!(
+        handle = self.core.handle,
+        "PUSH send_multipart called with empty frames vector. Sending nothing."
+      );
+      return Ok(());
+      // Option 3: Send a single empty message (this might be `send(Msg::new())` behavior)
+      // For now, let's go with "do nothing" for an empty Vec.
+    }
+
+    // Ensure MORE flags are set correctly on the frames.
+    let num_frames = frames.len();
+    for (i, frame) in frames.iter_mut().enumerate() {
+      if i < num_frames - 1 {
+        frame.set_flags(frame.flags() | MsgFlags::MORE);
+      } else {
+        frame.set_flags(frame.flags() & !MsgFlags::MORE);
+      }
+    }
+
+    let timeout_opt: Option<Duration> = { self.core_state().options.sndtimeo };
+
+    // 1. Select a peer pipe using the load balancer.
+    let pipe_write_id = loop {
+      if let Some(id) = self.load_balancer.get_next_pipe() {
+        break id; // Found an available peer pipe.
+      }
+      // No peer currently available. Check if the socket itself is still operational.
+      if self.core.command_sender().is_closed() {
+        tracing::warn!(
+          handle = self.core.handle,
+          "PUSH send_multipart failed: Core command mailbox closed (socket likely terminated)."
+        );
+        return Err(ZmqError::InvalidState("Socket terminated".into()));
+      }
+      // Behavior depends on timeout settings for finding a peer.
+      match timeout_opt {
+        Some(duration) if duration.is_zero() => {
+          tracing::trace!(
+            handle = self.core.handle,
+            "PUSH send_multipart failed (non-blocking): No connected peers"
+          );
+          return Err(ZmqError::ResourceLimitReached); // EAGAIN
+        }
+        None => {
+          // Infinite wait for a peer
+          tracing::trace!(
+            handle = self.core.handle,
+            "PUSH send_multipart blocking: Waiting for available peer..."
+          );
+          self.load_balancer.wait_for_pipe().await; // Wait for notification.
+          continue; // Loop back to try getting a pipe again.
+        }
+        Some(duration) => {
+          // Timed wait for a peer
+          tracing::trace!(
+            handle = self.core.handle,
+            ?duration,
+            "PUSH send_multipart timed wait: Waiting for available peer..."
+          );
+          match tokio::time::timeout(duration, self.load_balancer.wait_for_pipe()).await {
+            Ok(()) => continue, // Wait succeeded, pipe might be available now.
+            Err(_timeout_elapsed) => {
+              tracing::debug!(
+                handle = self.core.handle,
+                ?duration,
+                "PUSH send_multipart timed out waiting for peer"
+              );
+              return Err(ZmqError::Timeout); // Timeout elapsed.
+            }
+          }
+        }
+      }
+    };
+
+    // 2. Get the sender channel for the selected pipe.
+    let pipe_tx = if let Some(tx) = self.core_state().get_pipe_sender(pipe_write_id) {
+      tx
+    } else {
+        // This implies the load balancer gave an ID for a pipe that just disappeared.
+        // This could happen if the peer disconnected right after get_next_pipe()
+        // but before get_pipe_sender().
+        tracing::warn!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          "PUSH send_multipart: Pipe sender for chosen peer disappeared. Removing from LB."
+        );
+        self.load_balancer.remove_pipe(pipe_write_id);
+        // For PUSH, failing to send to one peer due to it disappearing might mean
+        // we should retry with another peer if SNDTIMEO allows, or just fail this send.
+        // Given we already selected a peer, let's treat this as a send failure for this attempt.
+        return Err(ZmqError::HostUnreachable(
+          "Chosen peer for PUSH send disappeared".into(),
+        ));
+    };
+
+    // 3. Send all frames sequentially to the chosen pipe.
+    for (frame_idx, frame_to_send) in frames.into_iter().enumerate() {
+      // frame_to_send is consumed by send_msg_with_timeout
+      match send_msg_with_timeout(
+        &pipe_tx,
+        frame_to_send, // frame_to_send is moved here
+        timeout_opt,   // SNDTIMEO applies to each part for HWM blocking
+        self.core.handle,
+        pipe_write_id,
+      )
+      .await
+      {
+        Ok(()) => { /* Part sent successfully */ }
+        Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
+          // HWM reached or timeout sending this part to the chosen peer.
+          // PUSH sockets typically drop the message (or rest of it) in this case.
+          tracing::debug!(
+            handle = self.core.handle,
+            pipe_id = pipe_write_id,
+            frame_index = frame_idx,
+            "PUSH send_multipart: Dropping frame (and subsequent) for chosen peer due to HWM/Timeout."
+          );
+          // Return Ok(()) because the PUSH send operation itself doesn't fail overall
+          // just because one peer was temporarily congested. The message is "lost" for that peer.
+          return Ok(());
+        }
+        Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::Internal(_)) => {
+          // Fatal error for this pipe (e.g., peer disconnected mid-send).
+          tracing::warn!(
+            handle = self.core.handle,
+            pipe_id = pipe_write_id,
+            frame_index = frame_idx,
+            error = %e,
+            "PUSH send_multipart: Chosen peer pipe closed/error during send. Removing from LB."
+          );
+          self.load_balancer.remove_pipe(pipe_write_id);
+          // Propagate as an error for this send_multipart call, as the chosen peer died.
+          // Or, if SNDTIMEO is infinite, we could try to pick another peer, but that adds complexity.
+          // For now, if the chosen one dies, the send fails.
+          return Err(e);
+        }
+        Err(e) => {
+          // Other unexpected errors
+          tracing::error!(
+            handle = self.core.handle,
+            pipe_id = pipe_write_id,
+            frame_index = frame_idx,
+            error = %e,
+            "PUSH send_multipart: Unexpected error sending to chosen peer."
+          );
+          return Err(e);
+        }
+      }
+    }
+
+    Ok(())
   }
 
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    unimplemented!("Not implemented yet")
+    Err(ZmqError::UnsupportedFeature("PUSH sockets cannot receive messages"))
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -286,12 +448,9 @@ impl ISocket for PushSocket {
       "PUSH attaching pipe"
     );
     // Store the mapping from read ID to write ID for cleanup during detachment.
-    self
-      .pipe_read_to_write_id
-      .write()
-      .insert(pipe_read_id, pipe_write_id);
+    self.pipe_read_to_write_id.write().insert(pipe_read_id, pipe_write_id);
     // Add the pipe's write ID to the load balancer so messages can be sent to it.
-    self.load_balancer.add_pipe(pipe_write_id).await;
+    self.load_balancer.add_pipe(pipe_write_id);
   }
 
   async fn update_peer_identity(&self, pipe_read_id: usize, identity: Option<Blob>) {
@@ -315,7 +474,7 @@ impl ISocket for PushSocket {
     let maybe_write_id = self.pipe_read_to_write_id.write().remove(&pipe_read_id);
     if let Some(write_id) = maybe_write_id {
       // If a corresponding write ID was found, remove it from the load balancer.
-      self.load_balancer.remove_pipe(write_id).await;
+      self.load_balancer.remove_pipe(write_id);
       tracing::trace!(
         handle = self.core.handle,
         pipe_read_id = pipe_read_id,

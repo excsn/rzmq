@@ -19,6 +19,10 @@ pub(crate) struct IncomingMessageOrchestrator {
 impl IncomingMessageOrchestrator {
   pub fn new(core: &Arc<SocketCore>) -> Self {
     let rcvhwm = core.core_state.read().options.rcvhwm;
+    Self::new_with_hwm(&core, rcvhwm)
+  }
+
+  pub(crate) fn new_with_hwm(core: &Arc<SocketCore>, rcvhwm: usize) -> Self {
     Self {
       socket_core_handle: core.handle,
       main_incoming_queue: FairQueue::new(rcvhwm.max(1)),

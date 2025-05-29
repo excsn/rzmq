@@ -80,7 +80,7 @@ impl ISocket for PullSocket {
 
   /// PULL sockets cannot send messages. This method will always return an error.
   async fn send(&self, _msg: Msg) -> Result<(), ZmqError> {
-    Err(ZmqError::InvalidState("PULL sockets cannot send messages"))
+    Err(ZmqError::UnsupportedFeature("PULL sockets cannot send messages"))
   }
 
   /// Receives a message using the PULL pattern.
@@ -151,11 +151,11 @@ impl ISocket for PullSocket {
   }
 
   async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
-    Err(ZmqError::InvalidState("PULL sockets cannot send messages"))
+    Err(ZmqError::UnsupportedFeature("PULL sockets cannot send messages"))
   }
 
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    unimplemented!("Not implemented yet")
+    Err(ZmqError::UnsupportedFeature("PULL sockets cannot send messages"))
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {

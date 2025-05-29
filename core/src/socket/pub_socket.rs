@@ -1,10 +1,10 @@
-use crate::{delegate_to_core, Blob};
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
-use crate::socket::core::SocketCore;
+use crate::socket::core::{send_msg_with_timeout, SocketCore};
 use crate::socket::patterns::Distributor;
 use crate::socket::ISocket;
+use crate::{delegate_to_core, Blob, MsgFlags};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -85,9 +85,10 @@ impl ISocket for PubSocket {
   /// PUB sockets do not report send errors like `ResourceLimitReached` or `Timeout`
   /// to the user; they either succeed in queuing or drop (for SNDTIMEO=0).
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
-    let payload_preview_str = msg.data()
-        .map(|d| String::from_utf8_lossy(&d.iter().take(20).copied().collect::<Vec<_>>()).into_owned())
-        .unwrap_or_else(|| "<empty_payload>".to_string());
+    let payload_preview_str = msg
+      .data()
+      .map(|d| String::from_utf8_lossy(&d.iter().take(20).copied().collect::<Vec<_>>()).into_owned())
+      .unwrap_or_else(|| "<empty_payload>".to_string());
 
     tracing::debug!(
         handle = self.core.handle,
@@ -98,7 +99,11 @@ impl ISocket for PubSocket {
     // Use the distributor to send the message to all connected peer pipes.
     // `send_to_all` internally handles HWM and timeouts for each pipe.
     // It collects fatal errors (like ConnectionClosed) for pipes that need cleanup.
-    match self.distributor.send_to_all(&msg, self.core.handle, &self.core.core_state).await {
+    match self
+      .distributor
+      .send_to_all(&msg, self.core.handle, &self.core.core_state)
+      .await
+    {
       Ok(()) => Ok(()), // Succeeded for all reachable peers (or message was dropped due to HWM for some).
       Err(errors) => {
         // Some peers disconnected or had fatal errors during the send attempt.
@@ -126,12 +131,154 @@ impl ISocket for PubSocket {
     Err(ZmqError::InvalidState("PUB sockets cannot receive messages"))
   }
 
-  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
-    unimplemented!("Not Implemented yet")
+  async fn send_multipart(&self, mut frames: Vec<Msg>) -> Result<(), ZmqError> {
+    if frames.is_empty() {
+      // Sending an empty multipart message could be interpreted as sending
+      // a single empty message without the MORE flag.
+      // Or it could be an error. ZMQ PUB generally just sends what it's given.
+      // If we send one empty message:
+      // return self.send(Msg::new()).await;
+      // For now, let's consider it an invalid operation or do nothing.
+      tracing::warn!(
+        handle = self.core.handle,
+        "PUB send_multipart called with empty frames vector. Doing nothing."
+      );
+      return Ok(()); // Or perhaps Err(ZmqError::InvalidMessage("Cannot send empty multipart message".into()))
+    }
+
+    // Ensure MORE flags are set correctly on the frames to be sent.
+    // The last frame must NOT have MORE. All preceding frames MUST have MORE.
+    let num_frames = frames.len();
+    for (i, frame) in frames.iter_mut().enumerate() {
+      if i < num_frames - 1 {
+        // This is not the last frame, ensure MORE is set.
+        frame.set_flags(frame.flags() | MsgFlags::MORE);
+      } else {
+        // This is the last frame, ensure MORE is NOT set.
+        frame.set_flags(frame.flags() & !MsgFlags::MORE);
+      }
+    }
+
+    // Use the distributor to get peer pipe WRITE IDs
+    let peer_pipe_write_ids = self.distributor.get_peer_ids().await;
+    if peer_pipe_write_ids.is_empty() {
+      tracing::trace!(
+        handle = self.core.handle,
+        "PUB send_multipart: No connected peers to send to."
+      );
+      return Ok(()); // No peers, so "success" in the sense of no error, but message not sent.
+    }
+
+    let timeout_opt = self.core.core_state.read().options.sndtimeo;
+    let mut all_fatal_send_errors: Vec<(usize, ZmqError)> = Vec::new();
+
+    for pipe_write_id in peer_pipe_write_ids {
+      let pipe_sender = if let Some(pipe_sender) = self.core.core_state.read().get_pipe_sender(pipe_write_id) {
+        pipe_sender
+      } else {
+        tracing::warn!(
+          handle = self.core.handle,
+          pipe_id = pipe_write_id,
+          "PUB send_multipart: Pipe sender not found in core state. Stale pipe ID in distributor?"
+        );
+        // This pipe_write_id is stale, should be removed from distributor.
+        all_fatal_send_errors.push((
+          pipe_write_id,
+          ZmqError::Internal("Distributor had stale pipe ID".into()),
+        ));
+        continue;
+      };
+
+      tracing::trace!(
+        handle = self.core.handle,
+        target_pipe_id = pipe_write_id,
+        num_frames = num_frames,
+        "PUB send_multipart: Distributing multipart message to pipe."
+      );
+      let mut pipe_had_fatal_error = false;
+      for (frame_idx, frame_to_send) in frames.iter().enumerate() {
+        // Important: Each frame is cloned for sending to this specific pipe.
+        // Distributor::send_to_all in the single `send` method also clones.
+        match send_msg_with_timeout(
+          &pipe_sender,
+          frame_to_send.clone(),
+          timeout_opt,
+          self.core.handle,
+          pipe_write_id,
+        )
+        .await
+        {
+          Ok(()) => { /* Frame sent successfully to this pipe */ }
+          Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
+            // HWM/Timeout for this specific pipe.
+            // PUB sockets silently drop messages for congested peers.
+            tracing::trace!(
+              handle = self.core.handle,
+              pipe_id = pipe_write_id,
+              frame_index = frame_idx,
+              "PUB send_multipart: Dropping frame (and subsequent for this peer) due to HWM/Timeout."
+            );
+            pipe_had_fatal_error = true; // Treat as if we can't send more to this peer for this logical message
+            break; // Stop sending further parts of this logical message to *this* congested peer
+          }
+          Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::Internal(_)) => {
+            // Fatal error for this pipe. Record it.
+            tracing::debug!(
+                handle = self.core.handle,
+                pipe_id = pipe_write_id,
+                frame_index = frame_idx,
+                error = %e,
+                "PUB send_multipart: Fatal error sending to pipe. Marking for cleanup."
+            );
+            all_fatal_send_errors.push((pipe_write_id, e));
+            pipe_had_fatal_error = true;
+            break; // Stop sending further parts to *this* dead peer
+          }
+          Err(e) => {
+            // Other unexpected errors
+            tracing::error!(
+                handle = self.core.handle,
+                pipe_id = pipe_write_id,
+                frame_index = frame_idx,
+                error = %e,
+                "PUB send_multipart: Unexpected error sending to pipe."
+            );
+            all_fatal_send_errors.push((pipe_write_id, e));
+            pipe_had_fatal_error = true;
+            break;
+          }
+        }
+      }
+      if pipe_had_fatal_error {
+        // If we broke sending to this peer, we might want to ensure it's
+        // removed from distributor for subsequent messages if it was a ConnectionClosed type error.
+        // The main error collection below will handle this.
+      }
+    }
+
+    // After attempting to send to all peers, clean up any distributor entries for pipes
+    // that had fatal errors (ConnectionClosed, Internal).
+    if !all_fatal_send_errors.is_empty() {
+      for (failed_pipe_id, error_detail) in all_fatal_send_errors {
+        // Only remove for truly fatal errors, not just HWM/Timeout drops
+        if matches!(error_detail, ZmqError::ConnectionClosed | ZmqError::Internal(_)) {
+          tracing::debug!(
+              handle = self.core.handle,
+              pipe_id = failed_pipe_id,
+              error = %error_detail,
+              "PUB send_multipart: Removing disconnected/errored peer from distributor."
+          );
+          self.distributor.remove_pipe(failed_pipe_id).await;
+        }
+      }
+    }
+
+    Ok(()) // PUB send operations (single or multipart) generally return Ok(()) to the user,
+           // even if messages were dropped for some subscribers due to HWM or disconnections.
   }
 
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    unimplemented!("Not implemented yet")
+    Err(ZmqError::InvalidState("PUB sockets cannot receive messages"))
   }
 
   // --- Pattern-Specific Option Handling ---
@@ -181,10 +328,7 @@ impl ISocket for PubSocket {
       "PUB attaching pipe"
     );
     // Store the mapping from read ID to write ID for cleanup during detachment.
-    self
-      .pipe_read_to_write_id
-      .write()
-      .insert(pipe_read_id, pipe_write_id);
+    self.pipe_read_to_write_id.write().insert(pipe_read_id, pipe_write_id);
     // Add the pipe's write ID to the distributor so messages can be fanned out to it.
     self.distributor.add_pipe(pipe_write_id).await;
   }

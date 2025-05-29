@@ -146,6 +146,10 @@ impl ISocket for RouterSocket {
 
   // --- Pattern-Specific Logic ---
   async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
+    
     let mut current_target_guard = self.current_send_target.lock().await;
     let core_opts = self.core_state().options.clone(); // Clone options for use
     let timeout_opt: Option<Duration> = core_opts.sndtimeo;
@@ -378,6 +382,9 @@ impl ISocket for RouterSocket {
   }
 
   async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
     if frames.is_empty() {
       return Err(ZmqError::InvalidMessage("Cannot send an empty set of frames.".into()));
     }
