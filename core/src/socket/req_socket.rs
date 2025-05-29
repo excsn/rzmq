@@ -11,7 +11,7 @@ use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to Socket
 
 use async_trait::async_trait;
 use futures::future::Either;
-use parking_lot::RwLockReadGuard;
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::HashMap; // For pipe_read_to_write_id map.
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,7 +56,7 @@ pub(crate) struct ReqSocket {
   /// Maps a pipe's read ID (from SocketCore's perspective) to its corresponding write ID.
   /// This is needed during `pipe_detached` to correctly update the state if the target
   /// peer (to whom a request was sent) disconnects.
-  pipe_read_to_write_id: Mutex<HashMap<usize, usize>>,
+  pipe_read_to_write_id: RwLock<HashMap<usize, usize>>,
 }
 
 impl ReqSocket {
@@ -77,7 +77,7 @@ impl ReqSocket {
         state: ReqState::ReadyToSend,
         reply_or_error_notifier: Arc::new(Notify::new()),
       }),
-      pipe_read_to_write_id: Mutex::new(HashMap::new()),
+      pipe_read_to_write_id: RwLock::new(HashMap::new()),
     }
   }
 
@@ -444,7 +444,7 @@ impl ISocket for ReqSocket {
         match op_state_guard.state {
           ReqState::ExpectingReply { target_pipe_write_id } => {
             // Check if this message is from the correct pipe (optional strictness)
-            let expected_read_pipe = self.pipe_read_to_write_id.lock().await.iter().find_map(|(r_id, w_id)| {
+            let expected_read_pipe = self.pipe_read_to_write_id.read().iter().find_map(|(r_id, w_id)| {
               if *w_id == target_pipe_write_id {
                 Some(*r_id)
               } else {
@@ -516,8 +516,7 @@ impl ISocket for ReqSocket {
     // Store the mapping from read ID to write ID for state management on detachment.
     self
       .pipe_read_to_write_id
-      .lock()
-      .await
+      .write()
       .insert(pipe_read_id, pipe_write_id);
     // Add the pipe's write ID to the load balancer for sending requests.
     self.load_balancer.add_pipe(pipe_write_id).await;
@@ -543,7 +542,7 @@ impl ISocket for ReqSocket {
       "REQ detaching pipe"
     );
     // Remove the read ID -> write ID mapping and get the write ID.
-    let maybe_write_id = self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
+    let maybe_write_id = self.pipe_read_to_write_id.write().remove(&pipe_read_id);
 
     if let Some(write_id) = maybe_write_id {
       // Remove the detached pipe's write ID from the load balancer.

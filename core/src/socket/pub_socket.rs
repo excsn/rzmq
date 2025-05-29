@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use parking_lot::RwLock;
 
 /// Implements the PUB (Publish) socket pattern.
 /// PUB sockets distribute messages to all connected SUB (Subscribe) peers.
@@ -24,7 +24,7 @@ pub(crate) struct PubSocket {
   distributor: Distributor,
   /// Maps a pipe's read ID (from SocketCore's perspective) to its corresponding write ID.
   /// This is needed during `pipe_detached` to correctly remove the pipe from the `distributor`.
-  pipe_read_to_write_id: Mutex<HashMap<usize, usize>>,
+  pipe_read_to_write_id: RwLock<HashMap<usize, usize>>,
 }
 
 impl PubSocket {
@@ -36,7 +36,7 @@ impl PubSocket {
     Self {
       core,
       distributor: Distributor::new(),
-      pipe_read_to_write_id: Mutex::new(HashMap::new()),
+      pipe_read_to_write_id: RwLock::new(HashMap::new()),
     }
   }
 }
@@ -183,8 +183,7 @@ impl ISocket for PubSocket {
     // Store the mapping from read ID to write ID for cleanup during detachment.
     self
       .pipe_read_to_write_id
-      .lock()
-      .await
+      .write()
       .insert(pipe_read_id, pipe_write_id);
     // Add the pipe's write ID to the distributor so messages can be fanned out to it.
     self.distributor.add_pipe(pipe_write_id).await;
@@ -208,7 +207,7 @@ impl ISocket for PubSocket {
       "PUB detaching pipe"
     );
     // Remove the read ID -> write ID mapping.
-    let maybe_write_id = self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
+    let maybe_write_id = self.pipe_read_to_write_id.write().remove(&pipe_read_id);
     if let Some(write_id) = maybe_write_id {
       // If a corresponding write ID was found, remove it from the distributor.
       self.distributor.remove_pipe(write_id).await;
