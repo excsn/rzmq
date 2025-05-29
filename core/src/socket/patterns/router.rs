@@ -1,16 +1,16 @@
 use crate::message::Blob;
 use std::collections::HashMap;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 /// Maps peer identities (Blobs) to outgoing pipe write IDs.
 /// Used by ROUTER sockets to send messages to specific peers.
 #[derive(Debug, Default)]
 pub(crate) struct RouterMap {
   // Map: Peer Identity -> Pipe Write ID (Core -> Session channel)
-  pub(crate) identity_to_pipe: Mutex<HashMap<Blob, usize>>,
+  pub(crate) identity_to_pipe: RwLock<HashMap<Blob, usize>>,
   // Map: Pipe Read ID -> Peer Identity (Needed for cleanup on detach)
   // We only learn the Read ID on detach, so need this reverse lookup.
-  pub(crate) read_pipe_to_identity: Mutex<HashMap<usize, Blob>>,
+  pub(crate) read_pipe_to_identity: RwLock<HashMap<usize, Blob>>,
 }
 
 impl RouterMap {
@@ -20,7 +20,7 @@ impl RouterMap {
 
   /// Gets the identity associated with a given pipe read ID.
   pub async fn get_identity_by_read_pipe(&self, pipe_read_id: usize) -> Option<Blob> {
-    self.read_pipe_to_identity.lock().await.get(&pipe_read_id).cloned()
+    self.read_pipe_to_identity.read().await.get(&pipe_read_id).cloned()
   }
 
   /// Adds or updates the mapping for a peer.
@@ -30,8 +30,8 @@ impl RouterMap {
     pipe_read_id: usize,  // ID Core reads from this peer
     pipe_write_id: usize, // ID Core writes to this peer
   ) {
-    let mut id_to_pipe_guard = self.identity_to_pipe.lock().await;
-    let mut pipe_to_id_guard = self.read_pipe_to_identity.lock().await;
+    let mut id_to_pipe_guard = self.identity_to_pipe.write().await;
+    let mut pipe_to_id_guard = self.read_pipe_to_identity.write().await;
 
     // Check if another pipe was using this identity
     if let Some(old_pipe_write_id) = id_to_pipe_guard.insert(identity.clone(), pipe_write_id) {
@@ -63,11 +63,11 @@ impl RouterMap {
 
   /// Removes a peer mapping using the pipe READ ID (typically provided on detachment).
   pub async fn remove_peer_by_read_pipe(&self, pipe_read_id: usize) {
-    let mut pipe_to_id_guard = self.read_pipe_to_identity.lock().await;
+    let mut pipe_to_id_guard = self.read_pipe_to_identity.write().await;
     if let Some(identity) = pipe_to_id_guard.remove(&pipe_read_id) {
       // Also remove the forward mapping
       drop(pipe_to_id_guard); // Release lock before acquiring next
-      let mut id_to_pipe_guard = self.identity_to_pipe.lock().await;
+      let mut id_to_pipe_guard = self.identity_to_pipe.write().await;
       id_to_pipe_guard.remove(&identity);
       tracing::trace!(?identity, pipe_read_id, "RouterMap removed peer by read pipe");
     } else {
@@ -77,6 +77,6 @@ impl RouterMap {
 
   /// Gets the pipe write ID for a given peer identity.
   pub async fn get_pipe(&self, identity: &Blob) -> Option<usize> {
-    self.identity_to_pipe.lock().await.get(identity).copied()
+    self.identity_to_pipe.read().await.get(identity).copied()
   }
 }

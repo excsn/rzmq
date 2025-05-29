@@ -1,11 +1,8 @@
-// core/src/socket/dealer_socket.rs
-
 use crate::delegate_to_core;
 use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
-use crate::socket::options::SocketOptions;
 use crate::socket::patterns::LoadBalancer;
 use crate::socket::ISocket;
 
@@ -15,7 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::RwLockReadGuard;
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::timeout as tokio_timeout;
 
@@ -230,7 +227,7 @@ pub(crate) struct DealerSocket {
   core: Arc<SocketCore>,
   load_balancer: Arc<LoadBalancer>, // Arc for sharing with processor
   incoming_orchestrator: IncomingMessageOrchestrator,
-  pipe_read_to_write_id: Mutex<HashMap<usize, usize>>,
+  pipe_read_to_write_id: RwLock<HashMap<usize, usize>>, //TODO Should review the usefulness of this
   pending_outgoing_queue: Arc<Mutex<VecDeque<Vec<Msg>>>>, // Arc for sharing
   outgoing_queue_activity_notifier: Arc<Notify>,          // Notifies processor of new msgs or available pipes
   peer_availability_notifier: Arc<Notify>,                // Notifies senders/processor of peer changes
@@ -269,7 +266,7 @@ impl DealerSocket {
       core,
       load_balancer: lb_arc,
       incoming_orchestrator: orchestrator,
-      pipe_read_to_write_id: Mutex::new(HashMap::new()),
+      pipe_read_to_write_id: RwLock::new(HashMap::new()),
       pending_outgoing_queue: pending_queue_arc,
       outgoing_queue_activity_notifier: queue_notifier_arc,
       peer_availability_notifier: peer_notifier_arc,
@@ -635,7 +632,7 @@ impl ISocket for DealerSocket {
     );
     self
       .pipe_read_to_write_id
-      .lock()
+      .write()
       .await
       .insert(pipe_read_id, pipe_write_id);
     self.load_balancer.add_pipe(pipe_write_id).await;
@@ -657,7 +654,7 @@ impl ISocket for DealerSocket {
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
     tracing::debug!("[Dealer {}] Detaching pipe_read_id: {}", self.core.handle, pipe_read_id);
-    let maybe_write_id = self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
+    let maybe_write_id = self.pipe_read_to_write_id.write().await.remove(&pipe_read_id);
     if let Some(write_id) = maybe_write_id {
       self.load_balancer.remove_pipe(write_id).await;
 

@@ -1,10 +1,8 @@
-// src/socket/patterns/trie.rs
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use async_recursion::async_recursion;
-use tokio::sync::RwLock; // Use RwLock for concurrent read access, blocking write
+use tokio::sync::RwLock;
 
 /// A node in the subscription trie.
 #[derive(Debug, Default)]

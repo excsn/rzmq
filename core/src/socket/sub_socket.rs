@@ -1,22 +1,19 @@
-// src/socket/sub_socket.rs
-
 use crate::error::ZmqError;
-use crate::message::Msg; // For recv method and subscription commands.
+use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
-use crate::socket::core::{CoreState, SocketCore}; // Core components.
-use crate::socket::options::{SocketOptions, SUBSCRIBE, UNSUBSCRIBE}; // Option constants.
-use crate::socket::patterns::SubscriptionTrie; // SUB uses SubscriptionTrie and FairQueue.
+use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::options::{SUBSCRIBE, UNSUBSCRIBE};
+use crate::socket::patterns::SubscriptionTrie;
 use crate::socket::ISocket;
-use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to SocketCore. // The trait this struct implements.
+use crate::{delegate_to_core, Blob};
 use super::patterns::IncomingMessageOrchestrator; 
 
-use async_channel::Sender as AsyncSender; // For sending commands over pipes.
+use async_channel::Sender as AsyncSender;
 use async_trait::async_trait;
-use parking_lot::RwLockReadGuard;
-use std::collections::HashMap; // For pipe_read_to_write_id map.
+use parking_lot::{RwLock, RwLockReadGuard};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// Implements the SUB (Subscribe) socket pattern.
 /// SUB sockets receive messages published by PUB (Publish) sockets.
@@ -33,7 +30,7 @@ pub(crate) struct SubSocket {
   incoming_orchestrator: IncomingMessageOrchestrator,
   /// Maps a pipe's read ID (from SocketCore's perspective) to its corresponding write ID.
   /// This is needed to send SUBSCRIBE/CANCEL command messages upstream to the correct PUB peer.
-  pipe_read_to_write_id: Mutex<HashMap<usize, usize>>,
+  pipe_read_to_write_id: RwLock<HashMap<usize, usize>>,
 }
 
 impl SubSocket {
@@ -51,7 +48,7 @@ impl SubSocket {
       core,
       subscriptions: SubscriptionTrie::new(),
       incoming_orchestrator: orchestrator,
-      pipe_read_to_write_id: Mutex::new(HashMap::new()),
+      pipe_read_to_write_id: RwLock::new(HashMap::new()),
     }
   }
 
@@ -119,7 +116,7 @@ impl SubSocket {
     // Collect all target pipe senders to send the command to.
     let mut target_pipe_senders: Vec<(usize, AsyncSender<Msg>)> = Vec::new();
     {
-      let pipe_map_guard = self.pipe_read_to_write_id.lock().await;
+      let pipe_map_guard = self.pipe_read_to_write_id.read();
 
       if pipe_map_guard.is_empty() {
         tracing::trace!(
@@ -343,8 +340,7 @@ impl ISocket for SubSocket {
     // Store the mapping from read ID to write ID for sending subscription commands.
     self
       .pipe_read_to_write_id
-      .lock()
-      .await
+      .write()
       .insert(pipe_read_id, pipe_write_id);
 
     // --- FIX: Send existing subscriptions to the newly attached peer ---
@@ -405,7 +401,7 @@ impl ISocket for SubSocket {
       "SUB detaching pipe"
     );
     // Remove the read ID -> write ID mapping.
-    self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
+    self.pipe_read_to_write_id.write().remove(&pipe_read_id);
 
     // ADD: Clear any state the orchestrator might hold for this pipe.
     self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await;

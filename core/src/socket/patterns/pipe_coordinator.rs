@@ -1,27 +1,27 @@
 use std::{collections::HashMap, time::Duration};
 use std::sync::Arc;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use parking_lot::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::ZmqError; // Using Semaphore for per-destination lock
+use crate::ZmqError;
 
-// Renaming for clarity within this context
 type PipeId = usize;
 
 #[derive(Debug)]
 pub struct WritePipeCoordinator {
-  pipe_semaphores: Mutex<HashMap<PipeId, Arc<Semaphore>>>,
+  pipe_semaphores: RwLock<HashMap<PipeId, Arc<Semaphore>>>,
 }
 
 impl WritePipeCoordinator {
   pub fn new() -> Self {
     Self {
-      pipe_semaphores: Mutex::new(HashMap::new()),
+      pipe_semaphores: RwLock::new(HashMap::new()),
     }
   }
 
   // Called when a pipe is attached to the RouterSocket
   pub async fn add_pipe(&self, pipe_id: PipeId) {
-    let mut semaphores_guard = self.pipe_semaphores.lock().await;
+    let mut semaphores_guard = self.pipe_semaphores.write();
     semaphores_guard
       .entry(pipe_id)
       .or_insert_with(|| Arc::new(Semaphore::new(1)));
@@ -30,7 +30,7 @@ impl WritePipeCoordinator {
 
   // Called when a pipe is detached
   pub async fn remove_pipe(&self, pipe_id: PipeId) -> Option<Arc<Semaphore>> {
-    let mut semaphores_guard = self.pipe_semaphores.lock().await;
+    let mut semaphores_guard = self.pipe_semaphores.write();
     let removed = semaphores_guard.remove(&pipe_id);
     if removed.is_some() {
       tracing::trace!(pipe_id, "WritePipeCoordinator: Removed semaphore for pipe.");
@@ -48,7 +48,7 @@ impl WritePipeCoordinator {
     timeout_opt: Option<Duration>,
   ) -> Result<OwnedSemaphorePermit, ZmqError> {
     let semaphore_arc = {
-      let semaphores_guard = self.pipe_semaphores.lock().await;
+      let semaphores_guard = self.pipe_semaphores.read();
       semaphores_guard.get(&pipe_id).cloned()
     };
 

@@ -3,13 +3,13 @@ use crate::message::Msg;
 use crate::socket::core::send_msg_with_timeout;
 use crate::CoreState;
 use std::collections::HashSet;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 /// Distributes messages to a set of connected pipes (write IDs).
 #[derive(Debug, Default)]
 pub(crate) struct Distributor {
   // Store pipe WRITE IDs (Core -> Session channel ID)
-  peers: Mutex<HashSet<usize>>,
+  peers: RwLock<HashSet<usize>>,
 }
 
 impl Distributor {
@@ -19,7 +19,7 @@ impl Distributor {
 
   /// Adds a peer pipe (by its write ID).
   pub async fn add_pipe(&self, pipe_write_id: usize) {
-    let mut peers_guard = self.peers.lock().await;
+    let mut peers_guard = self.peers.write().await;
     if peers_guard.insert(pipe_write_id) {
       tracing::trace!(pipe_id = pipe_write_id, "Distributor added pipe");
     }
@@ -27,7 +27,7 @@ impl Distributor {
 
   /// Removes a peer pipe (by its write ID).
   pub async fn remove_pipe(&self, pipe_write_id: usize) {
-    let mut peers_guard = self.peers.lock().await;
+    let mut peers_guard = self.peers.write().await;
     if peers_guard.remove(&pipe_write_id) {
       tracing::trace!(pipe_id = pipe_write_id, "Distributor removed pipe");
     }
@@ -35,7 +35,7 @@ impl Distributor {
 
   /// Returns a snapshot of the current peer pipe write IDs.
   pub async fn get_peer_ids(&self) -> Vec<usize> {
-    let peers_guard = self.peers.lock().await;
+    let peers_guard = self.peers.read().await;
     peers_guard.iter().copied().collect() // Clone IDs into a new Vec
   }
 

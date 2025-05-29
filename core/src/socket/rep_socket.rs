@@ -3,7 +3,6 @@ use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
-use crate::socket::options::SocketOptions;
 use crate::socket::patterns::FairQueue;
 use crate::socket::{ISocket, SourcePipeReadId};
 
@@ -12,7 +11,7 @@ use parking_lot::RwLockReadGuard;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
@@ -32,7 +31,7 @@ pub(crate) struct RepSocket {
   core: Arc<SocketCore>,
   incoming_request_queue: FairQueue,
   state: Mutex<RepState>,
-  pipe_read_to_write_id: Mutex<HashMap<usize, usize>>,
+  pipe_read_to_write_id: RwLock<HashMap<usize, usize>>,
 }
 
 impl RepSocket {
@@ -42,7 +41,7 @@ impl RepSocket {
       core,
       incoming_request_queue: FairQueue::new(queue_capacity),
       state: Mutex::new(RepState::ReadyToReceive),
-      pipe_read_to_write_id: Mutex::new(HashMap::new()),
+      pipe_read_to_write_id: RwLock::new(HashMap::new()),
     }
   }
 
@@ -212,7 +211,7 @@ impl ISocket for RepSocket {
     drop(current_state_guard);
 
     let pipe_write_id_for_reply = {
-      let map_guard = self.pipe_read_to_write_id.lock().await;
+      let map_guard = self.pipe_read_to_write_id.read().await;
       match map_guard.get(&peer_to_reply_to.source_pipe_read_id).copied() {
         Some(id) => id,
         None => {
@@ -332,7 +331,7 @@ impl ISocket for RepSocket {
     );
     self
       .pipe_read_to_write_id
-      .lock()
+      .write()
       .await
       .insert(pipe_read_id, pipe_write_id);
     self.incoming_request_queue.pipe_attached(pipe_read_id);
@@ -354,7 +353,7 @@ impl ISocket for RepSocket {
       pipe_read_id = pipe_read_id,
       "REP detaching pipe"
     );
-    self.pipe_read_to_write_id.lock().await.remove(&pipe_read_id);
+    self.pipe_read_to_write_id.write().await.remove(&pipe_read_id);
     self.incoming_request_queue.pipe_detached(pipe_read_id);
 
     let mut current_state_guard = self.state.lock().await;

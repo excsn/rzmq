@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use async_channel::{bounded, Receiver as AsyncReceiver, SendError, Sender as AsyncSender, TrySendError};
 use futures::future::join_all;
 use parking_lot::lock_api::RwLockUpgradableReadGuard;
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, Interval};
 
@@ -402,7 +402,7 @@ pub struct SocketCore {
   pub(crate) context: Context,
   pub(crate) command_sender: MailboxSender,
   pub(crate) core_state: parking_lot::RwLock<CoreState>,
-  socket_logic: Mutex<Option<Weak<dyn ISocket>>>,
+  socket_logic: RwLock<Option<Weak<dyn ISocket>>>,
   shutdown_coordinator: Mutex<ShutdownCoordinator>,
 }
 
@@ -418,7 +418,6 @@ impl SocketCore {
     let (cmd_tx, cmd_rx) = mailbox(capacity);
 
     initial_options.socket_type_name = format!("{:?}", socket_type).to_uppercase();
-    let initial_options_for_isocket = initial_options.clone();
 
     let core_state_instance_new = CoreState::new(handle, socket_type, initial_options);
 
@@ -427,7 +426,7 @@ impl SocketCore {
       context: context.clone(),
       command_sender: cmd_tx.clone(),
       core_state: parking_lot::RwLock::new(core_state_instance_new),
-      socket_logic: Mutex::new(None),
+      socket_logic: RwLock::new(None),
       shutdown_coordinator: Mutex::new(ShutdownCoordinator::default()),
     });
 
@@ -442,7 +441,7 @@ impl SocketCore {
       SocketType::Pull => Arc::new(PullSocket::new(socket_core_arc.clone())),
     };
 
-    if let Ok(mut socket_logic_weak_ref_guard) = socket_core_arc.socket_logic.try_lock() {
+    if let Ok(mut socket_logic_weak_ref_guard) = socket_core_arc.socket_logic.try_write() {
       *socket_logic_weak_ref_guard = Some(Arc::downgrade(&socket_logic_arc_impl));
     } else {
       return Err(ZmqError::Internal(
@@ -471,7 +470,7 @@ impl SocketCore {
   pub(crate) async fn get_socket_logic(&self) -> Option<Arc<dyn ISocket>> {
     self
       .socket_logic
-      .lock()
+      .read()
       .await
       .as_ref()
       .and_then(|weak_ref| weak_ref.upgrade())

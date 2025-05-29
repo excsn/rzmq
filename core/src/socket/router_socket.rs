@@ -1,12 +1,10 @@
-// src/socket/router_socket.rs
-
 use crate::delegate_to_core;
 use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore};
-use crate::socket::options::{SocketOptions, ROUTER_MANDATORY};
-use crate::socket::patterns::{incoming_orchestrator::IncomingMessageOrchestrator, RouterMap}; // Use RouterMap and FairQueue
+use crate::socket::options::ROUTER_MANDATORY;
+use crate::socket::patterns::{incoming_orchestrator::IncomingMessageOrchestrator, RouterMap};
 use crate::socket::ISocket;
 
 use std::collections::HashMap;
@@ -667,12 +665,9 @@ impl ISocket for RouterSocket {
 
     if let Some(pipe_write_id) = pipe_write_id_opt {
       if let Some(old_id) = old_identity_opt.as_ref() {
-        let mut id_to_pipe_w_guard = self.router_map_for_send.identity_to_pipe.lock().await; // TokioMutex
-        id_to_pipe_w_guard.remove(old_id);
-        // drop(id_to_pipe_w_guard) happens implicitly
+        self.router_map_for_send.identity_to_pipe.write().await.remove(old_id);
       }
-      let mut id_to_pipe_w_guard = self.router_map_for_send.identity_to_pipe.lock().await; // TokioMutex
-      id_to_pipe_w_guard.insert(new_identity.clone(), pipe_write_id);
+      self.router_map_for_send.identity_to_pipe.write().await.insert(new_identity.clone(), pipe_write_id);
     } else {
       tracing::error!(
         handle = self.core.handle,

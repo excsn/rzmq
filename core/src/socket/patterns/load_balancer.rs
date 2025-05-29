@@ -1,7 +1,5 @@
-// src/socket/patterns/load_balancer.rs
-
 use std::{collections::VecDeque, sync::Arc};
-use tokio::sync::{Mutex, Notify}; // Use Mutex for interior mutability needed by ISocket::send
+use tokio::sync::{Mutex, Notify};
 
 /// Distributes messages to available pipes in a round-robin fashion.
 #[derive(Debug, Default)]
