@@ -2,6 +2,8 @@
 
 //! Type aliases for actor communication channels based on `async-channel`.
 
+#[cfg(feature = "io-uring")]
+use crate::engine::uring_core::AppToUringEngineCmd;
 use crate::runtime::command::Command; // Import the Command enum that these mailboxes will carry.
 
 /// The sending end of an actor's mailbox.
@@ -11,6 +13,13 @@ pub type MailboxSender = async_channel::Sender<Command>;
 /// The receiving end of an actor's mailbox.
 /// Only one task should typically own and receive from a `MailboxReceiver` to process commands sequentially.
 pub type MailboxReceiver = async_channel::Receiver<Command>;
+
+#[cfg(feature = "io-uring")]
+pub type URingMailboxSender = async_channel::Sender<AppToUringEngineCmd>;
+
+
+#[cfg(feature = "io-uring")]
+pub type URingMailboxReceiver = async_channel::Receiver<AppToUringEngineCmd>;
 
 /// Default capacity for bounded mailboxes created by the `mailbox()` helper function.
 /// This capacity applies to the single mailbox used by `SocketCore` and other simpler actors.

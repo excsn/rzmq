@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 /// Type alias for the mailbox sender used by actors to send `Command`s.
 /// This is typically cloned and passed around.
-pub type MailboxSender = async_channel::Sender<Command>;
+pub type MailboxSender = async_channel::Sender<Command>; // TODO Remove this
 
 /// Describes how SessionBase connects to its engine.
 #[derive(Debug)]

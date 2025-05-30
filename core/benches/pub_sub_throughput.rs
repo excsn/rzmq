@@ -18,7 +18,7 @@ const NUM_MESSAGES_PUB_SUB: usize = 1000;
 const BIND_ADDR_PUB_SUB: &str = "tcp://127.0.0.1:5682"; // Unique port
 const SETUP_TIMEOUT_PUB_SUB: Duration = Duration::from_secs(5);
 const EVENT_RECV_TIMEOUT_PUB_SUB: Duration = Duration::from_secs(4);
-const BENCH_HWM_PUB_SUB: i32 = 100_000;
+const BENCH_HWM_PUB_SUB: i32 = 1_000_000;
 
 // --- Helper: wait_for_event (can be in common.rs) ---
 async fn wait_for_event_pub_sub(

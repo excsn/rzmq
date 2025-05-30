@@ -10,6 +10,7 @@ use crate::protocol::zmtp::command::{
 };
 use crate::protocol::zmtp::greeting::{ZmtpGreeting, GREETING_LENGTH, GREETING_VERSION_MAJOR, MECHANISM_LENGTH};
 use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
+use crate::runtime::mailbox::URingMailboxReceiver;
 use crate::runtime::{ActorType, Command as SessionBaseCommand, MailboxReceiver, MailboxSender};
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
@@ -18,9 +19,9 @@ use crate::socket::options::ZmtpEngineConfig;
 use crate::Blob;
 
 use super::uring_recv::UringMultishotReceiver;
-use tokio_uring::buf::BufResult;
+use tokio_uring::BufResult;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -30,7 +31,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 use std::{fmt, io};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt}; // Use alias for std AsyncWriteExt
+use tokio::io::{AsyncWriteExt as TokioAsyncWriteExt}; 
 use tokio::time::interval as tokio_interval;
 use tokio_uring::net::TcpStream as UringTcpStream;
 
@@ -46,9 +47,8 @@ pub(crate) enum EncodedMsgParts {
   ForSendZc(Bytes, Option<Bytes>),
 }
 
-#[derive(Debug)]
 pub(crate) enum ActiveReceiveFutureUring {
-  UringMultishot(Pin<Box<dyn Future<Output = BufResult<(usize, Vec<BytesMut>)>> + Send>>),
+  UringMultishot(Pin<Box<dyn Future<Output = BufResult<usize, Vec<BytesMut>>> + Send>>),
   NotActive,
 }
 
@@ -61,15 +61,13 @@ impl Default for ActiveReceiveFutureUring {
 pub(crate) struct ZmtpEngineCoreUring {
   handle: usize,
   session_base_mailbox: MailboxSender,
-  app_cmd_rx: MailboxReceiver<AppToUringEngineCmd>,
+  app_cmd_rx: URingMailboxReceiver,
   stream: UringTcpStream,
   config: ZmtpEngineConfig,
   is_server: bool,
   mechanism: Box<dyn Mechanism>,
   data_cipher: Option<Box<dyn IDataCipher>>,
-  // New buffer for raw network reads, used when a data_cipher is active.
-  // `self.read_buffer` will then be used for zmtp_manual_parser input after decryption.
-  network_bytes_buffer: BytesMut, // For accumulating bytes from socket before decryption/parsing secure messages
+  network_bytes_buffer: BytesMut, 
   read_buffer: BytesMut,
   zmtp_manual_parser: ZmtpManualParser,
   multishot_receiver_manager: Option<UringMultishotReceiver>,
@@ -114,7 +112,7 @@ impl ZmtpEngineCoreUring {
   pub fn new(
     handle: usize,
     session_base_mailbox: MailboxSender,
-    app_cmd_rx: MailboxReceiver<AppToUringEngineCmd>,
+    app_cmd_rx: URingMailboxReceiver,
     stream: UringTcpStream,
     config: ZmtpEngineConfig,
     is_server: bool,
@@ -150,7 +148,7 @@ impl ZmtpEngineCoreUring {
       is_server,
       mechanism: Box::new(NullMechanism),
       data_cipher: None,
-      network_bytes_buffer: BytesMut::with_capacity(8192 * 2), // Initialize new buffer
+      network_bytes_buffer: BytesMut::with_capacity(8192 * 2), 
       read_buffer: BytesMut::with_capacity(8192 * 2),
       zmtp_manual_parser: ZmtpManualParser::new(),
       multishot_receiver_manager: ms_receiver_init,
@@ -211,7 +209,7 @@ impl ZmtpEngineCoreUring {
   }
 
   async fn send_greeting_uring(&mut self) -> Result<(), ZmqError> {
-    let mut greeting_buf = BytesMut::with_capacity(GREETING_LENGTH);
+    let mut greeting_buf_bytes_mut = BytesMut::with_capacity(GREETING_LENGTH);
 
     let own_greeting_mechanism_bytes = {
       if self.config.use_noise_xx {
@@ -255,7 +253,7 @@ impl ZmtpEngineCoreUring {
         tracing::debug!(engine_handle = self.handle, "Uring: Proposing NULL in own greeting.");
         NullMechanism::NAME_BYTES
       }
-      #[cfg(not(feature = "noise_xx"))] // If noise_xx feature is NOT compiled
+      #[cfg(not(feature = "noise_xx"))] 
       {
         if self.config.use_plain {
           tracing::debug!(
@@ -273,10 +271,11 @@ impl ZmtpEngineCoreUring {
       }
     };
 
-    ZmtpGreeting::encode(&own_greeting_mechanism_bytes, self.is_server, &mut greeting_buf);
-    self.stream.write_all(&greeting_buf).await?;
-    // No explicit flush needed for uring after write_all if not corked.
-    // If corked, uncorking is the "flush".
+    ZmtpGreeting::encode(&own_greeting_mechanism_bytes, self.is_server, &mut greeting_buf_bytes_mut);
+    // <<< MODIFIED START [Convert BytesMut to Vec<u8> for write_all] >>>
+    let (res, _) = self.stream.write_all(greeting_buf_bytes_mut.to_vec()).await;
+    res?;
+    // <<< MODIFIED END >>>
     tracing::debug!(engine_handle = self.handle, "Sent own ZMTP greeting (uring).");
     self.last_activity_time = Instant::now();
     Ok(())
@@ -285,10 +284,16 @@ impl ZmtpEngineCoreUring {
   async fn receive_greeting_uring(&mut self) -> Result<ZmtpGreeting, ZmqError> {
     let mut received_greeting_bytes = BytesMut::with_capacity(GREETING_LENGTH);
     while received_greeting_bytes.len() < GREETING_LENGTH {
-      let bytes_read = self.stream.read_buf(&mut received_greeting_bytes).await?;
+      let remaining_to_read = GREETING_LENGTH - received_greeting_bytes.len();
+      let mut temp_buf = vec![0u8; remaining_to_read.min(1024)]; 
+
+      let (res, temp_buf_after_read) = self.stream.read(temp_buf).await;
+      let bytes_read = res?;
+      
       if bytes_read == 0 {
         return Err(ZmqError::ConnectionClosed);
       }
+      received_greeting_bytes.put_slice(&temp_buf_after_read[..bytes_read]);
       self.last_activity_time = Instant::now();
     }
     ZmtpGreeting::decode(&mut received_greeting_bytes)?
@@ -327,14 +332,20 @@ impl ZmtpEngineCoreUring {
         let encoded_token = self.encode_msg_for_send(&cmd_msg)?;
         match encoded_token {
           EncodedMsgParts::ForWriteAll(bytes) => {
-            self.stream.write_all(&bytes).await?;
+            // <<< MODIFIED START [Convert Bytes to Vec<u8> for write_all] >>>
+            let (res, _) = self.stream.write_all(bytes.to_vec()).await;
+            res?;
+            // <<< MODIFIED END >>>
           }
           EncodedMsgParts::ForSendZc(hdr, payload_opt) => {
-            self.stream.write_all(&hdr).await?;
+            // <<< MODIFIED START [Convert Bytes to Vec<u8> for write_all] >>>
+            let (res_hdr, _) = self.stream.write_all(hdr.to_vec()).await;
+            res_hdr?;
+            // <<< MODIFIED END >>>
             if let Some(body) = payload_opt {
               if !body.is_empty() {
-                let (res, _) = self.stream.send_zc(&body).await;
-                res?;
+                let (res_body, _) = self.stream.send_zc(&body).await;
+                res_body?;
               }
             }
           }
@@ -347,10 +358,13 @@ impl ZmtpEngineCoreUring {
           match self.zmtp_manual_parser.decode_from_buffer(&mut self.read_buffer) {
             Ok(Some(msg)) => break msg,
             Ok(None) => {
-              let bytes_read = self.stream.read_buf(&mut self.read_buffer).await?;
+              let mut temp_read_buf = vec![0u8; 4096]; 
+              let (res, temp_read_buf_after_read) = self.stream.read(temp_read_buf).await;
+              let bytes_read = res?;
               if bytes_read == 0 {
                 return Err(ZmqError::ConnectionClosed);
               }
+              self.read_buffer.put_slice(&temp_read_buf_after_read[..bytes_read]); 
               self.last_activity_time = Instant::now();
               continue;
             }
@@ -364,7 +378,6 @@ impl ZmtpEngineCoreUring {
         }
         self.mechanism.process_token(received_msg.data().unwrap_or_default())?;
       }
-      // TODO: Implement ZAP interaction if self.mechanism.zap_request_needed()
     }
     if self.mechanism.is_error() {
       return Err(ZmqError::SecurityError(
@@ -375,13 +388,6 @@ impl ZmtpEngineCoreUring {
   }
 
   async fn exchange_ready_commands_uring(&mut self) -> Result<Option<Blob>, ZmqError> {
-    // Operates on self.stream, self.read_buffer, self.zmtp_manual_parser
-    // Similar logic to the READY part of ZmtpEngineCoreStd::perform_security_and_ready_handshake
-    // Send local READY
-    // Receive peer's READY (looping with self.stream.read_buf into self.read_buffer, then parse with self.zmtp_manual_parser)
-    // Extract identity from peer's READY
-    // Return peer's identity from READY command
-    // Placeholder for brevity, but it's a direct adaptation
     let mut peer_identity_from_ready: Option<Blob> = None;
     let local_socket_type_name = self.config.socket_type_name.clone();
     let local_routing_id = self.config.routing_id.clone();
@@ -401,14 +407,20 @@ impl ZmtpEngineCoreUring {
 
       match encoded_ready {
         EncodedMsgParts::ForWriteAll(bytes) => {
-          self.stream.write_all(&bytes).await?;
+          // <<< MODIFIED START [Convert Bytes to Vec<u8> for write_all] >>>
+          let (res, _) = self.stream.write_all(bytes.to_vec()).await;
+          res?;
+          // <<< MODIFIED END >>>
         }
         EncodedMsgParts::ForSendZc(hdr, opt_body) => {
-          self.stream.write_all(&hdr).await?;
+          // <<< MODIFIED START [Convert Bytes to Vec<u8> for write_all] >>>
+          let (res_hdr, _) = self.stream.write_all(hdr.to_vec()).await;
+          res_hdr?;
+          // <<< MODIFIED END >>>
           if let Some(b) = opt_body {
             if !b.is_empty() {
-              let (res, _) = self.stream.send_zc(&b).await;
-              res?;
+              let (res_body, _) = self.stream.send_zc(&b).await;
+              res_body?;
             }
           }
         }
@@ -428,10 +440,13 @@ impl ZmtpEngineCoreUring {
           }
         }
         None => {
-          let n = self.stream.read_buf(&mut self.read_buffer).await?;
+          let mut temp_read_buf = vec![0u8; 4096];
+          let (res, temp_read_buf_after_read) = self.stream.read(temp_read_buf).await;
+          let n = res?;
           if n == 0 {
             return Err(ZmqError::ConnectionClosed);
           }
+          self.read_buffer.put_slice(&temp_read_buf_after_read[..n]);
           self.last_activity_time = Instant::now();
         }
       }
@@ -446,7 +461,7 @@ impl ZmtpEngineCoreUring {
     if self.is_server {
       let mut server_ready_props = HashMap::new();
       server_ready_props.insert("Socket-Type".to_string(), local_socket_type_name.as_bytes().to_vec());
-      if let Some(id_blob) = local_routing_id {
+      if let Some(id_blob) = self.config.routing_id.clone() { 
         if !id_blob.is_empty() && id_blob.len() <= 255 {
           server_ready_props.insert("Identity".to_string(), id_blob.to_vec());
         }
@@ -455,27 +470,26 @@ impl ZmtpEngineCoreUring {
       let encoded_ready = self.encode_msg_for_send(&server_ready_cmd_msg)?;
       match encoded_ready {
         EncodedMsgParts::ForWriteAll(bytes) => {
-          self.stream.write_all(&bytes).await?;
+          // <<< MODIFIED START [Convert Bytes to Vec<u8> for write_all] >>>
+          let (res, _) = self.stream.write_all(bytes.to_vec()).await;
+          res?;
+          // <<< MODIFIED END >>>
         }
         EncodedMsgParts::ForSendZc(hdr, opt_body) => {
-          self.stream.write_all(&hdr).await?;
+          // <<< MODIFIED START [Convert Bytes to Vec<u8> for write_all] >>>
+          let (res_hdr, _) = self.stream.write_all(hdr.to_vec()).await;
+          res_hdr?;
+          // <<< MODIFIED END >>>
           if let Some(b) = opt_body {
             if !b.is_empty() {
-              let (res, _) = self.stream.send_zc(&b).await;
-              res?;
+              let (res_body, _) = self.stream.send_zc(&b).await;
+              res_body?;
             }
           }
         }
       }
       self.last_activity_time = Instant::now();
     }
-    // let final_peer_id = self
-    //   .mechanism
-    //   .peer_identity()
-    //   .map(Blob::from)
-    //   .or(peer_identity_from_ready);
-
-    // Ok(final_peer_id)
     Ok(peer_identity_from_ready)
   }
 
@@ -539,25 +553,18 @@ impl ZmtpEngineCoreUring {
     tracing::info!("ZmtpEngineCoreUring (handle {}) run_loop starting.", self.handle);
     let mut final_error_for_actor_stop: Option<ZmqError> = None;
 
-    // --- Handshake Phase (operates on self.stream: UringTcpStream) ---
-    // --- Handshake Phase (operates on self.stream: UringTcpStream) ---
-    let handshake_and_ready_result: Result<Option<Blob> /* final peer id */, ZmqError> = async {
-      // 1. Greetings (uses self.stream for read_buf/write_all)
-      self.send_greeting_uring().await?; // Uses self.stream
-      let peer_greeting = self.receive_greeting_uring().await?; // Uses self.stream & self.read_buffer
-      self.read_buffer.clear(); // Clear after greeting, before security handshake ZMTP commands
+    let handshake_and_ready_result: Result<Option<Blob>, ZmqError> = async {
+      self.send_greeting_uring().await?; 
+      let peer_greeting = self.receive_greeting_uring().await?; 
+      self.read_buffer.clear(); 
 
-      // 2. Security Token Exchange (uses self.stream for ZMTP command frames)
-      // This sets self.mechanism
       self.perform_security_handshake_uring(peer_greeting).await?;
-      self.read_buffer.clear(); // Clear after security tokens, before ZMTP READY commands
+      self.read_buffer.clear(); 
 
-      // 3. ZMTP READY Command Exchange (uses self.stream for ZMTP command frames)
       let identity_from_ready_cmd = self.exchange_ready_commands_uring().await?;
-      self.read_buffer.clear(); // Clear after READY commands, before data phase
+      self.read_buffer.clear(); 
 
-      // 4. Determine final peer identity and set up data_cipher
-      let mechanism_peer_id = self.mechanism.peer_identity(); // Get before consuming mechanism
+      let mechanism_peer_id = self.mechanism.peer_identity(); 
 
       if self.mechanism.status() == MechanismStatus::Ready {
         let current_mechanism_box = std::mem::replace(&mut self.mechanism, Box::new(NullMechanism));
@@ -571,7 +578,7 @@ impl ZmtpEngineCoreUring {
           }
           Err(e) => {
             tracing::error!(engine_handle = self.handle, "Failed to get data cipher (uring): {}", e);
-            return Err(e); // Propagate error to handshake_and_ready_result
+            return Err(e); 
           }
         }
       } else {
@@ -607,7 +614,6 @@ impl ZmtpEngineCoreUring {
             engine_handle = self.handle,
             "ZMTP handshake & READY successful (uring). Entering main loop."
           );
-          // If using multishot AND no encryption, arm it now.
           if self.config.use_recv_multishot && self.data_cipher.is_none() {
             self.try_arm_multishot_recv_future_uring();
           }
@@ -639,10 +645,7 @@ impl ZmtpEngineCoreUring {
       pong_timeout_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
       'main_loop: loop {
-        // Determine if specialized uring I/O can be used
         let is_encrypted_session = self.data_cipher.is_some();
-
-        // Conditions for enabling specialized uring receive paths
         let can_poll_multishot_recv = !is_encrypted_session
           && self.config.use_recv_multishot
           && matches!(
@@ -650,30 +653,23 @@ impl ZmtpEngineCoreUring {
             ActiveReceiveFutureUring::UringMultishot(_)
           );
 
-        let can_use_standard_read_buf = matches!(self.active_recv_future_holder, ActiveReceiveFutureUring::NotActive)
+        let can_use_standard_read = matches!(self.active_recv_future_holder, ActiveReceiveFutureUring::NotActive)
           && (is_encrypted_session || !self.config.use_recv_multishot)
           && self.network_bytes_buffer.capacity() > self.network_bytes_buffer.len();
 
         tokio::select! {
           biased;
-
-          // --- SEND PATH (AppToUringEngineCmd::SendMsg) ---
           app_command_res = self.app_cmd_rx.recv() => {
             match app_command_res {
               Ok(AppToUringEngineCmd::SendMsg(rzmq_msg)) => {
                 let original_msg_is_last_part = !rzmq_msg.is_more();
-
-                // 1. ZMTP-frame the rzmq_msg
-                //    encode_msg_for_send uses self.config.use_send_zerocopy internally to decide variant.
                 let encoded_zmtp_parts = match self.encode_msg_for_send(&rzmq_msg) {
                   Ok(parts) => parts,
                   Err(e) => { final_error_for_actor_stop = Some(e); break 'main_loop; }
                 };
 
-                // 2. Encrypt if cipher active, otherwise prepare for direct send
                 let wire_send_op_result: Result<(), io::Error> = async {
                   if let Some(cipher) = &mut self.data_cipher {
-                    // Encrypted path: combine ZMTP parts, then encrypt
                     let plaintext_zmtp_frame_bytes = match encoded_zmtp_parts {
                       EncodedMsgParts::ForWriteAll(bytes) => bytes,
                       EncodedMsgParts::ForSendZc(hdr, payload_opt) => {
@@ -686,29 +682,31 @@ impl ZmtpEngineCoreUring {
                     let encrypted_wire_bytes = cipher.encrypt_zmtp_frame(plaintext_zmtp_frame_bytes)
                                                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-                    // Send encrypted blob (Noise message: [len][ciphertext+tag])
-                    // Try to use send_zc for the main part of the encrypted blob.
                     if self.config.use_send_zerocopy && encrypted_wire_bytes.len() > 2 {
                       let (len_prefix, main_blob) = encrypted_wire_bytes.split_at(2);
-                      self.stream.write_all(len_prefix).await?;
+                      // <<< MODIFIED START [Convert slice to Vec for write_all] >>>
+                      self.stream.write_all(len_prefix.to_vec()).await.0?;
+                      // <<< MODIFIED END >>>
                       if !main_blob.is_empty() { self.stream.send_zc(&Bytes::copy_from_slice(main_blob)).await.0?; }
                     } else {
-                      self.stream.write_all(&encrypted_wire_bytes).await?;
+                      // <<< MODIFIED START [Convert Bytes to Vec for write_all] >>>
+                      self.stream.write_all(encrypted_wire_bytes.to_vec()).await.0?;
+                      // <<< MODIFIED END >>>
                     }
                   } else {
-                    // Raw ZMTP path (no encryption)
                     match encoded_zmtp_parts {
-                      EncodedMsgParts::ForWriteAll(bytes) => self.stream.write_all(&bytes).await?,
+                      // <<< MODIFIED START [Convert Bytes to Vec for write_all] >>>
+                      EncodedMsgParts::ForWriteAll(bytes) => self.stream.write_all(bytes.to_vec()).await.0?,
                       EncodedMsgParts::ForSendZc(hdr, payload_opt) => {
-                        self.stream.write_all(&hdr).await?;
+                        self.stream.write_all(hdr.to_vec()).await.0?;
                         if let Some(body) = payload_opt { if !body.is_empty() { self.stream.send_zc(&body).await.0?; }}
                       }
+                      // <<< MODIFIED END >>>
                     }
                   }
                   Ok(())
                 }.await;
 
-                // 3. TCP_CORK logic (applied before send, released after)
                 #[cfg(target_os="linux")]
                 if self.config.use_cork {
                   if let Some(fd) = self.cork_fd {
@@ -737,22 +735,29 @@ impl ZmtpEngineCoreUring {
                   }
                 }
               }
-              Ok(AppToUringEngineCmd::Stop) => { final_error_for_actor_stop = None; break 'main_loop; } // Clean stop
+              Ok(AppToUringEngineCmd::Stop) => { final_error_for_actor_stop = None; break 'main_loop; } 
               Err(_) => { final_error_for_actor_stop = Some(ZmqError::Internal("AppCmdRx closed for Uring Engine".into())); break 'main_loop; }
             }
           }
 
-          // --- RECEIVE PATH: Multishot (only if NO cipher and configured) ---
-          multishot_res = async { /* poll self.active_recv_future_holder ... */ }, if can_poll_multishot_recv => {
-            self.active_recv_future_holder = ActiveReceiveFutureUring::NotActive; // Reset before processing
-            match multishot_res { // This is the BufResult from the future
-              Ok(Ok((num_filled, returned_buffers))) => {
+          multishot_res = async { 
+            let future_to_poll = match std::mem::replace(&mut self.active_recv_future_holder, ActiveReceiveFutureUring::NotActive) {
+                ActiveReceiveFutureUring::UringMultishot(fut) => fut,
+                ActiveReceiveFutureUring::NotActive => {
+                    tracing::error!(engine_handle = self.handle, "UringEngine: Multishot future was NotActive unexpectedly.");
+                    // This return will be caught by the match below
+                    return Err(io::Error::new(io::ErrorKind::Other, "Multishot future vanished"));
+                }
+            };
+            future_to_poll.await // This is BufResult<usize, Vec<BytesMut>>
+          }, if can_poll_multishot_recv => {
+            match multishot_res { 
+              Ok((num_filled, returned_buffers)) => { 
                 self.last_activity_time = Instant::now();
-                self.expecting_first_frame_of_msg = true; // Received data, reset send expectation
+                self.expecting_first_frame_of_msg = true; 
                 #[cfg(target_os="linux")] if self.is_corked { if self.set_tcp_cork_uring(false).await.is_err() { final_error_for_actor_stop = Some(ZmqError::Internal("Cork unset failed (ms_recv)".into())); break 'main_loop; }}
 
                 if let Some(ms_mgr) = self.multishot_receiver_manager.as_mut() {
-                  // `process_completed_submission` uses ZmtpCodec to parse Msgs from raw ZMTP frames
                   match ms_mgr.process_completed_submission(num_filled, returned_buffers) {
                     Ok(decoded_zmtp_msgs) => {
                       for msg in decoded_zmtp_msgs {
@@ -768,50 +773,45 @@ impl ZmtpEngineCoreUring {
                   break 'main_loop;
                 }
               }
-              Ok(Err(e)) => { final_error_for_actor_stop = Some(ZmqError::from(e)); break 'main_loop; } // IO error from recv_multishot
-              Err(_) => { /* Future dropped/cancelled, ignore */ }
+              Err(e) => { final_error_for_actor_stop = Some(ZmqError::from(e)); break 'main_loop; } 
             }
-            // Re-arm multishot if still no error and conditions met
             if final_error_for_actor_stop.is_none() && !is_encrypted_session && self.config.use_recv_multishot {
                self.try_arm_multishot_recv_future_uring();
             }
           }
-
-          // --- RECEIVE PATH: Standard read_buf (used if cipher active OR multishot not configured/armed) ---
-          // Reads raw bytes into `self.network_bytes_buffer`.
-          // If cipher active, decrypts from `network_bytes_buffer` into `self.read_buffer`.
-          // If no cipher (and multishot wasn't used for this read), moves data from `network_bytes_buffer` to `self.read_buffer`.
-          // Then, `self.zmtp_manual_parser` decodes ZMTP messages from `self.read_buffer`.
-          read_buf_res = self.stream.read_buf(&mut self.network_bytes_buffer), if can_use_standard_read_buf => {
-            match read_buf_res {
-              Ok(0) => { // EOF
+          
+          read_res_tuple = async {
+            let mut temp_read_buf = vec![0u8; self.network_bytes_buffer.capacity().saturating_sub(self.network_bytes_buffer.len()).max(4096)]; 
+            self.stream.read(temp_read_buf).await 
+          }, if can_use_standard_read => { 
+            let (read_result_io, temp_buf_after_read) = read_res_tuple; 
+            match read_result_io {
+              Ok(0) => { 
                 final_error_for_actor_stop = Some(ZmqError::ConnectionClosed);
                 break 'main_loop;
               }
-              Ok(_) => { // Some bytes read into self.network_bytes_buffer
+              Ok(bytes_read) => { 
+                self.network_bytes_buffer.put_slice(&temp_buf_after_read[..bytes_read]); 
                 self.last_activity_time = Instant::now();
                 self.expecting_first_frame_of_msg = true;
                 #[cfg(target_os="linux")] if self.is_corked { if self.set_tcp_cork_uring(false).await.is_err() { final_error_for_actor_stop = Some(ZmqError::Internal("Cork unset failed (rb_recv)".into())); break 'main_loop; }}
 
                 if let Some(cipher) = &mut self.data_cipher {
-                  // Decrypt from network_bytes_buffer, append plaintext ZMTP to self.read_buffer
                   'decrypt_loop_uring: loop {
                     match cipher.decrypt_wire_data_to_zmtp_frame(&mut self.network_bytes_buffer) {
                       Ok(Some(plaintext_zmtp_bytes)) => {
                         self.read_buffer.put(plaintext_zmtp_bytes);
                       }
-                      Ok(None) => break 'decrypt_loop_uring, // Need more in network_bytes_buffer
+                      Ok(None) => break 'decrypt_loop_uring, 
                       Err(e) => { final_error_for_actor_stop = Some(e); break 'main_loop; }
                     }
                   }
                 } else {
-                  // No cipher, move data directly to ZMTP parser's input buffer (self.read_buffer)
                   self.read_buffer.extend_from_slice(&self.network_bytes_buffer);
                   self.network_bytes_buffer.clear();
                 }
                 if final_error_for_actor_stop.is_some() { break 'main_loop; }
 
-                // Parse ZMTP from self.read_buffer
                 'parse_loop_uring: loop {
                   match self.zmtp_manual_parser.decode_from_buffer(&mut self.read_buffer) {
                     Ok(Some(msg)) => {
@@ -819,17 +819,11 @@ impl ZmtpEngineCoreUring {
                         break 'main_loop;
                       }
                     }
-                    Ok(None) => break 'parse_loop_uring, // Need more in self.read_buffer
+                    Ok(None) => break 'parse_loop_uring, 
                     Err(e) => { final_error_for_actor_stop = Some(e); break 'main_loop; }
                   }
                 }
                 if final_error_for_actor_stop.is_some() { break 'main_loop; }
-
-                // Optional buffer compaction for network_bytes_buffer and read_buffer
-                // if self.network_bytes_buffer.capacity() > ... { self.network_bytes_buffer = BytesMut::with_capacity(...); }
-
-                // If multishot is configured but wasn't used (e.g. because cipher was active,
-                // but now isn't, or if it just wasn't armed), try to arm it for next time.
                 if !is_encrypted_session && self.config.use_recv_multishot && matches!(self.active_recv_future_holder, ActiveReceiveFutureUring::NotActive) {
                   self.try_arm_multishot_recv_future_uring();
                 }
@@ -838,42 +832,41 @@ impl ZmtpEngineCoreUring {
             }
           }
 
-          // --- Heartbeat PING Timer ---
           _ = async { ping_check_timer.as_mut().unwrap().tick().await }, if keepalive_ping_enabled && !self.waiting_for_pong && ping_check_timer.is_some() => {
             let now = Instant::now();
             if now.duration_since(self.last_activity_time) >= self.heartbeat_ivl.unwrap() {
               let ping_to_send_msg = ZmtpCommand::create_ping(0, b"");
-              // ZMTP-frame (encode_msg_for_send will produce ForWriteAll for commands)
               let encoded_ping_parts = match self.encode_msg_for_send(&ping_to_send_msg) {
                   Ok(parts) => parts, Err(e) => { final_error_for_actor_stop = Some(e); break 'main_loop; }
               };
               let plaintext_ping_bytes = match encoded_ping_parts {
                   EncodedMsgParts::ForWriteAll(b) => b,
-                  EncodedMsgParts::ForSendZc(h, p_opt) => { // Should not happen for commands, but handle
+                  EncodedMsgParts::ForSendZc(h, p_opt) => { 
                       let mut temp = BytesMut::new(); temp.put(h); if let Some(p) = p_opt { temp.put(p); } temp.freeze()
                   }
               };
 
-              // Encrypt if cipher active
               let wire_bytes_ping = if let Some(cipher) = &mut self.data_cipher {
                 match cipher.encrypt_zmtp_frame(plaintext_ping_bytes) {
                   Ok(eb) => eb, Err(e) => { final_error_for_actor_stop = Some(e); break 'main_loop; }
                 }
               } else { plaintext_ping_bytes };
 
-              // Corking logic
               #[cfg(target_os="linux")]
               if self.config.use_cork {
                 if let Some(fd) = self.cork_fd { if !self.is_corked { if self.set_tcp_cork_uring(true).await.is_err() { final_error_for_actor_stop=Some(ZmqError::Internal("cork err".into())); break 'main_loop; }}}}
 
-              // Send PING (potentially ZC for encrypted blob)
               let ping_send_op_result: Result<(), io::Error> = async {
                   if self.data_cipher.is_some() && self.config.use_send_zerocopy && wire_bytes_ping.len() > 2 {
                       let (len_prefix, main_blob) = wire_bytes_ping.split_at(2);
-                      self.stream.write_all(len_prefix).await?;
+                      // <<< MODIFIED START [Convert slice to Vec for write_all] >>>
+                      self.stream.write_all(len_prefix.to_vec()).await.0?;
+                      // <<< MODIFIED END >>>
                       if !main_blob.is_empty() { self.stream.send_zc(&Bytes::copy_from_slice(main_blob)).await.0?; }
                   } else {
-                      self.stream.write_all(&wire_bytes_ping).await?;
+                      // <<< MODIFIED START [Convert Bytes to Vec for write_all] >>>
+                      self.stream.write_all(wire_bytes_ping.to_vec()).await.0?;
+                      // <<< MODIFIED END >>>
                   }
                   Ok(())
               }.await;
@@ -888,17 +881,16 @@ impl ZmtpEngineCoreUring {
               self.waiting_for_pong = true; pong_timeout_timer.reset();
 
               #[cfg(target_os="linux")] if self.is_corked { if self.set_tcp_cork_uring(false).await.is_err() { final_error_for_actor_stop=Some(ZmqError::Internal("cork err".into())); break 'main_loop;} }
-              self.expecting_first_frame_of_msg = true; // PING is a complete logical message
+              self.expecting_first_frame_of_msg = true; 
             }
           }
 
-          // --- PONG Timeout ---
           _ = pong_timeout_timer.tick(), if self.waiting_for_pong => {
             final_error_for_actor_stop = Some(ZmqError::Timeout);
             #[cfg(target_os="linux")] if self.is_corked { if self.set_tcp_cork_uring(false).await.is_err() {} self.expecting_first_frame_of_msg = true;}
             break 'main_loop;
           }
-        } // end select!
+        } 
       }
     }
 
@@ -920,13 +912,10 @@ impl ZmtpEngineCoreUring {
         .send(SessionBaseCommand::EngineError { error: err.clone() })
         .await;
     }
+    self.active_recv_future_holder = ActiveReceiveFutureUring::NotActive; 
 
-    // Engine owns self.stream (UringTcpStream) directly. Close it.
-    // If active_recv_future_holder holds a future, it needs to be dropped/cancelled before stream close.
-    self.active_recv_future_holder = ActiveReceiveFutureUring::NotActive; // Drop any active future
-
-    let _ = self.stream.shutdown(std::net::Shutdown::Both); // More graceful than just close sometimes
-    let close_res = self.stream.close().await; // Close the uring stream
+    let _ = self.stream.shutdown(std::net::Shutdown::Both); 
+    let close_res = self.stream.close().await; 
     if let Err(e) = close_res {
       tracing::warn!(engine_handle = self.handle, error = %e, "Error closing UringTcpStream.");
     }
@@ -971,10 +960,11 @@ impl ZmtpEngineCoreUring {
                 plaintext_pong_bytes
               };
 
-              // Send potentially encrypted PONG
               if self.data_cipher.is_some() && self.config.use_send_zerocopy && wire_bytes_pong.len() > 2 {
                 let (len_prefix, main_blob) = wire_bytes_pong.split_at(2);
-                self.stream.write_all(len_prefix).await.map_err(ZmqError::from)?;
+                // <<< MODIFIED START [Convert slice to Vec for write_all] >>>
+                self.stream.write_all(len_prefix.to_vec()).await.0.map_err(ZmqError::from)?;
+                // <<< MODIFIED END >>>
                 if !main_blob.is_empty() {
                   self
                     .stream
@@ -984,7 +974,9 @@ impl ZmtpEngineCoreUring {
                     .map_err(ZmqError::from)?;
                 }
               } else {
-                self.stream.write_all(&wire_bytes_pong).await.map_err(ZmqError::from)?;
+                // <<< MODIFIED START [Convert Bytes to Vec for write_all] >>>
+                self.stream.write_all(wire_bytes_pong.to_vec()).await.0.map_err(ZmqError::from)?;
+                // <<< MODIFIED END >>>
               }
             }
             .await;
@@ -1036,6 +1028,6 @@ pub struct UringLaunchInformation {
   pub is_server: bool,
   pub context_clone: Context,
   pub session_base_mailbox: MailboxSender,
-  pub app_to_engine_cmd_rx: MailboxReceiver<AppToUringEngineCmd>,
+  pub app_to_engine_cmd_rx: URingMailboxReceiver,
   pub parent_session_handle_id: usize,
 }

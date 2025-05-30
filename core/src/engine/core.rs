@@ -31,6 +31,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::interval;
 use tokio_util::codec::{Encoder, Framed};
 
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
+
 /// Core ZMTP engine logic, generic over the underlying stream type `S`.
 /// This struct encapsulates the state and logic for handling the ZMTP protocol,
 /// including handshakes (greeting, security, ready commands) and message exchange.

@@ -29,6 +29,9 @@ pub mod socket;
 /// Deals with network transport layers (TCP, IPC, Inproc).
 pub mod transport;
 
+#[cfg(feature = "io-uring")]
+pub mod io_uring_backend;
+
 /// A conditional main macro.
 ///
 /// If the `io-uring` feature is enabled and the target is Linux,
