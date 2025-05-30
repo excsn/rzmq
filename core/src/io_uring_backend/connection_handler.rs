@@ -3,6 +3,7 @@
 #![cfg(feature = "io-uring")]
 
 use crate::message::Msg;
+use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
 use std::any::Any;
 use std::os::unix::io::RawFd;
@@ -144,7 +145,15 @@ pub trait UringConnectionHandler: Send {
 
 pub trait ProtocolHandlerFactory: Send + Sync + 'static {
     fn id(&self) -> &'static str;
-    fn create_handler(&self, fd: RawFd, worker_io_config: Arc<WorkerIoConfig>) -> Box<dyn UringConnectionHandler + Send>;
+
+    // This is now the primary method for the generic worker to call
+    fn create_handler( // Renamed from create_handler_from_enum_config for simplicity
+        &self,
+        fd: RawFd,
+        worker_io_config: Arc<WorkerIoConfig>,
+        protocol_config: &ProtocolConfig, // Takes a reference to the enum
+        is_server: bool,
+    ) -> Result<Box<dyn UringConnectionHandler + Send>, String>;
 }
 
 #[derive(Clone)]
@@ -154,3 +163,5 @@ pub struct WorkerIoConfig {
 
 // UserData re-export from ops.rs
 pub use crate::io_uring_backend::ops::UserData;
+
+use super::ops::ProtocolConfig;

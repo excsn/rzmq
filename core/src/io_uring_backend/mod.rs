@@ -2,15 +2,14 @@
 
 #![cfg(feature = "io-uring")]
 
-// <<< MODIFIED START: Declare all submodules we'll create >>>
 use crate::ZmqError; // Common error type from the crate root
 
 pub mod buffer_manager;
-pub mod connection_handler; // For the UringConnectionHandler trait and ZMTP impl
+pub mod connection_handler;
 pub mod ops;
 pub mod worker;
-pub mod one_shot_sender; // Moved here
-// <<< MODIFIED END >>>
+pub mod one_shot_sender;
+pub mod zmtp_handler;
 
 // Re-export key types for easier access from the ZMTP engine adapter that will use this backend
 pub use ops::{UringOpRequest, UringOpCompletion, UserData};

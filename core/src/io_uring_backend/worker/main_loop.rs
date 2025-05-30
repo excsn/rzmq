@@ -80,7 +80,7 @@ impl UringWorker {
                 let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::RegisterRawBuffersSuccess { user_data }));
                 Ok(false)
             }
-            UringOpRequest::Listen { user_data, addr, ref protocol_handler_factory_id, reply_tx: _ } => {
+            UringOpRequest::Listen { user_data, addr, ref protocol_handler_factory_id, protocol_config, reply_tx: _ } => {
                 let socket_fd = match addr {
                     std::net::SocketAddr::V4(_) => unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) },
                     std::net::SocketAddr::V6(_) => unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) },
@@ -131,12 +131,13 @@ impl UringWorker {
                     reply_tx: reply_tx.clone(), 
                     op_name: op_name_str.clone(),
                     protocol_handler_factory_id: Some(protocol_handler_factory_id.clone()),
+                    protocol_config: Some(protocol_config.clone()),
                     fd_created_for_connect_op: None,
                     listener_fd: Some(socket_fd), 
                     target_fd_for_shutdown: None,
                 });
                 
-                self.handler_manager.add_listener_metadata(socket_fd, protocol_handler_factory_id.clone());
+                self.handler_manager.add_listener_metadata(socket_fd, protocol_handler_factory_id.clone(), protocol_config);
 
                 let accept_ud = self.internal_op_tracker.new_op_id(socket_fd, InternalOpType::Accept, InternalOpPayload::None);
                 let mut client_addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -186,7 +187,7 @@ impl UringWorker {
                 Ok(submitted_accept_sqe_ok)
             }
 
-            UringOpRequest::Connect { user_data, target_addr, ref protocol_handler_factory_id, reply_tx: _original_reply_tx_in_req } => {
+            UringOpRequest::Connect { user_data, target_addr, ref protocol_handler_factory_id, protocol_config, reply_tx: _original_reply_tx_in_req } => {
                 let mut fd_created_for_connect_op: Option<RawFd> = None;
                 let ring_has_ext_arg = self.ring.params().is_feature_ext_arg();
 
@@ -197,6 +198,7 @@ impl UringWorker {
                 let temp_connect_req_for_builder = UringOpRequest::Connect {
                     user_data, target_addr,
                     protocol_handler_factory_id: protocol_handler_factory_id.clone(),
+                    protocol_config: protocol_config.clone(),
                     reply_tx: reply_tx.clone() // Use the cloned reply_tx
                 };
 
@@ -209,6 +211,7 @@ impl UringWorker {
                         self.external_op_tracker.add_op(user_data, ExternalOpContext {
                             reply_tx: reply_tx.clone(), op_name: op_name_str.clone(),
                             protocol_handler_factory_id: Some(protocol_handler_factory_id.clone()),
+                            protocol_config: Some(protocol_config.clone()),
                             fd_created_for_connect_op, 
                             listener_fd: None, target_fd_for_shutdown: None,
                         });
@@ -230,7 +233,7 @@ impl UringWorker {
                             self.external_op_tracker.take_op(user_data); 
                             if let Some(fd_conn) = fd_created_for_connect_op { unsafe { libc::close(fd_conn); }}
                             // Reconstruct the original UringOpRequest::Connect to return for retry
-                            Err(UringOpRequest::Connect { user_data, target_addr, protocol_handler_factory_id: protocol_handler_factory_id.clone(), reply_tx })
+                            Err(UringOpRequest::Connect { user_data, target_addr, protocol_handler_factory_id: protocol_handler_factory_id.clone(), protocol_config, reply_tx })
                         }
                     }
                     Ok(None) => { 
@@ -255,7 +258,7 @@ impl UringWorker {
                     Ok(Some(sqe)) => {
                         self.external_op_tracker.add_op(user_data, ExternalOpContext {
                             reply_tx: reply_tx.clone(), op_name: op_name_str.clone(),
-                            protocol_handler_factory_id: None, fd_created_for_connect_op: None,
+                            protocol_handler_factory_id: None, protocol_config: None, fd_created_for_connect_op: None,
                             listener_fd: None, target_fd_for_shutdown: None,
                         });
                         let mut sq = unsafe { self.ring.submission_shared() };
@@ -329,7 +332,7 @@ impl UringWorker {
                     let ops_to_queue = handler.close_initiated(&interface);
                     self.external_op_tracker.add_op(user_data, ExternalOpContext{
                         reply_tx: reply_tx.clone(), op_name: op_name_str,
-                        protocol_handler_factory_id: None, fd_created_for_connect_op: None,
+                        protocol_handler_factory_id: None, protocol_config: None, fd_created_for_connect_op: None,
                         listener_fd: None, target_fd_for_shutdown: Some(fd),
                     });
                     let mut fds_to_close_dummy = VecDeque::new();

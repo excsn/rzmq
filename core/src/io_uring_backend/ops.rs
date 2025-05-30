@@ -3,12 +3,19 @@
 #![cfg(feature = "io-uring")]
 
 use super::one_shot_sender::OneShotSender;
+use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
 use std::net::{SocketAddr}; // Removed SocketAddrV6, Ipv6Addr as they are not directly used by ops.rs
 use std::os::unix::io::RawFd;
 use std::fmt;
 use std::any::Any;
 use std::sync::Arc;
+
+#[derive(Clone, Debug)] // Ensure Debug and Clone are derivable
+pub enum ProtocolConfig {
+    Zmtp(Arc<ZmtpEngineConfig>),
+    // Example: Http(Arc<HttpConfig>),
+}
 
 pub type UserData = u64;
 
@@ -34,12 +41,14 @@ pub enum UringOpRequest {
     user_data: UserData,
     addr: SocketAddr,
     protocol_handler_factory_id: String,
+    protocol_config: ProtocolConfig, 
     reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
   },
   Connect {
     user_data: UserData,
     target_addr: SocketAddr,
     protocol_handler_factory_id: String,
+    protocol_config: ProtocolConfig, 
     reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
   },
   StartFdReadLoop {

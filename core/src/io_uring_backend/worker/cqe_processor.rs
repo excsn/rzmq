@@ -157,9 +157,13 @@ pub(crate) fn process_all_cqes(
                             });
 
                         if let Some(ref factory_id) = ext_op_ctx.protocol_handler_factory_id {
+                            let protocol_config = ext_op_ctx.protocol_config.clone();
+
                             match handler_manager.create_and_add_handler(
                                 connected_fd,
                                 factory_id,
+                                protocol_config.as_ref().unwrap(),
+                                false,
                                 buffer_manager, // Pass Option<&BufferRingManager>
                                 default_bgid_val_from_worker, // Pass the default bgid
                             ) {
@@ -224,10 +228,21 @@ pub(crate) fn process_all_cqes(
                         let listener_fd = handler_fd; // FD of the listening socket
                         info!("CQE Processor: Internal Accept CQE (ud:{}) on listener FD {} -> new client FD {}", cqe_user_data, listener_fd, client_fd);
 
-                        if let Some(listener_factory_id) = handler_manager.get_listener_factory_id(listener_fd) {
+                        let mut factory_id = None;
+                        let mut protocol_config = None;
+
+                        {
+                            if let Some(listener_info) = handler_manager.get_listener_metadata(listener_fd) {
+                                factory_id = Some(listener_info.factory_id_for_accepted_connections.to_string());
+                                protocol_config = Some(listener_info.protocol_config_for_accepted.clone());
+                            }
+                        }
+                        if factory_id.is_some() {
                             match handler_manager.create_and_add_handler(
                                 client_fd,
-                                &listener_factory_id,
+                                &factory_id.unwrap(),
+                                &protocol_config.unwrap(),
+                                true, // is_server = true for accepted connections
                                 buffer_manager,
                                 default_bgid_val_from_worker,
                             ) {
