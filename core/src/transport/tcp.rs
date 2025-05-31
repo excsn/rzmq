@@ -12,9 +12,9 @@ use crate::runtime::{
 use crate::runtime::global_uring_state;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::{
-    UringOpRequest as WorkerUringOpRequest,
-    UringOpCompletion as WorkerUringOpCompletion,
-    ProtocolConfig as WorkerProtocolConfig,
+  UringOpRequest as WorkerUringOpRequest,
+  UringOpCompletion as WorkerUringOpCompletion,
+  ProtocolConfig as WorkerProtocolConfig,
 };
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSender;
@@ -23,9 +23,11 @@ use tokio::sync::oneshot as tokio_oneshot;
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::{IntoRawFd, FromRawFd, RawFd};
 
-use crate::socket::connection_iface::{ISocketConnection, SessionConnection};
+// <<< MODIFIED [No longer need SessionConnection here for standard path, ISocketConnection needed for UringFdConnection] >>>
 #[cfg(feature = "io-uring")]
 use crate::socket::connection_iface::UringFdConnection;
+use crate::socket::connection_iface::ISocketConnection; // Still needed for Arc<dyn ISocketConnection> in event
+
 use crate::runtime::command::EngineConnectionType as CommandEngineConnectionType; 
 
 use crate::session::{self, SessionBase}; 
@@ -50,6 +52,7 @@ mod underlying_std_net {
 }
 
 // --- TcpListener Actor ---
+// ... (TcpListener struct definition remains the same)
 #[derive(Debug)]
 pub(crate) struct TcpListener {
   handle: usize,
@@ -60,7 +63,9 @@ pub(crate) struct TcpListener {
   parent_socket_id: usize,
 }
 
+
 impl TcpListener {
+  // ... (create_and_spawn method signature and initial setup remain similar)
   pub(crate) fn create_and_spawn(
     handle: usize,
     endpoint: String, 
@@ -126,7 +131,7 @@ impl TcpListener {
     let listener_actor = TcpListener {
       handle, 
       endpoint: resolved_uri.clone(), 
-      mailbox_receiver: rx, // Correctly assign receiver
+      mailbox_receiver: rx, 
       listener_handle: accept_loop_task_jh, 
       context: context.clone(), 
       parent_socket_id,
@@ -138,6 +143,7 @@ impl TcpListener {
     Ok((tx, cmd_loop_jh, resolved_uri))
   }
 
+  // ... (run_command_loop remains the same)
   async fn run_command_loop(self) { 
     let listener_cmd_loop_handle = self.handle;
     let listener_cmd_loop_actor_type = ActorType::Listener;
@@ -174,7 +180,7 @@ impl TcpListener {
               }
             }
           }
-          cmd_result = self.mailbox_receiver.recv() => { // Correctly use self.mailbox_receiver
+          cmd_result = self.mailbox_receiver.recv() => { 
             match cmd_result {
               Ok(Command::Stop) => {
                 tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener received Stop command");
@@ -216,6 +222,7 @@ impl TcpListener {
     );
     tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener command loop actor fully stopped.");
   }
+
 
   async fn run_accept_loop(
     accept_loop_handle: usize,
@@ -268,10 +275,11 @@ impl TcpListener {
             async move {
               let _permit_scoped_for_task = _permit_guard; 
 
-              let mut connection_iface_opt: Option<Arc<dyn ISocketConnection>> = None;
-              let mut interaction_model_opt: Option<ConnectionInteractionModel> = None;
-              // connection_instance_id is derived from iface or session_hdl_id later
-              let mut managing_actor_task_id_val: Option<TaskId> = None;
+              // <<< MODIFIED START [Centralize ConnectionInterface and InteractionModel setup] >>>
+              let mut connection_iface_for_event: Option<Arc<dyn ISocketConnection>> = None;
+              let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
+              let mut managing_actor_task_id_for_event: Option<TaskId> = None;
+              // <<< MODIFIED END >>>
               let mut setup_successful = true;
 
               if use_io_uring_for_session {
@@ -291,9 +299,9 @@ impl TcpListener {
                         let (reply_tx_for_op, reply_rx_for_op) = tokio_oneshot::channel();
 
                         let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
-                            user_data: user_data_for_op, fd: raw_fd,
-                            protocol_handler_factory_id: "zmtp-uring/3.1".to_string(), protocol_config,
-                            is_server_role: true, reply_tx: WorkerOneShotSender::new(reply_tx_for_op),
+                          user_data: user_data_for_op, fd: raw_fd,
+                          protocol_handler_factory_id: "zmtp-uring/3.1".to_string(), protocol_config,
+                          is_server_role: true, reply_tx: WorkerOneShotSender::new(reply_tx_for_op),
                         };
                         
                         if let Err(e) = worker_op_tx.as_async().send(register_fd_req).await {
@@ -304,8 +312,11 @@ impl TcpListener {
                           match reply_rx_for_op.await {
                             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
                               info!("Registered accepted FD {} with UringWorker.", raw_fd);
-                              connection_iface_opt = Some(Arc::new(UringFdConnection::new(raw_fd)));
-                              interaction_model_opt = Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
+                              // <<< MODIFIED START [Set up common variables for event] >>>
+                              connection_iface_for_event = Some(Arc::new(UringFdConnection::new(raw_fd)));
+                              interaction_model_for_event = Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
+                              // managing_actor_task_id_for_event remains None for UringFd path
+                              // <<< MODIFIED END >>>
                             }
                             Ok(Ok(other_completion)) => { 
                               tracing::error!("UringWorker bad success for RegisterExternalFd (fd {}): {:?}", raw_fd, other_completion); 
@@ -344,61 +355,64 @@ impl TcpListener {
                   let session_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                   let engine_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                  let pipe_hwm = socket_options_clone.rcvhwm.max(socket_options_clone.sndhwm).max(1);
-                  let (tx_core_to_session, rx_session_from_core) = async_channel::bounded(pipe_hwm);
-                  let (tx_session_to_core, _rx_core_from_session) = async_channel::bounded(pipe_hwm);
+                  // <<< REMOVED [Pipe creation and AttachPipe send from here] >>>
 
                   let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
-                      session_hdl_id, connection_specific_uri_for_task.clone(), 
-                      monitor_tx_clone.clone(), context_clone.clone(), parent_socket_core_id,
+                    session_hdl_id, connection_specific_uri_for_task.clone(), 
+                    monitor_tx_clone.clone(), context_clone.clone(), parent_socket_core_id,
                   );
-                  managing_actor_task_id_val = Some(session_task_hdl.id());
-
-                  let pipe_read_id_sess = context_clone.inner().next_handle();
-                  let pipe_write_id_sess = context_clone.inner().next_handle();
-                  let attach_pipe_cmd = Command::AttachPipe {
-                      rx_from_core: rx_session_from_core, tx_to_core: tx_session_to_core.clone(),
-                      pipe_read_id: pipe_read_id_sess, pipe_write_id: pipe_write_id_sess,
+                  // <<< MODIFIED START [Set up common variables for event - ViaSessionActor] >>>
+                  managing_actor_task_id_for_event = Some(session_task_hdl.id());
+                  // connection_iface_for_event will be None here, SocketCore will create it.
+                  interaction_model_for_event = Some(ConnectionInteractionModel::ViaSessionActor { 
+                    session_actor_mailbox: session_cmd_mailbox.clone(),
+                    session_actor_handle_id: session_hdl_id, // Pass the session's handle ID
+                  });
+                  // <<< MODIFIED END >>>
+                  
+                  // <<< REMOVED [AttachPipe command send from here] >>>
+                  
+                  // Attach Engine to Session
+                  let (engine_mb, engine_task_hdl) = create_and_spawn_tcp_engine(
+                    engine_hdl_id, session_cmd_mailbox.clone(), tokio_tcp_stream, 
+                    socket_options_clone.clone(), true, &context_clone, session_hdl_id,
+                  );
+                  let attach_engine_cmd = Command::Attach {
+                    connection: CommandEngineConnectionType::Standard { engine_mailbox: engine_mb },
+                    engine_handle: Some(engine_hdl_id), engine_task_handle: Some(engine_task_hdl),
                   };
-                  if session_cmd_mailbox.send(attach_pipe_cmd).await.is_err() {
-                    tracing::error!("AttachPipe to Session {} failed.", session_hdl_id); 
+                  if session_cmd_mailbox.send(attach_engine_cmd).await.is_err() {
+                    tracing::error!("AttachEngine to Session {} failed.", session_hdl_id); 
                     session_task_hdl.abort(); setup_successful = false;
-                  } else {
-                    let (engine_mb, engine_task_hdl) = create_and_spawn_tcp_engine(
-                        engine_hdl_id, session_cmd_mailbox.clone(), tokio_tcp_stream, 
-                        socket_options_clone.clone(), true, &context_clone, session_hdl_id,
-                    );
-                    let attach_engine_cmd = Command::Attach {
-                        connection: CommandEngineConnectionType::Standard { engine_mailbox: engine_mb },
-                        engine_handle: Some(engine_hdl_id), engine_task_handle: Some(engine_task_hdl),
-                    };
-                    if session_cmd_mailbox.send(attach_engine_cmd).await.is_err() {
-                      tracing::error!("AttachEngine to Session {} failed.", session_hdl_id); 
-                      session_task_hdl.abort(); setup_successful = false;
-                    } else {
-                      connection_iface_opt = Some(Arc::new(SessionConnection::new(session_cmd_mailbox.clone(), session_hdl_id, tx_core_to_session)));
-                      interaction_model_opt = Some(ConnectionInteractionModel::ViaSessionActor { session_actor_mailbox: session_cmd_mailbox });
-                    }
                   }
+                  // No SessionConnection constructed here by Listener
                 }
               }
 
               if setup_successful {
-                if let (Some(conn_iface), Some(inter_model)) = (connection_iface_opt, interaction_model_opt) {
+                // <<< MODIFIED START [Use common variables for event publication] >>>
+                if let Some(inter_model) = interaction_model_for_event {
                   let event = SystemEvent::NewConnectionEstablished {
-                      parent_core_id: parent_socket_core_id, 
-                      endpoint_uri: connection_specific_uri_for_task.clone(), 
-                      target_endpoint_uri: endpoint_uri_listener.clone(), 
-                      connection_iface: conn_iface,
-                      interaction_model: inter_model,
-                      // connection_instance_id removed from event construction
-                      managing_actor_task_id: managing_actor_task_id_val,
+                    parent_core_id: parent_socket_core_id, 
+                    endpoint_uri: connection_specific_uri_for_task.clone(), 
+                    target_endpoint_uri: endpoint_uri_listener.clone(), 
+                    connection_iface: connection_iface_for_event, // Will be None for ViaSessionActor here
+                    interaction_model: inter_model,
+                    managing_actor_task_id: managing_actor_task_id_for_event,
                   };
                   if context_clone.event_bus().publish(event).is_err() {
                     tracing::error!("Failed to publish NewConnectionEstablished for {}", connection_specific_uri_for_task);
+                    // If session was spawned, it needs to be aborted
+                    if let Some(task_id) = managing_actor_task_id_for_event {
+                        // This is tricky, we don't have the JoinHandle here directly if it was session path.
+                        // The SessionBase will stop itself if its parent (SocketCore) doesn't attach pipes.
+                        // For UringFd, the FD might need explicit close if `connection_iface_for_event` was set.
+                        tracing::warn!("NewConnectionEstablished publish failed, related session/FD for task_id {:?} might need manual cleanup if not handled by its own lifecycle.", task_id);
+                    }
                   }
+                // <<< MODIFIED END >>>
                 } else {
-                  tracing::error!("Inconsistent state: setup_successful true but connection details missing for {}", connection_specific_uri_for_task);
+                  tracing::error!("Inconsistent state: setup_successful true but interaction model missing for {}", connection_specific_uri_for_task);
                 }
               } else {
                 tracing::warn!("Connection setup failed for {}, NewConnectionEstablished not published.", connection_specific_uri_for_task);
@@ -425,15 +439,18 @@ impl TcpListener {
   }
 } 
 
+
 // --- TcpConnecter Actor ---
+// ... (UnifiedConnectOutcome definition remains the same)
 type UnifiedConnectOutcome = (
-    Arc<dyn ISocketConnection>,       
-    ConnectionInteractionModel,       
-    // usize, // connection_instance_id - removed, will be derived from ISocketConnection
-    Option<TaskId>, // managing_actor_task_id                   
-    String, // actual_peer_uri                         
+  // <<< MODIFIED [connection_iface is Option here, SocketCore will finalize for Session path] >>>
+  Option<Arc<dyn ISocketConnection>>, // Arc<dyn ISocketConnection>,       
+  ConnectionInteractionModel,       
+  Option<TaskId>, // managing_actor_task_id                   
+  String, // actual_peer_uri                         
 );
 
+// ... (TcpConnecter struct definition remains the same)
 #[derive(Debug)]
 pub(crate) struct TcpConnecter { 
   handle: usize,
@@ -445,7 +462,9 @@ pub(crate) struct TcpConnecter {
   parent_socket_id: usize,
 }
 
+
 impl TcpConnecter {
+  // ... (create_and_spawn method remains the same)
   pub(crate) fn create_and_spawn( 
     handle: usize, endpoint: String, options: Arc<SocketOptions>,
     context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
@@ -466,6 +485,7 @@ impl TcpConnecter {
     task_join_handle
   }
   
+  // ... (run_connect_loop remains similar, focusing on logic for trying connections)
   async fn run_connect_loop(mut self, monitor_tx: Option<MonitorSender>) { 
     let connecter_handle = self.handle;
     let actor_type = ActorType::Connecter;
@@ -540,25 +560,25 @@ impl TcpConnecter {
 
       tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: TCP connect attempt #{}", attempt_count);
 
-      // <<< MODIFIED: Pass monitor_tx to try_connect_once >>>
       let single_attempt_outcome: Result<UnifiedConnectOutcome, ZmqError> = self
         .try_connect_once(&target_socket_addr, &endpoint_uri_clone, &mut system_event_rx, &monitor_tx)
         .await;
 
       match single_attempt_outcome {
-        Ok((connection_iface, interaction_model, managing_actor_task_id, actual_peer_uri)) => {
+        // <<< MODIFIED [connection_iface is now Option in UnifiedConnectOutcome] >>>
+        Ok((connection_iface_opt, interaction_model, managing_actor_task_id, actual_peer_uri)) => {
           tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, actual_peer = %actual_peer_uri, "Connecter: TCP connect successful.");
           let event = SystemEvent::NewConnectionEstablished {
-              parent_core_id: self.parent_socket_id,
-              endpoint_uri: actual_peer_uri, 
-              target_endpoint_uri: endpoint_uri_clone.clone(), 
-              connection_iface, interaction_model,
-              // connection_instance_id field removed
-              managing_actor_task_id,
+            parent_core_id: self.parent_socket_id,
+            endpoint_uri: actual_peer_uri, 
+            target_endpoint_uri: endpoint_uri_clone.clone(), 
+            connection_iface: connection_iface_opt, // Pass the Option
+            interaction_model,
+            managing_actor_task_id,
           };
           if self.context.event_bus().publish(event).is_err() {
-              tracing::error!("Connecter: Failed to publish NewConnectionEstablished for {}.", endpoint_uri_clone);
-              last_connect_attempt_error = Some(ZmqError::Internal("Failed to publish NewConnectionEstablished".into()));
+            tracing::error!("Connecter: Failed to publish NewConnectionEstablished for {}.", endpoint_uri_clone);
+            last_connect_attempt_error = Some(ZmqError::Internal("Failed to publish NewConnectionEstablished".into()));
           } else { last_connect_attempt_error = None; }
           break 'connecter_life_loop; 
         }
@@ -603,7 +623,7 @@ impl TcpConnecter {
     target_socket_addr: &StdSocketAddr,
     endpoint_uri_original: &str, 
     system_event_rx: &mut broadcast::Receiver<SystemEvent>,
-    monitor_tx: &Option<MonitorSender>, // <<< MODIFIED: Added monitor_tx parameter >>>
+    monitor_tx: &Option<MonitorSender>,
   ) -> Result<UnifiedConnectOutcome, ZmqError> {
     let use_io_uring = self.context_options.io_uring.session_enabled && cfg!(feature = "io-uring");
 
@@ -630,9 +650,9 @@ impl TcpConnecter {
           let (reply_tx_for_op, reply_rx_for_op) = tokio_oneshot::channel();
 
           let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
-              user_data: user_data_for_op, fd: raw_fd,
-              protocol_handler_factory_id: "zmtp-uring/3.1".to_string(), protocol_config,
-              is_server_role: false, reply_tx: WorkerOneShotSender::new(reply_tx_for_op),
+            user_data: user_data_for_op, fd: raw_fd,
+            protocol_handler_factory_id: "zmtp-uring/3.1".to_string(), protocol_config,
+            is_server_role: false, reply_tx: WorkerOneShotSender::new(reply_tx_for_op),
           };
           
           worker_op_tx.as_async().send(register_fd_req).await.map_err(|e| 
@@ -642,10 +662,11 @@ impl TcpConnecter {
           match reply_rx_for_op.await {
             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
               info!("Successfully registered connected FD {} with UringWorker.", raw_fd);
+              // <<< MODIFIED [ISocketConnection is Some for UringFd path] >>>
               let connection_iface: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd));
               let interaction_model = ConnectionInteractionModel::ViaUringFd { fd: raw_fd };
               Ok((
-                connection_iface, interaction_model, 
+                Some(connection_iface), interaction_model, 
                 None, 
                 format!("tcp://{}", peer_addr_actual)
               ))
@@ -668,7 +689,7 @@ impl TcpConnecter {
           }
         }
         #[cfg(not(feature = "io-uring"))] { unreachable!(); }
-      } else { 
+      } else { // Standard path for SessionBase
         let std_tokio_stream = underlying_std_net::TcpStream::connect(target_socket_addr)
           .await.map_err(|e| ZmqError::from_io_endpoint(e, endpoint_uri_original))?;
         apply_tcp_socket_options_to_tokio(&std_tokio_stream, &self.config)?;
@@ -677,47 +698,40 @@ impl TcpConnecter {
         let session_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let engine_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let pipe_hwm = self.context_options.rcvhwm.max(self.context_options.sndhwm).max(1);
-        let (tx_core_to_session, rx_session_from_core) = async_channel::bounded(pipe_hwm);
-        let (tx_session_to_core, _rx_core_from_session) = async_channel::bounded(pipe_hwm); 
+        // <<< REMOVED [Pipe creation and AttachPipe send from here for standard path] >>>
 
         let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
-            session_hdl_id, format!("tcp://{}", peer_addr_actual), 
-            // <<< MODIFIED: Use monitor_tx passed as parameter >>>
-            monitor_tx.clone(), 
-            // <<< MODIFIED END >>>
-            self.context.clone(), self.parent_socket_id,
+          session_hdl_id, format!("tcp://{}", peer_addr_actual), 
+          monitor_tx.clone(), 
+          self.context.clone(), self.parent_socket_id,
         );
 
-        let pipe_read_id_sess = self.context.inner().next_handle();
-        let pipe_write_id_sess = self.context.inner().next_handle();
-        let attach_pipe_cmd = Command::AttachPipe {
-            rx_from_core: rx_session_from_core, tx_to_core: tx_session_to_core.clone(),
-            pipe_read_id: pipe_read_id_sess, pipe_write_id: pipe_write_id_sess,
-        };
-        if session_cmd_mailbox.send(attach_pipe_cmd).await.is_err() {
-            session_task_hdl.abort(); return Err(ZmqError::Internal("Failed AttachPipe to Session".into()));
-        }
-
+        // <<< REMOVED [AttachPipe Command send from here] >>>
+        
+        // Attach Engine
         let (engine_mb, engine_task_hdl) = create_and_spawn_tcp_engine(
-            engine_hdl_id, session_cmd_mailbox.clone(), std_tokio_stream,
-            self.context_options.clone(), false, &self.context, session_hdl_id,
+          engine_hdl_id, session_cmd_mailbox.clone(), std_tokio_stream,
+          self.context_options.clone(), false, &self.context, session_hdl_id,
         );
         let attach_engine_cmd = Command::Attach {
-            connection: CommandEngineConnectionType::Standard { engine_mailbox: engine_mb },
-            engine_handle: Some(engine_hdl_id), engine_task_handle: Some(engine_task_hdl),
+          connection: CommandEngineConnectionType::Standard { engine_mailbox: engine_mb },
+          engine_handle: Some(engine_hdl_id), engine_task_handle: Some(engine_task_hdl),
         };
         if session_cmd_mailbox.send(attach_engine_cmd).await.is_err() {
-            session_task_hdl.abort(); return Err(ZmqError::Internal("Failed AttachEngine to Session".into()));
+          session_task_hdl.abort(); return Err(ZmqError::Internal("Failed AttachEngine to Session".into()));
         }
 
-        let connection_iface: Arc<dyn ISocketConnection> = Arc::new(SessionConnection::new(session_cmd_mailbox.clone(), session_hdl_id, tx_core_to_session));
-        let interaction_model = ConnectionInteractionModel::ViaSessionActor { session_actor_mailbox: session_cmd_mailbox };
+        // <<< MODIFIED [connection_iface is None here; interaction_model provides session_actor_handle_id] >>>
+        let interaction_model = ConnectionInteractionModel::ViaSessionActor { 
+          session_actor_mailbox: session_cmd_mailbox,
+          session_actor_handle_id: session_hdl_id,
+        };
         
         Ok((
-            connection_iface, interaction_model, 
-            Some(session_task_hdl.id()), 
-            format!("tcp://{}", peer_addr_actual)
+          None, // SocketCore will construct the SessionConnection
+          interaction_model, 
+          Some(session_task_hdl.id()), 
+          format!("tcp://{}", peer_addr_actual)
         ))
       }
     }; 
@@ -725,23 +739,24 @@ impl TcpConnecter {
     tokio::select! { 
       biased; 
       _ = async { 
-          loop {
-              match system_event_rx.recv().await {
-                  Ok(SystemEvent::ContextTerminating) => break,
-                  Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => break,
-                  Ok(_) => continue,
-                  Err(_) => break, 
-              }
+        loop {
+          match system_event_rx.recv().await {
+            Ok(SystemEvent::ContextTerminating) => break,
+            Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => break,
+            Ok(_) => continue,
+            Err(_) => break, 
           }
+        }
       } => {
         Err(ZmqError::Internal("Connect aborted by system event.".into()))
       }
       connect_outcome_result = connect_future => {
-          connect_outcome_result 
+        connect_outcome_result 
       }
     }
   }
 
+  // ... (wait_for_retry_delay_internal method remains the same)
   async fn wait_for_retry_delay_internal( 
     &self, system_event_rx: &mut broadcast::Receiver<SystemEvent>, delay: Duration,
     monitor_tx: &Option<MonitorSender>, next_attempt_num: usize,
@@ -757,22 +772,23 @@ impl TcpConnecter {
       let _ = tx.try_send(SocketEvent::ConnectRetried { endpoint: self.endpoint.clone(), interval: delay, });
     }
     tokio::select! {
-        biased; 
-        event_res = system_event_rx.recv() => {
-            match event_res {
-                Ok(SystemEvent::ContextTerminating) => Ok(false),
-                Ok(SystemEvent::SocketClosing { socket_id: s_id }) if s_id == self.parent_socket_id => Ok(false),
-                Err(_) => Ok(false), 
-                Ok(_) => Ok(true), 
-            }
+      biased; 
+      event_res = system_event_rx.recv() => {
+        match event_res {
+          Ok(SystemEvent::ContextTerminating) => Ok(false),
+          Ok(SystemEvent::SocketClosing { socket_id: s_id }) if s_id == self.parent_socket_id => Ok(false),
+          Err(_) => Ok(false), 
+          Ok(_) => Ok(true), 
         }
-        _ = tokio::time::sleep(delay) => Ok(true), 
+      }
+      _ = tokio::time::sleep(delay) => Ok(true), 
     }
   } 
 } 
 
 
 // --- Helper Functions ---
+// ... (is_fatal_accept_error, is_fatal_connect_error, apply_socket2_options_pre_connect, apply_tcp_socket_options_to_tokio, apply_tcp_socket_options_to_std, ZmtpEngineConfig::from remain the same)
 pub(crate) fn is_fatal_accept_error(e: &io::Error) -> bool { matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe) }
 
 pub(crate) fn is_fatal_connect_error(e: &ZmqError) -> bool {
@@ -841,9 +857,9 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       use_recv_multishot: options.io_uring.recv_multishot, 
       use_cork: options.tcp_cork, 
       #[cfg(feature = "io-uring")] 
-      recv_multishot_buffer_count: options.io_uring.recv_buffer_count, // Corrected field name
+      recv_multishot_buffer_count: options.io_uring.recv_buffer_count,
       #[cfg(feature = "io-uring")]
-      recv_multishot_buffer_capacity: options.io_uring.recv_buffer_size, // Corrected field name
+      recv_multishot_buffer_capacity: options.io_uring.recv_buffer_size,
       #[cfg(feature = "noise_xx")]
       use_noise_xx: options.noise_xx_options.enabled,
       #[cfg(feature = "noise_xx")]
