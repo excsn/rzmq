@@ -18,7 +18,7 @@ full = ["default", "ipc", "inproc", "noise_xx"]
 full-linux = ["full", "io-uring"]
 default = ["ipc", "inproc"]
 
-io-uring = ["dep:io-uring", "dep:io_uring_buf_ring", "dep:tokio-uring"]
+io-uring = ["dep:io-uring", "dep:io_uring_buf_ring"]
 noise_xx = ["dep:snow", "dep:x25519-dalek"]
 ipc = []
 inproc = []
@@ -37,7 +37,6 @@ tokio-util = { version = "^0.7", features = ["codec"] }
 futures = "^0.3"
 parking_lot = "^0"
 kanal = "^0.1"
-tokio-uring = { version = "^0", optional = true }
 
 # --- I/O & Buffers ---
 bytes = "^1.4"
@@ -112,6 +111,11 @@ path = "examples/plain_req_rep.rs"
 name = "noise_xx_push_pull"
 path = "examples/noise_xx_push_pull.rs"
 required-features = ["noise_xx"]
+
+[[example]]
+name = "iouring_basic"
+path = "examples/iouring_basic.rs"
+required-features = ["io-uring"]
 
 [[test]]
 name = "inproc_minimal"
