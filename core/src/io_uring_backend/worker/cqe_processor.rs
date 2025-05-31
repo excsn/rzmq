@@ -24,9 +24,10 @@ pub(crate) fn process_handler_blueprints(
     fd: RawFd,
     ops_output: HandlerIoOps,
     internal_ops: &mut InternalOpTracker,
-    sq: &mut squeue::SubmissionQueue<'_>, // Accepts a mutable borrow of an SQ
+    sq: &mut squeue::SubmissionQueue<'_>,
     default_bgid_for_read_sqe: Option<u16>,
-    fds_to_initiate_close_queue: &mut VecDeque<RawFd>, // Changed from Vec to VecDeque
+    fds_to_initiate_close_queue: &mut VecDeque<RawFd>,
+    pending_sqe_retry_queue: &mut VecDeque<(RawFd, HandlerSqeBlueprint)>,
 ) {
     if ops_output.initiate_close_due_to_error {
         warn!("CQE Processor: Handler for FD {} requested error close via HandlerIoOps.", fd);
@@ -35,37 +36,25 @@ pub(crate) fn process_handler_blueprints(
         }
     }
 
-    // === START NEW LOGGING ===
-    debug!(
-        "[PROCESS_BLUEPRINT_ENTRY FD={}] Processing {} blueprints. Default BGID: {:?}",
-        fd,
-        ops_output.sqe_blueprints.len(),
-        default_bgid_for_read_sqe
-    );
-    // === END NEW LOGGING ===
-
-    for (idx, blueprint) in ops_output.sqe_blueprints.iter().enumerate() { // Use .iter().enumerate()
-        // === START NEW LOGGING ===
-        debug!(
-            "[PROCESS_BLUEPRINT FD={}] Iteration #{} for blueprint: {:?}",
-            fd, idx, blueprint
-        );
-        // === END NEW LOGGING ===
+    for (idx, blueprint_ref) in ops_output.sqe_blueprints.iter().enumerate() {
 
         if unsafe { sq.is_full() } {
             warn!(
-                "CQE Processor: Submission queue full while processing blueprints for FD {}. Blueprint {:?} dropped. (TODO: Requeue this blueprint)",
-                fd, blueprint
+                "CQE Processor: Submission queue full while processing blueprints for FD {}. Blueprint {:?} will be requeued.",
+                fd, blueprint_ref
             );
+            // Requeue the blueprint instead of dropping it.
+            // Need to clone the blueprint as we only have a reference.
+            pending_sqe_retry_queue.push_back((fd, (*blueprint_ref).clone()));
             continue;
         }
 
         let mut op_payload_for_tracker = InternalOpPayload::None;
-        if let HandlerSqeBlueprint::RequestSend { data } = blueprint { // Use blueprint directly
+        if let HandlerSqeBlueprint::RequestSend { data } = blueprint_ref { // Use blueprint directly
             op_payload_for_tracker = InternalOpPayload::SendBuffer(data.clone());
         }
 
-        let sqe_build_result: Result<(squeue::Entry, InternalOpType), String> = match blueprint { // Use blueprint
+        let sqe_build_result: Result<(squeue::Entry, InternalOpType), String> = match blueprint_ref { // Use blueprint
             HandlerSqeBlueprint::RequestRingRead => {
                 if let Some(bgid) = default_bgid_for_read_sqe {
                     let read_op_builder = opcode::Read::new(types::Fd(fd), std::ptr::null_mut(), 0)
@@ -74,15 +63,9 @@ pub(crate) fn process_handler_blueprints(
 
                     let mut entry: squeue::Entry = read_op_builder.build();
                     entry = entry.flags(squeue::Flags::BUFFER_SELECT);
-                    // === START NEW LOGGING ===
-                    debug!("[PROCESS_BLUEPRINT FD={}] Built RingRead SQE.", fd);
-                    // === END NEW LOGGING ===
                     Ok((entry, InternalOpType::RingRead))
                 } else {
                     let err_msg = "RequestRingRead blueprint: No default_buffer_ring_group_id configured/passed for SQE construction.".to_string();
-                    // === START NEW LOGGING ===
-                    error!("[PROCESS_BLUEPRINT FD={}] Error for RingRead: {}", fd, err_msg);
-                    // === END NEW LOGGING ===
                     Err(err_msg)
                 }
             }
@@ -90,16 +73,10 @@ pub(crate) fn process_handler_blueprints(
                 let ptr = data.as_ptr();
                 let len = data.len() as u32;
                 let entry = opcode::Send::new(types::Fd(fd), ptr, len).build();
-                // === START NEW LOGGING ===
-                debug!("[PROCESS_BLUEPRINT FD={}] Built Send SQE (len: {}).", fd, len);
-                // === END NEW LOGGING ===
                 Ok( (entry, InternalOpType::Send) )
             }
             HandlerSqeBlueprint::RequestClose => {
                 let entry = opcode::Close::new(types::Fd(fd)).build();
-                // === START NEW LOGGING ===
-                debug!("[PROCESS_BLUEPRINT FD={}] Built Close SQE.", fd);
-                // === END NEW LOGGING ===
                 Ok( (entry, InternalOpType::CloseFd) )
             }
         };
@@ -108,30 +85,18 @@ pub(crate) fn process_handler_blueprints(
             Ok((mut entry_to_submit, op_type)) => {
                 let user_data = internal_ops.new_op_id(fd, op_type, op_payload_for_tracker);
                 entry_to_submit = entry_to_submit.user_data(user_data);
-                
-                // === START NEW LOGGING ===
-                debug!(
-                    "[PROCESS_BLUEPRINT FD={}] SQE built successfully. UserData: {}. Attempting to push to SQ.",
-                    fd, user_data
-                );
-                // === END NEW LOGGING ===
 
                 unsafe {
-                    // === START NEW LOGGING ===
-                    let sq_len_before_push = sq.len();
                     let push_result = sq.push(&entry_to_submit);
-                    let sq_len_after_push = sq.len();
-                    debug!(
-                        "[PROCESS_BLUEPRINT FD={}] Pushed SQE (ud:{}) for OpType::{:?}. PushResult: {:?}. SQ len before: {}, SQ len after: {}.",
-                        fd, user_data, op_type, push_result, sq_len_before_push, sq_len_after_push
-                    );
-                    // === END NEW LOGGING ===
                     
                     if push_result.is_err() { 
-                        warn!("CQE Processor: SQ push failed for FD {} blueprint {:?} (race condition or SQ became full?). Op dropped.", fd, entry_to_submit);
-                        let _dropped_details = internal_ops.take_op_details(user_data);
+                        warn!("CQE Processor: SQ push failed for FD {} blueprint {:?} (race condition or SQ became full?). Op requeued.", fd, entry_to_submit);
+                        
+                        // Requeue if push fails even after initial SQ full check (race condition).
+                        // Also, need to clean up the internal_op_tracker entry for this failed push.
+                        let _dropped_details = internal_ops.take_op_details(user_data); // Clean up tracker
+                        pending_sqe_retry_queue.push_back((fd, blueprint_ref.clone())); // Requeue
                     } else {
-                        // This trace log was already here, keep it.
                         trace!("CQE Processor: Queued SQE (ud:{}) for FD {} from blueprint: {:?}", user_data, fd, entry_to_submit);
                     }
                 }
@@ -141,9 +106,6 @@ pub(crate) fn process_handler_blueprints(
             }
         }
     }
-    // === START NEW LOGGING ===
-    debug!("[PROCESS_BLUEPRINT_EXIT FD={}] Finished processing blueprints.", fd);
-    // === END NEW LOGGING ===
 }
 
 
@@ -156,6 +118,7 @@ pub(crate) fn process_all_cqes(
     worker_io_config: &WorkerIoConfig,
     default_bgid_val_from_worker: Option<u16>,
     fds_to_initiate_close_queue: &mut VecDeque<RawFd>,
+    pending_sqe_retry_queue: &mut VecDeque<(RawFd, HandlerSqeBlueprint)>,
 ) -> Result<(), ZmqError> {
 
     // Get a local, short-lived CompletionQueue reference from the ring.
@@ -222,7 +185,8 @@ pub(crate) fn process_all_cqes(
                                         internal_ops,
                                         &mut sq_for_initial_ops,
                                         default_bgid_val_from_worker,
-                                        fds_to_initiate_close_queue
+                                        fds_to_initiate_close_queue,
+                                        pending_sqe_retry_queue,
                                     );
                                     // sq_for_initial_ops drops here
                                     UringOpCompletion::ConnectSuccess { user_data: cqe_user_data, connected_fd, peer_addr, local_addr }
@@ -299,7 +263,8 @@ pub(crate) fn process_all_cqes(
                                          internal_ops,
                                          &mut sq_for_accept_initial_ops,
                                          default_bgid_val_from_worker,
-                                         fds_to_initiate_close_queue
+                                         fds_to_initiate_close_queue,
+                                        pending_sqe_retry_queue,
                                      );
                                      // sq_for_accept_initial_ops drops
                                 }
@@ -470,7 +435,8 @@ pub(crate) fn process_all_cqes(
                             internal_ops,
                             &mut sq_for_handler_resp_ops,
                             default_bgid_val_from_worker,
-                            fds_to_initiate_close_queue
+                            fds_to_initiate_close_queue,
+                            pending_sqe_retry_queue,
                         );
                         // sq_for_handler_resp_ops drops
                     } else { // Handler not found for this FD

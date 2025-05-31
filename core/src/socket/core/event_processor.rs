@@ -2,11 +2,12 @@
 
 use crate::error::ZmqError;
 use crate::runtime::{Command, SystemEvent};
-// <<< MODIFIED [SessionConnection needed here to construct it] >>>
 #[cfg(feature = "io-uring")]
 use crate::runtime::global_uring_state;
 use crate::runtime::system_events::ConnectionInteractionModel;
 use crate::socket::connection_iface::{ISocketConnection, SessionConnection};
+#[cfg(feature = "io-uring")]
+use crate::socket::connection_iface::UringFdConnection;
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
 use crate::socket::core::{command_processor, pipe_manager, shutdown, SocketCore};
 use crate::socket::ISocket;
@@ -65,7 +66,6 @@ pub(crate) async fn process_system_event(
       parent_core_id,
       endpoint_uri,
       target_endpoint_uri,
-      // <<< MODIFIED [connection_iface_from_event is now Option] >>>
       connection_iface: connection_iface_from_event_opt,
       interaction_model,
       managing_actor_task_id,
@@ -88,7 +88,7 @@ pub(crate) async fn process_system_event(
             new_conn_uri = %endpoint_uri,
             "SocketCore ignoring NewConnectionEstablished during its shutdown. Attempting to close new connection."
           );
-          // <<< MODIFIED [Handle Option for connection_iface] >>>
+          
           if let Some(iface) = connection_iface_from_event_opt {
             if let Err(e) = iface.close_connection().await {
               tracing::error!(handle = core_handle, new_conn_uri = %endpoint_uri, "Error closing orphaned new connection: {}", e);
@@ -198,7 +198,7 @@ pub(crate) async fn process_system_event(
         .await;
       }
     }
-    // <<< MODIFIED START [ActorStarted event processing moved here, it was implicit before] >>>
+    
     SystemEvent::ActorStarted {
       handle_id: _started_actor_id,
       actor_type: _actor_type,
@@ -210,7 +210,7 @@ pub(crate) async fn process_system_event(
       // No specific action needed by SocketCore for ActorStarted events *of other actors* in general.
       // It publishes ActorStarted for its own children (Listeners, Connecters, PipeReaders).
       tracing::trace!(handle = core_handle, event = ?event, "SocketCore observed ActorStarted event (typically no action needed by SocketCore for this).");
-    } // <<< MODIFIED END >>>
+    }
   }
   Ok(())
 }
@@ -221,14 +221,12 @@ async fn handle_new_connection_established(
   socket_logic_strong: &Arc<dyn ISocket>,
   endpoint_uri_from_event: String,
   target_endpoint_uri_from_event: String,
-  // <<< MODIFIED [connection_iface_from_event_opt is Option] >>>
   connection_iface_from_event_opt: Option<Arc<dyn ISocketConnection>>,
   interaction_model_from_event: ConnectionInteractionModel,
   _managing_actor_task_id_from_event: Option<TaskId>,
 ) -> Result<(), ZmqError> {
   let core_handle = core_arc.handle;
-
-  // <<< MODIFIED START [Derive connection_instance_id based on interaction_model] >>>
+  
   let connection_instance_id = match &interaction_model_from_event {
     ConnectionInteractionModel::ViaSessionActor {
       session_actor_handle_id,
@@ -241,8 +239,7 @@ async fn handle_new_connection_established(
       unreachable!("ViaUringFd model when io-uring feature is disabled")
     }
   };
-  // <<< MODIFIED END >>>
-
+  
   let is_outbound_this_core_initiated = {
     let core_s_guard = core_arc.core_state.read();
     !core_s_guard.endpoints.values().any(|ep_info| {
@@ -251,7 +248,6 @@ async fn handle_new_connection_established(
   };
 
   match interaction_model_from_event {
-    // <<< MODIFIED START [Handle ViaSessionActor with session_actor_handle_id] >>>
     ConnectionInteractionModel::ViaSessionActor {
       session_actor_mailbox,
       session_actor_handle_id,
@@ -273,7 +269,8 @@ async fn handle_new_connection_established(
       .await?;
 
       let arc_socket_options = core_arc.core_state.read().options.clone(); 
-      
+      let core_context_clone = core_arc.context.clone();
+
       // Construct the SessionConnection *after* pipes are set up by pipe_manager
       let tx_core_to_session_for_iface = core_arc
         .core_state
@@ -288,8 +285,8 @@ async fn handle_new_connection_established(
         session_actor_handle_id,
         tx_core_to_session_for_iface,
         arc_socket_options,
+        core_context_clone,
       ));
-      // <<< MODIFIED END >>>
 
       let endpoint_info = EndpointInfo {
         mailbox: session_actor_mailbox.clone(),
@@ -300,7 +297,6 @@ async fn handle_new_connection_established(
         handle_id: session_actor_handle_id, // Use session_actor_handle_id from event
         target_endpoint_uri: Some(target_endpoint_uri_from_event),
         is_outbound_connection: is_outbound_this_core_initiated,
-        // <<< MODIFIED [Use the final_connection_iface constructed above] >>>
         connection_iface: final_connection_iface,
       };
 
@@ -338,10 +334,24 @@ async fn handle_new_connection_established(
         "NewConnectionEstablished: io_uring FD path."
       );
 
-      // <<< MODIFIED [Ensure connection_iface_from_event_opt is Some for UringFd path] >>>
-      let final_connection_iface_uring = connection_iface_from_event_opt
-        .ok_or_else(|| ZmqError::Internal("Missing connection_iface for ViaUringFd model".into()))?;
-      // <<< MODIFIED END >>>
+      // Construct UringFdConnection with the SocketCore's context.
+      // The connection_iface_from_event_opt should be None here, as UringWorker does not create it.
+      // SocketCore creates it.
+      let final_connection_iface_uring = if let Some(iface_from_event) = connection_iface_from_event_opt {
+        // This case implies the Listener/Connecter (if it's a Uring-aware one in future)
+        // somehow created and passed an ISocketConnection for a UringFd.
+        // This is less likely with the current design where SocketCore constructs UringFdConnection.
+        tracing::warn!(handle = core_handle, fd = fd, "Using pre-existing ISocketConnection for ViaUringFd. This is unusual.");
+        iface_from_event
+      } else {
+        let arc_socket_options_uring = core_arc.core_state.read().options.clone();
+        let core_context_clone_uring = core_arc.context.clone();
+        Arc::new(UringFdConnection::new(
+          fd, 
+          arc_socket_options_uring,
+          core_context_clone_uring, // Pass the context
+        ))
+      };
 
       let uring_fd_as_endpoint_handle_id = fd as usize;
 
@@ -357,7 +367,6 @@ async fn handle_new_connection_established(
         handle_id: uring_fd_as_endpoint_handle_id,
         target_endpoint_uri: Some(target_endpoint_uri_from_event),
         is_outbound_connection: is_outbound_this_core_initiated,
-        // <<< MODIFIED [Use final_connection_iface_uring] >>>
         connection_iface: final_connection_iface_uring,
       };
 

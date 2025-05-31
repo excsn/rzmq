@@ -11,7 +11,7 @@ use kanal::Sender as KanalSender;
 use bytes::Bytes; // For HandlerSqeBlueprint::RequestSend
 
 // --- Blueprints for SQEs requested by handlers ---
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum HandlerSqeBlueprint {
     /// Request a ring-buffered read for the handler's FD.
     /// The UringWorker will use the default_buffer_ring_group_id.

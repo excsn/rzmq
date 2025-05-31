@@ -312,11 +312,10 @@ impl TcpListener {
                           match reply_rx_for_op.await {
                             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
                               info!("Registered accepted FD {} with UringWorker.", raw_fd);
-                              let local_iface_for_uring: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, socket_options_clone.clone())); // Pass Arc<SocketOptions>
+                              let local_iface_for_uring: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, socket_options_clone.clone(), context_clone.clone()));
                               connection_iface_for_event = Some(local_iface_for_uring);
                               interaction_model_for_event = Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
                               // managing_actor_task_id_for_event remains None for UringFd path
-                              // <<< MODIFIED END >>>
                             }
                             Ok(Ok(other_completion)) => { 
                               tracing::error!("UringWorker bad success for RegisterExternalFd (fd {}): {:?}", raw_fd, other_completion); 
@@ -663,7 +662,7 @@ impl TcpConnecter {
             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
               info!("Successfully registered connected FD {} with UringWorker.", raw_fd);
               // <<< MODIFIED [ISocketConnection is Some for UringFd path] >>>
-              let connection_iface: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, self.context_options.clone()));
+              let connection_iface: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, self.context_options.clone(), self.context.clone()));
               let interaction_model = ConnectionInteractionModel::ViaUringFd { fd: raw_fd };
               Ok((
                 Some(connection_iface), interaction_model, 

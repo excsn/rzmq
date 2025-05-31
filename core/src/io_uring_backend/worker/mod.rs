@@ -12,15 +12,13 @@ use std::mem;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr, Ipv6Addr};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::thread;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
-    ProtocolHandlerFactory, WorkerIoConfig,
-    // UringConnectionHandler, SubmissionQueueWriter, UringWorkerInterface, // Not directly used in this file's public API
+    ProtocolHandlerFactory, WorkerIoConfig, HandlerSqeBlueprint,
 };
-use crate::io_uring_backend::ops::{UringOpRequest, UringOpCompletion, UserData}; // UserData for ops.rs
+use crate::io_uring_backend::ops::UringOpRequest; // UserData for ops.rs
 // use crate::io_uring_backend::one_shot_sender::OneShotSender; // Not directly used by UringWorker struct or spawn()
 use crate::message::Msg; // For WorkerIoConfig
 use crate::ZmqError;
@@ -29,7 +27,7 @@ use io_uring::IoUring;
 // Publicly re-export for use within io_uring_backend module
 pub(crate) use external_op_tracker::{ExternalOpContext, ExternalOpTracker};
 pub(crate) use handler_manager::HandlerManager;
-pub(crate) use internal_op_tracker::{InternalOpDetails, InternalOpTracker, InternalOpPayload, InternalOpType};
+pub(crate) use internal_op_tracker::{InternalOpTracker, InternalOpPayload, InternalOpType};
 
 // Declare internal worker sub-modules
 mod cqe_processor;
@@ -55,6 +53,9 @@ pub struct UringWorker {
     default_buffer_ring_group_id_val: Option<u16>,
     fds_needing_close_initiated_pass: VecDeque<RawFd>,
     shutdown_requested: bool, 
+    // Added queue for SQEs that couldn't be submitted immediately.
+    // Stores (FD to operate on, Blueprint of the SQE to retry)
+    pending_sqe_retry_queue: VecDeque<(RawFd, HandlerSqeBlueprint)>,
 }
 
 impl fmt::Debug for UringWorker {
@@ -68,6 +69,7 @@ impl fmt::Debug for UringWorker {
       .field("internal_op_tracker_len", &self.internal_op_tracker.op_to_details.len())
       .field("default_buffer_ring_group_id_val", &self.default_buffer_ring_group_id_val)
       .field("shutdown_requested", &self.shutdown_requested) 
+      .field("pending_sqe_retry_queue_len", &self.pending_sqe_retry_queue.len())
       .finish_non_exhaustive()
   }
 }
@@ -100,7 +102,8 @@ impl UringWorker {
               worker_io_config,
               default_buffer_ring_group_id_val: None,
               fds_needing_close_initiated_pass: VecDeque::new(),
-              shutdown_requested: false, 
+              shutdown_requested: false,
+              pending_sqe_retry_queue: VecDeque::new(),
             };
             
             let loop_result = main_loop::run_worker_loop(&mut worker);

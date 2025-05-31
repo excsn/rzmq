@@ -4,7 +4,6 @@ use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::SystemEvent;
 use crate::runtime::{command::Command, mailbox::MailboxSender as SessionMailboxSender};
-// <<< ADDED [SocketOptions needed for SNDTIMEO] >>>
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSender;
 #[cfg(feature = "io-uring")]
@@ -15,30 +14,29 @@ use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
 use crate::socket::SocketEvent;
 use crate::Context;
-use std::any::Any;
-#[cfg(feature = "io-uring")]
-use tokio::sync::oneshot as tokio_oneshot;
 
-use async_trait::async_trait;
+use std::any::Any;
 use std::fmt;
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
-// <<< ADDED [For send_message timeout logic] >>>
+
 use async_channel::{SendError, TrySendError};
+use async_trait::async_trait;
 use tokio::time::timeout as tokio_timeout;
+
+#[cfg(feature = "io-uring")]
+use tokio::sync::oneshot as tokio_oneshot;
 
 #[async_trait]
 pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
-  // <<< MODIFIED [send_message no longer needs explicit timeout, it will use stored options] >>>
   async fn send_message(&self, msg: Msg) -> Result<(), ZmqError>;
   async fn close_connection(&self) -> Result<(), ZmqError>;
   fn get_connection_id(&self) -> usize;
   fn as_any(&self) -> &dyn Any;
 }
 
-// ... (DummyConnection remains the same)
 #[derive(Debug, Clone)]
 pub(crate) struct DummyConnection;
 
@@ -58,21 +56,32 @@ impl ISocketConnection for DummyConnection {
   }
 }
 
-// <<< MODIFIED START [SessionConnection struct and new method] >>>
-#[derive(Debug)]
-// Not Clone anymore due to SocketOptions potentially being mutated by SocketCore elsewhere if not careful
-// However, SocketOptions is Arc'd from SocketCore's state which is under RwLock, so cloning Arc<SocketOptions> is fine.
-// Let's make it Clone if SocketOptions is Arc<SocketOptions>.
-// If SocketOptions is directly held, then not Clone.
-// Current SocketOptions in CoreState is not Arc'd, so SessionConnection cannot be Clone if it holds SocketOptions directly.
-// Let's make it hold Arc<SocketOptions> for clonability and safety.
-#[derive(Clone)] // Now it can be Clone again
+#[derive(Clone)]
 pub(crate) struct SessionConnection {
   session_mailbox: SessionMailboxSender,
   connection_id: usize,
   pipe_to_session_tx: async_channel::Sender<Msg>,
-  // <<< ADDED [Field to store socket options, primarily for SNDTIMEO] >>>
   socket_options: Arc<SocketOptions>,
+  // Added context field to generate unique UserData for operations.
+  // This is necessary if UringFdConnection needs a similar capability and we want to keep new() signatures consistent
+  // or if SessionConnection itself might later interact with systems needing unique IDs.
+  // For now, primarily for UringFdConnection pattern.
+  #[allow(dead_code)] // May not be used if SessionConnection doesn't directly create ops for ExternalOpTracker
+  context: Context, 
+}
+
+// Added Debug impl for SessionConnection manually as Context was added which makes auto-derive complex
+impl fmt::Debug for SessionConnection {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("SessionConnection")
+      .field("session_mailbox_closed", &self.session_mailbox.is_closed())
+      .field("connection_id", &self.connection_id)
+      .field("pipe_to_session_tx_closed", &self.pipe_to_session_tx.is_closed())
+      .field("socket_options", &self.socket_options)
+      // Context doesn't have a simple Debug, so just indicate its presence
+      .field("context_present", &true) 
+      .finish()
+  }
 }
 
 impl SessionConnection {
@@ -80,22 +89,21 @@ impl SessionConnection {
     session_mailbox: SessionMailboxSender,
     connection_id: usize,
     pipe_to_session_tx: async_channel::Sender<Msg>,
-    // <<< ADDED [socket_options parameter] >>>
     socket_options: Arc<SocketOptions>,
+    context: Context,
   ) -> Self {
     Self {
       session_mailbox,
       connection_id,
       pipe_to_session_tx,
-      socket_options, // Store it
+      socket_options,
+      context,
     }
   }
 }
-// <<< MODIFIED END >>>
 
 #[async_trait]
 impl ISocketConnection for SessionConnection {
-  // <<< MODIFIED START [send_message now uses stored socket_options for SNDTIMEO] >>>
   async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
     let timeout_opt = self.socket_options.sndtimeo; // Get SNDTIMEO from stored options
 
@@ -192,22 +200,35 @@ impl ISocketConnection for SessionConnection {
 // UringFdConnection::send_message already has its own timeout logic for worker reply,
 // which could be tied to SNDTIMEO if passed or accessed.
 #[cfg(feature = "io-uring")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct UringFdConnection {
   fd: RawFd,
   worker_op_tx: kanal::Sender<UringOpRequest>,
-  // <<< ADDED [Field to store socket options, primarily for SNDTIMEO] >>>
   socket_options: Arc<SocketOptions>,
+  context: Context,
+}
+
+#[cfg(feature = "io-uring")]
+impl fmt::Debug for UringFdConnection {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("UringFdConnection")
+      .field("fd", &self.fd)
+      .field("worker_op_tx_closed", &self.worker_op_tx.is_closed())
+      .field("socket_options", &self.socket_options)
+      .field("context_present", &true)
+      .finish()
+  }
 }
 
 #[cfg(feature = "io-uring")]
 impl UringFdConnection {
-  // <<< MODIFIED [new takes Arc<SocketOptions>] >>>
-  pub(crate) fn new(fd: RawFd, socket_options: Arc<SocketOptions>) -> Self {
+  pub(crate) fn new(fd: RawFd, socket_options: Arc<SocketOptions>,
+    context: Context,) -> Self {
     Self {
       fd,
       worker_op_tx: global_uring_state::get_global_uring_worker_op_tx(),
       socket_options,
+      context,
     }
   }
 }
@@ -215,11 +236,11 @@ impl UringFdConnection {
 #[cfg(feature = "io-uring")]
 #[async_trait]
 impl ISocketConnection for UringFdConnection {
-  // <<< MODIFIED START [send_message uses stored socket_options.sndtimeo for its internal timeout] >>>
   async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
     let (reply_tx, reply_rx) = tokio_oneshot::channel();
+    let unique_user_data = self.context.inner().next_handle() as u64;
     let req = UringOpRequest::SendDataViaHandler {
-      user_data: 0,
+      user_data: unique_user_data,
       fd: self.fd,
       app_data: Arc::new(msg),
       reply_tx: WorkerOneShotSender::new(reply_tx),
@@ -274,12 +295,13 @@ impl ISocketConnection for UringFdConnection {
       }
     }
   }
-  // <<< MODIFIED END >>>
-  // ... (close_connection, get_connection_id, as_any for UringFdConnection remain the same)
+  
   async fn close_connection(&self) -> Result<(), ZmqError> {
     let (reply_tx, reply_rx) = tokio_oneshot::channel();
+
+    let unique_user_data = self.context.inner().next_handle() as u64;
     let req = UringOpRequest::ShutdownConnectionHandler {
-      user_data: 0,
+      user_data: unique_user_data,
       fd: self.fd,
       reply_tx: WorkerOneShotSender::new(reply_tx),
     };
@@ -326,7 +348,7 @@ impl ISocketConnection for UringFdConnection {
   }
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub(crate) struct InprocConnection {
   connection_id: usize,
   local_pipe_write_id_to_peer: usize,
@@ -335,12 +357,25 @@ pub(crate) struct InprocConnection {
   context: Context,
   data_tx_to_peer: async_channel::Sender<Msg>,
   monitor_tx: Option<MonitorSender>,
-  // <<< ADDED [Field to store socket options, primarily for SNDTIMEO] >>>
   socket_options: Arc<SocketOptions>,
 }
 
+impl fmt::Debug for InprocConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InprocConnection")
+            .field("connection_id", &self.connection_id)
+            .field("local_pipe_write_id_to_peer", &self.local_pipe_write_id_to_peer)
+            .field("local_pipe_read_id_from_peer", &self.local_pipe_read_id_from_peer)
+            .field("peer_inproc_name_or_uri", &self.peer_inproc_name_or_uri)
+            .field("context_present", &true) // Context doesn't have a simple Debug
+            .field("data_tx_to_peer_closed", &self.data_tx_to_peer.is_closed())
+            .field("monitor_tx_is_some", &self.monitor_tx.is_some())
+            .field("socket_options", &self.socket_options)
+            .finish()
+    }
+}
+
 impl InprocConnection {
-  // <<< MODIFIED START [Added socket_options parameter to new] >>>
   pub(crate) fn new(
     connection_id: usize,
     local_pipe_write_id_to_peer: usize,
@@ -349,7 +384,7 @@ impl InprocConnection {
     context: Context,
     data_tx_to_peer: async_channel::Sender<Msg>,
     monitor_tx: Option<MonitorSender>,
-    socket_options: Arc<SocketOptions>, // Added parameter
+    socket_options: Arc<SocketOptions>,
   ) -> Self {
     Self {
       connection_id,
@@ -359,10 +394,9 @@ impl InprocConnection {
       context,
       data_tx_to_peer,
       monitor_tx,
-      socket_options, // Store it
+      socket_options,
     }
   }
-  // <<< MODIFIED END >>>
 }
 
 #[async_trait]
