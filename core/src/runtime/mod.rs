@@ -5,6 +5,8 @@
 pub mod actor_drop_guard;
 pub mod command;
 pub mod event_bus;
+#[cfg(feature = "io-uring")]
+pub mod global_uring_state;
 pub mod latch;
 pub mod mailbox;
 pub mod one_shot_sender;
@@ -22,8 +24,6 @@ pub use event_bus::EventBus;
 pub use system_events::{ActorType, SystemEvent};
 
 pub use command::EngineConnectionType;
-#[cfg(feature = "io-uring")]
-pub use crate::engine::uring_core::{AppToUringEngineCmd, UringLaunchInformation};
 
 // Sync Primitives
 pub(crate) use latch::CountDownLatch;

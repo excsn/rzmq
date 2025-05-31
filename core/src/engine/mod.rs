@@ -3,11 +3,6 @@ pub mod zmtp_tcp;
 #[cfg(feature = "ipc")]
 pub mod zmtp_ipc;
 
-#[cfg(feature = "io-uring")]
-pub(crate) mod uring_core;
-#[cfg(feature = "io-uring")]
-mod uring_recv;
-
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::security::MechanismStatus; // Needs security module defined

@@ -30,7 +30,7 @@ impl<T> Clone for OneShotSender<T> {
 }
 
 impl<T: Send> OneShotSender<T> { 
-  pub fn new_generic(sender: oneshot::Sender<T>) -> Self { 
+  pub fn new(sender: oneshot::Sender<T>) -> Self { 
     Self {
       inner: Arc::new(Mutex::new(Some(sender))),
     }

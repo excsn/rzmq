@@ -3,7 +3,6 @@
 #![cfg(feature = "io-uring")]
 
 use crate::message::Msg;
-use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
 use std::any::Any;
 use std::os::unix::io::RawFd;

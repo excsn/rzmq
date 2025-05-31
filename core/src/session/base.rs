@@ -6,9 +6,6 @@ use crate::runtime::{mailbox, ActorType, Command, EngineConnectionType, MailboxR
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::{Blob, Msg};
 
-#[cfg(feature = "io-uring")]
-use crate::runtime::AppToUringEngineCmd;
-
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -105,9 +102,8 @@ impl SessionBase {
 
       let event = SystemEvent::PeerIdentityEstablished {
         parent_core_id: self.parent_socket_id,
-        core_pipe_read_id: core_pipe_read_id_for_event, // This is Session's pipe_write_id
+        connection_identifier: core_pipe_read_id_for_event, // This is Session's pipe_write_id
         peer_identity: identity_to_publish,             // This is the Blob itself
-        session_handle_id: session_handle,
       };
 
       if self.context.event_bus().publish(event).is_err() {
@@ -405,11 +401,6 @@ impl SessionBase {
         tracing::debug!(handle = self.handle, "Session signaling Stop to Standard Engine.");
         let _ = engine_mailbox.send(Command::Stop).await;
       }
-      #[cfg(feature = "io-uring")]
-      Some(EngineConnectionType::Uring { app_to_engine_cmd_tx }) => {
-        tracing::debug!(handle = self.handle, "Session signaling Stop to Uring Engine.");
-        let _ = app_to_engine_cmd_tx.send(AppToUringEngineCmd::Stop).await;
-      }
       None => {
         tracing::trace!(
           handle = self.handle,
@@ -425,11 +416,6 @@ impl SessionBase {
         .send(Command::SessionPushCmd { msg })
         .await
         .map_err(|_| ZmqError::Internal("Std Engine mailbox closed for SessionPushCmd".into())),
-      #[cfg(feature = "io-uring")]
-      Some(EngineConnectionType::Uring { app_to_engine_cmd_tx }) => app_to_engine_cmd_tx
-        .send(AppToUringEngineCmd::SendMsg(msg))
-        .await
-        .map_err(|_| ZmqError::Internal("Uring Engine channel closed for SendMsg".into())),
       None => {
         tracing::warn!(
           handle = self.handle,

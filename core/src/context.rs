@@ -1,6 +1,4 @@
-use crate::error::ZmqError;
-#[cfg(feature = "io-uring")]
-use crate::runtime::uring_runtime;
+use crate::error::{ZmqError, ZmqResult};
 use crate::runtime::{ActorType, EventBus, MailboxSender, SystemEvent, WaitGroup, DEFAULT_MAILBOX_CAPACITY};
 use crate::socket::{Socket, SocketType}; // For creating and managing Sockets
 
@@ -8,10 +6,18 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid clash
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::warn;
 
-use std::time::Duration;
+#[cfg(feature = "io-uring")]
+use crate::runtime::global_uring_state;
+#[cfg(feature = "io-uring")]
+use crate::io_uring_backend::ops::UringOpRequest;
+#[cfg(feature = "io-uring")]
+use kanal::Sender as KanalSender;
+#[cfg(feature = "io-uring")]
+use std::os::fd::RawFd;
 
 /// Information stored in the inproc registry for a bound endpoint.
 /// This is used by in-process connectors to find the binder.
@@ -49,17 +55,28 @@ pub(crate) struct ContextInner {
   /// Used to prevent redundant shutdown operations and to signal actors.
   pub(crate) shutdown_initiated: AtomicBool,
   actor_mailbox_capacity: usize,
+
+  #[cfg(feature = "io-uring")]
+  pub(crate) uring_worker_op_tx: Option<KanalSender<UringOpRequest>>,
 }
 
 impl ContextInner {
   /// Creates new shared context state
   /// and spawning the event listener task.
-  fn new(actor_mailbox_capacity: usize) -> Self {
+  fn new(actor_mailbox_capacity: usize) -> ZmqResult<Self> {
 
     let event_bus = Arc::new(EventBus::new());
     let actor_wait_group = WaitGroup::new();
 
-    Self {
+
+    #[cfg(feature = "io-uring")]
+    let uring_op_tx_for_this_context = {
+      global_uring_state::ensure_global_uring_systems_started()?;
+      // Get a clone of the global sender.
+      Some(global_uring_state::get_global_uring_worker_op_tx())
+    };
+    
+    Ok(Self {
       next_handle: Arc::new(std::sync::atomic::AtomicUsize::new(1)), // Start handle IDs from 1.
       sockets: parking_lot::RwLock::new(HashMap::new()),
       #[cfg(feature = "inproc")]
@@ -68,7 +85,9 @@ impl ContextInner {
       actor_wait_group,
       shutdown_initiated: AtomicBool::new(false),
       actor_mailbox_capacity,
-    }
+      #[cfg(feature = "io-uring")]
+      uring_worker_op_tx: uring_op_tx_for_this_context,
+    })
   }
 
   pub(crate) fn get_actor_mailbox_capacity(&self) -> usize {
@@ -206,6 +225,23 @@ impl ContextInner {
   pub(crate) fn event_bus(&self) -> Arc<EventBus> {
     self.event_bus.clone()
   }
+
+  #[cfg(feature = "io-uring")]
+  pub(crate) fn get_uring_worker_op_tx(&self) -> Option<KanalSender<UringOpRequest>> {
+    self.uring_worker_op_tx.clone()
+  }
+
+  // Registration/unregistration for FD -> SocketCore mailbox map now delegates to global_uring_state
+  #[cfg(feature = "io-uring")]
+  pub(crate) fn register_uring_fd_for_socket_core(fd: RawFd, core_mailbox: MailboxSender) {
+
+      global_uring_state::register_uring_fd_socket_core_mailbox(fd, core_mailbox);
+  }
+
+  #[cfg(feature = "io-uring")]
+  pub(crate) fn unregister_uring_fd(fd: RawFd) {
+      global_uring_state::unregister_uring_fd_socket_core_mailbox(fd);
+  }
 }
 
 /// A handle to an rzmq context, managing sockets and shared resources.
@@ -234,14 +270,8 @@ impl Context {
 
     tracing::debug!(target_capacity = capacity, "Creating new rzmq Context");
 
-    #[cfg(feature = "io-uring")]
-    {
-      tracing::debug!("io-uring feature enabled, ensuring UringRuntimeManager is started.");
-      uring_runtime::ensure_uring_runtime_manager_started();
-    }
-
     Ok(Self {
-      inner: Arc::new(ContextInner::new(capacity)),
+      inner: Arc::new(ContextInner::new(capacity)?),
     })
   }
 
@@ -253,13 +283,7 @@ impl Context {
     // `create_socket_actor` now returns the ISocket logic and the single command_sender.
     let (socket_logic, command_sender) = crate::socket::create_socket_actor(handle, self.clone(), socket_type)?;
 
-    // Register the socket's command mailbox with the context.
-    // WG increment for the socket actor happens via an ActorStarted event published by create_socket_actor.
-    let inner_clone = self.inner.clone();
-    let cmd_sender_clone = command_sender.clone();
-    tokio::spawn(async move {
-      inner_clone.register_socket(handle, cmd_sender_clone);
-    });
+    self.inner.register_socket(handle, command_sender.clone());
 
     // The public `Socket` handle now needs the command_sender to interact with its `SocketCore`.
     Ok(Socket::new(socket_logic, command_sender))
@@ -277,6 +301,14 @@ impl Context {
   pub async fn term(&self) -> Result<(), ZmqError> {
     self.inner.shutdown().await; // Ensure shutdown is initiated.
     self.inner.wait_for_termination().await; // Wait using the WG.
+
+    // This is complex. For now, the global worker keeps running.
+    // A proper shutdown of global systems would require tracking active Context instances.
+    // if Arc::strong_count(&self.inner) == 1 && Arc::weak_count(&self.inner) == 0 {
+    //    #[cfg(feature = "io-uring")]
+    //    global_uring_state::shutdown_global_uring_systems();
+    // }
+
     Ok(())
   }
 

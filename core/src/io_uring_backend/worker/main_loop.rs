@@ -285,6 +285,102 @@ impl UringWorker {
                 }
             }
 
+            UringOpRequest::RegisterExternalFd {
+                user_data,
+                fd,
+                protocol_handler_factory_id,
+                protocol_config,
+                is_server_role,
+                reply_tx: _, // Original reply_tx from request, use cloned `reply_tx` from outer scope
+            } => {
+                info!(
+                    "UringWorker: Received RegisterExternalFd (ud: {}, fd: {}, factory: {}, server_role: {})",
+                    user_data, fd, protocol_handler_factory_id, is_server_role
+                );
+                // Add to external_op_tracker BEFORE calling handler_manager,
+                // so if handler_manager errors, we can reply with OpError.
+                self.external_op_tracker.add_op(
+                    user_data,
+                    ExternalOpContext {
+                        reply_tx: reply_tx.clone(), // Use the cloned reply_tx
+                        op_name: op_name_str.clone(),
+                        // These fields might not be strictly necessary for RegisterExternalFd's ExternalOpContext
+                        // but kept for consistency if some generic error reply logic uses them.
+                        protocol_handler_factory_id: Some(protocol_handler_factory_id.clone()),
+                        protocol_config: Some(protocol_config.clone()),
+                        fd_created_for_connect_op: None, // FD is provided, not created by worker
+                        listener_fd: None,
+                        target_fd_for_shutdown: Some(fd), // For potential shutdown later
+                    },
+                );
+
+                match self.handler_manager.create_and_add_handler(
+                    fd,
+                    &protocol_handler_factory_id,
+                    &protocol_config,
+                    is_server_role,
+                    self.buffer_manager.as_ref(),
+                    self.default_buffer_ring_group_id_val,
+                ) {
+                    Ok(initial_ops_from_handler) => {
+                        debug!(
+                            "UringWorker: Handler created for registered FD {}. Processing initial ops.", fd
+                        );
+                        // Process any initial blueprints from the handler (e.g., start reading)
+                        let mut sq_for_initial_handler_ops = unsafe { self.ring.submission_shared() };
+                        // We need a mutable fds_to_initiate_close_queue. If it's part of self, use self.
+                        // For now, assuming it's a local var in run_worker_loop, which means this function
+                        // cannot directly add to it. This implies process_handler_blueprints should return
+                        // FDs to close or this part needs rework.
+                        // Let's assume process_handler_blueprints can manage its side effects, or we pass a dummy VecDeque.
+                        let mut dummy_fds_to_close_q = VecDeque::new();
+                        cqe_processor::process_handler_blueprints(
+                            fd,
+                            initial_ops_from_handler,
+                            &mut self.internal_op_tracker,
+                            &mut sq_for_initial_handler_ops,
+                            self.default_buffer_ring_group_id_val,
+                            &mut dummy_fds_to_close_q, // Dummy queue for now
+                        );
+                        if !dummy_fds_to_close_q.is_empty() {
+                            warn!("UringWorker: RegisterExternalFd for FD {} generated unexpected close requests immediately.", fd);
+                            // TODO: Handle these if necessary by adding to worker's main close queue
+                        }
+                        drop(sq_for_initial_handler_ops);
+
+                        // Reply with success to the original requester via the ExternalOpContext.
+                        // We already added to tracker, now take it to reply.
+                        if let Some(mut op_ctx) = self.external_op_tracker.take_op(user_data) {
+                            let _ = op_ctx.reply_tx.take_and_send_sync(Ok(
+                                UringOpCompletion::RegisterExternalFdSuccess { user_data, fd },
+                            ));
+                        } else {
+                            // Should not happen if add_op was successful
+                            error!("UringWorker: ExternalOpContext missing for ud {} after successful RegisterExternalFd.", user_data);
+                        }
+                        Ok(true) // Indicated SQEs might have been pushed by process_handler_blueprints
+                    }
+                    Err(err_msg) => {
+                        error!(
+                            "UringWorker: Failed to create handler for registered FD {}: {}", fd, err_msg
+                        );
+                        // Reply with error via the ExternalOpContext
+                        if let Some(mut op_ctx) = self.external_op_tracker.take_op(user_data) {
+                            let _ = op_ctx.reply_tx.take_and_send_sync(Ok(
+                                UringOpCompletion::OpError {
+                                    user_data,
+                                    op_name: op_name_str.clone(),
+                                    error: ZmqError::Internal(err_msg),
+                                },
+                            ));
+                        }
+                        // Important: The external FD was not successfully managed. The caller needs to know.
+                        // The UringWorker should NOT attempt to close this FD as it doesn't own it yet.
+                        Ok(false) // No SQEs pushed by this path itself, though handler creation failed.
+                    }
+                }
+            }
+
             UringOpRequest::StartFdReadLoop { user_data, fd, reply_tx: _ } => { 
                 if self.handler_manager.contains_handler_for(fd) {
                     trace!("UringWorker: Received StartFdReadLoop for fd {}. Handler will manage reads via prepare_sqes.", fd);

@@ -661,7 +661,7 @@ impl SocketCore {
               Ok(SystemEvent::ActorStopping { handle_id: child_actor_id, actor_type: _child_type, endpoint_uri, error }) => {
                 Self::process_child_completion(core_arc.clone(), &socket_logic_strong, child_actor_id, endpoint_uri.as_deref(), "ActorStoppingEvent", error.as_ref()).await;
               }
-              Ok(SystemEvent::NewConnectionEstablished { parent_core_id, endpoint_uri, target_endpoint_uri, session_mailbox, session_handle_id, session_task_id }) => {
+              Ok(SystemEvent::NewConnectionEstablished { parent_core_id, endpoint_uri, target_endpoint_uri, session_mailbox, session_handle_id, managing_actor_task_id }) => {
                 if parent_core_id == core_handle {
                   if current_shutdown_phase == ShutdownPhase::Running {
                     let dummy_join_handle = tokio::spawn(async move { tracing::trace!("Dummy task for session_task_id: {}", session_task_id); }); // Placeholder
@@ -672,7 +672,7 @@ impl SocketCore {
                   }
                 }
               }
-              Ok(SystemEvent::PeerIdentityEstablished { parent_core_id, core_pipe_read_id, peer_identity, session_handle_id }) => {
+              Ok(SystemEvent::PeerIdentityEstablished { parent_core_id, connection_identifier, peer_identity, session_handle_id }) => {
                 if parent_core_id == core_handle {
                   if current_shutdown_phase == ShutdownPhase::Running {
                     tracing::debug!(

@@ -6,7 +6,9 @@ use crate::context::Context; // For accessing the inproc registry and event bus.
                              // use crate::context::InprocBinding; // Not directly used here, but ContextInner uses it.
 use crate::error::ZmqError;
 use crate::message::Msg; // For the data type exchanged over inproc pipes.
-use crate::runtime::{OneShotSender, SystemEvent}; // Command for reconstructing InprocConnectRequest if needed by SocketCore.
+use crate::runtime::{OneShotSender, SystemEvent}; use crate::socket::connection_iface::InprocBinderSideConnection;
+use crate::socket::core::pipe_manager::run_pipe_reader_task;
+// Command for reconstructing InprocConnectRequest if needed by SocketCore.
 use crate::socket::core::{EndpointInfo, EndpointType, SocketCore}; // For managing endpoint state.
 use crate::socket::SocketEvent; // For emitting monitor events.
 
@@ -151,7 +153,7 @@ pub(crate) async fn connect_inproc(
   let connector_context_clone = core_arc.context.clone();
   let connector_command_sender_clone = core_arc.command_sender();
   // Connector receives on this pipe
-  let pipe_reader_task_join_handle = tokio::spawn(SocketCore::run_pipe_reader_task(
+  let pipe_reader_task_join_handle = tokio::spawn(run_pipe_reader_task(
     connector_context_clone,
     connector_core_handle,
     connector_command_sender_clone,
@@ -164,17 +166,28 @@ pub(crate) async fn connect_inproc(
     .pipe_reader_task_handles
     .insert(pipe_id_connector_reads_from_binder, pipe_reader_task_join_handle);
 
-  // Store EndpointInfo for the connector
   let inproc_endpoint_entry_handle_id = core_arc.context.inner().next_handle();
+  let inproc_conn_iface = Arc::new(
+      crate::socket::connection_iface::InprocConnection::new(
+          inproc_endpoint_entry_handle_id, // Use the unique ID for this EndpointInfo entry
+          pipe_id_connector_writes_to_binder,
+          pipe_id_connector_reads_from_binder,
+          format!("inproc://{}", name), // Peer is the binder service name
+          core_arc.context.clone(),
+          tx_connector_to_binder.clone(), // This is the sender to the binder
+      )
+  );
+  // Store EndpointInfo for the connector
   let endpoint_info = EndpointInfo {
     mailbox: core_arc.command_sender(),
-    task_handle: tokio::spawn(async {}), // Dummy JoinHandle
+    task_handle: None,
     endpoint_type: EndpointType::Session,
     endpoint_uri: connector_uri_str.clone(),
     pipe_ids: Some((pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder)),
     handle_id: inproc_endpoint_entry_handle_id,
     target_endpoint_uri: Some(connector_uri_str.clone()),
     is_outbound_connection: true,
+    connection_iface: inproc_conn_iface,
   };
   core_arc.core_state.write()
     .endpoints
@@ -372,8 +385,9 @@ pub(crate) async fn disconnect_inproc(
   let pipes_were_removed = core_arc.core_state.write().remove_pipe_state(pipe_id_connector_writes, pipe_id_connector_reads);
   let monitor_tx_for_event = core_arc.core_state.read().get_monitor_sender_clone();
   // EndpointInfo for the dummy task_handle associated with inproc is implicitly cleaned by `endpoints.remove`.
-  // `removed_endpoint_info.task_handle.abort()` is not strictly necessary if it's a dummy.
-  removed_endpoint_info.task_handle.abort(); // Abort the dummy task handle just in case.
+  if let Some(handle) = removed_endpoint_info.task_handle {
+    handle.abort();
+  }
 
   // 5. Notify the connector's `ISocket` logic about the pipe detachment.
   if pipes_were_removed {

@@ -85,7 +85,7 @@ pub(crate) struct SocketOptions {
   pub linger: Option<Duration>, // ZMQ uses -1 for infinite, 0 for immediate, >0 for ms -> map to Duration
   pub reconnect_ivl: Option<Duration>, // Initial reconnect interval (None = ZMQ default, often 0 = no reconnect)
   pub reconnect_ivl_max: Option<Duration>, // Max reconnect interval (for exponential backoff)
-  // pub backlog: Option<u32>, // TODO - For listener
+  pub backlog: Option<u32>,
   // Identity
   pub routing_id: Option<Blob>,
   pub socket_type_name: String, // e.g., "REQ", "REP" - needed for READY cmd
@@ -129,6 +129,7 @@ impl Default for SocketOptions {
       linger: Some(Duration::ZERO), // 0 in ZMQ (different from socket default!)
       reconnect_ivl: Some(Duration::from_millis(DEFAULT_RECONNECT_IVL_MS)),
       reconnect_ivl_max: Some(Duration::ZERO), // ZMQ default is 0 (disable max/backoff)
+      backlog: None,
       routing_id: None,
       socket_type_name: "UNKNOWN".to_string(), // Default, should be set on creation
       tcp_keepalive_enabled: 0,                // 0 (use system default) in ZMQ

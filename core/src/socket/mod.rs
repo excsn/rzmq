@@ -4,7 +4,7 @@
 // Each sub-module handles a specific aspect of socket functionality.
 
 /// Contains the `SocketCore` actor implementation and related internal types.
-pub mod core;
+pub(crate) mod core;
 /// Defines `SocketEvent` for monitoring and related channel types.
 pub mod events;
 /// Defines socket option constants (e.g., SNDHWM) and parsing helpers.
@@ -13,6 +13,8 @@ pub mod options;
 pub mod patterns;
 /// Defines the public `Socket` handle and `SocketType` enum.
 pub mod types;
+
+pub(crate) mod connection_iface;
 
 // Declare modules for each specific socket type implementation (ISocket trait implementors).
 pub mod dealer_socket;
@@ -33,14 +35,6 @@ use crate::socket::options::SocketOptions; // For initial socket configuration.
 
 // Import specific socket pattern implementations.
 use crate::socket::core::SocketCore; // The core actor logic.
-use crate::socket::dealer_socket::DealerSocket;
-use crate::socket::pub_socket::PubSocket;
-use crate::socket::pull_socket::PullSocket;
-use crate::socket::push_socket::PushSocket;
-use crate::socket::rep_socket::RepSocket;
-use crate::socket::req_socket::ReqSocket;
-use crate::socket::router_socket::RouterSocket;
-use crate::socket::sub_socket::SubSocket;
 use crate::Blob;
 
 use async_trait::async_trait; // For defining asynchronous traits.

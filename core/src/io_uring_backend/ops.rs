@@ -51,6 +51,14 @@ pub enum UringOpRequest {
     protocol_config: ProtocolConfig, 
     reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
   },
+  RegisterExternalFd {
+    user_data: UserData,
+    fd: RawFd, // The externally established FD
+    protocol_handler_factory_id: String,
+    protocol_config: ProtocolConfig,
+    is_server_role: bool, // True if this FD is from an accepted connection on server-side
+    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+  },
   StartFdReadLoop {
     user_data: UserData,
     fd: RawFd,
@@ -78,6 +86,7 @@ impl UringOpRequest {
             Self::RegisterRawBuffers { user_data, .. } |
             Self::Listen { user_data, .. } |
             Self::Connect { user_data, .. } |
+            Self::RegisterExternalFd { user_data, .. } |
             Self::StartFdReadLoop { user_data, .. } |
             Self::SendDataViaHandler { user_data, .. } |
             Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
@@ -92,6 +101,7 @@ impl UringOpRequest {
             Self::RegisterRawBuffers { .. } => "RegisterRawBuffers".to_string(),
             Self::Listen { .. } => "Listen".to_string(),
             Self::Connect { .. } => "Connect".to_string(),
+            Self::RegisterExternalFd { .. } => "RegisterExternalFd".to_string(),
             Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
             Self::SendDataViaHandler { .. } => "SendDataViaHandler".to_string(),
             Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
@@ -105,6 +115,7 @@ impl UringOpRequest {
             Self::InitializeBufferRing { reply_tx, .. } |
             Self::RegisterRawBuffers { reply_tx, .. } |
             Self::Listen { reply_tx, .. } |
+            Self::RegisterExternalFd { reply_tx, .. } |
             Self::Connect { reply_tx, .. } |
             Self::StartFdReadLoop { reply_tx, .. } |
             Self::SendDataViaHandler { reply_tx, .. } |
@@ -138,6 +149,13 @@ impl fmt::Debug for UringOpRequest {
                     .field("protocol_handler_factory_id", protocol_handler_factory_id)
                     .finish_non_exhaustive()
             }
+            UringOpRequest::RegisterExternalFd { user_data, fd, protocol_handler_factory_id, is_server_role, .. } => f
+                .debug_struct("RegisterExternalFd")
+                .field("user_data", user_data)
+                .field("fd", fd)
+                .field("protocol_handler_factory_id", protocol_handler_factory_id)
+                .field("is_server_role", is_server_role)
+                .finish_non_exhaustive(),
             UringOpRequest::StartFdReadLoop { user_data, fd, .. } => f
                 .debug_struct("StartFdReadLoop")
                 .field("user_data", user_data).field("fd", fd)
@@ -162,6 +180,7 @@ pub enum UringOpCompletion {
   RegisterRawBuffersSuccess { user_data: UserData },
   ListenSuccess { user_data: UserData, listener_fd: RawFd, actual_addr: SocketAddr },
   ConnectSuccess { user_data: UserData, connected_fd: RawFd, peer_addr: SocketAddr, local_addr: SocketAddr },
+  RegisterExternalFdSuccess { user_data: UserData, fd: RawFd },
   StartFdReadLoopAck { user_data: UserData, fd: RawFd },
   SendDataViaHandlerAck { user_data: UserData, fd: RawFd },
   ShutdownConnectionHandlerComplete { user_data: UserData, fd: RawFd },
@@ -170,7 +189,6 @@ pub enum UringOpCompletion {
 
 impl fmt::Debug for UringOpCompletion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // ... (Debug impl as before)
         match self {
             UringOpCompletion::NopSuccess { user_data } => f.debug_struct("NopSuccess").field("user_data", user_data).finish(),
             UringOpCompletion::InitializeBufferRingSuccess { user_data, bgid } => f
@@ -184,6 +202,11 @@ impl fmt::Debug for UringOpCompletion {
                 .debug_struct("ConnectSuccess")
                 .field("user_data", user_data).field("connected_fd", connected_fd)
                 .field("peer_addr", peer_addr).field("local_addr", local_addr).finish(),
+            UringOpCompletion::RegisterExternalFdSuccess { user_data, fd } => f
+                .debug_struct("RegisterExternalFdSuccess")
+                .field("user_data", user_data)
+                .field("fd", fd)
+                .finish(),
             UringOpCompletion::StartFdReadLoopAck { user_data, fd } => f
                 .debug_struct("StartFdReadLoopAck")
                 .field("user_data", user_data).field("fd", fd).finish(),

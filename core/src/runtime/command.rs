@@ -4,18 +4,15 @@ use crate::message::Msg;
 use crate::socket::MonitorSender; // For UserMonitor command
 use crate::{error::ZmqError, Blob}; // Blob for EngineReady, ZmqError for replies
 
-#[cfg(feature = "io-uring")]
-use crate::engine::uring_core::AppToUringEngineCmd;
 use super::mailbox::MailboxSender as SessionBaseCommandSender;
+
+#[cfg(feature = "io-uring")]
+use std::os::unix::io::RawFd; 
 
 // Using tokio's oneshot for replies within commands.
 // async_channel is used for the mailboxes themselves and for inter-actor pipes.
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use tokio::sync::oneshot;
-
-/// Type alias for the mailbox sender used by actors to send `Command`s.
-/// This is typically cloned and passed around.
-pub type MailboxSender = async_channel::Sender<Command>; // TODO Remove this
 
 /// Describes how SessionBase connects to its engine.
 #[derive(Debug)]
@@ -23,12 +20,6 @@ pub enum EngineConnectionType {
   /// Connection to a standard engine running in the main Tokio runtime.
   Standard {
     engine_mailbox: SessionBaseCommandSender, // Mailbox to send SessionBaseCommand to std engine
-  },
-  /// Connection to an io_uring engine running in a dedicated runtime.
-  #[cfg(feature = "io-uring")]
-  Uring {
-    // Channel to send specific commands (like SendMsg) to the uring engine.
-    app_to_engine_cmd_tx: async_channel::Sender<AppToUringEngineCmd>,
   },
 }
 
@@ -160,19 +151,21 @@ pub enum Command {
     /// The ID the Session uses to write to its pipe (SocketCore reads from this ID).
     pipe_write_id: usize,
   },
-  // Note: InprocConnectRequest and InprocPipeClosed were moved to SystemEvents.
-  // Commands like CleanupComplete, ReportError, ConnSuccess, ConnFailed, *Stopped
-  // were also replaced by ActorStopping or other SystemEvents.
-  // The following commands are REMOVED as their functionality is now handled by SystemEvents:
-  // - CleanupComplete
-  // - ReportError
-  // - ConnSuccess
-  // - ConnFailed
-  // - ListenerStopped
-  // - ConnecterStopped
-  // - SessionStopped
-  // - InprocConnectRequest (functionality moved to SystemEvent::InprocBindingRequest)
-  // - InprocPipeClosed (functionality moved to SystemEvent::InprocPipePeerClosed)
+  #[cfg(feature = "io-uring")]
+  UringFdMessage {
+    fd: RawFd,
+    msg: Msg,
+  },
+  #[cfg(feature = "io-uring")]
+  UringFdError {
+    fd: RawFd,
+    error: ZmqError,
+  },
+  #[cfg(feature = "io-uring")]
+  UringFdHandshakeComplete { // Used by global_uring_state processor to inform SocketCore
+    fd: RawFd,
+    peer_identity: Option<Blob>,
+  },
 }
 
 impl Command {
@@ -201,9 +194,12 @@ impl Command {
       Command::PipeMessageReceived { .. } => "PipeMessageReceived",
       Command::PipeClosedByPeer { .. } => "PipeClosedByPeer",
       Command::AttachPipe { .. } => "AttachPipe",
-      // Removed variants are no longer listed here.
-      // Consider adding a catch-all if new temporary commands are added during dev.
-      // For now, this covers all defined variants.
+      #[cfg(feature = "io-uring")]
+      Command::UringFdMessage { .. } => "UringFdMessage",
+      #[cfg(feature = "io-uring")]
+      Command::UringFdError { .. } => "UringFdError",
+      #[cfg(feature = "io-uring")]
+      Command::UringFdHandshakeComplete { .. } => "UringFdHandshakeComplete",
     }
   }
 }
