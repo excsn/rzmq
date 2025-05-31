@@ -13,7 +13,14 @@ async fn main() -> Result<(), ZmqError> {
   if std::env::var("RUST_LOG").is_err() {
     std::env::set_var("RUST_LOG", "info,rzmq=debug"); 
   }
-  tracing_subscriber::fmt::init();
+  
+  tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::TRACE) // Adjust log level (INFO, DEBUG, TRACE)
+    .with_thread_ids(true)
+    .with_thread_names(true)
+    .with_target(true)
+    .compact()
+    .init();
 
   println!("Starting DEALER-ROUTER example (potential io_uring usage)...");
 
