@@ -115,11 +115,15 @@ pub(crate) async fn process_socket_command(
         }
         Command::UserClose { reply_tx } => {
             tracing::info!(handle = core_handle, "SocketCore received UserClose command.");
+            // Publish event first, then initiate shutdown
+            shutdown::publish_socket_closing_event(&core_arc.context, core_handle).await;
             shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
             let _ = reply_tx.send(Ok(())); // Acknowledge close initiation
         }
         Command::Stop => { // Direct stop command to SocketCore
             tracing::info!(handle=core_handle, "SocketCore received direct Stop command.");
+            // Publish event first, then initiate shutdown
+            shutdown::publish_socket_closing_event(&core_arc.context, core_handle).await;
             shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
         }
 
@@ -526,8 +530,6 @@ pub(crate) async fn handle_connect_failed_event(
     }
 }
 
-
-// --- Stubs for other command handlers ---
 async fn handle_user_disconnect(
     core_arc: Arc<SocketCore>,
     socket_logic_strong: &Arc<dyn ISocket>,
@@ -657,174 +659,9 @@ async fn handle_set_option(
     Err(e) => return Err(e),
   }
 
-  let mut state_g = core_arc.core_state.write();
-
-  #[cfg(feature = "io-uring")]
-  {
-    if option == IO_URING_SESSION_ENABLED {
-      state_g.options.io_uring.session_enabled = options::parse_bool_option(value)?;
-      tracing::debug!(
-        handle = core_arc.handle,
-        "IO_URING_SESSION_ENABLED set to {}",
-        state_g.options.io_uring.session_enabled
-      );
-      return Ok(());
-    }
-
-    if option == IO_URING_SNDZEROCOPY {
-      state_g.options.io_uring.send_zerocopy = options::parse_bool_option(value)?;
-      // Note: This typically affects new engines. Existing engines won't change behavior.
-      tracing::debug!(
-        handle = core_arc.handle,
-        "IO_URING_SNDZEROCOPY set to {}",
-        state_g.options.io_uring.send_zerocopy
-      );
-      return Ok(());
-    } else if option == IO_URING_RCVMULTISHOT {
-      state_g.options.io_uring.recv_multishot = options::parse_bool_option(value)?;
-      tracing::debug!(
-        handle = core_arc.handle,
-        "IO_URING_RCVMULTISHOT set to {}",
-        state_g.options.io_uring.recv_multishot
-      );
-      return Ok(());
-    }
-
-    if option == options::IO_URING_RECV_BUFFER_COUNT {
-      let count = options::parse_i32_option(value)?.max(1) as usize; // Ensure at least 1
-      state_g.options.io_uring.recv_buffer_count = count;
-      tracing::debug!(handle = core_arc.handle, "IO_URING_RECV_BUFFER_COUNT set to {}", count);
-      return Ok(());
-    } else if option == options::IO_URING_RECV_BUFFER_SIZE {
-      let size = options::parse_i32_option(value)?.max(1024) as usize; // Ensure min size, e.g., 1KB
-      state_g.options.io_uring.recv_buffer_size = size;
-      tracing::debug!(handle = core_arc.handle, "IO_URING_RECV_BUFFER_SIZE set to {}", size);
-      return Ok(());
-    }
-  }
-
-  #[cfg(feature = "noise_xx")]
-  {
-    // Ensure noise_xx_options is mutable if it wasn't already (though state_g is write guard)
-    // let noise_opts = &mut state_g.options.noise_xx_options; // if not using a RwLockWriteGuard already
-
-    if option == options::NOISE_XX_ENABLED {
-      state_g.options.noise_xx_options.enabled = options::parse_bool_option(value)?;
-      tracing::debug!(
-        handle = core_arc.handle,
-        "NOISE_XX_ENABLED set to {}",
-        state_g.options.noise_xx_options.enabled
-      );
-      return Ok(());
-    } else if option == options::NOISE_XX_STATIC_SECRET_KEY {
-      state_g.options.noise_xx_options.static_secret_key_bytes =
-        Some(options::parse_key_option::<32>(value, option)?);
-      tracing::debug!(handle = core_arc.handle, "NOISE_XX_STATIC_SECRET_KEY set.");
-      return Ok(());
-    } else if option == options::NOISE_XX_REMOTE_STATIC_PUBLIC_KEY {
-      state_g.options.noise_xx_options.remote_static_public_key_bytes =
-        Some(options::parse_key_option::<32>(value, option)?);
-      tracing::debug!(handle = core_arc.handle, "NOISE_XX_REMOTE_STATIC_PUBLIC_KEY set.");
-      return Ok(());
-    }
-  }
-
-  if option == TCP_CORK_OPT {
-    state_g.options.tcp_cork = options::parse_bool_option(value)?;
-    tracing::debug!(
-      handle = core_arc.handle,
-      "TCP_CORK_OPT set to {}",
-      state_g.options.tcp_cork
-    );
-    return Ok(());
-  }
-
-  match option {
-    SNDHWM => {
-      state_g.options.sndhwm = parse_i32_option(value)?.max(0) as usize;
-    }
-    RCVHWM => {
-      state_g.options.rcvhwm = parse_i32_option(value)?.max(0) as usize;
-    }
-    LINGER => {
-      state_g.options.linger = options::parse_linger_option(value)?;
-    }
-    RECONNECT_IVL => {
-      state_g.options.reconnect_ivl = options::parse_reconnect_ivl_option(value)?;
-    }
-    RECONNECT_IVL_MAX => {
-      state_g.options.reconnect_ivl_max = options::parse_reconnect_ivl_max_option(value)?;
-    }
-    MAX_CONNECTIONS => {
-      state_g.options.max_connections = options::parse_max_connections_option(value, option)?;
-      // NOTE: This option change will only affect NEW listeners created after this point.
-      // Existing listeners will continue with the limit they were started with.
-      // To dynamically change for an existing listener is more complex (e.g., signal listener to update its semaphore).
-      tracing::debug!(
-        handle = core_arc.handle,
-        "MAX_CONNECTIONS set to {:?}",
-        state_g.options.max_connections
-      )
-    }
-    HEARTBEAT_IVL => {
-      state_g.options.heartbeat_ivl = parse_heartbeat_option(value, option)?;
-    }
-    HEARTBEAT_TIMEOUT => {
-      state_g.options.heartbeat_timeout = parse_heartbeat_option(value, option)?;
-    }
-    HANDSHAKE_IVL => {
-      state_g.options.handshake_ivl = parse_handshake_option(value, option)?;
-    }
-    ZAP_DOMAIN => {
-      state_g.options.zap_domain =
-        Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
-    }
-    PLAIN_SERVER => {
-      state_g.options.plain_options.server_role = Some(parse_bool_option(value)?);
-      state_g.options.plain_options.enabled = true;
-    }
-    PLAIN_USERNAME => {
-      state_g.options.plain_options.username =
-        Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
-      state_g.options.plain_options.enabled = true;
-    }
-    PLAIN_PASSWORD => {
-      state_g.options.plain_options.password =
-        Some(String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option))?);
-      state_g.options.plain_options.enabled = true;
-    }
-    ROUTING_ID => {
-      state_g.options.routing_id = Some(parse_blob_option(value)?);
-    }
-    RCVTIMEO => {
-      state_g.options.rcvtimeo = parse_timeout_option(value, option)?;
-    }
-    SNDTIMEO => {
-      state_g.options.sndtimeo = parse_timeout_option(value, option)?;
-    }
-    TCP_KEEPALIVE => {
-      state_g.options.tcp_keepalive_enabled = parse_keepalive_mode_option(value)?;
-    }
-    TCP_KEEPALIVE_IDLE => {
-      state_g.options.tcp_keepalive_idle = parse_secs_duration_option(value)?;
-    }
-    TCP_KEEPALIVE_CNT => {
-      state_g.options.tcp_keepalive_count = parse_u32_option(value)?;
-    }
-    TCP_KEEPALIVE_INTVL => {
-      state_g.options.tcp_keepalive_interval = parse_secs_duration_option(value)?;
-    }
-    ROUTER_MANDATORY => {
-      state_g.options.router_mandatory = parse_bool_option(value)?;
-    }
-    SUBSCRIBE | UNSUBSCRIBE => {
-      return Err(ZmqError::UnsupportedOption(option));
-    }
-    _ => {
-      return Err(ZmqError::UnsupportedOption(option));
-    }
-  }
-  Ok(())
+  let mut core_s_write = core_arc.core_state.write();
+  // Delegate to the new helper in options.rs
+  options::apply_core_option_value(&mut core_s_write.options, option, value)
 }
 
 async fn handle_get_option(
@@ -840,81 +677,9 @@ async fn handle_get_option(
     Err(e_val) => return Err(e_val),
   }
 
-  let state_g = core_arc.core_state.read();
-
-  if option == options::LAST_ENDPOINT {
-    return match &state_g.last_bound_endpoint {
-      Some(endpoint_str) => Ok(endpoint_str.as_bytes().to_vec()),
-      None => Ok(Vec::new()),
-    };
-  }
-
-  #[cfg(feature = "io-uring")]
-  {
-    if option == IO_URING_SESSION_ENABLED {
-      return Ok((state_g.options.io_uring.session_enabled as i32).to_ne_bytes().to_vec());
-    }
-
-    if option == options::IO_URING_SNDZEROCOPY {
-      return Ok((state_g.options.io_uring.send_zerocopy as i32).to_ne_bytes().to_vec());
-    } else if option == options::IO_URING_RCVMULTISHOT {
-      return Ok((state_g.options.io_uring.recv_multishot as i32).to_ne_bytes().to_vec());
-    }
-
-    if option == options::IO_URING_RECV_BUFFER_COUNT {
-      return Ok((state_g.options.io_uring.recv_buffer_count as i32).to_ne_bytes().to_vec());
-    } else if option == options::IO_URING_RECV_BUFFER_SIZE {
-      return Ok((state_g.options.io_uring.recv_buffer_size as i32).to_ne_bytes().to_vec());
-    }
-  }
-
-  #[cfg(feature = "noise_xx")]
-  {
-    if option == options::NOISE_XX_ENABLED {
-      return Ok((state_g.options.noise_xx_options.enabled as i32).to_ne_bytes().to_vec());
-    } else if option == options::NOISE_XX_STATIC_SECRET_KEY {
-      return Err(ZmqError::PermissionDenied("Secret key option is write-only".into()));
-    } else if option == options::NOISE_XX_REMOTE_STATIC_PUBLIC_KEY {
-      return state_g
-        .options
-        .noise_xx_options
-        .remote_static_public_key_bytes
-        .map(|k| k.to_vec())
-        .ok_or(ZmqError::Internal(
-          "Option NOISE_XX_REMOTE_STATIC_PUBLIC_KEY not set".into(),
-        ));
-    }
-  }
-
-  if option == TCP_CORK_OPT {
-    return Ok((state_g.options.tcp_cork as i32).to_ne_bytes().to_vec());
-  }
-
-  match option {
-    SNDHWM => Ok((state_g.options.sndhwm as i32).to_ne_bytes().to_vec()),
-    RCVHWM => Ok((state_g.options.rcvhwm as i32).to_ne_bytes().to_vec()),
-    LINGER => Ok(state_g.options.linger.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
-    RECONNECT_IVL => Ok(state_g.options.reconnect_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
-    RECONNECT_IVL_MAX => Ok(state_g.options.reconnect_ivl_max.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
-    MAX_CONNECTIONS => Ok(state_g.options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
-    HEARTBEAT_IVL => Ok(state_g.options.heartbeat_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
-    HEARTBEAT_TIMEOUT => Ok(state_g.options.heartbeat_timeout.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
-    HANDSHAKE_IVL => Ok(state_g.options.handshake_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
-    ZAP_DOMAIN => state_g.options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-    PLAIN_SERVER => state_g.options.plain_options.server_role.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-    PLAIN_USERNAME => state_g.options.plain_options.username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-    ROUTING_ID => state_g.options.routing_id.as_ref().map(|b| b.to_vec()).ok_or(ZmqError::Internal("Option not set".into())),
-    RCVTIMEO => Ok(state_g.options.rcvtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
-    SNDTIMEO => Ok(state_g.options.sndtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
-    TCP_KEEPALIVE => Ok(state_g.options.tcp_keepalive_enabled.to_ne_bytes().to_vec()),
-    TCP_KEEPALIVE_IDLE => Ok(state_g.options.tcp_keepalive_idle.map_or(0, |d| d.as_secs() as i32).to_ne_bytes().to_vec()),
-    TCP_KEEPALIVE_CNT => Ok(state_g.options.tcp_keepalive_count.map_or(0, |c| c as i32).to_ne_bytes().to_vec()),
-    TCP_KEEPALIVE_INTVL => Ok(state_g.options.tcp_keepalive_interval.map_or(0, |d| d.as_secs() as i32).to_ne_bytes().to_vec()),
-    ROUTER_MANDATORY => Ok((state_g.options.router_mandatory as i32).to_ne_bytes().to_vec()),
-    16 /* ZMQ_TYPE */ => Ok((state_g.socket_type as i32).to_ne_bytes().to_vec()),
-    SUBSCRIBE | UNSUBSCRIBE => Err(ZmqError::UnsupportedOption(option)),
-    _ => Err(ZmqError::UnsupportedOption(option)),
-  }
+  let core_s_read = core_arc.core_state.read();
+  // Delegate to the new helper in options.rs
+  options::retrieve_core_option_value(&core_s_read.options, &core_s_read, option)
 }
 
 async fn handle_user_monitor(
@@ -925,5 +690,3 @@ async fn handle_user_monitor(
     core_arc.core_state.write().monitor_tx = Some(monitor_tx);
     let _ = reply_tx.send(Ok(()));
 }
-
-// Ensure DummyConnection is defined in connection_iface.rs for handle_user_bind

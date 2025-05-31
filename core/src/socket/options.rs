@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::{Blob, ZmqError};
+use crate::{Blob, CoreState, ZmqError};
 
 // Use values consistent with libzmq where possible
 pub const SNDHWM: i32 = 23;
@@ -399,4 +399,137 @@ pub(crate) fn parse_key_option<const N: usize>(value: &[u8], option_id: i32) -> 
 
 pub(crate) fn parse_string_option(value: &[u8], option_id: i32) -> Result<String, ZmqError> {
   String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option_id))
+}
+
+
+// --- New Helper Functions for Applying/Retrieving Core Options ---
+
+/// Applies a core-level socket option value to the `SocketOptions` struct.
+/// This function centralizes the logic for parsing and setting options that
+/// are managed by `SocketCore` or affect its underlying configuration.
+/// Pattern-specific options (like SUBSCRIBE for SUB) are handled by `ISocket::set_pattern_option`.
+pub(crate) fn apply_core_option_value(
+    options: &mut SocketOptions, // Mutable reference to update
+    option_id: i32,
+    value: &[u8],
+) -> Result<(), ZmqError> {
+    tracing::debug!(option_id, value_len=value.len(), "Applying core socket option");
+    match option_id {
+        SNDHWM => options.sndhwm = parse_i32_option(value)?.max(0) as usize,
+        RCVHWM => options.rcvhwm = parse_i32_option(value)?.max(0) as usize,
+        LINGER => options.linger = parse_linger_option(value)?,
+        ROUTING_ID => options.routing_id = Some(parse_blob_option(value)?),
+        RECONNECT_IVL => options.reconnect_ivl = parse_reconnect_ivl_option(value)?,
+        RECONNECT_IVL_MAX => options.reconnect_ivl_max = parse_reconnect_ivl_max_option(value)?,
+        RCVTIMEO => options.rcvtimeo = parse_timeout_option(value, option_id)?,
+        SNDTIMEO => options.sndtimeo = parse_timeout_option(value, option_id)?,
+        TCP_KEEPALIVE => options.tcp_keepalive_enabled = parse_keepalive_mode_option(value)?,
+        TCP_KEEPALIVE_IDLE => options.tcp_keepalive_idle = parse_secs_duration_option(value)?,
+        TCP_KEEPALIVE_CNT => options.tcp_keepalive_count = parse_u32_option(value)?,
+        TCP_KEEPALIVE_INTVL => options.tcp_keepalive_interval = parse_secs_duration_option(value)?,
+        HEARTBEAT_IVL => options.heartbeat_ivl = parse_heartbeat_option(value, option_id)?,
+        HEARTBEAT_TIMEOUT => options.heartbeat_timeout = parse_heartbeat_option(value, option_id)?,
+        HANDSHAKE_IVL => options.handshake_ivl = parse_handshake_option(value, option_id)?,
+        MAX_CONNECTIONS => options.max_connections = parse_max_connections_option(value, option_id)?,
+        TCP_CORK_OPT => options.tcp_cork = parse_bool_option(value)?,
+
+        ROUTER_MANDATORY => { //TODO Supposedly pattern specific, so...
+          options.router_mandatory = parse_bool_option(value)?;
+        }
+        ZAP_DOMAIN => options.zap_domain = Some(parse_string_option(value, option_id)?),
+        PLAIN_SERVER => {
+            options.plain_options.server_role = Some(parse_bool_option(value)?);
+            options.plain_options.enabled = true; // Enable PLAIN if server role is set
+        }
+        PLAIN_USERNAME => {
+            options.plain_options.username = Some(parse_string_option(value, option_id)?);
+            options.plain_options.enabled = true;
+        }
+        PLAIN_PASSWORD => {
+            options.plain_options.password = Some(parse_string_option(value, option_id)?);
+            options.plain_options.enabled = true;
+        }
+
+        #[cfg(feature = "noise_xx")]
+        NOISE_XX_ENABLED => options.noise_xx_options.enabled = parse_bool_option(value)?,
+        #[cfg(feature = "noise_xx")]
+        NOISE_XX_STATIC_SECRET_KEY => options.noise_xx_options.static_secret_key_bytes = Some(parse_key_option::<32>(value, option_id)?),
+        #[cfg(feature = "noise_xx")]
+        NOISE_XX_REMOTE_STATIC_PUBLIC_KEY => options.noise_xx_options.remote_static_public_key_bytes = Some(parse_key_option::<32>(value, option_id)?),
+
+        #[cfg(feature = "io-uring")]
+        IO_URING_SESSION_ENABLED => options.io_uring.session_enabled = parse_bool_option(value)?,
+        #[cfg(feature = "io-uring")]
+        IO_URING_SNDZEROCOPY => options.io_uring.send_zerocopy = parse_bool_option(value)?,
+        #[cfg(feature = "io-uring")]
+        IO_URING_RCVMULTISHOT => options.io_uring.recv_multishot = parse_bool_option(value)?,
+        #[cfg(feature = "io-uring")]
+        IO_URING_RECV_BUFFER_COUNT => options.io_uring.recv_buffer_count = parse_i32_option(value)?.max(1) as usize,
+        #[cfg(feature = "io-uring")]
+        IO_URING_RECV_BUFFER_SIZE => options.io_uring.recv_buffer_size = parse_i32_option(value)?.max(1024) as usize,
+
+        // Options handled by pattern logic (ISocket) or read-only, or not applicable for set_option
+        SUBSCRIBE | UNSUBSCRIBE | LAST_ENDPOINT  /* Pattern specific */ |
+        16 /* ZMQ_TYPE (read-only) */ => return Err(ZmqError::UnsupportedOption(option_id)),
+
+        _ => return Err(ZmqError::InvalidOption(option_id)), // Unknown option ID
+    }
+    Ok(())
+}
+
+/// Retrieves a core-level socket option value from the `SocketOptions` and `CoreState` structs.
+pub(crate) fn retrieve_core_option_value(
+    options: &SocketOptions,       // Read reference
+    core_s_reader: &CoreState, // Read reference to CoreState for things like LAST_ENDPOINT
+    option_id: i32,
+) -> Result<Vec<u8>, ZmqError> {
+    match option_id {
+        SNDHWM => Ok((options.sndhwm as i32).to_ne_bytes().to_vec()),
+        RCVHWM => Ok((options.rcvhwm as i32).to_ne_bytes().to_vec()),
+        LINGER => Ok(options.linger.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
+        ROUTING_ID => options.routing_id.as_ref().map(|b| b.to_vec()).ok_or(ZmqError::Internal("Option ROUTING_ID not set".into())),
+        RECONNECT_IVL => Ok(options.reconnect_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()), // 0 if None
+        RECONNECT_IVL_MAX => Ok(options.reconnect_ivl_max.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()), // 0 if None
+        RCVTIMEO => Ok(options.rcvtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
+        SNDTIMEO => Ok(options.sndtimeo.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
+        LAST_ENDPOINT => Ok(core_s_reader.last_bound_endpoint.as_deref().unwrap_or("").as_bytes().to_vec()),
+        TCP_KEEPALIVE => Ok(options.tcp_keepalive_enabled.to_ne_bytes().to_vec()),
+        TCP_KEEPALIVE_IDLE => Ok(options.tcp_keepalive_idle.map_or(0, |d| d.as_secs() as i32).to_ne_bytes().to_vec()),
+        TCP_KEEPALIVE_CNT => Ok(options.tcp_keepalive_count.map_or(0, |c| c as i32).to_ne_bytes().to_vec()),
+        TCP_KEEPALIVE_INTVL => Ok(options.tcp_keepalive_interval.map_or(0, |d| d.as_secs() as i32).to_ne_bytes().to_vec()),
+        HEARTBEAT_IVL => Ok(options.heartbeat_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
+        HEARTBEAT_TIMEOUT => Ok(options.heartbeat_timeout.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
+        HANDSHAKE_IVL => Ok(options.handshake_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
+        MAX_CONNECTIONS => Ok(options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
+        TCP_CORK_OPT => Ok((options.tcp_cork as i32).to_ne_bytes().to_vec()),
+        ZAP_DOMAIN => options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option ZAP_DOMAIN not set".into())),
+        PLAIN_SERVER => options.plain_options.server_role.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_SERVER not set".into())),
+        PLAIN_USERNAME => options.plain_options.username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_USERNAME not set".into())),
+        PLAIN_PASSWORD => Err(ZmqError::PermissionDenied("PLAIN_PASSWORD is write-only".into())),
+
+
+        #[cfg(feature = "noise_xx")]
+        NOISE_XX_ENABLED => Ok((options.noise_xx_options.enabled as i32).to_ne_bytes().to_vec()),
+        #[cfg(feature = "noise_xx")]
+        NOISE_XX_STATIC_SECRET_KEY => Err(ZmqError::PermissionDenied("NOISE_XX_STATIC_SECRET_KEY is write-only".into())),
+        #[cfg(feature = "noise_xx")]
+        NOISE_XX_REMOTE_STATIC_PUBLIC_KEY => options.noise_xx_options.remote_static_public_key_bytes.map(|k| k.to_vec()).ok_or(ZmqError::Internal("Option NOISE_XX_REMOTE_STATIC_PUBLIC_KEY not set".into())),
+
+        #[cfg(feature = "io-uring")]
+        IO_URING_SESSION_ENABLED => Ok((options.io_uring.session_enabled as i32).to_ne_bytes().to_vec()),
+        #[cfg(feature = "io-uring")]
+        IO_URING_SNDZEROCOPY => Ok((options.io_uring.send_zerocopy as i32).to_ne_bytes().to_vec()),
+        #[cfg(feature = "io-uring")]
+        IO_URING_RCVMULTISHOT => Ok((options.io_uring.recv_multishot as i32).to_ne_bytes().to_vec()),
+        #[cfg(feature = "io-uring")]
+        IO_URING_RECV_BUFFER_COUNT => Ok((options.io_uring.recv_buffer_count as i32).to_ne_bytes().to_vec()),
+        #[cfg(feature = "io-uring")]
+        IO_URING_RECV_BUFFER_SIZE => Ok((options.io_uring.recv_buffer_size as i32).to_ne_bytes().to_vec()),
+
+        // Options handled by pattern logic or read-only by nature
+        16 /* ZMQ_TYPE */ => Ok((core_s_reader.socket_type as i32).to_ne_bytes().to_vec()),
+        SUBSCRIBE | UNSUBSCRIBE | ROUTER_MANDATORY => Err(ZmqError::UnsupportedOption(option_id)), // Pattern specific
+
+        _ => Err(ZmqError::InvalidOption(option_id)),
+    }
 }

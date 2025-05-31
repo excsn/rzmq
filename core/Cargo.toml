@@ -112,3 +112,12 @@ path = "examples/plain_req_rep.rs"
 name = "noise_xx_push_pull"
 path = "examples/noise_xx_push_pull.rs"
 required-features = ["noise_xx"]
+
+
+[[test]]
+name = "noise_xx"
+required-features = ["noise_xx"]
+
+[[test]]
+name = "zerocopy_send"
+required-features = ["io-uring"]

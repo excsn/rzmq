@@ -387,17 +387,118 @@ pub(crate) async fn cleanup_stopped_child_resources(
     }
 }
 
+/// Cleans up resources for a specific connection identified by its endpoint URI.
+/// This is typically called when a UserDisconnect command is processed for a non-inproc session.
+/// It initiates closure of the connection and removes state from SocketCore.
+///
+/// The `_expected_handle_id_if_known` can be used as an assertion if the caller has it,
+/// to ensure we're cleaning up the intended connection if multiple endpoints somehow share a URI (unlikely).
+/// For now, we'll primarily rely on the URI.
 pub(crate) async fn cleanup_session_state_by_uri(
-    _core_arc: Arc<SocketCore>,
-    _endpoint_uri: &str,
-    _socket_logic_strong: &Arc<dyn ISocket>,
-    _stopping_child_handle_id: usize,
-) -> Option<EndpointInfo> {
-    tracing::warn!("STUB: cleanup_session_state_by_uri called. Needs full implementation.");
-    // This function would be similar to the logic inside cleanup_stopped_child_resources
-    // but initiated by URI directly, perhaps when a UserDisconnect is processed.
-    // It should ensure it doesn't interfere if called concurrently with ActorStopping.
-    None
+    core_arc: Arc<SocketCore>,
+    endpoint_uri: &str,
+    socket_logic_strong: &Arc<dyn ISocket>,
+    _expected_handle_id_if_known: Option<usize>, // Optional: for assertion/confirmation
+) -> Option<EndpointInfo> { // Returns the removed EndpointInfo if found
+    let core_handle = core_arc.handle;
+    tracing::debug!(
+        parent_core_handle = core_handle,
+        uri_to_cleanup = %endpoint_uri,
+        "Attempting to cleanup session state by URI."
+    );
+
+    let mut removed_endpoint_info: Option<EndpointInfo> = None;
+    let mut detached_pipe_read_id: Option<usize> = None;
+
+    // 1. Find and remove the EndpointInfo by URI.
+    // This must be done under a write lock to prevent races.
+    {
+        let mut core_s_write = core_arc.core_state.write();
+        if let Some(ep_info_to_remove) = core_s_write.endpoints.remove(endpoint_uri) {
+            // Assert that we are removing the correct type of endpoint (Session)
+            if ep_info_to_remove.endpoint_type != EndpointType::Session {
+                tracing::error!(
+                    handle = core_handle,
+                    uri = %endpoint_uri,
+                    actual_type = ?ep_info_to_remove.endpoint_type,
+                    "Cleanup by URI: Expected Session type, found {:?}. Reinserting and erroring.",
+                    ep_info_to_remove.endpoint_type
+                );
+                // Put it back if it's not a session, this call was misused.
+                core_s_write.endpoints.insert(endpoint_uri.to_string(), ep_info_to_remove);
+                // This case should ideally not happen if UserDisconnect logic is correct.
+                return None; // Or return an error
+            }
+
+            tracing::info!(
+                handle = core_handle,
+                uri = %endpoint_uri,
+                child_id = ep_info_to_remove.handle_id, // Session actor handle or RawFd
+                "Removed EndpointInfo by URI during proactive cleanup."
+            );
+
+            // a. Clean up pipe state (if it was a session-like endpoint with pipes)
+            if let Some((core_write_id, core_read_id)) = ep_info_to_remove.pipe_ids {
+                // remove_pipe_state also removes from pipe_read_id_to_endpoint_uri
+                core_s_write.remove_pipe_state(core_write_id, core_read_id);
+                detached_pipe_read_id = Some(core_read_id);
+                tracing::debug!(handle = core_handle, uri=%endpoint_uri, "Removed pipe state for proactively cleaned up session.");
+            }
+
+            // b. If it was an io_uring FD, unregister it from global state
+            #[cfg(feature = "io-uring")]
+            if ep_info_to_remove.connection_iface.as_any().is::<crate::socket::connection_iface::UringFdConnection>() {
+                let fd = ep_info_to_remove.handle_id as RawFd;
+                core_s_write.uring_fd_to_endpoint_uri.remove(&fd);
+                crate::runtime::global_uring_state::unregister_uring_fd_socket_core_mailbox(fd);
+                tracing::debug!(handle = core_handle, uri=%endpoint_uri, %fd, "Unregistered UringFD state for proactively cleaned up session.");
+            }
+
+            // c. Emit Disconnected monitor event
+            core_s_write.send_monitor_event(SocketEvent::Disconnected { endpoint: endpoint_uri.to_string() });
+
+            removed_endpoint_info = Some(ep_info_to_remove); // Store the removed info
+        } else {
+            tracing::warn!(handle = core_handle, uri=%endpoint_uri, "Cleanup by URI: EndpointInfo not found (already removed or connect failed?).");
+            return None; // Nothing to do if not found
+        }
+    } // Write lock on core_state released
+
+    // 2. If EndpointInfo was successfully found and removed:
+    if let Some(ref ep_info) = removed_endpoint_info {
+        // a. Initiate close on the connection interface.
+        //    This will tell SessionBase to stop or UringWorker to close the FD.
+        tracing::debug!(
+            handle = core_handle,
+            uri = %ep_info.endpoint_uri,
+            conn_id = ep_info.handle_id,
+            "Cleanup by URI: Calling close_connection() on ISocketConnection."
+        );
+        if let Err(e) = ep_info.connection_iface.close_connection().await {
+            tracing::warn!(
+                handle = core_handle,
+                uri = %ep_info.endpoint_uri,
+                conn_id = ep_info.handle_id,
+                "Error calling close_connection() during cleanup by URI: {}", e
+            );
+        }
+
+        // b. Abort its task_handle (this is None for Sessions, but cleanup is generic)
+        if let Some(task_handle) = &ep_info.task_handle {
+            if !task_handle.is_finished() { // Check if it's Some and not finished
+                task_handle.abort();
+                tracing::debug!(handle = core_handle, uri=%ep_info.endpoint_uri, "Aborted task_handle during cleanup by URI (if applicable).");
+            }
+        }
+
+        // c. Notify ISocket logic about pipe detachment if applicable
+        if let Some(read_id) = detached_pipe_read_id {
+            socket_logic_strong.pipe_detached(read_id).await;
+            tracing::debug!(handle = core_handle, uri=%ep_info.endpoint_uri, pipe_read_id = read_id, "Notified ISocket of pipe detachment during cleanup by URI.");
+        }
+    }
+
+    removed_endpoint_info // Return the removed info, caller might use it (e.g., for logging)
 }
 
 pub(crate) async fn cleanup_session_state_by_pipe(
