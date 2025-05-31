@@ -29,7 +29,7 @@ bench_external_clients = []
 rzmq_macros = { version = "^0", path = "../macros" }
 
 # --- Core Async Runtime & Concurrency ---
-async-channel = "^1.8"
+async-channel = "^2"
 async-trait = "^0.1.88"
 async-recursion = "^1.0"
 tokio = { version = "^1", features = ["fs", "rt", "rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
