@@ -313,7 +313,7 @@ impl TcpListener {
                             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
                               info!("Registered accepted FD {} with UringWorker.", raw_fd);
                               // <<< MODIFIED START [Set up common variables for event] >>>
-                              connection_iface_for_event = Some(Arc::new(UringFdConnection::new(raw_fd)));
+                              let connection_iface: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, self.context_options.clone()));
                               interaction_model_for_event = Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
                               // managing_actor_task_id_for_event remains None for UringFd path
                               // <<< MODIFIED END >>>

@@ -1,15 +1,17 @@
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::socket::core::send_msg_with_timeout;
-use crate::CoreState;
-use std::collections::HashSet;
-use tokio::sync::RwLock;
+use crate::socket::connection_iface::ISocketConnection;
+use crate::socket::core::CoreState;
 
-/// Distributes messages to a set of connected pipes (write IDs).
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+
+/// Distributes messages to a set of connected peer URIs.
 #[derive(Debug, Default)]
 pub(crate) struct Distributor {
-  // Store pipe WRITE IDs (Core -> Session channel ID)
-  peers: RwLock<HashSet<usize>>,
+  peer_uris: RwLock<HashSet<String>>,
 }
 
 impl Distributor {
@@ -17,104 +19,105 @@ impl Distributor {
     Self::default()
   }
 
-  /// Adds a peer pipe (by its write ID).
-  pub async fn add_pipe(&self, pipe_write_id: usize) {
-    let mut peers_guard = self.peers.write().await;
-    if peers_guard.insert(pipe_write_id) {
-      tracing::trace!(pipe_id = pipe_write_id, "Distributor added pipe");
+  /// Adds a peer URI to the set for distribution.
+  pub fn add_peer_uri(&self, endpoint_uri: String) {
+    let mut peers_guard = self.peer_uris.write();
+    if peers_guard.insert(endpoint_uri.clone()) {
+      // Clone since insert takes ownership
+      tracing::trace!(uri = %endpoint_uri, "Distributor added peer URI");
     }
   }
 
-  /// Removes a peer pipe (by its write ID).
-  pub async fn remove_pipe(&self, pipe_write_id: usize) {
-    let mut peers_guard = self.peers.write().await;
-    if peers_guard.remove(&pipe_write_id) {
-      tracing::trace!(pipe_id = pipe_write_id, "Distributor removed pipe");
+  /// Removes a peer URI from the set.
+  pub fn remove_peer_uri(&self, endpoint_uri: &str) {
+    let mut peers_guard = self.peer_uris.write();
+    if peers_guard.remove(endpoint_uri) {
+      tracing::trace!(uri = %endpoint_uri, "Distributor removed peer URI");
     }
   }
 
-  /// Returns a snapshot of the current peer pipe write IDs.
-  pub async fn get_peer_ids(&self) -> Vec<usize> {
-    let peers_guard = self.peers.read().await;
-    peers_guard.iter().copied().collect() // Clone IDs into a new Vec
+  /// Returns a snapshot of the current peer URIs.
+  pub fn get_peer_uris(&self) -> Vec<String> {
+    let peers_guard = self.peer_uris.read();
+    peers_guard.iter().cloned().collect() // Clone URIs into a new Vec
   }
 
-  /// Sends a message to all currently registered peer pipes.
-  /// Acquires the necessary senders from CoreState.
+  /// Sends a message to all currently registered peer URIs.
+  /// Looks up `ISocketConnection` from `CoreState` for each URI.
   /// Errors are collected, but sending continues to other peers.
   pub async fn send_to_all(
     &self,
     msg: &Msg,
     core_handle: usize,
-    core_state_mutex: &parking_lot::RwLock<CoreState>,
-  ) -> Result<(), Vec<(usize, ZmqError)>> {
-    let peer_ids = self.get_peer_ids().await;
-    tracing::debug!(handle = core_handle, ?peer_ids, "Distributor::send_to_all: Distributing to peer_ids");
-    if peer_ids.is_empty() {
+    core_state_accessor: &parking_lot::RwLock<CoreState>, // Direct access to CoreState
+  ) -> Result<(), Vec<(String, ZmqError)>> {
+    // Error now returns URI and ZmqError
+    let uris_to_send_to = self.get_peer_uris(); // This is synchronous as RwLock is parking_lot
+    tracing::debug!(
+      handle = core_handle,
+      num_peers = uris_to_send_to.len(),
+      "Distributor::send_to_all: Distributing to peer URIs"
+    );
+    if uris_to_send_to.is_empty() {
       return Ok(());
     }
 
-    let mut failed_pipes = Vec::new();
-    let mut send_futures = Vec::new();
-    let timeout_opt = core_state_mutex.read().options.sndtimeo;
+    let mut failed_uris = Vec::new(); // Store (URI, Error) for failures
 
-    for pipe_write_id in peer_ids {
-      if let Some(sender) = core_state_mutex.read().get_pipe_sender(pipe_write_id) {
-        let msg_clone = msg.clone();
-        let payload_preview_str = msg_clone.data()
-            .map(|d| String::from_utf8_lossy(&d.iter().take(20).copied().collect::<Vec<_>>()).into_owned()) // Convert Cow to owned String
-            .unwrap_or_else(|| "<empty_payload>".to_string());
+    // We need to iterate and await sends. To avoid holding core_state_accessor lock across awaits,
+    // collect ISocketConnection interfaces first, or re-fetch per send.
+    // Re-fetching per send is safer against stale EndpointInfo but might be slightly less performant.
+    // Given minimal changes, let's re-fetch.
 
-        tracing::trace!(
-            handle = core_handle,
-            target_pipe_id = pipe_write_id,
-            msg_payload_preview = %payload_preview_str, // Use the owned String
-            "Distributor::send_to_all: Preparing send future for pipe"
-        );
-        send_futures.push(async move {
-          match send_msg_with_timeout(&sender, msg_clone, timeout_opt, core_handle, pipe_write_id).await {
-              Ok(()) => {
-                tracing::trace!(handle = core_handle, pipe_id = pipe_write_id, "Distributor: send_msg_with_timeout successful for pipe.");
-                Ok(pipe_write_id)},
-              Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
-                tracing::trace!(handle=core_handle, pipe_id=pipe_write_id, "PUB (Distributor) dropping message due to HWM/Timeout for pipe");
-                Err(None) 
-              }
-              Err(e @ ZmqError::ConnectionClosed) => {
-                tracing::debug!(handle=core_handle, pipe_id=pipe_write_id, "PUB (Distributor) peer disconnected during send to pipe");
-                Err(Some((pipe_write_id, e)))
-              }
-              Err(e) => {
-                tracing::error!(handle=core_handle, pipe_id=pipe_write_id, error=%e, "PUB (Distributor) send to pipe encountered unexpected error");
-                Err(Some((pipe_write_id, e)))
-              }
+    for uri_to_send in uris_to_send_to {
+      let conn_iface_opt: Option<Arc<dyn ISocketConnection>> = {
+        // Short scope for read lock
+        let core_s_read = core_state_accessor.read();
+        core_s_read
+          .endpoints
+          .get(&uri_to_send)
+          .map(|ep_info| ep_info.connection_iface.clone())
+      };
+
+      if let Some(conn_iface) = conn_iface_opt {
+        let msg_clone = msg.clone(); // Clone message for each send
+                                     // ISocketConnection.send_message() handles SNDTIMEO internally
+        match conn_iface.send_message(msg_clone).await {
+          Ok(()) => {
+            tracing::trace!(handle = core_handle, uri = %uri_to_send, "Distributor: send_message successful for URI.");
           }
-        });
+          Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
+            tracing::trace!(handle = core_handle, uri = %uri_to_send, "PUB (Distributor) dropping message due to HWM/Timeout for URI");
+            // For PUB, these are not considered fatal errors for the Distributor's list of peers.
+            // The message is just dropped for this peer.
+          }
+          Err(e @ ZmqError::ConnectionClosed) => {
+            tracing::debug!(handle = core_handle, uri = %uri_to_send, "PUB (Distributor) peer disconnected during send to URI");
+            failed_uris.push((uri_to_send.clone(), e)); // URI needs to be removed from distributor
+          }
+          Err(e) => {
+            tracing::error!(handle = core_handle, uri = %uri_to_send, error = %e, "PUB (Distributor) send to URI encountered unexpected error");
+            failed_uris.push((uri_to_send.clone(), e)); // URI needs to be removed if error is persistent
+          }
+        }
       } else {
         tracing::warn!(
-          handle = core_handle, // Use the passed core_handle for logging
-          pipe_id = pipe_write_id,
-          "Distributor: Pipe sender not found in core state during send."
+            handle = core_handle,
+            uri = %uri_to_send,
+            "Distributor: ISocketConnection not found for URI. Stale URI?"
         );
-        failed_pipes.push((
-          pipe_write_id,
-          ZmqError::Internal("Distributor found stale pipe ID".into()),
+        // This URI is stale in the distributor, mark for removal.
+        failed_uris.push((
+          uri_to_send.clone(),
+          ZmqError::Internal("Distributor found stale URI".into()),
         ));
       }
     }
 
-    let results = futures::future::join_all(send_futures).await;
-
-    for result in results {
-      if let Err(Some(error_tuple)) = result {
-        failed_pipes.push(error_tuple);
-      }
-    }
-
-    if failed_pipes.is_empty() {
+    if failed_uris.is_empty() {
       Ok(())
     } else {
-      Err(failed_pipes)
+      Err(failed_uris)
     }
   }
 }

@@ -1,105 +1,75 @@
-// src/socket/req_socket.rs
+// core/src/socket/req_socket.rs
 
 use crate::error::ZmqError;
-use crate::message::{Msg, MsgFlags}; // For send/recv and managing MORE flag.
+use crate::message::{Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
-use crate::socket::core::{send_msg_with_timeout, CoreState, SocketCore}; // Core components and send helper.
-use crate::socket::options::SocketOptions; // For initial socket options (e.g., RCVHWM for queue).
-use crate::socket::patterns::{FairQueue, LoadBalancer}; // REQ uses LoadBalancer (out) and FairQueue (in for reply).
+use crate::socket::connection_iface::ISocketConnection;
+use crate::socket::core::state::EndpointInfo;
+use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::patterns::{FairQueue, LoadBalancer};
 use crate::socket::ISocket;
-use crate::{delegate_to_core, Blob}; // Macro for delegating API calls to SocketCore. // The trait this struct implements.
+use crate::{delegate_to_core, Blob};
 
 use async_trait::async_trait;
-use futures::future::Either;
+use futures::future::Either; // Kept as it was in your original provided code for recv_multipart
 use parking_lot::{RwLock, RwLockReadGuard};
-use std::collections::HashMap; // For pipe_read_to_write_id map.
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex, MutexGuard, Notify}; // Mutex for state, oneshot for API replies.
-use tokio::time::timeout; // For send/recv timeouts.
+use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard, Notify};
+use tokio::time::timeout as tokio_timeout;
 
-/// Represents the state of the REQ socket's send/receive cycle.
-/// REQ sockets must follow a strict send-then-receive pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReqState {
-  /// Socket is ready to send the next request.
   ReadyToSend,
-  /// Socket has sent a request to a specific peer (identified by `target_pipe_write_id`)
-  /// and is now expecting a reply from that same peer.
-  ExpectingReply { target_pipe_write_id: usize },
+  ExpectingReply { target_endpoint_uri: String }, // MODIFIED
 }
 
 #[derive(Debug)]
-struct ReqRecvState {
+struct ReqRecvStateInternal {
+  // Renamed from ReqRecvState
   state: ReqState,
-  // Notifier for when the specific outstanding request is resolved (either by reply or error)
   reply_or_error_notifier: Arc<Notify>,
 }
 
-/// Implements the REQ (Request) socket pattern.
-/// REQ sockets send requests and receive replies in a strict alternating sequence.
-/// A REQ socket must `send()` a message, then `recv()` a reply, before it can `send()` again.
-/// Outgoing requests are load-balanced across available connected REP (or ROUTER) peers.
 #[derive(Debug)]
 pub(crate) struct ReqSocket {
-  /// Arc to the shared `SocketCore` actor that manages common socket state and transport.
   core: Arc<SocketCore>,
-  /// `LoadBalancer` to choose which connected peer to send the next request to.
   load_balancer: LoadBalancer,
-  /// `FairQueue` to buffer the incoming reply. Although REQ expects only one reply
-  /// per request, using `FairQueue` (with capacity 1) simplifies receiving that reply
-  /// via the standard `handle_pipe_event` mechanism.
   incoming_reply_queue: FairQueue,
-  /// Tracks the current state of the request-reply cycle (ReadyToSend or ExpectingReply).
-  /// Protected by a `Mutex` to ensure atomic state transitions.
-  state: Mutex<ReqRecvState>,
-  /// Maps a pipe's read ID (from SocketCore's perspective) to its corresponding write ID.
-  /// This is needed during `pipe_detached` to correctly update the state if the target
-  /// peer (to whom a request was sent) disconnects.
-  pipe_read_to_write_id: RwLock<HashMap<usize, usize>>,
+  state: TokioMutex<ReqRecvStateInternal>, // Mutex guards ReqStateInternal
+  pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>, // MODIFIED
 }
 
 impl ReqSocket {
-  /// Creates a new `ReqSocket`.
-  ///
-  /// # Arguments
-  /// * `core` - An `Arc` to the `SocketCore` managing this socket.
-  /// * `_options` - Initial socket options. `RCVHWM` is implicitly used for the reply queue capacity (set to 1).
   pub fn new(core: Arc<SocketCore>) -> Self {
-    // The reply queue for REQ only ever needs to hold one logical reply (which might be multi-part).
-    // A capacity of 1 for the FairQueue is sufficient.
     let reply_queue_capacity = 1;
     Self {
       core,
       load_balancer: LoadBalancer::new(),
       incoming_reply_queue: FairQueue::new(reply_queue_capacity),
-      state: Mutex::new(ReqRecvState {
+      state: TokioMutex::new(ReqRecvStateInternal {
         state: ReqState::ReadyToSend,
         reply_or_error_notifier: Arc::new(Notify::new()),
       }),
-      pipe_read_to_write_id: RwLock::new(HashMap::new()),
+      pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
     }
   }
 
-  /// Helper to get a locked guard for the `CoreState` within `SocketCore`.
-  fn core_state(&self) -> RwLockReadGuard<'_, CoreState> {
+  fn core_state_read(&self) -> RwLockReadGuard<'_, CoreState> {
     self.core.core_state.read()
   }
 }
 
 #[async_trait]
 impl ISocket for ReqSocket {
-  /// Returns a reference to the `SocketCore`.
   fn core(&self) -> &Arc<SocketCore> {
     &self.core
   }
-
-  /// Returns a clone of the `SocketCore`'s command mailbox sender.
   fn mailbox(&self) -> MailboxSender {
     self.core.command_sender()
   }
 
-  // --- API Method Implementations (mostly delegated to SocketCore) ---
   async fn bind(&self, endpoint: &str) -> Result<(), ZmqError> {
     delegate_to_core!(self, UserBind, endpoint: endpoint.to_string())
   }
@@ -122,179 +92,126 @@ impl ISocket for ReqSocket {
     delegate_to_core!(self, UserClose,)
   }
 
-  // --- Pattern-Specific Logic for send() and recv() ---
-
-  /// Sends a request message using the REQ pattern.
-  /// The socket must be in the `ReadyToSend` state. After a successful send,
-  /// it transitions to `ExpectingReply`.
-  /// Outgoing messages are load-balanced to one available peer.
   async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    
-    // ZMQ REQ sockets typically send only the first part of a multi-part message
-    // if the MORE flag is set on it, and ignore subsequent parts for that send operation.
-    // We'll mimic this by clearing the MORE flag on the message being sent.
+
     if msg.is_more() {
-      tracing::warn!(
-        handle = self.core.handle,
-        "REQ send: Message has MORE flag set; REQ sends single-part requests. Clearing MORE flag."
-      );
-      // Clear the MORE flag to ensure only this part is considered the request.
       msg.set_flags(msg.flags() & !MsgFlags::MORE);
+      tracing::trace!(
+        handle = self.core.handle,
+        "REQ send: Cleared MORE flag from outgoing message."
+      );
     }
 
-    // Lock the state to check and transition.
-    // This lock is held briefly for the state check.
     {
-      let current_state_guard = self.state.lock().await;
-      if !matches!(current_state_guard.state, ReqState::ReadyToSend) {
+      let current_state_internal_guard = self.state.lock().await;
+      if !matches!(current_state_internal_guard.state, ReqState::ReadyToSend) {
         return Err(ZmqError::InvalidState(
           "REQ socket must call recv() before sending again",
         ));
       }
-      // Lock released when current_state_guard goes out of scope here.
     }
 
-    // Get SNDTIMEO from options before potentially blocking on peer selection.
-    let timeout_opt: Option<Duration> = { self.core_state().options.sndtimeo };
+    let timeout_opt: Option<Duration> = self.core_state_read().options.sndtimeo;
 
-    // Select a peer pipe using the load balancer, waiting if necessary based on SNDTIMEO.
-    let pipe_write_id = loop {
-      if let Some(id) = self.load_balancer.get_next_pipe() {
-        break id; // Found an available peer pipe.
-      }
-      // No peer currently available, behavior depends on timeout settings.
-      match timeout_opt {
-        Some(duration) if duration.is_zero() => {
-          tracing::trace!(
-            handle = self.core.handle,
-            "REQ send failed (non-blocking): No connected peers"
-          );
-          return Err(ZmqError::ResourceLimitReached); // EAGAIN
+    // Peer selection loop - RETAINED FROM YOUR ORIGINAL PROVIDED CODE
+    let endpoint_uri_to_send_to = loop {
+      if let Some(uri) = self.load_balancer.get_next_connection_uri() {
+        if self.core_state_read().endpoints.contains_key(&uri) {
+          break uri;
+        } else {
+          self.load_balancer.remove_connection(&uri);
         }
-        None => {
-          tracing::trace!(
-            handle = self.core.handle,
-            "REQ send blocking: Waiting for available peer..."
-          );
-          self.load_balancer.wait_for_pipe().await;
-          continue; // Loop back to try getting a pipe.
+      } else {
+        if !self.core.is_running().await {
+          return Err(ZmqError::InvalidState(
+            "Socket terminated while waiting for peer".into(),
+          ));
         }
-        Some(duration) => {
-          tracing::trace!(
-            handle = self.core.handle,
-            ?duration,
-            "REQ send timed wait: Waiting for available peer..."
-          );
-          match timeout(duration, self.load_balancer.wait_for_pipe()).await {
-            Ok(()) => continue, // Wait succeeded.
-            Err(_timeout_elapsed) => {
-              tracing::debug!(
-                handle = self.core.handle,
-                ?duration,
-                "REQ send timed out waiting for peer"
-              );
-              return Err(ZmqError::Timeout); // Timeout elapsed.
-            }
+        match timeout_opt {
+          Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
+          None => {
+            self.load_balancer.wait_for_connection().await;
+            continue;
           }
+          Some(duration) => match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
+            Ok(()) => continue,
+            Err(_) => return Err(ZmqError::Timeout),
+          },
         }
       }
     };
 
-    // Get the sender channel for the selected pipe from CoreState.
-    let pipe_tx = {
-      let core_state_guard = self.core_state();
-      core_state_guard.get_pipe_sender(pipe_write_id).ok_or_else(|| {
-        tracing::error!(
-          handle = self.core.handle,
-          pipe_id = pipe_write_id,
-          "REQ send failed: Pipe sender disappeared after selection."
-        );
-        ZmqError::Internal("Pipe sender consistency error".into())
-      })?
-    }; // CoreState lock released.
+    let conn_iface: Arc<dyn ISocketConnection> = {
+      let core_s_read = self.core_state_read();
+      match core_s_read.endpoints.get(&endpoint_uri_to_send_to) {
+        Some(ep_info) => ep_info.connection_iface.clone(),
+        None => {
+          self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
+          return Err(ZmqError::HostUnreachable(format!(
+            "Peer at {} disappeared before send",
+            endpoint_uri_to_send_to
+          )));
+        }
+      }
+    };
 
-    // REQ sockets do not typically prepend an empty delimiter like DEALER.
-    // The message is sent as is (after ensuring no MORE flag).
+    // Standard ZMTP REQ->REP: send [<empty_frame_MORE>, <data_frame_NOMORE>]
+    let mut empty_delimiter = Msg::new();
+    empty_delimiter.set_flags(MsgFlags::MORE);
 
-    // Send the request message, respecting SNDTIMEO for HWM.
-    match send_msg_with_timeout(&pipe_tx, msg, timeout_opt, self.core.handle, pipe_write_id).await {
+    let send_delimiter_result = conn_iface.send_message(empty_delimiter).await;
+
+    let final_send_result = if send_delimiter_result.is_ok() {
+      msg.set_flags(msg.flags() & !MsgFlags::MORE);
+      conn_iface.send_message(msg).await
+    } else {
+      send_delimiter_result
+    };
+
+    match final_send_result {
       Ok(()) => {
-        // Send was successful. Now, transition state to ExpectingReply.
-        // This lock must be acquired *after* the send to avoid holding it during await.
-        let mut current_state_guard = self.state.lock().await;
-        // It's possible the state changed due to a concurrent pipe_detached event. Re-check.
-        match current_state_guard.state {
+        let mut current_state_internal_guard = self.state.lock().await;
+        match current_state_internal_guard.state {
           ReqState::ReadyToSend => {
-            current_state_guard.state = ReqState::ExpectingReply {
-              target_pipe_write_id: pipe_write_id,
+            current_state_internal_guard.state = ReqState::ExpectingReply {
+              target_endpoint_uri: endpoint_uri_to_send_to.clone(),
             };
           }
-          // If state is already ExpectingReply (e.g. due to a race or prior error leaving it so),
-          // this send was technically out of order according to the state machine.
-          // However, since the actual send succeeded, we might be in an inconsistent situation.
-          // For robustness, we could update target_pipe_write_id, but it implies an issue.
           ReqState::ExpectingReply { .. } => {
-            tracing::error!(handle = self.core.handle, state=?*current_state_guard, "REQ state was not ReadyToSend after successful send, but send proceeded. Protocol violation likely.");
-            // This scenario should ideally be prevented by the initial state check.
-            // If it happens, it suggests a race condition or logic error.
-            // Overwrite the state with the new target.
-            current_state_guard.state = ReqState::ExpectingReply {
-              target_pipe_write_id: pipe_write_id,
+            tracing::error!(handle = self.core.handle, state = ?current_state_internal_guard.state, "REQ state was not ReadyToSend after successful send. Protocol violation likely.");
+            current_state_internal_guard.state = ReqState::ExpectingReply {
+              target_endpoint_uri: endpoint_uri_to_send_to.clone(),
             };
-            // Consider returning an error or logging more severely.
           }
         }
-        drop(current_state_guard); // Release lock.
-
-        tracing::trace!(
-          handle = self.core.handle,
-          pipe_id = pipe_write_id,
-          "REQ sent request, now expecting reply from this pipe."
-        );
-        Ok(()) // Return success for the send operation.
+        Ok(())
       }
       Err(e @ ZmqError::ConnectionClosed) => {
-        // Connection closed during send attempt.
-        tracing::warn!(
-          handle = self.core.handle,
-          pipe_id = pipe_write_id,
-          "REQ send failed: Pipe channel closed"
-        );
-        self.load_balancer.remove_pipe(pipe_write_id); // Clean up load balancer.
-                                                       // State remains ReadyToSend as the transition to ExpectingReply didn't happen.
-        Err(e)
+        self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
+        Err(ZmqError::HostUnreachable(format!(
+          "Connection to {} closed during send",
+          endpoint_uri_to_send_to
+        )))
       }
-      // Other errors (ResourceLimitReached, Timeout, Internal) are propagated.
-      // State remains ReadyToSend in these cases.
       Err(e) => Err(e),
     }
   }
 
-  /// Receives a reply message using the REQ pattern.
-  /// The socket must be in the `ExpectingReply` state. After a successful receive,
-  /// it transitions back to `ReadyToSend`.
+  // recv() method - RETAINED FROM YOUR ORIGINAL PROVIDED CODE
   async fn recv(&self) -> Result<Msg, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    // Check current state. Must be ExpectingReply.
-    // The target_pipe_write_id stored in state isn't strictly used for filtering incoming replies here,
-    // as REQ only expects one reply from the peer it sent to. The FairQueue (capacity 1) ensures this.
-    // However, it's useful for `pipe_detached` to know if the *target* peer disconnected.
 
-    // Get RCVTIMEO from options.
-    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
+    let rcvtimeo_opt: Option<Duration> = { self.core_state_read().options.rcvtimeo };
 
-    let (current_target_pipe_id, notifier_clone) = {
+    let (_current_target_uri_ignored, notifier_clone) = {
       let op_state_guard = self.state.lock().await;
-      match op_state_guard.state {
-        ReqState::ExpectingReply { target_pipe_write_id } => (
-          Some(target_pipe_write_id),
-          op_state_guard.reply_or_error_notifier.clone(),
-        ),
+      match &op_state_guard.state {
+        ReqState::ExpectingReply { target_endpoint_uri: _ } => ((), op_state_guard.reply_or_error_notifier.clone()),
         ReqState::ReadyToSend => {
           return Err(ZmqError::InvalidState("REQ socket must call send() before receiving"));
         }
@@ -302,8 +219,7 @@ impl ISocket for ReqSocket {
     };
 
     loop {
-      // Loop to handle spurious wakeups or state changes
-      let pop_future = self.incoming_reply_queue.pop_message(); // Try to get immediately if available
+      let pop_future = self.incoming_reply_queue.pop_message();
       let notified_future = notifier_clone.notified();
 
       let selected_future = match rcvtimeo_opt {
@@ -311,23 +227,21 @@ impl ISocket for ReqSocket {
           tokio::select! {
               biased;
               pop_res = pop_future => Either::Left(pop_res),
-              _ = tokio::time::sleep(Duration::from_micros(10)) => { // Brief yield to allow pop_future to resolve if data is immediately there
+              _ = tokio::time::sleep(Duration::from_micros(10)) => {
                   tokio::select! {
-                     _ = notified_future => Either::Right(Ok(())), // Notified means state might have changed or error
-                     _ = tokio::time::timeout(duration, futures::future::pending::<()>()) => Either::Right(Err(ZmqError::Timeout)),
+                     _ = notified_future => Either::Right(Ok(())),
+                     _ = tokio_timeout(duration, futures::future::pending::<()>()) => Either::Right(Err(ZmqError::Timeout)),
                   }
               }
           }
         }
         _ => {
-          // RCVTIMEO is None (infinite) or zero (check queue once then wait on notifier)
           tokio::select! {
               biased;
               pop_res = pop_future => Either::Left(pop_res),
-               _ = tokio::time::sleep(Duration::from_micros(10)) => { // Brief yield
+               _ = tokio::time::sleep(Duration::from_micros(10)) => {
                   tokio::select!{
                       _ = notified_future => Either::Right(Ok(())),
-                      // For infinite timeout, if pop_future was None initially, we just wait on notifier
                   }
                }
           }
@@ -336,37 +250,26 @@ impl ISocket for ReqSocket {
 
       match selected_future {
         Either::Left(Ok(Some(mut msg))) => {
-          // Got a message from queue
           if msg.is_more() {
             msg.set_flags(msg.flags() & !MsgFlags::MORE);
           }
           let mut op_state_guard = self.state.lock().await;
           op_state_guard.state = ReqState::ReadyToSend;
-          // Notify any other tasks that might have been waiting on this old notifier,
-          // though for REQ, only one recv should be active.
           op_state_guard.reply_or_error_notifier.notify_waiters();
           return Ok(msg);
         }
         Either::Left(Ok(None)) => {
-          // Queue empty on try_pop, continue to wait on notifier or timeout
           if rcvtimeo_opt == Some(Duration::ZERO) {
             return Err(ZmqError::ResourceLimitReached);
           }
-          // Fall through to await notifier in the select if not timeout=0
         }
         Either::Left(Err(e)) => {
-          // Error from queue (e.g. closed)
           let mut op_state_guard = self.state.lock().await;
-          op_state_guard.state = ReqState::ReadyToSend; // Reset state
+          op_state_guard.state = ReqState::ReadyToSend;
           op_state_guard.reply_or_error_notifier.notify_waiters();
           return Err(e);
         }
         Either::Right(Ok(())) => {
-          // Notified by reply_or_error_notifier
-          // First, try to pop any message that might have arrived.
-          // This handles the case where handle_pipe_event (reply received) and
-          // pipe_detached (peer error) both signal the notifier nearly simultaneously.
-          // The reply should take precedence if available.
           if let Ok(Some(mut msg)) = self.incoming_reply_queue.try_pop_message() {
             if msg.is_more() {
               msg.set_flags(msg.flags() & !MsgFlags::MORE);
@@ -376,35 +279,23 @@ impl ISocket for ReqSocket {
             op_state_guard.reply_or_error_notifier.notify_waiters();
             return Ok(msg);
           }
-
-          // If no message was popped, then the notification was likely due to detachment/error.
-          // Now check the state.
           let op_state_guard = self.state.lock().await;
           if matches!(op_state_guard.state, ReqState::ReadyToSend) {
-            tracing::warn!(
-              handle = self.core.handle,
-              "REQ recv: Notified, queue empty, and state is ReadyToSend (peer likely detached)."
-            );
             return Err(ZmqError::Internal("Request cancelled due to peer detachment".into()));
           }
-          // Else, still ExpectingReply and queue was empty on this check, loop to wait again (or for RCVTIMEO).
-          tracing::trace!(
-            handle = self.core.handle,
-            "REQ recv: Notified, but queue empty and still ExpectingReply. Looping for RCVTIMEO or next event."
-          );
+          tracing::trace!("REQ recv: Notified, but queue empty and still ExpectingReply. Looping.");
         }
         Either::Right(Err(timeout_err @ ZmqError::Timeout)) => {
-          // This was a timeout on waiting for the notifier
           return Err(timeout_err);
         }
         Either::Right(Err(other_err)) => {
-          // Should not happen from pending()
           return Err(other_err);
         }
       }
     }
   }
 
+  // <<< REVERTED send_multipart to its original form from your provided code >>>
   async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
     tracing::warn!(
       handle = self.core.handle,
@@ -415,14 +306,14 @@ impl ISocket for ReqSocket {
     ))
   }
 
+  // <<< REVERTED recv_multipart to its original form from your provided code >>>
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let rcvtimeo_opt: Option<Duration> = { self.core_state().options.rcvtimeo };
+    let rcvtimeo_opt: Option<Duration> = { self.core_state_read().options.rcvtimeo };
     let overall_deadline = rcvtimeo_opt.map(|d| Instant::now() + d);
 
-    // Check initial state
     let initial_notifier_clone = {
       let op_state_guard = self.state.lock().await;
       match op_state_guard.state {
@@ -438,27 +329,21 @@ impl ISocket for ReqSocket {
     let mut reply_frames: Vec<Msg> = Vec::new();
 
     loop {
-      // Loop to collect all frames of a multipart message
-      // Calculate remaining time for this frame, if overall RCVTIMEO is set
       let current_frame_timeout = if let Some(deadline) = overall_deadline {
         deadline.checked_duration_since(Instant::now())
       } else {
-        None // Infinite
+        None
       };
 
-      // If RCVTIMEO is set and has expired for this frame
       if let Some(timeout_val) = current_frame_timeout {
         if timeout_val.is_zero() {
-          // Effectively means deadline has passed or is now
           if reply_frames.is_empty() {
-            return Err(ZmqError::Timeout); // Timeout before even first frame
+            return Err(ZmqError::Timeout);
           } else {
-            // Timeout mid-message. This is a protocol error for REQ if it expects a complete reply.
             tracing::warn!(
               handle = self.core.handle,
               "REQ recv_multipart: Timeout receiving subsequent part. Discarding partial reply."
             );
-            // We need to reset state because we consumed parts of a reply.
             let mut op_state_guard = self.state.lock().await;
             op_state_guard.state = ReqState::ReadyToSend;
             op_state_guard.reply_or_error_notifier.notify_waiters();
@@ -466,11 +351,9 @@ impl ISocket for ReqSocket {
           }
         }
       } else if rcvtimeo_opt.is_some() && current_frame_timeout.is_none() {
-        // RCVTIMEO was set, but deadline has passed (current_frame_timeout is None because now > deadline)
         if reply_frames.is_empty() {
           return Err(ZmqError::Timeout);
         } else {
-          /* ... reset state and return ProtocolViolation ... */
           let mut op_state_guard = self.state.lock().await;
           op_state_guard.state = ReqState::ReadyToSend;
           op_state_guard.reply_or_error_notifier.notify_waiters();
@@ -480,22 +363,20 @@ impl ISocket for ReqSocket {
         }
       }
 
-      // We need to select between getting a message from the queue and waiting on the notifier.
-      // The notifier tells us if data *might* be available OR if state changed (e.g. peer detach).
       let pop_future = self.incoming_reply_queue.pop_message();
-      let notified_future = initial_notifier_clone.notified(); // Use the initially cloned notifier
+      let notified_future = initial_notifier_clone.notified();
 
       enum FrameRecvOutcome {
         Frame(Msg),
         QueueClosedOrError(ZmqError),
-        NotifierFired,             // Notifier fired, need to re-check state / queue
-        TimeoutWaitingForNotifier, // Timed out specifically on notifier wait
+        NotifierFired,
+        TimeoutWaitingForNotifier,
       }
 
       let frame_outcome_result = match current_frame_timeout {
         Some(duration_for_this_frame) if !duration_for_this_frame.is_zero() => {
           tokio::select! {
-              biased; // Prioritize data if available
+              biased;
               pop_res = pop_future => {
                   match pop_res {
                       Ok(Some(msg)) => FrameRecvOutcome::Frame(msg),
@@ -503,7 +384,7 @@ impl ISocket for ReqSocket {
                       Err(e) => FrameRecvOutcome::QueueClosedOrError(e),
                   }
               },
-              notify_res = tokio::time::timeout(duration_for_this_frame, notified_future) => {
+              notify_res = tokio_timeout(duration_for_this_frame, notified_future) => {
                   match notify_res {
                       Ok(()) => FrameRecvOutcome::NotifierFired,
                       Err(_) => FrameRecvOutcome::TimeoutWaitingForNotifier,
@@ -512,16 +393,13 @@ impl ISocket for ReqSocket {
           }
         }
         _ => {
-          // Infinite or zero RCVTIMEO remaining for this frame
           if rcvtimeo_opt == Some(Duration::ZERO) && reply_frames.is_empty() {
-            // Special handling for RCVTIMEO=0 initial try
             match self.incoming_reply_queue.try_pop_message() {
               Ok(Some(msg)) => FrameRecvOutcome::Frame(msg),
               Ok(None) => return Err(ZmqError::ResourceLimitReached),
               Err(e) => FrameRecvOutcome::QueueClosedOrError(e),
             }
           } else {
-            // Infinite wait
             tokio::select! {
                 biased;
                 pop_res = pop_future => {
@@ -542,65 +420,36 @@ impl ISocket for ReqSocket {
           let is_last_part = !current_frame.is_more();
           reply_frames.push(current_frame);
           if is_last_part {
-            // This is the complete logical reply.
             let mut op_state_guard = self.state.lock().await;
-            // Re-check state. It could have changed if notifier fired concurrently and was processed by another loop iteration.
             if matches!(op_state_guard.state, ReqState::ExpectingReply { .. }) {
               op_state_guard.state = ReqState::ReadyToSend;
               op_state_guard.reply_or_error_notifier.notify_waiters();
               return Ok(reply_frames);
             } else {
-              // State changed (e.g. by peer detach). This reply is stale.
-              tracing::warn!(
-                handle = self.core.handle,
-                "REQ recv_multipart: State changed while reply was being assembled. Discarding."
-              );
-              // The lock will be released, and the outer loop will re-check state (and likely error).
-              // We don't need to explicitly `continue` here if the next iteration's state check handles it.
-              // However, to be safe and prevent using stale `initial_notifier_clone` if state changed drastically:
               return Err(ZmqError::InvalidState(
                 "REQ state changed mid-multipart receive, request likely cancelled.".into(),
               ));
             }
           }
-          // More parts expected, continue loop.
         }
         FrameRecvOutcome::NotifierFired => {
-          // Notifier fired. State might have changed (e.g. peer detached).
-          // Re-lock and check state at the beginning of the next loop iteration.
           let mut op_state_guard = self.state.lock().await;
           if !matches!(op_state_guard.state, ReqState::ExpectingReply { .. }) {
-            // State is no longer ExpectingReply (e.g. reset by pipe_detached).
-            // If we have partial frames, this is an error. If no frames, the main loop condition will catch it.
             if !reply_frames.is_empty() {
-              tracing::warn!(
-                handle = self.core.handle,
-                "REQ recv_multipart: State changed (notifier) with partial reply. Discarding."
-              );
-              op_state_guard.state = ReqState::ReadyToSend; // Ensure reset
+              op_state_guard.state = ReqState::ReadyToSend;
               op_state_guard.reply_or_error_notifier.notify_waiters();
               return Err(ZmqError::ProtocolViolation(
                 "Request cancelled mid-multipart reply due to state change.".into(),
               ));
             }
-            // If no frames yet, main loop's state check will handle erroring out.
           }
-          // else, still expecting reply, continue loop to try pop_message again.
-          tracing::trace!(
-            handle = self.core.handle,
-            "REQ recv_multipart: Notifier fired. Re-evaluating."
-          );
+          tracing::trace!("REQ recv_multipart: Notifier fired. Re-evaluating.");
           continue;
         }
         FrameRecvOutcome::TimeoutWaitingForNotifier => {
-          // This means overall RCVTIMEO expired
           if reply_frames.is_empty() {
             return Err(ZmqError::Timeout);
           } else {
-            tracing::warn!(
-              handle = self.core.handle,
-              "REQ recv_multipart: Timeout waiting for subsequent part. Discarding partial reply."
-            );
             let mut op_state_guard = self.state.lock().await;
             op_state_guard.state = ReqState::ReadyToSend;
             op_state_guard.reply_or_error_notifier.notify_waiters();
@@ -610,9 +459,8 @@ impl ISocket for ReqSocket {
           }
         }
         FrameRecvOutcome::QueueClosedOrError(e) => {
-          // FairQueue closed or errored. This is fatal for the REQ socket's ability to receive.
           let mut op_state_guard = self.state.lock().await;
-          op_state_guard.state = ReqState::ReadyToSend; // Reset state
+          op_state_guard.state = ReqState::ReadyToSend;
           op_state_guard.reply_or_error_notifier.notify_waiters();
           return Err(e);
         }
@@ -620,163 +468,141 @@ impl ISocket for ReqSocket {
     }
   }
 
-  // --- Pattern-Specific Option Handling ---
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
-    tracing::debug!(
-      handle = self.core.handle,
-      socket_type = "REQ",
-      option = option,
-      "set_pattern_option called"
-    );
-    // REQ sockets do not have specific pattern options like SUBSCRIBE.
     Err(ZmqError::UnsupportedOption(option))
   }
   async fn get_pattern_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
-    tracing::debug!(
-      handle = self.core.handle,
-      socket_type = "REQ",
-      option = option,
-      "get_pattern_option called"
-    );
-    // REQ sockets do not have readable pattern-specific options.
     Err(ZmqError::UnsupportedOption(option))
   }
 
-  // --- Internal Hooks called by SocketCore ---
   async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
-    // REQ sockets do not typically handle special commands beyond user API calls.
-    Ok(false) // Indicate command was not handled here.
+    Ok(false)
   }
 
-  /// Handles messages received from a pipe by the `SocketCore`.
-  /// For REQ, any message received on any pipe must be the reply it's waiting for.
-  /// It's pushed into the (capacity 1) `incoming_reply_queue`.
-  async fn handle_pipe_event(&self, pipe_id: usize, event: Command) -> Result<(), ZmqError> {
+  // <<< MODIFIED: handle_pipe_event checks against target_endpoint_uri >>>
+  async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
-        let op_state_guard = self.state.lock().await;
-        match op_state_guard.state {
-          ReqState::ExpectingReply { target_pipe_write_id } => {
-            // Check if this message is from the correct pipe (optional strictness)
-            let expected_read_pipe = self.pipe_read_to_write_id.read().iter().find_map(|(r_id, w_id)| {
-              if *w_id == target_pipe_write_id {
-                Some(*r_id)
-              } else {
-                None
-              }
-            });
+        let source_uri_opt = self.pipe_read_to_endpoint_uri.read().get(&pipe_read_id).cloned();
 
-            if expected_read_pipe.is_none() || expected_read_pipe != Some(pipe_id) {
-              tracing::warn!(
+        if source_uri_opt.is_none() {
+          tracing::warn!(
+            handle = self.core.handle,
+            pipe_id = pipe_read_id,
+            "REQ received reply from unknown pipe (no URI mapping). Dropping."
+          );
+          return Ok(());
+        }
+        let source_uri = source_uri_opt.unwrap();
+
+        let mut op_state_guard = self.state.lock().await;
+        match &op_state_guard.state {
+          ReqState::ExpectingReply { target_endpoint_uri } => {
+            if *target_endpoint_uri == source_uri {
+              let mut actual_payload = msg;
+              if actual_payload.size() == 0 && actual_payload.is_more() {
+                tracing::trace!(
                   handle = self.core.handle,
-                  received_from_pipe = pipe_id,
-                  expected_from_pipe_via_target_write_id = ?expected_read_pipe,
-                  target_write_id_in_state = target_pipe_write_id,
-                  "REQ received reply from unexpected pipe. Dropping."
-              );
-              // Drop message, do not notify, do not change state.
-              // The outstanding recv() will eventually timeout or be resolved by target peer detaching.
-              return Ok(());
-            }
-            // Message is from the correct peer. Drop guard before await.
-            drop(op_state_guard);
+                  pipe_id = pipe_read_id,
+                  "REQ handle_pipe_event: Received ZMTP empty delimiter, waiting for actual payload frame."
+                );
+                return Ok(());
+              }
 
-            tracing::trace!(
-              handle = self.core.handle,
-              pipe_id = pipe_id,
-              msg_size = msg.size(),
-              "REQ pushing reply to FairQueue"
-            );
-            if self.incoming_reply_queue.push_message(msg).await.is_err() {
-              tracing::error!(
-                handle = self.core.handle,
-                pipe_id = pipe_id,
-                "REQ: Failed to push reply to queue (full/closed)."
-              );
-              // This is an issue, the queue (capacity 1) should not be full if state is ExpectingReply.
-              // Reset state to allow new send if queue is broken.
-              let mut op_state_guard_err = self.state.lock().await;
-              op_state_guard_err.state = ReqState::ReadyToSend;
-              op_state_guard_err.reply_or_error_notifier.notify_waiters(); // Wake up any pending recv
+              if actual_payload.is_more() {
+                actual_payload.set_flags(actual_payload.flags() & !MsgFlags::MORE);
+              }
+
+              let notifier_to_signal = op_state_guard.reply_or_error_notifier.clone();
+              drop(op_state_guard);
+
+              if self.incoming_reply_queue.push_message(actual_payload).await.is_err() {
+                tracing::error!(
+                  handle = self.core.handle,
+                  pipe_id = pipe_read_id,
+                  "REQ: Failed to push reply to FairQueue."
+                );
+                let mut op_state_guard_err = self.state.lock().await;
+                op_state_guard_err.state = ReqState::ReadyToSend;
+                op_state_guard_err.reply_or_error_notifier.notify_waiters();
+              } else {
+                notifier_to_signal.notify_one();
+              }
             } else {
-              // Successfully queued, notify the pending recv.
-              self.state.lock().await.reply_or_error_notifier.notify_one();
+              tracing::warn!(handle = self.core.handle, source_pipe_id = pipe_read_id, source_uri = %source_uri, expected_target_uri = %target_endpoint_uri, "REQ received reply from unexpected peer. Dropping.");
             }
           }
           ReqState::ReadyToSend => {
-            drop(op_state_guard);
-            tracing::warn!(
-              handle = self.core.handle,
-              pipe_id = pipe_id,
-              msg_size = msg.size(),
-              "REQ received unexpected message from pipe (state ReadyToSend), dropping."
-            );
+            tracing::warn!(handle = self.core.handle, source_pipe_id = pipe_read_id, source_uri = %source_uri, "REQ received unexpected reply (state ReadyToSend). Dropping.");
           }
         }
       }
-      _ => { /* REQ sockets typically ignore other direct pipe events from SocketCore. */ }
+      _ => {}
     }
     Ok(())
   }
 
-  /// Called by `SocketCore` when a new pipe (connection to a REP/ROUTER peer) is attached.
-  async fn pipe_attached(&self, pipe_read_id: usize, pipe_write_id: usize, _peer_identity: Option<&[u8]>) {
-    tracing::debug!(
-      handle = self.core.handle,
-      pipe_read_id = pipe_read_id,
-      pipe_write_id = pipe_write_id,
-      "REQ attaching pipe"
-    );
-    // Store the mapping from read ID to write ID for state management on detachment.
-    self.pipe_read_to_write_id.write().insert(pipe_read_id, pipe_write_id);
-    // Add the pipe's write ID to the load balancer for sending requests.
-    self.load_balancer.add_pipe(pipe_write_id);
-    // Notify the incoming reply queue (FairQueue) that a pipe is attached.
-    self.incoming_reply_queue.pipe_attached(pipe_read_id);
+  // <<< MODIFIED: pipe_attached updates pipe_read_to_endpoint_uri and LoadBalancer with URI >>>
+  async fn pipe_attached(
+    &self,
+    pipe_read_id: usize,
+    _pipe_write_id: usize, // No longer used by ReqSocket as LoadBalancer stores URI
+    _peer_identity: Option<&[u8]>,
+  ) {
+    let endpoint_uri_option = self
+      .core_state_read()
+      .pipe_read_id_to_endpoint_uri
+      .get(&pipe_read_id)
+      .cloned();
+
+    if let Some(endpoint_uri) = endpoint_uri_option {
+      tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "REQ attaching connection");
+      self
+        .pipe_read_to_endpoint_uri
+        .write()
+        .insert(pipe_read_id, endpoint_uri.clone());
+      self.load_balancer.add_connection(endpoint_uri);
+      self.incoming_reply_queue.pipe_attached(pipe_read_id);
+    } else {
+      tracing::warn!(
+        handle = self.core.handle,
+        pipe_read_id,
+        "REQ pipe_attached: Endpoint URI not found for pipe in CoreState. Maps not updated."
+      );
+    }
   }
 
   async fn update_peer_identity(&self, pipe_read_id: usize, identity: Option<Blob>) {
     tracing::trace!(
       handle = self.core.handle,
-      socket_type = "THEIR_SOCKET_TYPE", // e.g., "DEALER"
+      socket_type = "REQ",
       pipe_read_id,
       ?identity,
-      "update_peer_identity called, but this socket type does not use peer identities. Ignoring."
+      "update_peer_identity called, but REQ socket does not use peer identities. Ignoring."
     );
   }
 
-  /// Called by `SocketCore` when a pipe is detached (peer disconnected or socket closing).
+  // <<< MODIFIED: pipe_detached uses pipe_read_to_endpoint_uri and updates state correctly >>>
   async fn pipe_detached(&self, pipe_read_id: usize) {
-    tracing::debug!(
-      handle = self.core.handle,
-      pipe_read_id = pipe_read_id,
-      "REQ detaching pipe"
-    );
-    // Remove the read ID -> write ID mapping and get the write ID.
-    let maybe_write_id = self.pipe_read_to_write_id.write().remove(&pipe_read_id);
+    tracing::debug!(handle = self.core.handle, pipe_read_id, "REQ detaching pipe");
 
-    if let Some(write_id) = maybe_write_id {
-      // Remove the detached pipe's write ID from the load balancer.
-      self.load_balancer.remove_pipe(write_id);
+    let maybe_endpoint_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id);
 
-      // Critical: If the detached pipe was the one we were expecting a reply from,
-      // reset the state machine to ReadyToSend to allow sending a new request.
+    if let Some(detached_uri) = maybe_endpoint_uri {
+      self.load_balancer.remove_connection(&detached_uri);
+
       let mut op_state_guard = self.state.lock().await;
-      if let ReqState::ExpectingReply { target_pipe_write_id } = op_state_guard.state {
-        if target_pipe_write_id == write_id {
-          tracing::warn!(
-            handle = self.core.handle,
-            pipe_read_id,
-            pipe_write_id = write_id,
-            "Target REP peer detached while REQ was expecting reply. Resetting state and notifying recv."
-          );
+      if let ReqState::ExpectingReply {
+        ref target_endpoint_uri,
+      } = op_state_guard.state
+      {
+        if *target_endpoint_uri == detached_uri {
+          tracing::warn!(handle = self.core.handle, pipe_id = pipe_read_id, uri = %detached_uri, "Target REP peer detached while REQ was expecting reply. Resetting state and notifying recv.");
           op_state_guard.state = ReqState::ReadyToSend;
-          op_state_guard.reply_or_error_notifier.notify_one(); // Notify the pending recv call
+          op_state_guard.reply_or_error_notifier.notify_one();
         }
       }
-      // Lock released.
     }
-    // Notify the incoming reply queue that the pipe is detached.
     self.incoming_reply_queue.pipe_detached(pipe_read_id);
   }
 }

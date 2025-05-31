@@ -28,7 +28,7 @@ pub mod sub_socket;
 
 // Import necessary types from other modules within the crate.
 use crate::context::Context; // For `create_socket_actor`.
-use crate::error::ZmqError; // For `Result` types in API methods.
+use crate::error::{ZmqError, ZmqResult}; // For `Result` types in API methods.
 use crate::message::Msg; // For `send`/`recv` message types.
 use crate::runtime::{Command, MailboxSender}; // For actor communication.
 use crate::socket::options::SocketOptions; // For initial socket configuration.
@@ -153,7 +153,7 @@ pub trait ISocket: Send + Sync + 'static {
 
   /// Applies a socket option that is relevant *only* to this specific socket type/pattern.
   /// This is called by `SocketCore` after it has handled core-level options.
-  async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError>;
+  async fn set_pattern_option(&self, option: i32, value: &[u8]) -> ZmqResult<()>;
 
   /// Retrieves a socket option value that is relevant *only* to this specific socket type/pattern.
   /// Called by `SocketCore` if it doesn't handle the option itself.

@@ -589,9 +589,16 @@ pub(crate) async fn process_inproc_binding_request_event(
     let inproc_endpoint_entry_handle_id = core_arc.context.inner().next_handle();
 
     // <<< MODIFIED START [InprocConnection for binder side] >>>
-    let binder_side_inproc_iface = Arc::new(crate::socket::connection_iface::InprocBinderSideConnection {
-      _connection_id: inproc_endpoint_entry_handle_id,
-    });
+    let binder_side_inproc_iface = Arc::new(crate::socket::connection_iface::InprocConnection::new(
+      inproc_endpoint_entry_handle_id,                 // connection_id for this EndpointInfo
+      binder_write_id_for_this_connection,             // Binder's local_pipe_write_id_to_peer (connector's read ID)
+      binder_read_id_for_this_connection,              // Binder's local_pipe_read_id_from_peer (connector's write ID)
+      connector_uri.clone(),                           // peer_inproc_name_or_uri is the connector's URI
+      core_arc.context.clone(),                        // Binder's context
+      pipe_tx_for_binder_to_send_to_connector.clone(), // data_tx_to_peer is the sender to the connector
+      core_arc.core_state.read().get_monitor_sender_clone(), // Binder's monitor
+      core_arc.core_state.read().options.clone(),      // Binder's socket options
+    ));
     // <<< MODIFIED END >>>
 
     let endpoint_info_for_binder = EndpointInfo {

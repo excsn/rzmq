@@ -126,5 +126,9 @@ name = "noise_xx"
 required-features = ["noise_xx"]
 
 [[test]]
+name = "multishot_receive"
+required-features = ["io-uring"]
+
+[[test]]
 name = "zerocopy_send"
 required-features = ["io-uring"]

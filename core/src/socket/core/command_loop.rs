@@ -3,7 +3,7 @@
 use crate::error::ZmqError;
 use crate::runtime::{ActorType, Command, MailboxReceiver, SystemEvent};
 use crate::socket::core::state::ShutdownPhase; // To access ShutdownPhase directly
-use crate::socket::core::{SocketCore, shutdown, event_processor, command_processor}; // For calling helpers
+use crate::socket::core::{command_processor, event_processor, shutdown, SocketCore}; // For calling helpers
 use crate::socket::ISocket;
 
 use std::sync::Arc;
@@ -14,32 +14,32 @@ use tokio::time::{interval, Interval};
 /// The main actor loop for `SocketCore`.
 /// It listens for user commands on its mailbox and system events on the event bus.
 pub(crate) async fn run_command_loop(
-    core_arc: Arc<SocketCore>,
-    socket_logic_strong: Arc<dyn ISocket>, // Strong Arc to the ISocket pattern logic
-    mut command_receiver: MailboxReceiver, // Mailbox for user commands, now mutable
-    mut system_event_rx: broadcast::Receiver<SystemEvent>, // Event bus receiver
+  core_arc: Arc<SocketCore>,
+  socket_logic_strong: Arc<dyn ISocket>, // Strong Arc to the ISocket pattern logic
+  mut command_receiver: MailboxReceiver, // Mailbox for user commands, now mutable
+  mut system_event_rx: broadcast::Receiver<SystemEvent>, // Event bus receiver
 ) {
-    let core_handle = core_arc.handle;
-    let core_actor_type = ActorType::SocketCore;
-    let context_clone_for_stop = core_arc.context.clone(); // For publishing ActorStopping
-    let socket_type_for_log = core_arc.core_state.read().socket_type; // Get once for logging
+  let core_handle = core_arc.handle;
+  let core_actor_type = ActorType::SocketCore;
+  let context_clone_for_stop = core_arc.context.clone(); // For publishing ActorStopping
+  let socket_type_for_log = core_arc.core_state.read().socket_type; // Get once for logging
 
-    tracing::info!(
-        handle = core_handle,
-        socket_type = ?socket_type_for_log,
-        "SocketCore actor main loop starting."
-    );
+  tracing::info!(
+      handle = core_handle,
+      socket_type = ?socket_type_for_log,
+      "SocketCore actor main loop starting."
+  );
 
-    // Linger check interval
-    let mut linger_check_interval: Interval = interval(Duration::from_millis(100)); // Adjusted interval
-    linger_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+  // Linger check interval
+  let mut linger_check_interval: Interval = interval(Duration::from_millis(100)); // Adjusted interval
+  linger_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut final_error_for_actorstop: Option<ZmqError> = None;
+  let mut final_error_for_actorstop: Option<ZmqError> = None;
 
-    // The main loop
-    // The Result<(), ZmqError> is conceptual for the loop's success/failure.
-    // If an unrecoverable error occurs, we'll set final_error_for_actorstop and break.
-    let _loop_result: Result<(), ()> = async { // Changed to Result<(), ()> for loop structure
+  // The main loop
+  // The Result<(), ZmqError> is conceptual for the loop's success/failure.
+  // If an unrecoverable error occurs, we'll set final_error_for_actorstop and break.
+  let _loop_result: Result<(), ()> = async { // Changed to Result<(), ()> for loop structure
         loop {
             let current_shutdown_phase = {
                 // Lock acquired and dropped quickly
@@ -169,75 +169,73 @@ pub(crate) async fn run_command_loop(
         Ok(()) // Loop finished (normally implies shutdown complete)
     }.await;
 
+  // --- Post-Loop Cleanup & ActorStopping Event ---
+  // This section runs after the main loop breaks (due to shutdown or fatal error).
+  tracing::info!(
+      handle = core_handle,
+      socket_type = ?socket_type_for_log,
+      "SocketCore main loop finished execution."
+  );
 
-    // --- Post-Loop Cleanup & ActorStopping Event ---
-    // This section runs after the main loop breaks (due to shutdown or fatal error).
-    tracing::info!(
+  // If loop exited due to an error that wasn't already part of a graceful shutdown,
+  // ensure shutdown is initiated and as much cleanup as possible happens.
+  // This is more of a failsafe.
+  let mut final_coord_guard = core_arc.shutdown_coordinator.lock().await;
+  if final_coord_guard.state != ShutdownPhase::Finished {
+    tracing::warn!(
         handle = core_handle,
-        socket_type = ?socket_type_for_log,
-        "SocketCore main loop finished execution."
+        current_phase = ?final_coord_guard.state,
+        "SocketCore loop exited prematurely or shutdown not fully completed. Attempting final cleanup."
     );
+    // Attempt to run the final cleanup stages if not already done.
+    // This is tricky because we are outside the select loop.
+    // For simplicity, we'll assume that if the loop broke, final_coord_guard.state
+    // should ideally be ShutdownPhase::Finished. If not, it might indicate an
+    // unhandled error path within the loop.
+    // A robust approach here might involve re-running parts of the shutdown sequence
+    // if they weren't completed, but that adds complexity.
+    // For now, we ensure we move to Finished state.
+    final_coord_guard.state = ShutdownPhase::Finished;
+  }
+  drop(final_coord_guard);
 
-    // If loop exited due to an error that wasn't already part of a graceful shutdown,
-    // ensure shutdown is initiated and as much cleanup as possible happens.
-    // This is more of a failsafe.
-    let mut final_coord_guard = core_arc.shutdown_coordinator.lock().await;
-    if final_coord_guard.state != ShutdownPhase::Finished {
-        tracing::warn!(
-            handle = core_handle,
-            current_phase = ?final_coord_guard.state,
-            "SocketCore loop exited prematurely or shutdown not fully completed. Attempting final cleanup."
-        );
-        // Attempt to run the final cleanup stages if not already done.
-        // This is tricky because we are outside the select loop.
-        // For simplicity, we'll assume that if the loop broke, final_coord_guard.state
-        // should ideally be ShutdownPhase::Finished. If not, it might indicate an
-        // unhandled error path within the loop.
-        // A robust approach here might involve re-running parts of the shutdown sequence
-        // if they weren't completed, but that adds complexity.
-        // For now, we ensure we move to Finished state.
-        final_coord_guard.state = ShutdownPhase::Finished;
-    }
-    drop(final_coord_guard);
+  // Unregister this socket from the context (if it was registered)
+  // This needs to be done carefully if context itself is shutting down.
+  // ContextInner::unregister_socket should be robust.
+  core_arc.context.inner().unregister_socket(core_handle);
 
-
-    // Unregister this socket from the context (if it was registered)
-    // This needs to be done carefully if context itself is shutting down.
-    // ContextInner::unregister_socket should be robust.
-    core_arc.context.inner().unregister_socket(core_handle);
-
-    // Unregister any bound inproc names.
-    #[cfg(feature = "inproc")]
-    {
-        // Take the names to avoid holding lock during async operations
-        let bound_names_to_unregister = {
-            let mut core_s_guard = core_arc.core_state.write();
-            std::mem::take(&mut core_s_guard.bound_inproc_names)
-        };
-        if !bound_names_to_unregister.is_empty() {
-            tracing::debug!(
-                handle = core_handle,
-                "SocketCore unregistering inproc names: {:?}",
-                bound_names_to_unregister
-            );
-            for name_val in bound_names_to_unregister {
-                // ContextInner::unregister_inproc is synchronous.
-                core_arc.context.inner().unregister_inproc(&name_val);
-            }
-        }
-    }
-
-    // Publish the final ActorStopping event for this SocketCore.
-    context_clone_for_stop.publish_actor_stopping(
-        core_handle,
-        core_actor_type,
-        None, // SocketCore itself doesn't have a single endpoint_uri
-        final_error_for_actorstop,
-    );
-
-    tracing::info!(
+  // Unregister any bound inproc names.
+  #[cfg(feature = "inproc")]
+  {
+    // Take the names to avoid holding lock during async operations
+    let bound_names_to_unregister = {
+      let mut core_s_guard = core_arc.core_state.write();
+      std::mem::take(&mut core_s_guard.bound_inproc_names)
+    };
+    if !bound_names_to_unregister.is_empty() {
+      tracing::debug!(
         handle = core_handle,
-        socket_type = ?socket_type_for_log,
-        "SocketCore actor task FULLY STOPPED."
-    );
+        "SocketCore unregistering inproc names: {:?}",
+        bound_names_to_unregister
+      );
+      for name_val in bound_names_to_unregister {
+        // ContextInner::unregister_inproc is synchronous.
+        core_arc.context.inner().unregister_inproc(&name_val);
+      }
+    }
+  }
+
+  // Publish the final ActorStopping event for this SocketCore.
+  context_clone_for_stop.publish_actor_stopping(
+    core_handle,
+    core_actor_type,
+    None, // SocketCore itself doesn't have a single endpoint_uri
+    final_error_for_actorstop,
+  );
+
+  tracing::info!(
+      handle = core_handle,
+      socket_type = ?socket_type_for_log,
+      "SocketCore actor task FULLY STOPPED."
+  );
 }

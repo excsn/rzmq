@@ -432,10 +432,6 @@ pub(crate) fn apply_core_option_value(
         HANDSHAKE_IVL => options.handshake_ivl = parse_handshake_option(value, option_id)?,
         MAX_CONNECTIONS => options.max_connections = parse_max_connections_option(value, option_id)?,
         TCP_CORK_OPT => options.tcp_cork = parse_bool_option(value)?,
-
-        ROUTER_MANDATORY => { //TODO Supposedly pattern specific, so...
-          options.router_mandatory = parse_bool_option(value)?;
-        }
         ZAP_DOMAIN => options.zap_domain = Some(parse_string_option(value, option_id)?),
         PLAIN_SERVER => {
             options.plain_options.server_role = Some(parse_bool_option(value)?);
@@ -469,7 +465,7 @@ pub(crate) fn apply_core_option_value(
         IO_URING_RECV_BUFFER_SIZE => options.io_uring.recv_buffer_size = parse_i32_option(value)?.max(1024) as usize,
 
         // Options handled by pattern logic (ISocket) or read-only, or not applicable for set_option
-        SUBSCRIBE | UNSUBSCRIBE | LAST_ENDPOINT  /* Pattern specific */ |
+        SUBSCRIBE | UNSUBSCRIBE | LAST_ENDPOINT  /* Pattern specific */ | ROUTER_MANDATORY |
         16 /* ZMQ_TYPE (read-only) */ => return Err(ZmqError::UnsupportedOption(option_id)),
 
         _ => return Err(ZmqError::InvalidOption(option_id)), // Unknown option ID

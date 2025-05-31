@@ -272,6 +272,8 @@ async fn handle_new_connection_established(
       )
       .await?;
 
+      let arc_socket_options = core_arc.core_state.read().options.clone(); 
+      
       // Construct the SessionConnection *after* pipes are set up by pipe_manager
       let tx_core_to_session_for_iface = core_arc
         .core_state
@@ -285,6 +287,7 @@ async fn handle_new_connection_established(
         session_actor_mailbox.clone(),
         session_actor_handle_id,
         tx_core_to_session_for_iface,
+        arc_socket_options,
       ));
       // <<< MODIFIED END >>>
 
