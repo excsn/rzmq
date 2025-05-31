@@ -195,6 +195,8 @@ impl ZmtpUringHandler {
             self.fd,
             self.final_peer_identity.as_ref().map(|id_blob| String::from_utf8_lossy(id_blob.as_ref()))
         );
+        // example: "ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_8_PEER_ID_None"
+        // or:      "ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_8_PEER_ID_Some(\"peer_id_content\")"
 
         interface.worker_io_config.parsed_msg_tx_zmtp.try_send(
             (self.fd, Err(ZmqError::Internal(signal_content))) 

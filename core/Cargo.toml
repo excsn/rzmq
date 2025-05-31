@@ -117,6 +117,16 @@ name = "iouring_basic"
 path = "examples/iouring_basic.rs"
 required-features = ["io-uring"]
 
+[[example]]
+name = "iouring_throughput"
+path = "examples/iouring_throughput.rs"
+required-features = ["io-uring"]
+
+[[example]]
+name = "iouring_multi_throughput"
+path = "examples/iouring_multi_throughput.rs"
+required-features = ["io-uring"]
+
 [[test]]
 name = "inproc_minimal"
 required-features = ["inproc"]

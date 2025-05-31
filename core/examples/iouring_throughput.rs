@@ -5,6 +5,9 @@ use rzmq::socket::options as zmq_opts; // For socket option constants
 use std::time::{Duration, Instant};
 use bytes::Bytes; // For efficient Bytes cloning
 
+const PRINT_SEND_RECV_MESSAGES: bool = false;
+const COMPACT_SEND_RECV_MESSAGES: bool = true;
+
 // Ensure rzmq::main is used if your library's io_uring feature might switch Tokio runtimes.
 // For this example, we'll use tokio::main and assume the library handles internal setup.
 #[tokio::main]
@@ -15,7 +18,7 @@ async fn main() -> Result<(), ZmqError> {
   }
   
   tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::DEBUG) // Adjust log level (INFO, DEBUG, TRACE)
+    .with_max_level(tracing::Level::WARN) // Adjust log level (INFO, DEBUG, TRACE)
     .with_thread_ids(true)
     .with_thread_names(true)
     .with_target(true)
@@ -29,6 +32,8 @@ async fn main() -> Result<(), ZmqError> {
   // --- ROUTER Socket (Server Side) ---
   let router_socket = ctx.socket(SocketType::Router)?;
   router_socket.set_option(zmq_opts::IO_URING_SESSION_ENABLED, true).await?;
+  router_socket.set_option(zmq_opts::RCVHWM, 5000).await?;
+  router_socket.set_option(zmq_opts::SNDHWM, 5000).await?;
   
   let endpoint = "tcp://127.0.0.1:5558"; // Ensure a unique port
   println!("ROUTER: Binding to {}...", endpoint);
@@ -64,12 +69,14 @@ async fn main() -> Result<(), ZmqError> {
             // or if the stripping logic leads to no payload.
              println!("ROUTER: Received message from {:?} with no payload after identity/delimiter, echoing identity back.", client_identity_frame.data());
           } else {
-            // println!(
-            //   "ROUTER: Received message from {:?} with {} payload parts. First part size: {}",
-            //   client_identity_frame.data(),
-            //   received_parts.len(),
-            //   received_parts[0].size()
-            // );
+            if PRINT_SEND_RECV_MESSAGES {
+              println!(
+                "ROUTER: Received message from {:?} with {} payload parts. First part size: {}",
+                client_identity_frame.data(),
+                received_parts.len(),
+                received_parts[0].size()
+              );
+            }
           }
 
           // Construct reply: [identity_frame_WITH_MORE, payload_part_1_WITH_MORE, ..., payload_part_N_NO_MORE]
@@ -163,15 +170,34 @@ async fn main() -> Result<(), ZmqError> {
         break; 
       }
     }
-    tokio::time::sleep(Duration::from_millis(1500)).await; 
 
     // DEALER receive: Expects only the payload, identity/delimiter stripped by socket.
     match dealer_socket.recv().await {
       Ok(reply_msg) => {
+
+        if PRINT_SEND_RECV_MESSAGES {
+          if COMPACT_SEND_RECV_MESSAGES {
+            
+            println!(
+              "[DEALER] Received reply (msg #{}) (Size: {})", 
+              i, // assuming i is the loop counter for messages
+              reply_msg.size()
+            );
+          } else {
+            println!(
+              "[DEALER] Received reply (msg #{}): '{}' (Size: {})", 
+              i, // assuming i is the loop counter for messages
+              String::from_utf8_lossy(reply_msg.data().unwrap_or_default()), 
+              reply_msg.size()
+            );
+          }
+        }
+
         // Basic validation, could be more thorough
         if reply_msg.size() == payload_size_bytes {
           messages_received += 1;
           bytes_received += reply_msg.size() as u64;
+          
         } else {
           eprintln!(
             "DEALER: Received reply with unexpected size. Expected: {}, Got: {}. Message #{}", 
@@ -192,6 +218,7 @@ async fn main() -> Result<(), ZmqError> {
     if (i + 1) % (num_messages_to_send / 10).max(1) == 0 { // Log progress every 10%
       println!("DEALER: Sent/Received {} messages...", i + 1);
     }
+    // tokio::time::sleep(Duration::from_millis(1500)).await; 
   }
 
   let duration = start_time.elapsed();
