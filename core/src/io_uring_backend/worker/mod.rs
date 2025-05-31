@@ -6,6 +6,7 @@ use io_uring::opcode;
 use io_uring::types;
 use kanal::{Receiver as KanalReceiver, Sender as KanalSender};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::mem;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr, Ipv6Addr};
@@ -51,7 +52,9 @@ pub struct UringWorker {
     
     // WorkerIoConfig is Arc'd because it's shared with handlers created by HandlerManager
     worker_io_config: Arc<WorkerIoConfig>,
-    default_buffer_ring_group_id_val: Option<u16>, // ADDED: Worker owns this value
+    default_buffer_ring_group_id_val: Option<u16>,
+    fds_needing_close_initiated_pass: VecDeque<RawFd>,
+    shutdown_requested: bool, 
 }
 
 impl fmt::Debug for UringWorker {
@@ -63,7 +66,8 @@ impl fmt::Debug for UringWorker {
       .field("buffer_manager_is_some", &self.buffer_manager.is_some()) 
       .field("external_op_tracker_len", &self.external_op_tracker.in_flight.len())
       .field("internal_op_tracker_len", &self.internal_op_tracker.op_to_details.len())
-      .field("default_buffer_ring_group_id_val", &self.default_buffer_ring_group_id_val) 
+      .field("default_buffer_ring_group_id_val", &self.default_buffer_ring_group_id_val)
+      .field("shutdown_requested", &self.shutdown_requested) 
       .finish_non_exhaustive()
   }
 }
@@ -93,8 +97,10 @@ impl UringWorker {
               handler_manager: HandlerManager::new(factories, worker_io_config.clone()), // Clone Arc
               external_op_tracker: ExternalOpTracker::new(),
               internal_op_tracker: InternalOpTracker::new(),
-              worker_io_config, // Move ownership of original Arc
+              worker_io_config,
               default_buffer_ring_group_id_val: None,
+              fds_needing_close_initiated_pass: VecDeque::new(),
+              shutdown_requested: false, 
             };
             
             let loop_result = main_loop::run_worker_loop(&mut worker);

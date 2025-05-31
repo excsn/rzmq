@@ -312,8 +312,8 @@ impl TcpListener {
                           match reply_rx_for_op.await {
                             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
                               info!("Registered accepted FD {} with UringWorker.", raw_fd);
-                              // <<< MODIFIED START [Set up common variables for event] >>>
-                              let connection_iface: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, self.context_options.clone()));
+                              let local_iface_for_uring: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, socket_options_clone.clone())); // Pass Arc<SocketOptions>
+                              connection_iface_for_event = Some(local_iface_for_uring);
                               interaction_model_for_event = Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
                               // managing_actor_task_id_for_event remains None for UringFd path
                               // <<< MODIFIED END >>>
@@ -663,7 +663,7 @@ impl TcpConnecter {
             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
               info!("Successfully registered connected FD {} with UringWorker.", raw_fd);
               // <<< MODIFIED [ISocketConnection is Some for UringFd path] >>>
-              let connection_iface: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd));
+              let connection_iface: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, self.context_options.clone()));
               let interaction_model = ConnectionInteractionModel::ViaUringFd { fd: raw_fd };
               Ok((
                 Some(connection_iface), interaction_model, 

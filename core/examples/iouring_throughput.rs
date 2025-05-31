@@ -15,7 +15,7 @@ async fn main() -> Result<(), ZmqError> {
   }
   
   tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::TRACE) // Adjust log level (INFO, DEBUG, TRACE)
+    .with_max_level(tracing::Level::DEBUG) // Adjust log level (INFO, DEBUG, TRACE)
     .with_thread_ids(true)
     .with_thread_names(true)
     .with_target(true)
@@ -64,12 +64,12 @@ async fn main() -> Result<(), ZmqError> {
             // or if the stripping logic leads to no payload.
              println!("ROUTER: Received message from {:?} with no payload after identity/delimiter, echoing identity back.", client_identity_frame.data());
           } else {
-            println!(
-              "ROUTER: Received message from {:?} with {} payload parts. First part size: {}",
-              client_identity_frame.data(),
-              received_parts.len(),
-              received_parts[0].size()
-            );
+            // println!(
+            //   "ROUTER: Received message from {:?} with {} payload parts. First part size: {}",
+            //   client_identity_frame.data(),
+            //   received_parts.len(),
+            //   received_parts[0].size()
+            // );
           }
 
           // Construct reply: [identity_frame_WITH_MORE, payload_part_1_WITH_MORE, ..., payload_part_N_NO_MORE]
@@ -163,6 +163,7 @@ async fn main() -> Result<(), ZmqError> {
         break; 
       }
     }
+    tokio::time::sleep(Duration::from_millis(1500)).await; 
 
     // DEALER receive: Expects only the payload, identity/delimiter stripped by socket.
     match dealer_socket.recv().await {

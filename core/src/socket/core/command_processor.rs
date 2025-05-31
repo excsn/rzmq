@@ -216,22 +216,41 @@ pub(crate) async fn process_socket_command(
     }
     #[cfg(feature = "io-uring")]
     Command::UringFdHandshakeComplete { fd, peer_identity } => {
+      // Find the endpoint URI associated with this FD
       let endpoint_uri_opt = core_arc.core_state.read().uring_fd_to_endpoint_uri.get(&fd).cloned();
       if let Some(uri) = endpoint_uri_opt {
-        let synthetic_read_id_opt = core_arc
-          .core_state
-          .read()
-          .endpoints
-          .get(&uri)
-          .and_then(|ep_info| ep_info.pipe_ids.map(|pids| pids.1));
+          // Find the synthetic pipe_read_id for this connection
+          // This ID is what ISocket uses to identify the "pipe" to this peer.
+          let synthetic_read_id_opt = core_arc
+              .core_state
+              .read()
+              .endpoints
+              .get(&uri) // Get EndpointInfo using the URI
+              .and_then(|ep_info| ep_info.pipe_ids.map(|pids| pids.1)); // pids.1 is synthetic_read_id
 
-        if let Some(s_read_id) = synthetic_read_id_opt {
-          socket_logic_strong.update_peer_identity(s_read_id, peer_identity).await;
-        } else {
-          tracing::warn!(handle=core_handle, %fd, %uri, "No synthetic_read_id for UringFdHandshakeComplete.");
-        }
+          if let Some(s_read_id) = synthetic_read_id_opt {
+              tracing::debug!(
+                  handle = core_handle, %fd, %uri, synth_pipe_id = s_read_id, ?peer_identity,
+                  "SocketCore: Processing UringFdHandshakeComplete. Notifying ISocket."
+              );
+              // Notify the ISocket pattern logic (e.g., RouterSocket) about the identity.
+              socket_logic_strong
+                  .update_peer_identity(s_read_id, peer_identity)
+                  .await;
+              // Optionally, SocketCore could also update its EndpointInfo if needed,
+              // though peer identity is primarily for the pattern logic.
+              // No error is generated here; this is a successful handshake step.
+          } else {
+              tracing::warn!(
+                  handle = core_handle, %fd, %uri,
+                  "SocketCore: No synthetic_read_id found for UringFdHandshakeComplete. ISocket not notified."
+              );
+          }
       } else {
-        tracing::warn!(handle=core_handle, %fd, "UringFdHandshakeComplete for unknown FD.");
+          tracing::warn!(
+              handle = core_handle, %fd,
+              "SocketCore: Received UringFdHandshakeComplete for an FD not mapped to a URI. Ignoring."
+          );
       }
     }
 

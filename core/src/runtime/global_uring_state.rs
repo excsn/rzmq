@@ -215,53 +215,69 @@ async fn run_global_uring_upstream_processor(
           warn!(raw_fd = fd, "UringUpstreamProcessor: Received message for unregistered FD. Discarding.");
         }
       }
-      Ok((fd, Err(zmq_error))) => {
-        info!(raw_fd = fd, error = %zmq_error, "UringUpstreamProcessor: Received Error/Signal for FD.");
+      Ok((fd, Err(original_zmq_error))) => {
+        info!(raw_fd = fd, error = %original_zmq_error, "UringUpstreamProcessor: Received Error/Signal for FD.");
         
-        let command_to_send_to_core: Option<Command>;
-        let error_string = zmq_error.to_string(); // Bind to a variable with longer lifetime
-        if error_string.starts_with("ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_") {
-            let parts: Vec<&str> = error_string.split("_PEER_ID_").collect();
-            let peer_id_str_opt = parts.get(1).map(|s| s.trim_end_matches(')')); 
-            
-            let peer_identity: Option<Blob> = peer_id_str_opt.and_then(|s| {
-                if s == "None" {
-                    None
-                } else {
-                    let inner_id_str = s.trim_start_matches("Some(\"").trim_start_matches("Some(b\"").trim_end_matches('\"');
-                    if inner_id_str.is_empty() && s != "None" { 
-                        Some(Blob::new()) 
-                    } else if s != "None" {
-                        Some(Blob::from(inner_id_str.as_bytes().to_vec()))
-                    } else {
-                        None
-                    }
-                }
-            });
+        let command_to_send_to_core: Command; 
+        let error_message_content = original_zmq_error.to_string(); // Bind to a variable with longer lifetime
 
-            debug!(raw_fd = fd, ?peer_identity, "UringUpstreamProcessor: Parsed HANDSHAKE_COMPLETE for FD.");
-            
-            command_to_send_to_core = Some(Command::UringFdHandshakeComplete { fd, peer_identity });
+        debug!(raw_fd = fd, "Checking error_message_content: '{}'", error_message_content);
+        if error_message_content.contains("ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_") {
+          // It's our special signal, extract details
+          let signal_part = error_message_content
+              .split("ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_")
+              .nth(1) // Get the part after the prefix
+              .unwrap_or(""); // Should always exist if contains worked
+
+          let parts: Vec<&str> = signal_part.split("_PEER_ID_").collect();
+          // The first part after "ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_" should be the FD, 
+          // but we already have `fd`. We are interested in the PEER_ID part.
+          let peer_id_str_opt = parts.get(1).map(|s| s.trim_end_matches(')')); 
+          
+          let peer_identity: Option<Blob> = peer_id_str_opt.and_then(|s| {
+              if s == "None" { // Explicitly check for "None" string from Debug format of Option<Blob>
+                  None
+              } else {
+                  // Attempt to strip "Some(" and potential quote variants if Blob's Debug includes them
+                  let inner_id_str = s
+                      .trim_start_matches("Some(\"")
+                      .trim_start_matches("Some(b\"")
+                      .trim_end_matches('\"')
+                      .trim_end_matches(')'); // Also trim closing parenthesis from Some(...)
+                  
+                  if inner_id_str.is_empty() && s != "None" { // If after stripping it's empty, but wasn't "None" string
+                      Some(Blob::new()) 
+                  } else if s != "None" { // If it wasn't "None" and isn't empty after stripping
+                      Some(Blob::from(inner_id_str.as_bytes().to_vec()))
+                  } else { // Was "None" or became empty in a way that implies None
+                      None
+                  }
+              }
+          });
+
+          debug!(raw_fd = fd, ?peer_identity, parsed_signal_part = signal_part, "UringUpstreamProcessor: Parsed HANDSHAKE_COMPLETE signal for FD.");
+          command_to_send_to_core = Command::UringFdHandshakeComplete { fd, peer_identity };
+
+      } else {
+          // This is a genuine error from ZmtpUringHandler, not our signal
+          warn!(raw_fd = fd, error = %original_zmq_error, "UringUpstreamProcessor: Forwarding genuine ZmqError for FD.");
+          command_to_send_to_core = Command::UringFdError { fd, error: original_zmq_error };
+      }
+
+        let socket_core_mailbox_clone: Option<SocketCoreMailboxSender> = {
+            let map_read = fd_to_mailbox_map.read();
+            map_read.get(&fd).cloned()
+        };
+        if let Some(socket_core_mailbox) = socket_core_mailbox_clone {
+              // Use try_send for signals/errors to avoid blocking processor if SocketCore mailbox is full
+              if socket_core_mailbox.try_send(command_to_send_to_core).is_err() { 
+                warn!(raw_fd=fd, "UringUpstreamProcessor: Failed to send command (HandshakeComplete/Error) to SocketCore for FD {}. Mailbox might be full or closed.", fd);
+                // If SocketCore mailbox is closed, its entry should eventually be removed from the map.
+              }
         } else {
-            warn!(raw_fd = fd, error = %error_string, "UringUpstreamProcessor: Non-handshake error/signal received for FD.");
-            command_to_send_to_core = Some(Command::UringFdError { fd, error: zmq_error });
+            warn!(raw_fd=fd, "UringUpstreamProcessor: Received signal/error for unregistered FD {}. Discarding signal.", fd);
         }
-
-        if let Some(cmd) = command_to_send_to_core {
-            let socket_core_mailbox_clone: Option<SocketCoreMailboxSender> = {
-                let map_read = fd_to_mailbox_map.read();
-                map_read.get(&fd).cloned()
-            };
-            if let Some(socket_core_mailbox) = socket_core_mailbox_clone {
-                 // Use try_send for signals/errors to avoid blocking processor if SocketCore mailbox is full
-                 if socket_core_mailbox.try_send(cmd).is_err() { 
-                    warn!(raw_fd=fd, "UringUpstreamProcessor: Failed to send command (HandshakeComplete/Error) to SocketCore for FD {}. Mailbox might be full or closed.", fd);
-                    // If SocketCore mailbox is closed, its entry should eventually be removed from the map.
-                 }
-            } else {
-                warn!(raw_fd=fd, "UringUpstreamProcessor: Received signal/error for unregistered FD {}. Discarding signal.", fd);
-            }
-        }
+        
       }
       Err(KanalReceiveError::Closed) => { 
         info!("UringUpstreamProcessor: Upstream message channel (msg_rx) closed because all senders dropped. Terminating task.");

@@ -30,50 +30,76 @@ pub(crate) fn process_handler_blueprints(
 ) {
     if ops_output.initiate_close_due_to_error {
         warn!("CQE Processor: Handler for FD {} requested error close via HandlerIoOps.", fd);
-        if !fds_to_initiate_close_queue.contains(&fd) { // Check contains before pushing
+        if !fds_to_initiate_close_queue.contains(&fd) { 
             fds_to_initiate_close_queue.push_back(fd);
         }
     }
 
-    for blueprint in ops_output.sqe_blueprints {
+    // === START NEW LOGGING ===
+    debug!(
+        "[PROCESS_BLUEPRINT_ENTRY FD={}] Processing {} blueprints. Default BGID: {:?}",
+        fd,
+        ops_output.sqe_blueprints.len(),
+        default_bgid_for_read_sqe
+    );
+    // === END NEW LOGGING ===
+
+    for (idx, blueprint) in ops_output.sqe_blueprints.iter().enumerate() { // Use .iter().enumerate()
+        // === START NEW LOGGING ===
+        debug!(
+            "[PROCESS_BLUEPRINT FD={}] Iteration #{} for blueprint: {:?}",
+            fd, idx, blueprint
+        );
+        // === END NEW LOGGING ===
+
         if unsafe { sq.is_full() } {
             warn!(
                 "CQE Processor: Submission queue full while processing blueprints for FD {}. Blueprint {:?} dropped. (TODO: Requeue this blueprint)",
                 fd, blueprint
             );
-            // TODO: Implement a robust mechanism to requeue blueprints or notify handler of submission failure.
-            // For now, it's dropped.
             continue;
         }
 
         let mut op_payload_for_tracker = InternalOpPayload::None;
-        if let HandlerSqeBlueprint::RequestSend { data } = &blueprint {
+        if let HandlerSqeBlueprint::RequestSend { data } = blueprint { // Use blueprint directly
             op_payload_for_tracker = InternalOpPayload::SendBuffer(data.clone());
         }
 
-        let sqe_build_result: Result<(squeue::Entry, InternalOpType), String> = match &blueprint {
+        let sqe_build_result: Result<(squeue::Entry, InternalOpType), String> = match blueprint { // Use blueprint
             HandlerSqeBlueprint::RequestRingRead => {
                 if let Some(bgid) = default_bgid_for_read_sqe {
                     let read_op_builder = opcode::Read::new(types::Fd(fd), std::ptr::null_mut(), 0)
-                        .offset(u64::MAX) // For ring buffers, offset usually u64::MAX
+                        .offset(u64::MAX) 
                         .buf_group(bgid);
 
                     let mut entry: squeue::Entry = read_op_builder.build();
                     entry = entry.flags(squeue::Flags::BUFFER_SELECT);
-
+                    // === START NEW LOGGING ===
+                    debug!("[PROCESS_BLUEPRINT FD={}] Built RingRead SQE.", fd);
+                    // === END NEW LOGGING ===
                     Ok((entry, InternalOpType::RingRead))
                 } else {
-                    Err("RequestRingRead blueprint: No default_buffer_ring_group_id configured/passed for SQE construction.".to_string())
+                    let err_msg = "RequestRingRead blueprint: No default_buffer_ring_group_id configured/passed for SQE construction.".to_string();
+                    // === START NEW LOGGING ===
+                    error!("[PROCESS_BLUEPRINT FD={}] Error for RingRead: {}", fd, err_msg);
+                    // === END NEW LOGGING ===
+                    Err(err_msg)
                 }
             }
             HandlerSqeBlueprint::RequestSend { data } => {
                 let ptr = data.as_ptr();
                 let len = data.len() as u32;
                 let entry = opcode::Send::new(types::Fd(fd), ptr, len).build();
+                // === START NEW LOGGING ===
+                debug!("[PROCESS_BLUEPRINT FD={}] Built Send SQE (len: {}).", fd, len);
+                // === END NEW LOGGING ===
                 Ok( (entry, InternalOpType::Send) )
             }
             HandlerSqeBlueprint::RequestClose => {
                 let entry = opcode::Close::new(types::Fd(fd)).build();
+                // === START NEW LOGGING ===
+                debug!("[PROCESS_BLUEPRINT FD={}] Built Close SQE.", fd);
+                // === END NEW LOGGING ===
                 Ok( (entry, InternalOpType::CloseFd) )
             }
         };
@@ -82,14 +108,30 @@ pub(crate) fn process_handler_blueprints(
             Ok((mut entry_to_submit, op_type)) => {
                 let user_data = internal_ops.new_op_id(fd, op_type, op_payload_for_tracker);
                 entry_to_submit = entry_to_submit.user_data(user_data);
+                
+                // === START NEW LOGGING ===
+                debug!(
+                    "[PROCESS_BLUEPRINT FD={}] SQE built successfully. UserData: {}. Attempting to push to SQ.",
+                    fd, user_data
+                );
+                // === END NEW LOGGING ===
 
                 unsafe {
-                    if sq.push(&entry_to_submit).is_err() { // Push to the passed-in `sq`
+                    // === START NEW LOGGING ===
+                    let sq_len_before_push = sq.len();
+                    let push_result = sq.push(&entry_to_submit);
+                    let sq_len_after_push = sq.len();
+                    debug!(
+                        "[PROCESS_BLUEPRINT FD={}] Pushed SQE (ud:{}) for OpType::{:?}. PushResult: {:?}. SQ len before: {}, SQ len after: {}.",
+                        fd, user_data, op_type, push_result, sq_len_before_push, sq_len_after_push
+                    );
+                    // === END NEW LOGGING ===
+                    
+                    if push_result.is_err() { 
                         warn!("CQE Processor: SQ push failed for FD {} blueprint {:?} (race condition or SQ became full?). Op dropped.", fd, entry_to_submit);
-                        // If push fails, we should ideally remove the op from internal_ops.
                         let _dropped_details = internal_ops.take_op_details(user_data);
-                        // TODO: Potentially notify handler that this blueprint failed submission.
                     } else {
+                        // This trace log was already here, keep it.
                         trace!("CQE Processor: Queued SQE (ud:{}) for FD {} from blueprint: {:?}", user_data, fd, entry_to_submit);
                     }
                 }
@@ -99,6 +141,9 @@ pub(crate) fn process_handler_blueprints(
             }
         }
     }
+    // === START NEW LOGGING ===
+    debug!("[PROCESS_BLUEPRINT_EXIT FD={}] Finished processing blueprints.", fd);
+    // === END NEW LOGGING ===
 }
 
 

@@ -13,8 +13,10 @@ use crate::protocol::zmtp::{
 };
 use crate::security::{
     self, negotiate_security_mechanism, IDataCipher, Mechanism, MechanismStatus, NullMechanism,
-    PlainMechanism, NoiseXxMechanism, // Assuming these are available if features enabled
+    PlainMechanism,
 };
+#[cfg(feature = "noise_xx")]
+use crate::security::NoiseXxMechanism;
 use crate::socket::options::ZmtpEngineConfig;
 use crate::message::{Msg, MsgFlags, Metadata};
 use crate::{Blob, ZmqError};
@@ -205,236 +207,378 @@ impl ZmtpUringHandler {
     fn process_buffered_reads(&mut self, interface: &UringWorkerInterface<'_>, ops: &mut HandlerIoOps) -> Result<bool, ZmqError> {
         let mut made_progress_this_call = false;
 
-        loop {
-            let initial_greeting_len = self.greeting_buffer.len();
-            let initial_network_acc_len = self.network_read_accumulator.len(); 
-            let initial_plaintext_acc_len = self.plaintext_zmtp_frame_accumulator.len();
+        // Outer loop: keep processing as long as progress is made or phases change
+        // and buffers might have data relevant to the new phase.
+        'phase_processing_loop: loop {
+            // Store initial buffer lengths to detect if any data was consumed in this iteration of the outer loop.
+            // This helps decide if we should loop again or if we're stuck.
+            let initial_greeting_len_outer = self.greeting_buffer.len();
+            let initial_network_acc_len_outer = self.network_read_accumulator.len();
+            let initial_plaintext_acc_len_outer = self.plaintext_zmtp_frame_accumulator.len();
+            let mut progress_this_iteration = false;
 
+
+            // Handshake timeout check
             if Instant::now() > self.handshake_timeout_deadline &&
                !matches!(self.phase, ZmtpHandlerPhase::DataPhase | ZmtpHandlerPhase::Error | ZmtpHandlerPhase::Closed) {
                 warn!(fd=self.fd, current_phase=?self.phase, "Overall handshake timeout occurred in process_buffered_reads.");
                 let err = ZmqError::Timeout;
-                let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, err.clone(), interface); *ops = temp_ops;
+                // transition_to_error will modify ops and self.phase
+                self.transition_to_error(ops, err.clone(), interface);
                 return Err(err); 
             }
             
+            trace!(fd=self.fd, phase=?self.phase, greeting_buf_len=self.greeting_buffer.len(), net_acc_len=self.network_read_accumulator.len(), "ProcessBufferedReads: Top of loop");
+
             match self.phase {
                 ZmtpHandlerPhase::Initial => {
                     error!(fd=self.fd, "ZmtpHandler in Initial phase during process_buffered_reads. This is a bug.");
-                    return Err(ZmqError::InvalidState("ZmtpHandler in Initial phase during data processing".into()));
-                }
-                ZmtpHandlerPhase::ClientSendGreeting | ZmtpHandlerPhase::ServerSendGreeting |
-                ZmtpHandlerPhase::ReadyClientSend | ZmtpHandlerPhase::ReadyServerSend => {
-                    return Ok(made_progress_this_call); 
+                    let err = ZmqError::InvalidState("ZmtpHandler in Initial phase during data processing".into());
+                    self.transition_to_error(ops, err.clone(), interface);
+                    return Err(err);
                 }
 
-                ZmtpHandlerPhase::ServerWaitClientGreeting | ZmtpHandlerPhase::ClientWaitServerGreeting => {
+                // Phases where this function primarily waits for send completions, not for processing read data.
+                ZmtpHandlerPhase::ClientSendGreeting | ZmtpHandlerPhase::ServerSendGreeting |
+                ZmtpHandlerPhase::ReadyClientSend | ZmtpHandlerPhase::ReadyServerSend => {
+                    trace!(fd=self.fd, phase=?self.phase, "ProcessBufferedReads: In a 'Send' phase, primarily waiting for send ACK. No read processing.");
+                    break 'phase_processing_loop; // No read processing in these states from this function
+                }
+
+                // Greeting Exchange (Server waiting for Client's Greeting)
+                ZmtpHandlerPhase::ServerWaitClientGreeting => {
                     let needed_for_greeting = GREETING_LENGTH.saturating_sub(self.greeting_buffer.len());
                     if needed_for_greeting > 0 {
                         let source_buf = &mut self.network_read_accumulator; 
                         let can_take = std::cmp::min(needed_for_greeting, source_buf.len());
                         if can_take > 0 {
                             self.greeting_buffer.put(source_buf.split_to(can_take));
-                            made_progress_this_call = true;
+                            progress_this_iteration = true;
                         }
-                        if self.greeting_buffer.len() < GREETING_LENGTH { return Ok(made_progress_this_call); }
+                        if self.greeting_buffer.len() < GREETING_LENGTH { break 'phase_processing_loop; /* Need more data for greeting */ }
                     }
 
                     match ZmtpGreeting::decode(&mut self.greeting_buffer) { 
                         Ok(Some(peer_greeting)) => {
-                            made_progress_this_call = true;
-                            debug!(fd = self.fd, role = if self.is_server {"S"} else {"C"}, ?peer_greeting, "Received and decoded peer greeting");
+                            progress_this_iteration = true;
+                            debug!(fd = self.fd, role = "S", ?peer_greeting, "Received and decoded client greeting");
                             if self.is_server == peer_greeting.as_server { 
                                 let err = ZmqError::SecurityError("Role mismatch in greeting".into());
-                                let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, err.clone(), interface); *ops = temp_ops; return Err(err);
+                                self.transition_to_error(ops, err.clone(), interface); return Err(err);
                             }
                             self.security_mechanism = Some(negotiate_security_mechanism(self.is_server, &self.zmtp_config, &peer_greeting, self.fd as usize)?);
                             info!(fd=self.fd, mechanism=?self.security_mechanism.as_ref().unwrap().name(), "Negotiated security mechanism");
 
-                            if self.is_server {
-                                let mut greeting_to_send_buf = BytesMut::with_capacity(GREETING_LENGTH);
-                                ZmtpGreeting::encode(self.zmtp_config.security_mechanism_bytes_to_propose(self.is_server), true, &mut greeting_to_send_buf);
-                                ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: greeting_to_send_buf.freeze() });
-                                self.phase = ZmtpHandlerPhase::ServerSendGreeting; 
-                            } else { 
-                                self.phase = ZmtpHandlerPhase::SecurityExchange;
-                                if let Some(token_vec) = self.security_mechanism.as_mut().unwrap().produce_token()? {
-                                    let token_msg = Msg::from_vec(token_vec).with_flags(MsgFlags::COMMAND);
-                                    ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: Self::zmtp_encode_msg_to_bytes(&token_msg)? });
-                                }
-                            }
+                            // Server sends its greeting in response
+                            let mut greeting_to_send_buf = BytesMut::with_capacity(GREETING_LENGTH);
+                            ZmtpGreeting::encode(self.zmtp_config.security_mechanism_bytes_to_propose(self.is_server), true, &mut greeting_to_send_buf);
+                            ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: greeting_to_send_buf.freeze() });
+                            self.phase = ZmtpHandlerPhase::ServerSendGreeting; // Expect ACK for this send
                         }
-                        Ok(None) => { return Ok(made_progress_this_call); }
-                        Err(e) => { let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, e.clone(), interface); *ops = temp_ops; return Err(e); }
+                        Ok(None) => { /* Should not happen if greeting_buffer.len() == GREETING_LENGTH */ }
+                        Err(e) => { self.transition_to_error(ops, e.clone(), interface); return Err(e); }
+                    }
+                }
+                
+                // Greeting Exchange (Client waiting for Server's Greeting) - similar to above
+                ZmtpHandlerPhase::ClientWaitServerGreeting => {
+                    let needed_for_greeting = GREETING_LENGTH.saturating_sub(self.greeting_buffer.len());
+                    if needed_for_greeting > 0 {
+                        let source_buf = &mut self.network_read_accumulator; 
+                        let can_take = std::cmp::min(needed_for_greeting, source_buf.len());
+                        if can_take > 0 {
+                            self.greeting_buffer.put(source_buf.split_to(can_take));
+                            progress_this_iteration = true;
+                        }
+                        if self.greeting_buffer.len() < GREETING_LENGTH { break 'phase_processing_loop; }
+                    }
+
+                    match ZmtpGreeting::decode(&mut self.greeting_buffer) { 
+                        Ok(Some(peer_greeting)) => {
+                            progress_this_iteration = true;
+                            debug!(fd = self.fd, role = "C", ?peer_greeting, "Received and decoded server greeting");
+                             if self.is_server == peer_greeting.as_server { 
+                                let err = ZmqError::SecurityError("Role mismatch in greeting".into());
+                                self.transition_to_error(ops, err.clone(), interface); return Err(err);
+                            }
+                            self.security_mechanism = Some(negotiate_security_mechanism(self.is_server, &self.zmtp_config, &peer_greeting, self.fd as usize)?);
+                            info!(fd=self.fd, mechanism=?self.security_mechanism.as_ref().unwrap().name(), "Negotiated security mechanism");
+                            self.phase = ZmtpHandlerPhase::SecurityExchange; // Now proceed to security token exchange
+                        }
+                        Ok(None) => {}
+                        Err(e) => { self.transition_to_error(ops, e.clone(), interface); return Err(e); }
                     }
                 }
 
                 ZmtpHandlerPhase::SecurityExchange => {
-                    let sec_mech = self.security_mechanism.as_mut().ok_or_else(|| ZmqError::InvalidState("Security mechanism None in SecurityExchange phase".into()))?;
-                    let mut action_this_pass_for_sec = false; 
+                    trace!(fd = self.fd, phase = ?self.phase, "ProcessBufferedReads: Entering SecurityExchange arm.");
 
-                    // <<< MODIFIED START [Removed is_my_turn(), rely on produce_token()] >>>
-                    // Try to produce and send our token if the mechanism has one.
-                    if let Some(token_to_send_vec) = sec_mech.produce_token()? {
-                        let token_msg = Msg::from_vec(token_to_send_vec).with_flags(MsgFlags::COMMAND);
-                        ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: Self::zmtp_encode_msg_to_bytes(&token_msg)? });
-                        made_progress_this_call = true; action_this_pass_for_sec = true;
-                    }
-                    // <<< MODIFIED END >>>
+                    let mut should_transition_out_of_security_exchange = false;
+                    let mut mechanism_name_for_log_on_completion = ""; 
+                    let mut peer_id_from_sec_mech_on_completion: Option<Blob> = None;
+                    let mut mechanism_had_error = false;
+                    let mut error_reason_from_mechanism = String::new();
 
-                    if !self.network_read_accumulator.is_empty() {
-                         match self.zmtp_parser.decode_from_buffer(&mut self.network_read_accumulator) { 
-                            Ok(Some(token_msg_from_peer)) => {
-                                made_progress_this_call = true; action_this_pass_for_sec = true;
-                                if !token_msg_from_peer.is_command() {
-                                    let err = ZmqError::SecurityError("Expected ZMTP COMMAND for security token".into());
-                                    let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, err.clone(), interface); *ops = temp_ops; return Err(err);
-                                }
-                                sec_mech.process_token(token_msg_from_peer.data().unwrap_or_default())?;
-                                // <<< MODIFIED START [Removed is_my_turn(), rely on produce_token()] >>>
-                                // After processing, it might be our turn again. produce_token() will handle this.
-                                if let Some(response_token_vec) = sec_mech.produce_token()? {
-                                    let response_token_msg = Msg::from_vec(response_token_vec).with_flags(MsgFlags::COMMAND);
-                                    ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: Self::zmtp_encode_msg_to_bytes(&response_token_msg)? });
-                                }
-                                // <<< MODIFIED END >>>
+                    if let Some(sec_mech_ref) = self.security_mechanism.as_mut() {
+                        if sec_mech_ref.is_complete() {
+                            info!(fd = self.fd, "SecurityExchange: Mechanism ({}) already complete. Preparing transition.", sec_mech_ref.name());
+                            mechanism_name_for_log_on_completion = sec_mech_ref.name();
+                            peer_id_from_sec_mech_on_completion = sec_mech_ref.peer_identity().map(Blob::from);
+                            should_transition_out_of_security_exchange = true;
+                        } else {
+                            let mut token_action_this_iteration = false;
+
+                            // Try to produce our token. produce_token() itself should handle "whose turn".
+                            if let Some(token_to_send_vec) = sec_mech_ref.produce_token()? {
+                                debug!(fd = self.fd, "SecurityExchange: Producing token (len {}).", token_to_send_vec.len());
+                                let token_msg = Msg::from_vec(token_to_send_vec).with_flags(MsgFlags::COMMAND);
+                                ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: Self::zmtp_encode_msg_to_bytes(&token_msg)? });
+                                progress_this_iteration = true; token_action_this_iteration = true;
                             }
-                            Ok(None) => { }
-                            Err(e) => { let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, e.clone(), interface); *ops = temp_ops; return Err(e); }
+
+                            // If there's data from the peer, try to process it.
+                            if !self.network_read_accumulator.is_empty() {
+                                match self.zmtp_parser.decode_from_buffer(&mut self.network_read_accumulator) {
+                                    Ok(Some(token_msg_from_peer)) => {
+                                        debug!(fd = self.fd, "SecurityExchange: Decoded peer token (len {}).", token_msg_from_peer.size());
+                                        progress_this_iteration = true; token_action_this_iteration = true;
+                                        if !token_msg_from_peer.is_command() {
+                                            let err_msg = "Expected ZMTP COMMAND for security token".to_string();
+                                            mechanism_had_error = true; 
+                                            error_reason_from_mechanism = err_msg;
+                                        } else {
+                                            sec_mech_ref.process_token(token_msg_from_peer.data().unwrap_or_default())?;
+                                        }
+                                        
+                                        // After processing peer's token, it might be our turn to send a response token.
+                                        // Call produce_token() again.
+                                        if !mechanism_had_error { // Only if no error so far
+                                            if let Some(response_token_vec) = sec_mech_ref.produce_token()? {
+                                                debug!(fd = self.fd, "SecurityExchange: Producing response token (len {}).", response_token_vec.len());
+                                                let response_token_msg = Msg::from_vec(response_token_vec).with_flags(MsgFlags::COMMAND);
+                                                ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: Self::zmtp_encode_msg_to_bytes(&response_token_msg)? });
+                                                // progress_this_iteration and token_action_this_iteration are likely already true
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        trace!(fd = self.fd, "SecurityExchange: Accumulator has data, but not a full ZMTP frame for security token yet.");
+                                    }
+                                    Err(e) => {
+                                        mechanism_had_error = true;
+                                        error_reason_from_mechanism = format!("Failed to parse ZMTP frame for security token: {}", e);
+                                    }
+                                }
+                            }
+                            
+                            // Check mechanism status after attempting to produce/process
+                            // This must happen *after* any produce_token or process_token calls in this iteration.
+                            if !mechanism_had_error { // Only check these if no parsing error occurred
+                                if sec_mech_ref.is_complete() {
+                                    info!(fd=self.fd, "SecurityExchange: Mechanism ({}) became complete after token produce/process.", sec_mech_ref.name());
+                                    mechanism_name_for_log_on_completion = sec_mech_ref.name();
+                                    peer_id_from_sec_mech_on_completion = sec_mech_ref.peer_identity().map(Blob::from);
+                                    should_transition_out_of_security_exchange = true;
+                                } else if sec_mech_ref.is_error() {
+                                    mechanism_had_error = true; // Mark that the mechanism itself reported an error
+                                    error_reason_from_mechanism = sec_mech_ref.error_reason().unwrap_or("Unknown security error from mechanism").to_string();
+                                }
+                            }
+
+                            // If an error occurred (either parsing or from mechanism), transition to error.
+                            if mechanism_had_error {
+                                let err = ZmqError::SecurityError(error_reason_from_mechanism.clone());
+                                self.transition_to_error(ops, err.clone(), interface); 
+                                return Err(err); // Fatal error in security exchange
+                            }
+                            
+                            // If no token action was taken in this sub-iteration AND the accumulator is empty AND not yet ready to transition,
+                            // then we are waiting.
+                            if !token_action_this_iteration && self.network_read_accumulator.is_empty() && !should_transition_out_of_security_exchange {
+                                trace!(fd = self.fd, "SecurityExchange: No token action, buffer empty, not complete. Waiting for peer/ACK.");
+                                break 'phase_processing_loop; 
+                            }
                         }
+                    } else {
+                        let err = ZmqError::InvalidState("CRITICAL: Security mechanism is None while in SecurityExchange phase.".into());
+                        self.transition_to_error(ops, err.clone(), interface); 
+                        return Err(err);
                     }
-                    
-                    if sec_mech.is_complete() {
-                        info!(fd = self.fd, "Security handshake complete. Mechanism: {}", sec_mech.name());
-                        self.peer_identity_from_security = sec_mech.peer_identity().map(Blob::from); 
-                        let taken_mechanism = self.security_mechanism.take().unwrap(); 
-                        let (cipher, _sec_peer_id_already_got) = taken_mechanism.into_data_cipher_parts()?;
+
+                    if should_transition_out_of_security_exchange {
+                        trace!(fd = self.fd, "SecurityExchange: Executing transition post-completion.");
+                        self.peer_identity_from_security = peer_id_from_sec_mech_on_completion;
+                        
+                        let taken_mechanism = self.security_mechanism.take()
+                            .expect("INTERNAL ERROR: security_mechanism was Some but now None before take for transition"); 
+                        
+                        let (cipher, _final_peer_id_from_sec_mech) = taken_mechanism.into_data_cipher_parts()?;
                         self.data_cipher = Some(cipher); 
                         
-                        self.phase = if self.is_server { ZmtpHandlerPhase::ReadyServerWaitClient } else { ZmtpHandlerPhase::ReadyClientSend };
+                        let old_phase_before_transition = self.phase; 
+                        self.phase = if self.is_server { 
+                            ZmtpHandlerPhase::ReadyServerWaitClient
+                        } else { 
+                            ZmtpHandlerPhase::ReadyClientSend       
+                        };
+                        info!(fd=self.fd, old_phase=?old_phase_before_transition, new_phase=?self.phase, mech_completed=mechanism_name_for_log_on_completion, "Transitioned out of SecurityExchange.");
+                        
                         if !self.is_server { 
                             let client_ready_msg = ZmtpReady::create_msg(self.build_ready_properties());
+                            debug!("[ZmtpHandler FD={}] Client adding its ZMTP READY Send blueprint (from SecurityExchange transition).", self.fd);
                             ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend{ data: Self::zmtp_encode_msg_to_bytes(&client_ready_msg)? });
+                        } else {
+                            debug!("[ZmtpHandler FD={}] Server finished security ({}), now in {:?} phase (from SecurityExchange transition). Waiting for client's ZMTP READY.", self.fd, mechanism_name_for_log_on_completion, self.phase);
                         }
-                        made_progress_this_call = true; 
-                    } else if sec_mech.is_error() {
-                        let err_reason = sec_mech.error_reason().unwrap_or("Unknown security error").to_string();
-                        let err = ZmqError::SecurityError(err_reason);
-                        let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, err.clone(), interface); *ops = temp_ops; return Err(err);
-                    } else if !action_this_pass_for_sec && self.network_read_accumulator.is_empty() {
-                        return Ok(made_progress_this_call);
+                        progress_this_iteration = true; 
                     }
                 }
 
-                ZmtpHandlerPhase::ReadyServerWaitClient | ZmtpHandlerPhase::ReadyClientWaitServer => {
-                    if self.network_read_accumulator.is_empty() { return Ok(made_progress_this_call); }
+                // ZMTP READY Command Exchange (Server waiting for Client's READY)
+                ZmtpHandlerPhase::ReadyServerWaitClient => {
+                    if self.network_read_accumulator.is_empty() { break 'phase_processing_loop; /* Need data */ }
                     match self.zmtp_parser.decode_from_buffer(&mut self.network_read_accumulator) { 
-                        Ok(Some(ready_msg_from_peer)) => {
-                            made_progress_this_call = true;
-                            match ZmtpCommand::parse(&ready_msg_from_peer) { 
+                        Ok(Some(ready_msg_from_client)) => {
+                            progress_this_iteration = true;
+                            match ZmtpCommand::parse(&ready_msg_from_client) { 
                                 Some(ZmtpCommand::Ready(ready_data)) => {
-                                    debug!(fd=self.fd, "Received READY from peer. Properties: {:?}", ready_data.properties);
+                                    debug!(fd=self.fd, "S: Received Client's READY. Properties: {:?}", ready_data.properties);
                                     if let Some(id_bytes_vec) = ready_data.properties.get("Identity") {
-                                        if !id_bytes_vec.is_empty() && id_bytes_vec.len() <= 255 {
-                                            self.peer_identity_from_ready = Some(Blob::from(id_bytes_vec.clone()));
-                                        } else {
-                                            warn!(fd=self.fd, id_len=id_bytes_vec.len(), "Peer sent invalid Identity in READY (empty or too long).");
-                                        }
+                                        // ... process identity ...
+                                        self.peer_identity_from_ready = Some(Blob::from(id_bytes_vec.clone()));
                                     }
                                     
-                                    if self.is_server { 
-                                        let server_ready_msg = ZmtpReady::create_msg(self.build_ready_properties());
-                                        ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: Self::zmtp_encode_msg_to_bytes(&server_ready_msg)? });
-                                        self.phase = ZmtpHandlerPhase::ReadyServerSend; 
-                                    } else { 
-                                        self.phase = ZmtpHandlerPhase::DataPhase;
-                                        info!(fd=self.fd, "ZmtpUringHandler: Client handshake fully complete. Transitioning to DataPhase.");
-                                        self.signal_upstream_handshake_complete(interface)?; 
-                                    }
+                                    // Server now sends its own READY
+                                    let server_ready_msg = ZmtpReady::create_msg(self.build_ready_properties());
+                                    debug!("[ZmtpHandler FD={}] S: Adding its ZMTP READY Send blueprint.", self.fd);
+                                    ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: Self::zmtp_encode_msg_to_bytes(&server_ready_msg)? });
+                                    self.phase = ZmtpHandlerPhase::ReadyServerSend; 
                                 }
                                 _ => { 
-                                    let err = ZmqError::ProtocolViolation("Expected READY command, got other/unparseable".into());
-                                    let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, err.clone(), interface); *ops = temp_ops; return Err(err);
+                                    let err = ZmqError::ProtocolViolation("S: Expected READY from client, got other/unparseable".into());
+                                    self.transition_to_error(ops, err.clone(), interface); return Err(err);
                                 }
                             }
                         }
-                        Ok(None) => return Ok(made_progress_this_call), 
-                        Err(e) => { let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, e.clone(), interface); *ops = temp_ops; return Err(e); }
+                        Ok(None) => { break 'phase_processing_loop; /* Need more data for client's READY */ }
+                        Err(e) => { self.transition_to_error(ops, e.clone(), interface); return Err(e); }
+                    }
+                }
+                
+                // ZMTP READY Command Exchange (Client waiting for Server's READY)
+                ZmtpHandlerPhase::ReadyClientWaitServer => {
+                    if self.network_read_accumulator.is_empty() { break 'phase_processing_loop; /* Need data */ }
+                     match self.zmtp_parser.decode_from_buffer(&mut self.network_read_accumulator) { 
+                        Ok(Some(ready_msg_from_server)) => {
+                            progress_this_iteration = true;
+                            match ZmtpCommand::parse(&ready_msg_from_server) { 
+                                Some(ZmtpCommand::Ready(ready_data)) => {
+                                    debug!(fd=self.fd, "C: Received Server's READY. Properties: {:?}", ready_data.properties);
+                                    if let Some(id_bytes_vec) = ready_data.properties.get("Identity") {
+                                         self.peer_identity_from_ready = Some(Blob::from(id_bytes_vec.clone()));
+                                    }
+                                    // Client handshake fully complete
+                                    self.phase = ZmtpHandlerPhase::DataPhase;
+                                    info!(fd=self.fd, "ZmtpUringHandler: Client handshake fully complete. Transitioning to DataPhase.");
+                                    self.signal_upstream_handshake_complete(interface)?; 
+                                }
+                                _ => { 
+                                    let err = ZmqError::ProtocolViolation("C: Expected READY from server, got other/unparseable".into());
+                                    self.transition_to_error(ops, err.clone(), interface); return Err(err);
+                                }
+                            }
+                        }
+                        Ok(None) => { break 'phase_processing_loop; /* Need more data for server's READY */ }
+                        Err(e) => { self.transition_to_error(ops, e.clone(), interface); return Err(e); }
                     }
                 }
 
                 ZmtpHandlerPhase::DataPhase => {
-                    let mut source_for_zmtp_parser: &mut BytesMut;
-                    
+                    // Decrypt network data into plaintext ZMTP frame accumulator first
                     if self.data_cipher.is_some() {
                         while !self.network_read_accumulator.is_empty() {
                              match self.data_cipher.as_mut().unwrap().decrypt_wire_data_to_zmtp_frame(&mut self.network_read_accumulator) {
                                 Ok(Some(plaintext_zmtp_frame_bytes)) => {
-                                    made_progress_this_call = true;
+                                    progress_this_iteration = true;
                                     self.plaintext_zmtp_frame_accumulator.put(plaintext_zmtp_frame_bytes);
                                 }
-                                Ok(None) => break, 
-                                Err(e) => { let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, e.clone(), interface); *ops = temp_ops; return Err(e); }
+                                Ok(None) => break, // Need more encrypted data
+                                Err(e) => { self.transition_to_error(ops, e.clone(), interface); return Err(e); }
                             }
                         }
-                        source_for_zmtp_parser = &mut self.plaintext_zmtp_frame_accumulator;
-                    } else {
-                        source_for_zmtp_parser = &mut self.network_read_accumulator;
+                    } else { // No cipher, move directly
+                        if !self.network_read_accumulator.is_empty() {
+                            progress_this_iteration = true;
+                            self.plaintext_zmtp_frame_accumulator.extend_from_slice(&self.network_read_accumulator);
+                            self.network_read_accumulator.clear();
+                        }
                     };
                     
-                    if source_for_zmtp_parser.is_empty() { return Ok(made_progress_this_call); } 
+                    if self.plaintext_zmtp_frame_accumulator.is_empty() { break 'phase_processing_loop; /* Need plaintext data */ }
 
-                    while !source_for_zmtp_parser.is_empty() {
-                        match self.zmtp_parser.decode_from_buffer(source_for_zmtp_parser) {
+                    // Process all complete ZMTP frames from plaintext_zmtp_frame_accumulator
+                    while !self.plaintext_zmtp_frame_accumulator.is_empty() {
+                        match self.zmtp_parser.decode_from_buffer(&mut self.plaintext_zmtp_frame_accumulator) {
                             Ok(Some(msg)) => {
-                                made_progress_this_call = true;
+                                progress_this_iteration = true;
                                 self.last_activity_time = Instant::now(); 
                                 if msg.is_command() {
+                                    // ... (handle PING, PONG, ERROR commands as before) ...
                                     match ZmtpCommand::parse(&msg) {
                                         Some(ZmtpCommand::Ping(ping_context_payload)) => {
                                             let pong_reply_msg = ZmtpCommand::create_pong(&ping_context_payload);
                                             let pong_plaintext_bytes = Self::zmtp_encode_msg_to_bytes(&pong_reply_msg)?;
                                             let pong_wire_bytes = Self::apply_encryption_if_needed(self.data_cipher.as_mut(), pong_plaintext_bytes)?;
                                             ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: pong_wire_bytes });
-                                            debug!(fd=self.fd, "Prepared PONG in response to PING");
+                                            debug!(fd=self.fd, "DataPhase: Prepared PONG in response to PING");
                                         }
                                         Some(ZmtpCommand::Pong(_pong_context_payload)) => {
                                             self.waiting_for_pong = false; self.last_ping_sent_time = None;
-                                            debug!(fd=self.fd, "Received PONG");
+                                            debug!(fd=self.fd, "DataPhase: Received PONG");
                                         }
                                         Some(ZmtpCommand::Error) => { 
-                                            warn!(fd = self.fd, "Peer sent ZMTP ERROR command. Transitioning to error state.");
+                                            warn!(fd = self.fd, "DataPhase: Peer sent ZMTP ERROR command.");
                                             let err = ZmqError::ProtocolViolation("Peer sent ZMTP ERROR command".into());
-                                            let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, err.clone(), interface); *ops = temp_ops; return Err(err);
+                                            self.transition_to_error(ops, err.clone(), interface); return Err(err);
                                         }
-                                        _ => { warn!(fd = self.fd, "Received unhandled ZMTP command in DataPhase: {:?}", msg.data()); }
+                                        _ => { warn!(fd = self.fd, "DataPhase: Received unhandled ZMTP command: {:?}", msg.data()); }
                                     }
-                                } else { 
+                                } else { // Data message
                                     if let Err(send_err) = interface.worker_io_config.parsed_msg_tx_zmtp.try_send((self.fd, Ok(msg))) {
-                                        error!(fd = self.fd, "Failed to send ZMTP data msg upstream: {:?}", send_err);
+                                        error!(fd = self.fd, "DataPhase: Failed to send ZMTP data msg upstream: {:?}", send_err);
                                         let err = ZmqError::Internal("Upstream channel error for ZMTP data".into());
-                                        let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, err.clone(), interface); *ops = temp_ops; return Err(err);
+                                        self.transition_to_error(ops, err.clone(), interface); return Err(err);
                                     }
                                 }
                             }
-                            Ok(None) => break, 
-                            Err(e) => { let mut temp_ops = std::mem::take(ops); self.transition_to_error(&mut temp_ops, e.clone(), interface); *ops = temp_ops; return Err(e); }
+                            Ok(None) => break, // Need more data in plaintext_zmtp_frame_accumulator
+                            Err(e) => { self.transition_to_error(ops, e.clone(), interface); return Err(e); }
                         }
                     }
                 }
-                ZmtpHandlerPhase::Error | ZmtpHandlerPhase::Closed => return Ok(made_progress_this_call),
-            } 
+                ZmtpHandlerPhase::Error | ZmtpHandlerPhase::Closed => {
+                    break 'phase_processing_loop; // Final states, no more processing
+                }
+            } // End match self.phase
 
-            let no_greeting_change = self.greeting_buffer.len() == initial_greeting_len;
-            let no_network_acc_change = self.network_read_accumulator.len() == initial_network_acc_len;
-            let no_plaintext_acc_change = self.plaintext_zmtp_frame_accumulator.len() == initial_plaintext_acc_len;
+            made_progress_this_call |= progress_this_iteration;
 
-            if no_greeting_change && no_network_acc_change && no_plaintext_acc_change && !made_progress_this_call {
-                break; 
+            // Check if loop should continue:
+            // If no data was consumed from any buffer, and no other progress (like phase change) was made in *this iteration*, break.
+            let no_greeting_change_outer = self.greeting_buffer.len() == initial_greeting_len_outer;
+            let no_network_acc_change_outer = self.network_read_accumulator.len() == initial_network_acc_len_outer;
+            let no_plaintext_acc_change_outer = self.plaintext_zmtp_frame_accumulator.len() == initial_plaintext_acc_len_outer;
+
+            if no_greeting_change_outer && no_network_acc_change_outer && no_plaintext_acc_change_outer && !progress_this_iteration {
+                trace!(fd=self.fd, phase=?self.phase, "ProcessBufferedReads: No data consumed or progress in this iteration. Breaking inner loop.");
+                break 'phase_processing_loop; 
             }
-            made_progress_this_call = false; 
-        } 
-        Ok(true) 
+            // If progress was made (data consumed or phase changed), allow loop to continue to re-evaluate with new state/buffers.
+            // Reset for next iteration of outer loop.
+            // made_progress_this_call is accumulated across iterations of this outer loop
+        } // End 'phase_processing_loop
+        
+        Ok(made_progress_this_call) // Return overall progress
     }
 }
 
