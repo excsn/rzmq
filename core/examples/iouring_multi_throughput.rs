@@ -31,6 +31,7 @@ async fn run_router_task(
 ) -> Result<(u64, u64), ZmqError> {
     let router_socket = ctx.socket(SocketType::Router)?;
     router_socket.set_option(zmq_opts::IO_URING_SESSION_ENABLED, ROUTER_IO_URING_ENABLED).await?;
+    router_socket.set_option(zmq_opts::IO_URING_RCVMULTISHOT, ROUTER_IO_URING_ENABLED).await?;
     router_socket.set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED).await?;
     router_socket.set_option(zmq_opts::RCVHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
     router_socket.set_option(zmq_opts::SNDHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
@@ -294,6 +295,7 @@ async fn main() -> Result<(), ZmqError> {
     let dealer_socket_main = ctx.socket(SocketType::Dealer)?;
     println!("[DEALER Main] Enabling IO_URING_SESSION_ENABLED...");
     dealer_socket_main.set_option(zmq_opts::IO_URING_SESSION_ENABLED, DEALER_IO_URING_ENABLED).await?;
+    dealer_socket_main.set_option(zmq_opts::IO_URING_RCVMULTISHOT, DEALER_IO_URING_ENABLED).await?;
     dealer_socket_main.set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED).await?;
     dealer_socket_main.set_option(zmq_opts::SNDHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
     dealer_socket_main.set_option(zmq_opts::RCVHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
