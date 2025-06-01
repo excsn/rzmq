@@ -3,11 +3,12 @@
 #![cfg(feature = "io-uring")]
 
 use crate::error::ZmqError;
+use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSender;
 use crate::io_uring_backend::ops::UringOpRequest;
+use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::io_uring_backend::worker::UringWorker;
 use crate::io_uring_backend::zmtp_handler::ZmtpHandlerFactory;
 use crate::io_uring_backend::UringOpCompletion;
-use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSender;
 use crate::message::{Msg, Blob};
 use crate::runtime::MailboxSender as SocketCoreMailboxSender;
 use crate::runtime::command::Command;
@@ -23,14 +24,14 @@ use once_cell::sync::OnceCell;
 use parking_lot::RwLock; 
 use tokio::sync::oneshot as tokio_oneshot;
 use tokio::task::JoinHandle as TokioTaskJoinHandle;
-use kanal::{Sender as KanalSender, Receiver as KanalReceiver, ReceiveError as KanalReceiveError}; 
+use kanal::{Sender as KanalSyncSender, Receiver as KanalReceiver, ReceiveError as KanalReceiveError}; 
 use tracing::{debug, error, info, warn, trace};
 
 // --- Global Static Cells ---
-static URING_WORKER_OP_TX: OnceCell<KanalSender<UringOpRequest>> = OnceCell::new();
+static URING_WORKER_OP_TX: OnceCell<SignalingOpSender> = OnceCell::new();
 static URING_WORKER_JOIN_HANDLE: OnceCell<StdThreadJoinHandle<Result<(), ZmqError>>> = OnceCell::new();
 
-static PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR: OnceCell<KanalSender<(RawFd, Result<Msg, ZmqError>)>> = OnceCell::new();
+static PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR: OnceCell<KanalSyncSender<(RawFd, Result<Msg, ZmqError>)>> = OnceCell::new();
 static PARSED_MSG_RX_FOR_PROCESSOR: OnceCell<KanalReceiver<(RawFd, Result<Msg, ZmqError>)>> = OnceCell::new();
 static URING_UPSTREAM_PROCESSOR_JOIN_HANDLE: OnceCell<TokioTaskJoinHandle<()>> = OnceCell::new();
 
@@ -51,7 +52,7 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
   })?; 
 
   // Initialize UringWorker first
-  let worker_op_tx = URING_WORKER_OP_TX.get_or_try_init(|| {
+  let worker_op_tx_signaler = URING_WORKER_OP_TX.get_or_try_init(|| {
     info!("GlobalUringState: Initializing and spawning global UringWorker thread.");
     let factories: Vec<Arc<dyn crate::io_uring_backend::connection_handler::ProtocolHandlerFactory>> =
         vec![Arc::new(ZmtpHandlerFactory {})];
@@ -60,8 +61,8 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
         .expect("PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR should be initialized by now")
         .clone();
 
-    let (op_tx_internal, join_handle_internal) = UringWorker::spawn(
-        256, 
+    let (signaling_op_tx_internal, join_handle_internal) = UringWorker::spawn(
+        256, //TODO This hsould be modifiable
         factories,
         parsed_msg_tx_for_worker,
     )?; 
@@ -69,8 +70,9 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
     if URING_WORKER_JOIN_HANDLE.set(join_handle_internal).is_err() {
         warn!("GlobalUringState: UringWorker spawned, but its JoinHandle could not be stored globally (already set?). This is unexpected.");
     }
+    
     debug!("GlobalUringState: Global UringWorker spawned successfully.");
-    Ok::<_, ZmqError>(op_tx_internal)
+    Ok::<_, ZmqError>(signaling_op_tx_internal)
   })?.clone(); // Clone the sender for our initialization request.
 
   // --- NEW: Initialize Default Buffer Ring ---
@@ -79,7 +81,8 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
   // A simple way is to make InitializeBufferRing idempotent in the worker, or just send it once.
   // For OnceCell, this whole block only runs once. So, sending it here is fine.
 
-  if !worker_op_tx.is_closed() { // Ensure worker is likely running
+  if !worker_op_tx_signaler.is_closed() {
+    // Ensure worker is likely running
       info!("GlobalUringState: Sending InitializeBufferRing request to UringWorker.");
       let (reply_tx, reply_rx) = tokio_oneshot::channel();
       let init_buf_ring_req = UringOpRequest::InitializeBufferRing {
@@ -108,34 +111,35 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
       // Simplest blocking approach (will block current thread):
       // Runtime for this blocking part:
 
-      if let Err(e) = worker_op_tx.send(init_buf_ring_req) { // Kanal send is async
-          error!("GlobalUringState: Failed to send InitializeBufferRing request: {}", e);
-          return Err(ZmqError::Internal(format!("Failed to send InitializeBufferRing: {}", e)));
-      }
-
       futures::executor::block_on(async {
-          match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
-              Ok(Ok(Ok(UringOpCompletion::InitializeBufferRingSuccess { .. }))) => {
-                  info!("GlobalUringState: Default buffer ring initialized successfully in UringWorker.");
-                  Ok(())
-              }
-              Ok(Ok(Ok(other_completion))) => {
-                  error!("GlobalUringState: UringWorker returned unexpected success for InitializeBufferRing: {:?}", other_completion);
-                  Err(ZmqError::Internal("InitializeBufferRing failed: unexpected completion".into()))
-              }
-              Ok(Ok(Err(e))) => {
-                  error!("GlobalUringState: UringWorker failed to initialize buffer ring: {}", e);
-                  Err(e)
-              }
-              Ok(Err(oneshot_err)) => { // oneshot::RecvError
-                  error!("GlobalUringState: Failed to receive reply for InitializeBufferRing: {}", oneshot_err);
-                  Err(ZmqError::Internal(format!("InitializeBufferRing reply channel error: {}", oneshot_err)))
-              }
-              Err(_timeout_elapsed) => { // tokio::time::error::Elapsed
-                  error!("GlobalUringState: Timeout waiting for InitializeBufferRing reply from UringWorker.");
-                  Err(ZmqError::Timeout)
-              }
-          }
+
+        if let Err(e) = worker_op_tx_signaler.send(init_buf_ring_req).await { // Kanal send is async
+            error!("GlobalUringState: Failed to send InitializeBufferRing request: {}", e);
+            return Err(ZmqError::Internal(format!("Failed to send InitializeBufferRing: {}", e)));
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+            Ok(Ok(Ok(UringOpCompletion::InitializeBufferRingSuccess { .. }))) => {
+                info!("GlobalUringState: Default buffer ring initialized successfully in UringWorker.");
+                Ok(())
+            }
+            Ok(Ok(Ok(other_completion))) => {
+                error!("GlobalUringState: UringWorker returned unexpected success for InitializeBufferRing: {:?}", other_completion);
+                Err(ZmqError::Internal("InitializeBufferRing failed: unexpected completion".into()))
+            }
+            Ok(Ok(Err(e))) => {
+                error!("GlobalUringState: UringWorker failed to initialize buffer ring: {}", e);
+                Err(e)
+            }
+            Ok(Err(oneshot_err)) => { // oneshot::RecvError
+                error!("GlobalUringState: Failed to receive reply for InitializeBufferRing: {}", oneshot_err);
+                Err(ZmqError::Internal(format!("InitializeBufferRing reply channel error: {}", oneshot_err)))
+            }
+            Err(_timeout_elapsed) => { // tokio::time::error::Elapsed
+                error!("GlobalUringState: Timeout waiting for InitializeBufferRing reply from UringWorker.");
+                Err(ZmqError::Timeout)
+            }
+        }
       })?; // Propagate error from block_on
   } else {
       error!("GlobalUringState: UringWorker op_tx channel is closed. Cannot initialize buffer ring.");
@@ -163,7 +167,7 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
   Ok(())
 }
 
-pub(crate) fn get_global_uring_worker_op_tx() -> KanalSender<UringOpRequest> {
+pub(crate) fn get_global_uring_worker_op_tx() -> SignalingOpSender {
   URING_WORKER_OP_TX.get()
     .expect("Global UringWorker OP_TX not initialized. Call ensure_global_uring_systems_started() first.")
     .clone()
@@ -197,6 +201,7 @@ async fn run_global_uring_upstream_processor(
 ) {
   info!("Global io_uring upstream message processor task started.");
   loop {
+    
     match msg_rx.as_async().recv().await {
       Ok((fd, Ok(msg))) => {
         trace!(raw_fd = fd, msg_size = msg.size(), "UringUpstreamProcessor: Received data Msg for FD.");
@@ -205,7 +210,9 @@ async fn run_global_uring_upstream_processor(
             map_read.get(&fd).cloned() // Clone the MailboxSender if found
         }; // map_read (RwLockReadGuard) is dropped here
 
+        
         if let Some(socket_core_mailbox) = socket_core_mailbox_clone {
+          //  println!("[UpstreamProc] Sent cmd to SocketCore {} mailbox; new_len: {}, cap: {:?}", fd, socket_core_mailbox.len(), socket_core_mailbox.capacity()); //TODO Remove Logging?
           let cmd = Command::UringFdMessage { fd, msg };
           if let Err(e) = socket_core_mailbox.send(cmd).await { 
             error!(raw_fd = fd, "UringUpstreamProcessor:s Failed to send UringFdMessage to SocketCore for FD {}: {}. Unregistering FD.", fd, e);

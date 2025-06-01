@@ -6,7 +6,7 @@ use rzmq_macros::test;
 use rzmq::socket::options::IO_URING_SNDZEROCOPY;
 
 use rzmq::{
-  socket::options::{SNDTIMEO, TCP_CORK_OPT}, // Assuming these constants exist
+  socket::options::{SNDTIMEO, TCP_CORK}, // Assuming these constants exist
   Context,
   Msg,
   MsgFlags,
@@ -45,7 +45,7 @@ async fn setup_zc_pair(
       "Setting TCP_CORK_OPT={} on SENDER for endpoint {}",
       enable_cork_on_sender, endpoint
     );
-    sender.set_option_raw(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
+    sender.set_option_raw(TCP_CORK, &(1i32).to_ne_bytes()).await?;
   }
 
   receiver.bind(endpoint).await?;

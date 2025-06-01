@@ -9,10 +9,14 @@ use futures::future::join_all; // For joining multiple task handles
 use tokio::task::JoinHandle;
 
 // --- Configuration Constants ---
-const NUM_DEALER_TASKS: usize = 4; // Number of concurrent dealer tasks
-const NUM_MESSAGES_PER_DEALER: u64 = 25_000; // Messages per dealer task
+const ROUTER_IO_URING_ENABLED: bool = true;
+const DEALER_IO_URING_ENABLED: bool = true;
+const TCP_CORK_ENABLED: u32 = 0;
+const NUM_DEALER_TASKS: usize = 32; // Number of concurrent dealer tasks
+const NUM_MESSAGES_PER_DEALER: u64 = 50000; // Messages per dealer task
 const PAYLOAD_SIZE_BYTES: usize = 1024; // 1KB
 const ROUTER_ENDPOINT: &str = "tcp://127.0.0.1:5558"; // Ensure a unique port
+const CLIENT_PIPELINE_DEPTH: usize = 10000; // How many messages can be sent before waiting for a reply to free up a slot.
 
 const TOTAL_MESSAGES_EXPECTED_BY_ROUTER: u64 = (NUM_DEALER_TASKS as u64) * NUM_MESSAGES_PER_DEALER;
 
@@ -27,8 +31,8 @@ async fn run_router_task(
     total_expected_messages: u64,
 ) -> Result<(u64, u64), ZmqError> {
     let router_socket = ctx.socket(SocketType::Router)?;
-    router_socket.set_option(zmq_opts::IO_URING_SESSION_ENABLED, true).await?;
-    router_socket.set_option(zmq_opts::TCP_CORK_OPT, 1).await?;
+    router_socket.set_option(zmq_opts::IO_URING_SESSION_ENABLED, ROUTER_IO_URING_ENABLED).await?;
+    router_socket.set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED).await?;
     router_socket.set_option(zmq_opts::RCVHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
     router_socket.set_option(zmq_opts::SNDHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
 
@@ -131,11 +135,10 @@ async fn run_dealer_task(
     // A simple way is to use a "pipeline" depth or a fixed number of outstanding messages.
     // For this example, we'll use a bounded channel to limit outstanding messages.
     // Let's say we allow up to `PIPELINE_DEPTH` messages to be "in-flight" without a reply.
-    const PIPELINE_DEPTH: usize = 100; // How many messages can be sent before waiting for a reply to free up a slot.
-    let (permit_tx, mut permit_rx) = tokio::sync::mpsc::channel(PIPELINE_DEPTH);
+    let (permit_tx, mut permit_rx) = tokio::sync::mpsc::channel(CLIENT_PIPELINE_DEPTH);
 
     // Fill the permit channel initially
-    for _ in 0..PIPELINE_DEPTH {
+    for _ in 0..CLIENT_PIPELINE_DEPTH {
         permit_tx.send(()).await.expect("Failed to fill permit channel");
     }
 
@@ -263,7 +266,7 @@ async fn main() -> Result<(), ZmqError> {
         std::env::set_var("RUST_LOG", "warn,rzmq=warn"); // Reduce default log spam for benchmarks
     }
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN) // Default to WARN
+        .with_max_level(tracing::Level::INFO) // Default to WARN
         .with_thread_ids(true)
         .with_thread_names(true)
         .with_target(true)
@@ -291,8 +294,8 @@ async fn main() -> Result<(), ZmqError> {
     // --- Main DEALER Socket Setup ---
     let dealer_socket_main = ctx.socket(SocketType::Dealer)?;
     println!("[DEALER Main] Enabling IO_URING_SESSION_ENABLED...");
-    dealer_socket_main.set_option(zmq_opts::IO_URING_SESSION_ENABLED, true).await?;
-    dealer_socket_main.set_option(zmq_opts::TCP_CORK_OPT, 1).await?;
+    dealer_socket_main.set_option(zmq_opts::IO_URING_SESSION_ENABLED, DEALER_IO_URING_ENABLED).await?;
+    dealer_socket_main.set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED).await?;
     dealer_socket_main.set_option(zmq_opts::SNDHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
     dealer_socket_main.set_option(zmq_opts::RCVHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
 

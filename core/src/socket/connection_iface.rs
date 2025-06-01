@@ -1,6 +1,6 @@
-// core/src/socket/connection_iface.rs
-
 use crate::error::ZmqError;
+#[cfg(feature = "io-uring")]
+use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::message::Msg;
 use crate::runtime::SystemEvent;
 use crate::runtime::{command::Command, mailbox::MailboxSender as SessionMailboxSender};
@@ -203,7 +203,7 @@ impl ISocketConnection for SessionConnection {
 #[derive(Clone)]
 pub(crate) struct UringFdConnection {
   fd: RawFd,
-  worker_op_tx: kanal::Sender<UringOpRequest>,
+  worker_op_tx: SignalingOpSender,
   socket_options: Arc<SocketOptions>,
   context: Context,
 }
@@ -246,7 +246,7 @@ impl ISocketConnection for UringFdConnection {
       reply_tx: WorkerOneShotSender::new(reply_tx),
     };
 
-    self.worker_op_tx.as_async().send(req).await.map_err(|e| {
+    self.worker_op_tx.send(req).await.map_err(|e| {
       tracing::error!(
         fd = self.fd,
         "Failed to send SendDataViaHandler request to UringWorker: {}",
@@ -305,7 +305,7 @@ impl ISocketConnection for UringFdConnection {
       fd: self.fd,
       reply_tx: WorkerOneShotSender::new(reply_tx),
     };
-    self.worker_op_tx.as_async().send(req).await.map_err(|e| {
+    self.worker_op_tx.send(req).await.map_err(|e| {
       tracing::error!(
         fd = self.fd,
         "Failed to send ShutdownConnectionHandler request to UringWorker: {}",

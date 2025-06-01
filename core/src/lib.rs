@@ -29,6 +29,8 @@ pub mod socket;
 /// Deals with network transport layers (TCP, IPC, Inproc).
 pub mod transport;
 
+pub(crate) mod profiler;
+
 #[cfg(feature = "io-uring")]
 pub mod io_uring_backend;
 

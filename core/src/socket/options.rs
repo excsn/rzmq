@@ -48,7 +48,7 @@ pub const IO_URING_RCVMULTISHOT: i32 = 1171;
 
 /// Socket option: Enable/disable TCP_CORK (Linux only).
 /// Value is i32 (0 or 1).
-pub const TCP_CORK_OPT: i32 = 1172;
+pub const TCP_CORK: i32 = 1172;
 
 /// Socket option (i32): Number of buffers to use in the io_uring multishot receive pool.
 /// Only effective if `IO_URING_RCVMULTISHOT` (the boolean flag) is also enabled.
@@ -431,7 +431,7 @@ pub(crate) fn apply_core_option_value(
         HEARTBEAT_TIMEOUT => options.heartbeat_timeout = parse_heartbeat_option(value, option_id)?,
         HANDSHAKE_IVL => options.handshake_ivl = parse_handshake_option(value, option_id)?,
         MAX_CONNECTIONS => options.max_connections = parse_max_connections_option(value, option_id)?,
-        TCP_CORK_OPT => options.tcp_cork = parse_bool_option(value)?,
+        TCP_CORK => options.tcp_cork = parse_bool_option(value)?,
         ZAP_DOMAIN => options.zap_domain = Some(parse_string_option(value, option_id)?),
         PLAIN_SERVER => {
             options.plain_options.server_role = Some(parse_bool_option(value)?);
@@ -497,7 +497,7 @@ pub(crate) fn retrieve_core_option_value(
         HEARTBEAT_TIMEOUT => Ok(options.heartbeat_timeout.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
         HANDSHAKE_IVL => Ok(options.handshake_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
         MAX_CONNECTIONS => Ok(options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
-        TCP_CORK_OPT => Ok((options.tcp_cork as i32).to_ne_bytes().to_vec()),
+        TCP_CORK => Ok((options.tcp_cork as i32).to_ne_bytes().to_vec()),
         ZAP_DOMAIN => options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option ZAP_DOMAIN not set".into())),
         PLAIN_SERVER => options.plain_options.server_role.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_SERVER not set".into())),
         PLAIN_USERNAME => options.plain_options.username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_USERNAME not set".into())),

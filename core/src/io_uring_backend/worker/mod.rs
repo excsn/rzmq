@@ -1,42 +1,41 @@
-// core/src/io_uring_backend/worker/mod.rs
-
 #![cfg(feature = "io-uring")]
 
-use io_uring::opcode;
-use io_uring::types;
-use kanal::{Receiver as KanalReceiver, Sender as KanalSender};
-use std::collections::HashMap;
+// Declare internal worker sub-modules
+mod cqe_processor;
+mod external_op_tracker;
+mod eventfd_poller;
+mod handler_manager;
+mod internal_op_tracker;
+mod main_loop;
+mod sqe_builder;
+
+use crate::io_uring_backend::buffer_manager::BufferRingManager;
+use crate::io_uring_backend::connection_handler::{
+    ProtocolHandlerFactory, WorkerIoConfig, HandlerSqeBlueprint,
+};
+use crate::io_uring_backend::ops::UringOpRequest;
+use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
+use crate::message::Msg;
+use crate::ZmqError;
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::mem;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr, Ipv6Addr};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
+
+use io_uring::IoUring;
+use io_uring::opcode;
+use io_uring::types;
+use kanal::{Receiver as KanalReceiver, AsyncSender as KanalAsyncSender, Sender as KanalSyncSender};
 use tracing::{error, info, trace, warn};
 
-use crate::io_uring_backend::buffer_manager::BufferRingManager;
-use crate::io_uring_backend::connection_handler::{
-    ProtocolHandlerFactory, WorkerIoConfig, HandlerSqeBlueprint,
-};
-use crate::io_uring_backend::ops::UringOpRequest; // UserData for ops.rs
-// use crate::io_uring_backend::one_shot_sender::OneShotSender; // Not directly used by UringWorker struct or spawn()
-use crate::message::Msg; // For WorkerIoConfig
-use crate::ZmqError;
-use io_uring::IoUring;
-
 // Publicly re-export for use within io_uring_backend module
+pub(crate) use eventfd_poller::EventFdPoller; 
 pub(crate) use external_op_tracker::{ExternalOpContext, ExternalOpTracker};
 pub(crate) use handler_manager::HandlerManager;
 pub(crate) use internal_op_tracker::{InternalOpTracker, InternalOpPayload, InternalOpType};
-
-// Declare internal worker sub-modules
-mod cqe_processor;
-mod external_op_tracker;
-mod handler_manager;
-mod internal_op_tracker;
-mod main_loop;
-mod sqe_builder;
-
 
 pub struct UringWorker {
     ring: IoUring,
@@ -56,6 +55,7 @@ pub struct UringWorker {
     // Added queue for SQEs that couldn't be submitted immediately.
     // Stores (FD to operate on, Blueprint of the SQE to retry)
     pending_sqe_retry_queue: VecDeque<(RawFd, HandlerSqeBlueprint)>,
+    pub(crate) event_fd_poller: EventFdPoller,
 }
 
 impl fmt::Debug for UringWorker {
@@ -70,6 +70,7 @@ impl fmt::Debug for UringWorker {
       .field("default_buffer_ring_group_id_val", &self.default_buffer_ring_group_id_val)
       .field("shutdown_requested", &self.shutdown_requested) 
       .field("pending_sqe_retry_queue_len", &self.pending_sqe_retry_queue.len())
+      .field("event_fd_poller", &self.event_fd_poller)
       .finish_non_exhaustive()
   }
 }
@@ -79,26 +80,51 @@ impl UringWorker {
     ring_entries: u32, // Number of entries for the io_uring SQ/CQ
     factories: Vec<Arc<dyn ProtocolHandlerFactory>>,
     // Provide the pre-created sender for parsed ZMTP messages
-    parsed_msg_tx_zmtp: KanalSender<(RawFd, Result<Msg, ZmqError>)>,
-  ) -> Result<(KanalSender<UringOpRequest>, std::thread::JoinHandle<Result<(), ZmqError>>), ZmqError> {
-    let (op_tx, op_rx) = kanal::unbounded::<UringOpRequest>();
+    parsed_msg_tx_zmtp: KanalSyncSender<(RawFd, Result<Msg, ZmqError>)>,
+  ) -> Result<(SignalingOpSender, std::thread::JoinHandle<Result<(), ZmqError>>), ZmqError> {
+
+    let (op_tx_sync, op_rx) = kanal::unbounded::<UringOpRequest>();
+    let op_tx_async_for_signaler: KanalAsyncSender<UringOpRequest> = op_tx_sync.to_async();
 
     let worker_io_config = Arc::new(WorkerIoConfig {
         parsed_msg_tx_zmtp,
     });
+
+    let event_fd_master_instance = eventfd::EventFD::new(
+        0, // initval
+        eventfd::EfdFlags::EFD_CLOEXEC | eventfd::EfdFlags::EFD_NONBLOCK,
+    ).map_err(|e| {
+        error!("Failed to create master EventFD for UringWorker: {}", e);
+        ZmqError::Internal(format!("Master EventFD creation failed: {}", e))
+    })?;
+
+    let signaling_op_sender = SignalingOpSender::new(
+        op_tx_async_for_signaler,
+        event_fd_master_instance.clone() // SignalingOpSender gets a clone
+    );
 
     let worker_thread_join_handle = std::thread::Builder::new()
       .name("rzmq-io-uring-worker".into())
       .spawn(move || { // worker_io_config is moved here
         match IoUring::new(ring_entries) {
           Ok(ring) => {
+
+
+            let mut internal_tracker = InternalOpTracker::new(); // Create tracker instance first
+
+            let event_fd_poller_instance = EventFdPoller::new_with_fd(
+                event_fd_master_instance, // Master instance moved here
+                &mut internal_tracker,
+            );
+
             let mut worker = UringWorker {
               ring,
               op_rx,
               buffer_manager: None, // Initialized via op request
               handler_manager: HandlerManager::new(factories, worker_io_config.clone()), // Clone Arc
               external_op_tracker: ExternalOpTracker::new(),
-              internal_op_tracker: InternalOpTracker::new(),
+              internal_op_tracker: internal_tracker, // Use the initialized tracker
+              event_fd_poller: event_fd_poller_instance, 
               worker_io_config,
               default_buffer_ring_group_id_val: None,
               fds_needing_close_initiated_pass: VecDeque::new(),
@@ -179,7 +205,7 @@ impl UringWorker {
       })
       .map_err(|e| ZmqError::Internal(format!("Failed to spawn UringWorker thread: {:?}", e)))?;
 
-    Ok((op_tx, worker_thread_join_handle))
+    Ok((signaling_op_sender, worker_thread_join_handle))
   }
 }
 

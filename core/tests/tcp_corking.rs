@@ -1,5 +1,5 @@
 use rzmq::{
-  socket::options::{SNDTIMEO, TCP_CORK_OPT},
+  socket::options::{SNDTIMEO, TCP_CORK},
   Context, Msg, MsgFlags, SocketType, ZmqError,
 };
 use std::time::Duration;
@@ -24,7 +24,7 @@ async fn setup_pair_with_cork(
       "Setting TCP_CORK_OPT={} on SENDER for endpoint {}",
       enable_cork_on_sender, endpoint
     );
-    sender.set_option_raw(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
+    sender.set_option_raw(TCP_CORK, &(1i32).to_ne_bytes()).await?;
   }
 
   receiver.bind(endpoint).await?;

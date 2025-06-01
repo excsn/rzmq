@@ -3,8 +3,9 @@
 #![cfg(feature = "io-uring")]
 
 use super::external_op_tracker::{ExternalOpTracker};
-use super::internal_op_tracker::{InternalOpDetails, InternalOpTracker, InternalOpType, InternalOpPayload};
+use super::eventfd_poller::EventFdPoller;
 use super::handler_manager::HandlerManager;
+use super::internal_op_tracker::{InternalOpDetails, InternalOpTracker, InternalOpType, InternalOpPayload};
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::ops::{UringOpCompletion, UserData};
 use crate::io_uring_backend::connection_handler::{
@@ -13,6 +14,7 @@ use crate::io_uring_backend::connection_handler::{
     HandlerIoOps, HandlerSqeBlueprint,
 };
 use crate::ZmqError;
+
 use io_uring::{cqueue, types, opcode, squeue, IoUring}; // Added IoUring
 use std::os::unix::io::RawFd;
 use std::mem;
@@ -119,6 +121,7 @@ pub(crate) fn process_all_cqes(
     default_bgid_val_from_worker: Option<u16>,
     fds_to_initiate_close_queue: &mut VecDeque<RawFd>,
     pending_sqe_retry_queue: &mut VecDeque<(RawFd, HandlerSqeBlueprint)>,
+    event_fd_poller: &mut EventFdPoller,
 ) -> Result<(), ZmqError> {
 
     // Get a local, short-lived CompletionQueue reference from the ring.
@@ -137,6 +140,22 @@ pub(crate) fn process_all_cqes(
         let cqe_flags = cqe.flags();
 
         trace!("CQE Processor: Received CQE UserData: {}, Result: {}, Flags: {:x}", cqe_user_data, cqe_result, cqe_flags);
+
+        if event_fd_poller.handle_cqe_if_matches(cqe_user_data, cqe_result, internal_ops) {
+            // The EventFdPoller handled it (read from eventfd, prepared for next poll).
+            // We also need to ensure the InternalOpTracker entry for this UserData is removed,
+            // as the UserData has served its purpose for this specific poll instance.
+            // The EventFdPoller itself does not directly call `take_op_details`.
+            if let Some(_details) = internal_ops.take_op_details(cqe_user_data) {
+                trace!("[CQE Processor] Consumed InternalOpDetails for handled EventFdPoll CQE (ud: {}).", cqe_user_data);
+            } else {
+                // This case should be rare if UserData generation and tracking is correct.
+                warn!("[CQE Processor] EventFdPoller handled CQE (ud: {}), but no corresponding InternalOpDetails found to consume.", cqe_user_data);
+            }
+            // The main_loop will call event_fd_poller.try_submit_initial_poll_sqe()
+            // in the next iteration to re-submit the poll with the new UserData.
+            continue; // Move to the next CQE
+        }
 
         // --- 1. Check if it's an External Operation Completion ---
         if let Some(mut ext_op_ctx) = external_ops.take_op(cqe_user_data) {
@@ -444,6 +463,25 @@ pub(crate) fn process_all_cqes(
                         // If payload was SendBuffer, it's dropped with op_details.
                     }
                 } // End RingRead/Send/GenericHandlerOp arm
+
+                // This case should ideally not be reached if `event_fd_poller.handle_cqe_if_matches` works correctly.
+                // But as a defensive measure or if the UserData ranges were to overlap accidentally.
+                InternalOpType::EventFdPoll => {
+                    warn!(
+                        "CQE Processor: Reached InternalOpType::EventFdPoll (ud: {}) directly. This should have been handled by EventFdPoller. Investigating.",
+                        cqe_user_data
+                    );
+                    // Attempt to delegate to the poller again, just in case.
+                    if !event_fd_poller.handle_cqe_if_matches(cqe_user_data, cqe_result, internal_ops) {
+                        error!(
+                            "CQE Processor: FATAL - EventFdPoll CQE (ud: {}) was not handled by EventFdPoller even on second attempt within internal ops match.",
+                            cqe_user_data
+                        );
+                        // This is a serious logic error. The UserData for EventFdPoll should be unique
+                        // and managed by EventFdPoller.
+                    }
+                    // The poller, if it handled it, would have set up for the next poll.
+                }
             } // End match op_type
         } else { // user_data did not match an external or internal op
             warn!("Worker: CQE for UNKNOWN user_data: {} (result: {}, flags: {:x}) - Not external or mapped internal op. CQE Ignored.", cqe_user_data, cqe_result, cqe_flags);

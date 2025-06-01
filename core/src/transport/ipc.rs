@@ -10,7 +10,6 @@ use crate::runtime::{
   MailboxReceiver as GenericMailboxReceiver, MailboxSender as GenericMailboxSender, SystemEvent,
 };
 use crate::transport::ipc::create_and_spawn_ipc_engine_wrapper as create_and_spawn_ipc_engine;
-// <<< MODIFIED [ISocketConnection only needed for event type, not SessionConnection here] >>>
 use crate::socket::connection_iface::ISocketConnection;
 // EngineConnectionType for Command::Attach for standard path
 use crate::runtime::command::EngineConnectionType as CommandEngineConnectionType;
@@ -24,7 +23,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-// <<< REMOVED [async_channel imports no longer needed here for pipes] >>>
 // use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 use tokio::sync::{broadcast, Semaphore};
@@ -32,7 +30,6 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout}; // timeout for connect attempt
 
 // --- IpcListener Actor ---
-// ... (IpcListener struct definition remains the same)
 #[derive(Debug)]
 pub(crate) struct IpcListener {
   handle: usize,
@@ -262,7 +259,6 @@ impl IpcListener {
               let session_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
               let engine_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-              // <<< REMOVED [Pipe creation and AttachPipe send from here] >>>
 
               let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
                 session_hdl_id,
@@ -272,8 +268,6 @@ impl IpcListener {
                 parent_socket_core_id,
               );
               let managing_actor_task_id_val = Some(session_task_hdl.id());
-
-              // <<< REMOVED [AttachPipe command send from here] >>>
 
               // Attach Engine to Session
               let mut setup_successful = true; // Assume success initially

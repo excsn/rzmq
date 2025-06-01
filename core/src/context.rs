@@ -1,10 +1,12 @@
 use crate::error::{ZmqError, ZmqResult};
+#[cfg(feature = "io-uring")]
+use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::runtime::{ActorType, EventBus, MailboxSender, SystemEvent, WaitGroup, DEFAULT_MAILBOX_CAPACITY};
-use crate::socket::{Socket, SocketType}; // For creating and managing Sockets
+use crate::socket::{Socket, SocketType};
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid clash
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,7 +59,7 @@ pub(crate) struct ContextInner {
   actor_mailbox_capacity: usize,
 
   #[cfg(feature = "io-uring")]
-  pub(crate) uring_worker_op_tx: Option<KanalSender<UringOpRequest>>,
+  pub(crate) uring_worker_op_tx: Option<SignalingOpSender>,
 }
 
 impl ContextInner {
@@ -227,7 +229,7 @@ impl ContextInner {
   }
 
   #[cfg(feature = "io-uring")]
-  pub(crate) fn get_uring_worker_op_tx(&self) -> Option<KanalSender<UringOpRequest>> {
+  pub(crate) fn get_uring_worker_op_tx(&self) -> Option<SignalingOpSender> {
     self.uring_worker_op_tx.clone()
   }
 

@@ -10,12 +10,13 @@ use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::ops::{UringOpRequest, UringOpCompletion}; // UserData implicitly used via ops
 use crate::io_uring_backend::connection_handler::{HandlerIoOps, UringWorkerInterface, HandlerSqeBlueprint};
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType};
+use crate::profiler::LoopProfiler;
 use crate::ZmqError;
 use io_uring::{opcode, types, squeue, Parameters};
 use std::collections::VecDeque;
 use std::os::fd::AsRawFd; // ADDED for as_raw_fd()
 use std::os::unix::io::RawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 use kanal::{ReceiveError as KanalReceiveError, ReceiveErrorTimeout as KanalReceiveErrorTimeout};
 
@@ -465,24 +466,50 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         worker.ring.as_raw_fd()
     );
 
+    let mut profiler = LoopProfiler::new(Duration::from_millis(10), 10000); // Log if loop > 10ms, or every 10000th iteration otherwise
     let mut pending_external_op_retry_queue: VecDeque<UringOpRequest> = VecDeque::new();
     
-    let mut kernel_poll_timeout_duration = Duration::from_micros(50); 
-    const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(50);
-    const IDLE_OP_RX_TIMEOUT: Duration = Duration::from_millis(50);
+    const KERNEL_POLL_INITIAL: Duration = Duration::from_millis(1);
+    let mut kernel_poll_timeout_duration = KERNEL_POLL_INITIAL; 
+    const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(16);
 
     loop {
+
+        profiler.loop_start();
+        
         let mut user_space_activity_this_cycle = false; // Tracks if user-space queues/handlers had items/generated ops
         let mut sqes_submitted_to_kernel_this_batch = 0;
         let mut cqe_processed_this_batch = 0;
 
+
+        profiler.mark_segment_end_and_start_new("submit_eventfd_poll_if_needed");
+        if !worker.shutdown_requested { // Only attempt if not shutting down
+            let mut sq_for_eventfd_poll = unsafe { worker.ring.submission_shared() };
+            // try_submit_initial_poll_sqe handles the `is_poll_submitted` check internally.
+            // It will also handle SQ full condition by returning false, leading to retry next loop.
+            let _eventfd_poll_submitted_or_already_active = worker
+                .event_fd_poller
+                .try_submit_initial_poll_sqe(&mut sq_for_eventfd_poll);
+            // We don't strictly need to track if an SQE was pushed here for user_space_activity_this_cycle,
+            // as the main SQ submit phase will catch it.
+            // However, if it *was* submitted, it implies activity.
+            if _eventfd_poll_submitted_or_already_active && !worker.event_fd_poller.is_poll_submitted {
+                 // This means it *tried* to submit but SQ was full.
+                 // Actual submission success is tracked by event_fd_poller.is_poll_submitted
+            }
+            drop(sq_for_eventfd_poll);
+        }
+
         // --- PHASE 0: Process Pending SQE Retry Queue ---
+
         // Only attempt if SQ is not full and queue has items.
         let mut items_to_process_from_sqe_retry_queue = worker.pending_sqe_retry_queue.len();
         if items_to_process_from_sqe_retry_queue > 0 {
           trace!("UringWorker: Processing SQE retry queue ({} items)", items_to_process_from_sqe_retry_queue);
           user_space_activity_this_cycle = true;
         }
+        profiler.mark_segment_end_and_start_new("process_sqe_retry_q");
+
         for _ in 0..items_to_process_from_sqe_retry_queue {
             if unsafe { worker.ring.submission_shared().is_full() } {
                 warn!("UringWorker: SQ full during SQE retry queue processing. {} items remain.", worker.pending_sqe_retry_queue.len());
@@ -510,10 +537,12 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             } else { break; } // Should not happen if len > 0
         }
 
+
+        profiler.mark_segment_end_and_start_new("process_ext_op_retry_q");
         // --- PHASE 1: Handle User-Space Requests and Handler Logic (Generate SQEs) ---
         
         // 1a. Process Retry Queue
-        let mut items_to_process_this_retry_cycle = pending_external_op_retry_queue.len();
+        let items_to_process_this_retry_cycle = pending_external_op_retry_queue.len();
         if items_to_process_this_retry_cycle > 0 {
             debug!("UringWorker: Processing retry queue ({} items)", items_to_process_this_retry_cycle);
             user_space_activity_this_cycle = true;
@@ -533,6 +562,9 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             } else { break; } 
         }
 
+
+        // <<<MODIFIED>>>
+        profiler.mark_segment_end_and_start_new("process_new_op_rx");
         // 1b. Process New External Ops from op_rx
         loop {
             if unsafe { worker.ring.submission_shared().is_full() } {
@@ -558,6 +590,8 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             }
         }
 
+        // <<<MODIFIED>>>
+        profiler.mark_segment_end_and_start_new("poll_conn_handlers");
         // 1c. Poll Connection Handlers
         if !worker.shutdown_requested && !unsafe { worker.ring.submission_shared().is_full() } {
             let handler_io_ops_list = worker.handler_manager.prepare_all_handler_io_ops(
@@ -590,6 +624,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             }
         }
         
+        profiler.mark_segment_end_and_start_new("process_fds_to_close");
         // 1d. Process FDs flagged for close
         if !worker.shutdown_requested {
             let mut fds_to_process_this_close_cycle = worker.fds_needing_close_initiated_pass.len();
@@ -608,6 +643,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             }
         }
 
+        profiler.mark_segment_end_and_start_new("submit_sqes_to_kernel");
         // --- PHASE 2: Submit SQEs to Kernel ---
         let sq_len_at_submit_time = unsafe { worker.ring.submission_shared().len() };
         if sq_len_at_submit_time > 0 {
@@ -621,6 +657,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                     if e.raw_os_error() == Some(libc::EBUSY) || e.raw_os_error() == Some(libc::EINTR) {
                         warn!("UringWorker: ring.submit() failed with EBUSY/EINTR. SQEs remain.");
                     } else {
+                        profiler.log_and_reset_for_next_loop(); 
                         error!("UringWorker: ring.submit() failed critically: {}. Shutting down.", e);
                         return Err(ZmqError::IoError { kind: e.kind(), message: e.to_string() });
                     }
@@ -628,6 +665,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             }
         }
 
+        profiler.mark_segment_end_and_start_new("process_kernel_cqes");
         // --- PHASE 3: Process Kernel Completions (CQEs) ---
         let cq_len_before_processing = unsafe { worker.ring.completion_shared().len() };
         // worker.ring.completion().sync(); // Not strictly needed if iterating directly after submit
@@ -637,14 +675,20 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             &mut worker.handler_manager, worker.buffer_manager.as_ref(), &worker.worker_io_config,
             worker.default_buffer_ring_group_id_val, &mut worker.fds_needing_close_initiated_pass,
                             &mut worker.pending_sqe_retry_queue,
-        ) { return Err(e); }
+            &mut worker.event_fd_poller,
+        ) { 
+            
+            profiler.log_and_reset_for_next_loop();
+            return Err(e);
+        }
         let cq_len_after_processing = unsafe { worker.ring.completion_shared().len() };
         cqe_processed_this_batch = cq_len_before_processing.saturating_sub(cq_len_after_processing);
         if cqe_processed_this_batch > 0 {
             trace!("UringWorker: Processed {} CQEs this batch.", cqe_processed_this_batch);
-            kernel_poll_timeout_duration = Duration::from_millis(1); 
+            kernel_poll_timeout_duration = KERNEL_POLL_INITIAL; 
         }
 
+        profiler.mark_segment_end_and_start_new("shutdown_check_and_idle_wait");
         // --- PHASE 4: Shutdown Check ---
         if worker.shutdown_requested &&
            worker.external_op_tracker.is_empty() &&
@@ -654,6 +698,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
            worker.fds_needing_close_initiated_pass.is_empty() &&
            worker.handler_manager.get_active_fds().is_empty() {
             info!("UringWorker: Graceful shutdown conditions met. Exiting main loop.");
+            profiler.log_and_reset_for_next_loop(); 
             break; 
         }
 
@@ -667,7 +712,9 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             let kernel_ops_are_pending = !worker.internal_op_tracker.is_empty() || 
                                         !worker.external_op_tracker.is_empty();
 
-            if !worker.shutdown_requested {
+            let eventfd_poll_is_active = worker.event_fd_poller.is_poll_submitted;
+
+            if !worker.shutdown_requested || eventfd_poll_is_active {
                 if kernel_ops_are_pending {
                     // Kernel ops are outstanding.
                     // Strategy:
@@ -678,14 +725,20 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                     match worker.op_rx.try_recv() {
                         Ok(Some(request_from_channel)) => {
                             trace!("UringWorker: Polled op_rx while kernel ops pending; got new request. Will process next iter.");
-                            pending_external_op_retry_queue.push_back(request_from_channel);
-                            kernel_poll_timeout_duration = Duration::from_millis(1); // Activity, reset kernel poll
+                            match worker.handle_external_op_request_submission(request_from_channel) {
+                                Ok(_sqe_produced) => {}
+                                Err(req_for_retry_queue) => { 
+                                    pending_external_op_retry_queue.push_back(req_for_retry_queue); 
+                                }
+                            }
+                            kernel_poll_timeout_duration = KERNEL_POLL_INITIAL; // Activity, reset kernel poll
                         }
                         Ok(None) => { // op_rx is empty
                             trace!(
-                                "UringWorker: op_rx empty. Kernel ops pending (int:{}, ext:{}). Waiting for CQEs with timeout: {:?}.",
+                                "UringWorker: op_rx empty. Kernel ops pending (int:{}, ext:{}, ev_poll:{}) or eventfd poll active. Waiting for CQEs with timeout: {:?}.",
                                 worker.internal_op_tracker.op_to_details.len(),
                                 worker.external_op_tracker.in_flight.len(),
+                                eventfd_poll_is_active,
                                 kernel_poll_timeout_duration
                             );
                             let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
@@ -697,7 +750,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                                 Ok(reaped_count) => {
                                     trace!("UringWorker: submit_with_args (timed wait for pending kernel ops) reaped {} CQEs.", reaped_count);
                                     if reaped_count > 0 { // Kernel activity
-                                        kernel_poll_timeout_duration = Duration::from_millis(1); 
+                                        kernel_poll_timeout_duration = KERNEL_POLL_INITIAL; 
                                     } else { // Kernel timed out or reaped 0
                                         kernel_poll_timeout_duration = (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
                                         trace!("UringWorker: Kernel wait timed out/reaped 0. New kernel_poll_timeout: {:?}", kernel_poll_timeout_duration);
@@ -709,38 +762,58 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                                         kernel_poll_timeout_duration = (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
                                     } else if e.raw_os_error() == Some(libc::EINTR) {
                                         warn!("UringWorker: submit_with_args (timed wait for pending kernel ops) interrupted (EINTR).");
-                                        kernel_poll_timeout_duration = Duration::from_millis(1);
+                                        kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
                                     } else {
                                         error!("UringWorker: ring.submit_with_args (timed wait for pending kernel ops) critical error: {}. Shutting down.", e);
+
+                                        profiler.mark_segment_end_and_start_new("kernel_wait_submit_with_args");
+                                        profiler.log_and_reset_for_next_loop();
                                         return Err(ZmqError::IoError{kind: e.kind(), message: e.to_string()});
                                     }
                                 }
                             }
+
+                            profiler.mark_segment_end_and_start_new("kernel_wait_submit_with_args");
                         }
                         Err(KanalReceiveError::Closed) | Err(KanalReceiveError::SendClosed) => {
                             info!("UringWorker: op_rx channel closed while checking (kernel ops pending branch).");
                             worker.shutdown_requested = true;
                         }
                     }
-                } else { // Truly idle: No user-space work, no kernel ops outstanding. Block on op_rx.
-                    trace!("UringWorker: Truly idle. Blocking on op_rx with timeout: {:?}.", IDLE_OP_RX_TIMEOUT);
-                    match worker.op_rx.recv_timeout(IDLE_OP_RX_TIMEOUT) {
-                        Ok(request_from_timeout) => {
-                            pending_external_op_retry_queue.push_back(request_from_timeout); 
-                            kernel_poll_timeout_duration = Duration::from_millis(1); 
+                } else { // Truly idle: No user-space work, no kernel ops outstanding.
+                     trace!(
+                        "UringWorker: No user-space work, no other kernel ops. Waiting for eventfd or kernel ops with timeout: {:?}.",
+                        kernel_poll_timeout_duration
+                    );
+                    let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
+                    let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
+                    match worker.ring.submitter().submit_with_args(1, &submit_args) {
+                        Ok(reaped_count) => {
+                            if reaped_count > 0 { kernel_poll_timeout_duration = KERNEL_POLL_INITIAL; }
+                            else { kernel_poll_timeout_duration = (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION); }
                         }
-                        Err(KanalReceiveErrorTimeout::Timeout) => { /* Normal idle timeout, loop again */ }
-                        Err(KanalReceiveErrorTimeout::Closed) | Err(KanalReceiveErrorTimeout::SendClosed) => {
-                            info!("UringWorker: op_rx channel closed during idle wait.");
-                            worker.shutdown_requested = true; 
+                        Err(e) => { /* Same error handling as above */ 
+                            if e.kind() == std::io::ErrorKind::TimedOut || e.raw_os_error() == Some(libc::ETIME) {
+                                kernel_poll_timeout_duration = (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
+                            } else if e.raw_os_error() == Some(libc::EINTR) {
+                                kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
+                            } else {
+                                error!("UringWorker: ring.submit_with_args (idle branch) critical error: {}. Shutting down.", e);
+                                profiler.log_and_reset_for_next_loop();
+                                return Err(ZmqError::IoError{kind: e.kind(), message: e.to_string()});
+                            }
                         }
                     }
+
+                    profiler.mark_segment_end_and_start_new("unified_kernel_wait");
                 }
             } // end if !worker.shutdown_requested
         } else { 
             // Work *was* done in this cycle. Reset kernel poll timeout to be responsive.
-            kernel_poll_timeout_duration = Duration::from_millis(1);
+            kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
         }
+
+        profiler.log_and_reset_for_next_loop(); 
     } // end main loop
 
     Ok(())

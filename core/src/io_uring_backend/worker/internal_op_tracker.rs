@@ -14,6 +14,7 @@ pub(crate) enum InternalOpType {
   Send,
   CloseFd,
   GenericHandlerOp,
+  EventFdPoll,
 }
 
 /// Payload associated with an internal operation, e.g., buffer for send.

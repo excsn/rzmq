@@ -6,7 +6,7 @@ use criterion::{
 #[cfg(feature = "io-uring")]
 use rzmq::socket::options::IO_URING_SNDZEROCOPY;
 use rzmq::{
-  socket::options::{RCVHWM, SNDHWM, SUBSCRIBE, TCP_CORK_OPT},
+  socket::options::{RCVHWM, SNDHWM, SUBSCRIBE, TCP_CORK},
   Context, Msg, SocketType, ZmqError,
 };
 use std::time::Duration;
@@ -52,13 +52,13 @@ async fn setup_dealer_router_send_comparison(
   if enable_cork_opt {
     #[cfg(target_os = "linux")]
     {
-        dealer.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
+        dealer.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await?;
         println!("[Setup {}] TCP_CORK_OPT enabled for DEALER", endpoint);
     }
     #[cfg(not(target_os = "linux"))]
     {
         // Silently ignore or log if TCP_CORK is attempted on non-Linux
-        let _ = dealer.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await;
+        let _ = dealer.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await;
         println!("[Setup {}] TCP_CORK_OPT requested but not applicable (not Linux)", endpoint);
     }
   }
@@ -111,12 +111,12 @@ async fn setup_pub_sub_send_comparison(
   if enable_cork_on_pub_opt {
     #[cfg(target_os = "linux")]
     {
-        publisher.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
+        publisher.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await?;
         println!("[Setup {}] TCP_CORK_OPT enabled for PUB", endpoint);
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = publisher.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await;
+        let _ = publisher.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await;
          println!("[Setup {}] TCP_CORK_OPT (PUB) requested but not applicable (not Linux)", endpoint);
     }
   }

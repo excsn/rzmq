@@ -304,7 +304,7 @@ impl TcpListener {
                           is_server_role: true, reply_tx: WorkerOneShotSender::new(reply_tx_for_op),
                         };
                         
-                        if let Err(e) = worker_op_tx.as_async().send(register_fd_req).await {
+                        if let Err(e) = worker_op_tx.send(register_fd_req).await {
                           tracing::error!("Send RegisterExternalFd to UringWorker for fd {}: {}", raw_fd, e);
                           unsafe { let _ = libc::close(raw_fd); } 
                           setup_successful = false;
@@ -312,8 +312,7 @@ impl TcpListener {
                           match reply_rx_for_op.await {
                             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
                               info!("Registered accepted FD {} with UringWorker.", raw_fd);
-                              let local_iface_for_uring: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, socket_options_clone.clone(), context_clone.clone()));
-                              connection_iface_for_event = Some(local_iface_for_uring);
+                              connection_iface_for_event = None;
                               interaction_model_for_event = Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
                               // managing_actor_task_id_for_event remains None for UringFd path
                             }
@@ -354,22 +353,17 @@ impl TcpListener {
                   let session_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                   let engine_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                  // <<< REMOVED [Pipe creation and AttachPipe send from here] >>>
-
                   let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
                     session_hdl_id, connection_specific_uri_for_task.clone(), 
                     monitor_tx_clone.clone(), context_clone.clone(), parent_socket_core_id,
                   );
-                  // <<< MODIFIED START [Set up common variables for event - ViaSessionActor] >>>
+
                   managing_actor_task_id_for_event = Some(session_task_hdl.id());
-                  // connection_iface_for_event will be None here, SocketCore will create it.
+                  connection_iface_for_event = None;
                   interaction_model_for_event = Some(ConnectionInteractionModel::ViaSessionActor { 
                     session_actor_mailbox: session_cmd_mailbox.clone(),
                     session_actor_handle_id: session_hdl_id, // Pass the session's handle ID
                   });
-                  // <<< MODIFIED END >>>
-                  
-                  // <<< REMOVED [AttachPipe command send from here] >>>
                   
                   // Attach Engine to Session
                   let (engine_mb, engine_task_hdl) = create_and_spawn_tcp_engine(
@@ -389,7 +383,6 @@ impl TcpListener {
               }
 
               if setup_successful {
-                // <<< MODIFIED START [Use common variables for event publication] >>>
                 if let Some(inter_model) = interaction_model_for_event {
                   let event = SystemEvent::NewConnectionEstablished {
                     parent_core_id: parent_socket_core_id, 
@@ -409,7 +402,6 @@ impl TcpListener {
                         tracing::warn!("NewConnectionEstablished publish failed, related session/FD for task_id {:?} might need manual cleanup if not handled by its own lifecycle.", task_id);
                     }
                   }
-                // <<< MODIFIED END >>>
                 } else {
                   tracing::error!("Inconsistent state: setup_successful true but interaction model missing for {}", connection_specific_uri_for_task);
                 }
@@ -654,18 +646,19 @@ impl TcpConnecter {
             is_server_role: false, reply_tx: WorkerOneShotSender::new(reply_tx_for_op),
           };
           
-          worker_op_tx.as_async().send(register_fd_req).await.map_err(|e| 
+          worker_op_tx.send(register_fd_req).await.map_err(|e| 
             ZmqError::Internal(format!("Send RegisterExternalFd to UringWorker: {}", e))
           )?;
           
           match reply_rx_for_op.await {
             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
               info!("Successfully registered connected FD {} with UringWorker.", raw_fd);
-              // <<< MODIFIED [ISocketConnection is Some for UringFd path] >>>
+              
               let connection_iface: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, self.context_options.clone(), self.context.clone()));
+              let connection_iface = None;
               let interaction_model = ConnectionInteractionModel::ViaUringFd { fd: raw_fd };
               Ok((
-                Some(connection_iface), interaction_model, 
+                connection_iface, interaction_model, 
                 None, 
                 format!("tcp://{}", peer_addr_actual)
               ))
@@ -720,14 +713,14 @@ impl TcpConnecter {
           session_task_hdl.abort(); return Err(ZmqError::Internal("Failed AttachEngine to Session".into()));
         }
 
-        // <<< MODIFIED [connection_iface is None here; interaction_model provides session_actor_handle_id] >>>
+        let connection_iface = None;
         let interaction_model = ConnectionInteractionModel::ViaSessionActor { 
           session_actor_mailbox: session_cmd_mailbox,
           session_actor_handle_id: session_hdl_id,
         };
         
         Ok((
-          None, // SocketCore will construct the SessionConnection
+          connection_iface,
           interaction_model, 
           Some(session_task_hdl.id()), 
           format!("tcp://{}", peer_addr_actual)

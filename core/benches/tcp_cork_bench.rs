@@ -4,7 +4,7 @@ use criterion::{
   criterion_group, criterion_main, measurement::WallTime, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
 use rzmq::{
-  socket::{options::{RCVHWM, SNDHWM, SUBSCRIBE, TCP_CORK_OPT}, LINGER},
+  socket::{options::{RCVHWM, SNDHWM, SUBSCRIBE, TCP_CORK}, LINGER},
   Context, Msg, SocketType, ZmqError,
 };
 use std::{sync::atomic::{AtomicU16, Ordering as AtomicOrdering}, time::Duration};
@@ -41,10 +41,10 @@ async fn setup_dealer_router_cork(
 
   if enable_cork {
     #[cfg(target_os = "linux")]
-    dealer.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
+    dealer.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await?;
     #[cfg(not(target_os = "linux"))]
     {
-      let _ = dealer.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await;
+      let _ = dealer.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await;
     }
   }
   dealer.set_option(SNDHWM, &(100i32).to_ne_bytes()).await?;
@@ -80,10 +80,10 @@ async fn setup_pub_sub_cork(
     publisher.set_option(LINGER, &(0i32).to_ne_bytes()).await?;
     subscriber.set_option(LINGER, &(0i32).to_ne_bytes()).await?;
     #[cfg(target_os = "linux")]
-    publisher.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await?;
+    publisher.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await?;
     #[cfg(not(target_os = "linux"))]
     {
-      let _ = publisher.set_option(TCP_CORK_OPT, &(1i32).to_ne_bytes()).await;
+      let _ = publisher.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await;
     }
   }
   publisher.set_option(SNDHWM, &(1000i32).to_ne_bytes()).await?;
