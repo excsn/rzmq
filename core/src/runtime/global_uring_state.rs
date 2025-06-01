@@ -82,6 +82,7 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
   // For OnceCell, this whole block only runs once. So, sending it here is fine.
 
   if !worker_op_tx_signaler.is_closed() {
+    //TODO: Need to think of a better way to get the num buffers and buffer capacity
     // Ensure worker is likely running
       info!("GlobalUringState: Sending InitializeBufferRing request to UringWorker.");
       let (reply_tx, reply_rx) = tokio_oneshot::channel();

@@ -11,8 +11,8 @@ use tokio::task::JoinHandle;
 const ROUTER_IO_URING_ENABLED: bool = true;
 const DEALER_IO_URING_ENABLED: bool = true;
 const TCP_CORK_ENABLED: u32 = 0;
-const NUM_DEALER_TASKS: usize = 8; // Number of concurrent dealer tasks
-const NUM_MESSAGES_PER_DEALER: u64 = 20000; // Messages per dealer task
+const NUM_DEALER_TASKS: usize = 2; // Number of concurrent dealer tasks
+const NUM_MESSAGES_PER_DEALER: u64 = 100000; // Messages per dealer task
 const PAYLOAD_SIZE_BYTES: usize = 1024; // 1KB
 const ROUTER_ENDPOINT: &str = "tcp://127.0.0.1:5558"; // Ensure a unique port
 const CLIENT_PIPELINE_DEPTH: usize = 15000; // How many messages can be sent before waiting for a reply to free up a slot.
