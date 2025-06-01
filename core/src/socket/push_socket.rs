@@ -172,9 +172,10 @@ impl ISocket for PushSocket {
       return Err(ZmqError::ResourceLimitReached);
     }
     if frames.is_empty() {
-      return Ok(());
+      return Ok(()); // Sending an empty multipart is a no-op for PUSH
     }
 
+    // Adjust MORE flags for the logical ZMQ message parts
     let num_frames = frames.len();
     for (i, frame) in frames.iter_mut().enumerate() {
       if i < num_frames - 1 {
@@ -183,10 +184,10 @@ impl ISocket for PushSocket {
         frame.set_flags(frame.flags() & !MsgFlags::MORE);
       }
     }
+    // `frames` now correctly represents the ZMTP frames of one logical ZMQ message.
 
     let sndtimeo_opt: Option<Duration> = self.core.core_state.read().options.sndtimeo;
 
-    // 1. Select a peer connection URI.
     let endpoint_uri_to_send_to = loop {
       if let Some(uri) = self.load_balancer.get_next_connection_uri() {
         if self.core.core_state.read().endpoints.contains_key(&uri) {
@@ -195,8 +196,8 @@ impl ISocket for PushSocket {
           self.load_balancer.remove_connection(&uri);
         }
       } else {
-        if self.core.command_sender().is_closed() {
-          return Err(ZmqError::InvalidState("Socket terminated".into()));
+        if !self.core.is_running().await {
+          return Err(ZmqError::InvalidState("Socket terminated while waiting for peer".into()));
         }
         match sndtimeo_opt {
           Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
@@ -212,7 +213,6 @@ impl ISocket for PushSocket {
       }
     };
 
-    // 2. Get the ISocketConnection interface.
     let connection_iface_arc = {
       let core_s = self.core.core_state.read();
       core_s
@@ -221,53 +221,18 @@ impl ISocket for PushSocket {
         .map(|ep_info| ep_info.connection_iface.clone())
         .ok_or_else(|| {
           self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-          ZmqError::HostUnreachable("Peer for multipart send disappeared after selection".into())
+          ZmqError::HostUnreachable("PUSH: Peer for multipart send disappeared after selection".into())
         })?
     };
 
-    // 3. Send all frames sequentially using the connection interface.
-    for (frame_idx, frame_to_send) in frames.into_iter().enumerate() {
-      match connection_iface_arc.send_message(frame_to_send).await {
-        Ok(()) => { /* Part sent successfully */ }
-        Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
-          tracing::debug!(
-            handle = self.core.handle,
-            uri = %endpoint_uri_to_send_to,
-            frame = frame_idx,
-            "PUSH send_multipart: Dropping frame (and subsequent) for chosen peer due to HWM/Timeout."
-          );
-          // PUSH drops for congested peer and returns Ok to app for the logical message.
-          return Ok(());
-        }
-        Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::Internal(_)) => {
-          tracing::warn!(
-            handle = self.core.handle,
-            uri = %endpoint_uri_to_send_to,
-            frame = frame_idx,
-            error = %e,
-            "PUSH send_multipart: Chosen peer pipe closed/error during send. Removing from LB."
-          );
-          self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-          return Err(if matches!(e, ZmqError::ConnectionClosed) {
-            ZmqError::HostUnreachable("Peer connection closed during multipart send".into())
-          } else {
-            e
-          });
-        }
-        Err(e) => {
-          tracing::error!(
-            handle = self.core.handle,
-            uri = %endpoint_uri_to_send_to,
-            frame = frame_idx,
-            error = %e,
-            "PUSH send_multipart: Unexpected error sending to chosen peer."
-          );
-          self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-          return Err(e);
-        }
+    match connection_iface_arc.send_multipart(frames).await {
+      Ok(()) => Ok(()),
+      Err(ZmqError::ConnectionClosed) => {
+        self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
+        Err(ZmqError::HostUnreachable("PUSH: Peer connection closed during multipart send".into()))
       }
+      Err(e) => Err(e),
     }
-    Ok(())
   }
 
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {

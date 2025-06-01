@@ -295,7 +295,6 @@ impl ISocket for ReqSocket {
     }
   }
 
-  // <<< REVERTED send_multipart to its original form from your provided code >>>
   async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
     tracing::warn!(
       handle = self.core.handle,
@@ -306,7 +305,6 @@ impl ISocket for ReqSocket {
     ))
   }
 
-  // <<< REVERTED recv_multipart to its original form from your provided code >>>
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));

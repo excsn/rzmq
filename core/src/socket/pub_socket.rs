@@ -102,13 +102,14 @@ impl ISocket for PubSocket {
 
   async fn send_multipart(&self, mut frames: Vec<Msg>) -> Result<(), ZmqError> {
     if !self.core.is_running().await {
-        return Err(ZmqError::InvalidState("Socket is closing".into()));
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     if frames.is_empty() {
       tracing::warn!(handle = self.core.handle, "PUB send_multipart called with empty frames vector. Doing nothing.");
       return Ok(());
     }
 
+    // Adjust MORE flags for the logical ZMQ message parts
     let num_frames = frames.len();
     for (i, frame) in frames.iter_mut().enumerate() {
       if i < num_frames - 1 {
@@ -117,42 +118,27 @@ impl ISocket for PubSocket {
         frame.set_flags(frame.flags() & !MsgFlags::MORE);
       }
     }
+    // `frames` now correctly represents the ZMTP frames of one logical ZMQ message.
 
-    // Iterate over each frame and send it using the distributor.
-    // This ensures each frame of the multipart message is fanned out.
-    // The ISocketConnection.send_message() itself handles individual frames.
-    let mut all_fatal_send_errors_for_uris: HashMap<String, ZmqError> = HashMap::new();
-
-    for frame_to_send in frames { // Iterate over owned frames
-        match self.distributor.send_to_all(&frame_to_send, self.core.handle, &self.core.core_state).await {
-            Ok(()) => { /* Frame successfully sent to all (or dropped for some due to HWM) */ }
-            Err(failed_sends) => {
-                for (uri, error) in failed_sends {
-                    // Only store the first fatal error for a given URI
-                    if matches!(error, ZmqError::ConnectionClosed | ZmqError::Internal(_)) {
-                        all_fatal_send_errors_for_uris.entry(uri).or_insert(error);
-                    }
-                }
-            }
-        }
-    }
-
-    if !all_fatal_send_errors_for_uris.is_empty() {
-      for (failed_uri, error_detail) in all_fatal_send_errors_for_uris {
-        tracing::debug!(
+    match self.distributor.send_to_all_multipart(frames, self.core.handle, &self.core.core_state).await {
+      Ok(()) => Ok(()),
+      Err(failed_uris_with_errors) => {
+        for (uri, error_detail) in failed_uris_with_errors {
+          tracing::debug!(
             handle = self.core.handle,
-            uri = %failed_uri,
+            uri = %uri,
             error = %error_detail,
             "PUB send_multipart: Removing disconnected/errored peer URI from distributor."
-        );
-        self.distributor.remove_peer_uri(&failed_uri);
+          );
+          self.distributor.remove_peer_uri(&uri);
+        }
+        Ok(()) 
       }
     }
-    Ok(()) 
   }
 
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    Err(ZmqError::InvalidState("PUB sockets cannot receive messages"))
+    Err(ZmqError::UnsupportedFeature("PUB sockets cannot receive messages"))
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
