@@ -335,6 +335,7 @@ impl UringWorker {
                             self.default_buffer_ring_group_id_val,
                             &mut self.fds_needing_close_initiated_pass,
                             &mut self.pending_sqe_retry_queue,
+                            &mut self.handler_manager,
                         );
                         if !self.fds_needing_close_initiated_pass.is_empty() {
                             warn!("UringWorker: RegisterExternalFd for FD {} generated unexpected close requests immediately.", fd);
@@ -407,6 +408,7 @@ impl UringWorker {
                         self.default_buffer_ring_group_id_val,
                         &mut local_fds_to_close_queue,
                         &mut self.pending_sqe_retry_queue,
+                        &mut self.handler_manager,
                     );
                     drop(sq_for_blueprints);
 
@@ -446,6 +448,7 @@ impl UringWorker {
                         &mut sq_for_shutdown_blueprints, self.default_buffer_ring_group_id_val,
                         &mut self.fds_needing_close_initiated_pass, // Pass mutable reference
                             &mut self.pending_sqe_retry_queue,
+                            &mut self.handler_manager,
                     );
                     drop(sq_for_shutdown_blueprints);
                  } else { 
@@ -469,9 +472,9 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
     let mut profiler = LoopProfiler::new(Duration::from_millis(10), 10000); // Log if loop > 10ms, or every 10000th iteration otherwise
     let mut pending_external_op_retry_queue: VecDeque<UringOpRequest> = VecDeque::new();
     
-    const KERNEL_POLL_INITIAL: Duration = Duration::from_millis(1);
+    const KERNEL_POLL_INITIAL: Duration = Duration::from_micros(1000);
     let mut kernel_poll_timeout_duration = KERNEL_POLL_INITIAL; 
-    const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(16);
+    const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(64);
 
     loop {
 
@@ -532,6 +535,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                     worker.default_buffer_ring_group_id_val,
                     &mut worker.fds_needing_close_initiated_pass,
                     &mut worker.pending_sqe_retry_queue, // Pass it back in case SQ is still full
+                    &mut worker.handler_manager
                 );
                 // sq_for_retry_blueprint is dropped
             } else { break; } // Should not happen if len > 0
@@ -619,6 +623,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                         &mut sq_for_handler_blueprints, worker.default_buffer_ring_group_id_val,
                         &mut worker.fds_needing_close_initiated_pass,
                         &mut worker.pending_sqe_retry_queue,
+                        &mut worker.handler_manager
                     );
                 }
             }
@@ -637,7 +642,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                         let close_io_ops = handler.close_initiated(&interface_for_close);
                         let mut sq_for_close_blueprints = unsafe { worker.ring.submission_shared() };
                         cqe_processor::process_handler_blueprints(fd_to_close, close_io_ops, &mut worker.internal_op_tracker, &mut sq_for_close_blueprints, worker.default_buffer_ring_group_id_val, &mut worker.fds_needing_close_initiated_pass,
-                            &mut worker.pending_sqe_retry_queue,);
+                            &mut worker.pending_sqe_retry_queue, &mut worker.handler_manager);
                     }
                 } else { break; } 
             }

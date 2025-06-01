@@ -1,22 +1,21 @@
 // examples/dealer_router_iouring_throughput.rs
 
 use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
-use rzmq::socket::options as zmq_opts; // For socket option constants
-use std::sync::Arc;
+use rzmq::socket::options as zmq_opts;
 use std::time::{Duration, Instant};
-use bytes::Bytes; // For efficient Bytes cloning
-use futures::future::join_all; // For joining multiple task handles
+use bytes::Bytes;
+use futures::future::join_all;
 use tokio::task::JoinHandle;
 
 // --- Configuration Constants ---
 const ROUTER_IO_URING_ENABLED: bool = true;
 const DEALER_IO_URING_ENABLED: bool = true;
 const TCP_CORK_ENABLED: u32 = 0;
-const NUM_DEALER_TASKS: usize = 32; // Number of concurrent dealer tasks
-const NUM_MESSAGES_PER_DEALER: u64 = 50000; // Messages per dealer task
+const NUM_DEALER_TASKS: usize = 8; // Number of concurrent dealer tasks
+const NUM_MESSAGES_PER_DEALER: u64 = 20000; // Messages per dealer task
 const PAYLOAD_SIZE_BYTES: usize = 1024; // 1KB
 const ROUTER_ENDPOINT: &str = "tcp://127.0.0.1:5558"; // Ensure a unique port
-const CLIENT_PIPELINE_DEPTH: usize = 10000; // How many messages can be sent before waiting for a reply to free up a slot.
+const CLIENT_PIPELINE_DEPTH: usize = 15000; // How many messages can be sent before waiting for a reply to free up a slot.
 
 const TOTAL_MESSAGES_EXPECTED_BY_ROUTER: u64 = (NUM_DEALER_TASKS as u64) * NUM_MESSAGES_PER_DEALER;
 

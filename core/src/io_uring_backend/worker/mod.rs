@@ -7,6 +7,7 @@ mod eventfd_poller;
 mod handler_manager;
 mod internal_op_tracker;
 mod main_loop;
+mod multishot_reader;
 mod sqe_builder;
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
@@ -36,6 +37,7 @@ pub(crate) use eventfd_poller::EventFdPoller;
 pub(crate) use external_op_tracker::{ExternalOpContext, ExternalOpTracker};
 pub(crate) use handler_manager::HandlerManager;
 pub(crate) use internal_op_tracker::{InternalOpTracker, InternalOpPayload, InternalOpType};
+pub(crate) use multishot_reader::MultishotReader; 
 
 pub struct UringWorker {
     ring: IoUring,

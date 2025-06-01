@@ -23,18 +23,19 @@ use tracing::{debug, error, info, trace, warn};
 
 // process_handler_blueprints (signature confirmed from previous discussions)
 pub(crate) fn process_handler_blueprints(
-    fd: RawFd,
+    fd_from_handler_iteration: RawFd,
     ops_output: HandlerIoOps,
     internal_ops: &mut InternalOpTracker,
     sq: &mut squeue::SubmissionQueue<'_>,
     default_bgid_for_read_sqe: Option<u16>,
     fds_to_initiate_close_queue: &mut VecDeque<RawFd>,
     pending_sqe_retry_queue: &mut VecDeque<(RawFd, HandlerSqeBlueprint)>,
+    handler_manager: &mut HandlerManager,
 ) {
     if ops_output.initiate_close_due_to_error {
-        warn!("CQE Processor: Handler for FD {} requested error close via HandlerIoOps.", fd);
-        if !fds_to_initiate_close_queue.contains(&fd) { 
-            fds_to_initiate_close_queue.push_back(fd);
+        warn!("CQE Processor: Handler for FD {} requested error close via HandlerIoOps.", fd_from_handler_iteration);
+        if !fds_to_initiate_close_queue.contains(&fd_from_handler_iteration) { 
+            fds_to_initiate_close_queue.push_back(fd_from_handler_iteration);
         }
     }
 
@@ -43,11 +44,11 @@ pub(crate) fn process_handler_blueprints(
         if unsafe { sq.is_full() } {
             warn!(
                 "CQE Processor: Submission queue full while processing blueprints for FD {}. Blueprint {:?} will be requeued.",
-                fd, blueprint_ref
+                fd_from_handler_iteration, blueprint_ref
             );
             // Requeue the blueprint instead of dropping it.
             // Need to clone the blueprint as we only have a reference.
-            pending_sqe_retry_queue.push_back((fd, (*blueprint_ref).clone()));
+            pending_sqe_retry_queue.push_back((fd_from_handler_iteration, (*blueprint_ref).clone()));
             continue;
         }
 
@@ -56,55 +57,118 @@ pub(crate) fn process_handler_blueprints(
             op_payload_for_tracker = InternalOpPayload::SendBuffer(data.clone());
         }
 
-        let sqe_build_result: Result<(squeue::Entry, InternalOpType), String> = match blueprint_ref { // Use blueprint
+        let sqe_build_result_opt: Option<Result<(squeue::Entry, InternalOpType), String>> = match blueprint_ref { // Use blueprint
             HandlerSqeBlueprint::RequestRingRead => {
                 if let Some(bgid) = default_bgid_for_read_sqe {
-                    let read_op_builder = opcode::Read::new(types::Fd(fd), std::ptr::null_mut(), 0)
+                    let read_op_builder = opcode::Read::new(types::Fd(fd_from_handler_iteration), std::ptr::null_mut(), 0)
                         .offset(u64::MAX) 
                         .buf_group(bgid);
 
                     let mut entry: squeue::Entry = read_op_builder.build();
                     entry = entry.flags(squeue::Flags::BUFFER_SELECT);
-                    Ok((entry, InternalOpType::RingRead))
+                    Some(Ok((entry, InternalOpType::RingRead)))
                 } else {
                     let err_msg = "RequestRingRead blueprint: No default_buffer_ring_group_id configured/passed for SQE construction.".to_string();
-                    Err(err_msg)
+                    Some(Err(err_msg))
                 }
             }
             HandlerSqeBlueprint::RequestSend { data } => {
                 let ptr = data.as_ptr();
                 let len = data.len() as u32;
-                let entry = opcode::Send::new(types::Fd(fd), ptr, len).build();
-                Ok( (entry, InternalOpType::Send) )
+                let entry = opcode::Send::new(types::Fd(fd_from_handler_iteration), ptr, len).build();
+                Some(Ok( (entry, InternalOpType::Send) ))
             }
             HandlerSqeBlueprint::RequestClose => {
-                let entry = opcode::Close::new(types::Fd(fd)).build();
-                Ok( (entry, InternalOpType::CloseFd) )
+                let entry = opcode::Close::new(types::Fd(fd_from_handler_iteration)).build();
+                Some(Ok( (entry, InternalOpType::CloseFd) ))
+            }
+            HandlerSqeBlueprint::RequestNewRingReadMultishot { fd, bgid } => {
+                let fd = *fd;
+                let bgid = *bgid;
+                // fd from blueprint should match fd_from_handler_iteration
+                if fd != fd_from_handler_iteration {
+                    error!("CQE Processor: FD mismatch in RequestNewRingReadMultishot! Handler FD {}, Blueprint FD {}. Dropping.", fd_from_handler_iteration, fd);
+                    continue;
+                }
+                let op_user_data = internal_ops.new_op_id(fd, InternalOpType::RingReadMultishot, InternalOpPayload::None);
+                let entry = opcode::RecvMulti::new(types::Fd(fd), bgid)
+                    .build()
+                    .user_data(op_user_data);
+                
+                unsafe {
+                    if sq.push(&entry).is_err() {
+                        warn!("CQE Processor: SQ push failed for FD {} RecvMulti. Op requeued.", fd);
+                        internal_ops.take_op_details(op_user_data); // Cleanup tracker for failed push
+                        pending_sqe_retry_queue.push_back((fd, HandlerSqeBlueprint::RequestNewRingReadMultishot { fd, bgid }));
+                    } else {
+                        trace!("CQE Processor: Queued RecvMulti SQE (ud:{}) for FD {}.", op_user_data, fd);
+                        // Inform the handler's MultishotReader about the submission
+                        if let Some(handler) = handler_manager.get_mut(fd) {
+                            handler.inform_multishot_reader_op_submitted(op_user_data, false, None);
+                        } else {
+                            warn!("CQE Processor: Handler for FD {} not found after submitting RecvMulti. Reader not informed.", fd);
+                            // This is problematic, as the reader won't know its active UserData.
+                            // Might need to cancel this op if handler is gone.
+                        }
+                    }
+                }
+                None
+            }
+            HandlerSqeBlueprint::RequestNewAsyncCancel { fd, target_user_data } => {
+                let fd = *fd;
+                let target_user_data = *target_user_data;
+                if fd != fd_from_handler_iteration {
+                    error!("CQE Processor: FD mismatch in RequestNewAsyncCancel! Handler FD {}, Blueprint FD {}. Dropping.", fd_from_handler_iteration, fd);
+                    continue;
+                }
+                let cancel_op_payload = InternalOpPayload::CancelTarget { target_user_data };
+                let cancel_op_user_data = internal_ops.new_op_id(fd, InternalOpType::AsyncCancel, cancel_op_payload);
+                let entry = opcode::AsyncCancel::new(target_user_data)
+                    .build()
+                    .user_data(cancel_op_user_data);
+
+                unsafe {
+                    if sq.push(&entry).is_err() {
+                        warn!("CQE Processor: SQ push failed for FD {} AsyncCancel (target_ud: {}). Op requeued.", fd, target_user_data);
+                        internal_ops.take_op_details(cancel_op_user_data);
+                        pending_sqe_retry_queue.push_back((fd, HandlerSqeBlueprint::RequestNewAsyncCancel { fd, target_user_data }));
+                    } else {
+                        trace!("CQE Processor: Queued AsyncCancel SQE (ud:{}, target_ud:{}) for FD {}.", cancel_op_user_data, target_user_data, fd);
+                        if let Some(handler) = handler_manager.get_mut(fd) {
+                            handler.inform_multishot_reader_op_submitted(cancel_op_user_data, true, Some(target_user_data));
+                        } else {
+                            warn!("CQE Processor: Handler for FD {} not found after submitting AsyncCancel. Reader not informed.", fd);
+                        }
+                    }
+                }
+                None
             }
         };
 
-        match sqe_build_result {
-            Ok((mut entry_to_submit, op_type)) => {
-                let user_data = internal_ops.new_op_id(fd, op_type, op_payload_for_tracker);
-                entry_to_submit = entry_to_submit.user_data(user_data);
+        if let Some(sqe_build_result) = sqe_build_result_opt {
+            match sqe_build_result {
+                Ok((mut entry_to_submit, op_type)) => {
+                    let user_data = internal_ops.new_op_id(fd_from_handler_iteration, op_type, op_payload_for_tracker);
+                    entry_to_submit = entry_to_submit.user_data(user_data);
 
-                unsafe {
-                    let push_result = sq.push(&entry_to_submit);
-                    
-                    if push_result.is_err() { 
-                        warn!("CQE Processor: SQ push failed for FD {} blueprint {:?} (race condition or SQ became full?). Op requeued.", fd, entry_to_submit);
+                    unsafe {
+                        let push_result = sq.push(&entry_to_submit);
                         
-                        // Requeue if push fails even after initial SQ full check (race condition).
-                        // Also, need to clean up the internal_op_tracker entry for this failed push.
-                        let _dropped_details = internal_ops.take_op_details(user_data); // Clean up tracker
-                        pending_sqe_retry_queue.push_back((fd, blueprint_ref.clone())); // Requeue
-                    } else {
-                        trace!("CQE Processor: Queued SQE (ud:{}) for FD {} from blueprint: {:?}", user_data, fd, entry_to_submit);
+                        if push_result.is_err() { 
+                            warn!("CQE Processor: SQ push failed for FD {} blueprint {:?} (race condition or SQ became full?). Op requeued.", fd_from_handler_iteration, entry_to_submit);
+                            
+                            // Requeue if push fails even after initial SQ full check (race condition).
+                            // Also, need to clean up the internal_op_tracker entry for this failed push.
+                            let _dropped_details = internal_ops.take_op_details(user_data); // Clean up tracker
+                            pending_sqe_retry_queue.push_back((fd_from_handler_iteration, blueprint_ref.clone())); // Requeue
+                        } else {
+                            trace!("CQE Processor: Queued SQE (ud:{}) for FD {} from blueprint: {:?}", user_data, fd_from_handler_iteration, entry_to_submit);
+                        }
                     }
                 }
-            }
-            Err(s) => {
-                error!("CQE Processor: Failed to build SQE for FD {} from blueprint: {}. Blueprint dropped.", fd, s);
+                Err(s) => {
+                    error!("CQE Processor: Failed to build SQE for FD {} from blueprint: {}. Blueprint dropped.", fd_from_handler_iteration, s);
+                }
             }
         }
     }
@@ -206,6 +270,7 @@ pub(crate) fn process_all_cqes(
                                         default_bgid_val_from_worker,
                                         fds_to_initiate_close_queue,
                                         pending_sqe_retry_queue,
+                                        handler_manager,
                                     );
                                     // sq_for_initial_ops drops here
                                     UringOpCompletion::ConnectSuccess { user_data: cqe_user_data, connected_fd, peer_addr, local_addr }
@@ -237,6 +302,91 @@ pub(crate) fn process_all_cqes(
                  tracing::warn!("CQE Processor: Reply_tx for external op ud {} was already taken.", cqe_user_data);
             }
             continue; // Processed as external op, move to next CQE
+        }
+
+        // Peek at op_details first, especially for multishot, to avoid taking it prematurely.
+        let op_details_peek = internal_ops.get_op_details(cqe_user_data);
+        let mut should_take_op_details_after_delegation = true; // Default to true for most ops
+
+        if let Some(peeked_details) = op_details_peek {
+            let handler_fd_for_op = peeked_details.fd;
+            let op_type_for_op = peeked_details.op_type;
+
+            if matches!(op_type_for_op, InternalOpType::RingReadMultishot | InternalOpType::AsyncCancel) {
+                if let Some(handler) = handler_manager.get_mut(handler_fd_for_op) {
+                    let bm = buffer_manager.expect("BufferManager must exist for multishot ops");
+                    let interface = UringWorkerInterface::new(
+                        handler_fd_for_op, worker_io_config, Some(bm), default_bgid_val_from_worker
+                    );
+                    // Delegate to handler's multishot reader
+                    if let Some(ms_result) = handler.delegate_cqe_to_multishot_reader(
+                        &cqe, bm, &interface, internal_ops // Pass mut internal_ops
+                    ) {
+                        // MultishotReader::process_cqe now returns (HandlerIoOps, bool_should_cleanup_this_ud)
+                        match ms_result {
+                            Ok((handler_ops_from_ms, should_cleanup_current_multishot_ud)) => {
+                                if !should_cleanup_current_multishot_ud && op_type_for_op == InternalOpType::RingReadMultishot {
+                                    // This was a multishot data CQE with F_MORE still set.
+                                    // Do NOT take its details from internal_ops yet.
+                                    should_take_op_details_after_delegation = false;
+                                    trace!("[CQE Processor] Multishot op ud {} still active (F_MORE). Not taking op_details.", cqe_user_data);
+                                }
+                                // If it was an AsyncCancel CQE, its own UD should be cleaned (should_cleanup_current_multishot_ud would be true).
+                                // The target of the cancel also needs cleanup.
+                                if op_type_for_op == InternalOpType::AsyncCancel {
+                                    let mut target_ud_to_clean_additionally: Option<UserData> = None;
+                                    if let Some(taken_cancel_op_details) = internal_ops.take_op_details(cqe_user_data) {
+                                        trace!("[CQE Processor] Consumed InternalOpDetails for AsyncCancel (ud: {}).", cqe_user_data);
+                                        if let InternalOpPayload::CancelTarget { target_user_data } = taken_cancel_op_details.payload {
+                                            target_ud_to_clean_additionally = Some(target_user_data);
+                                        } else {
+                                            warn!("[CQE Processor] AsyncCancel CQE (ud: {}) payload was not CancelTarget.", cqe_user_data);
+                                        }
+                                    } else {
+                                        warn!("[CQE Processor] Failed to take details for AsyncCancel op (ud: {}), already taken?", cqe_user_data);
+                                    }
+                                
+                                    if let Some(target_ud) = target_ud_to_clean_additionally {
+                                        if internal_ops.take_op_details(target_ud).is_some() {
+                                            trace!("[CQE Processor] Cleaned up original multishot op (ud: {}) due to its AsyncCancel (ud: {}) completion.", target_ud, cqe_user_data);
+                                        } else {
+                                            warn!("[CQE Processor] AsyncCancel for ud {} completed, but target ud {} not found in tracker.", cqe_user_data, target_ud);
+                                        }
+                                    }
+                                }
+
+                                if !handler_ops_from_ms.sqe_blueprints.is_empty() || handler_ops_from_ms.initiate_close_due_to_error {
+                                    let mut sq_for_ms_handler_ops = unsafe { ring.submission_shared() };
+                                    process_handler_blueprints(
+                                        handler_fd_for_op, handler_ops_from_ms, internal_ops,
+                                        &mut sq_for_ms_handler_ops, default_bgid_val_from_worker,
+                                        fds_to_initiate_close_queue, pending_sqe_retry_queue, handler_manager,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("[CQE Processor] Error from MultishotReader for FD {}: {}. Closing.", handler_fd_for_op, e);
+                                if !fds_to_initiate_close_queue.contains(&handler_fd_for_op) {
+                                    fds_to_initiate_close_queue.push_back(handler_fd_for_op);
+                                }
+                                // If error, the multishot op is likely terminated, so its UD should be cleaned.
+                                should_take_op_details_after_delegation = true;
+                            }
+                        }
+                        // Since it was handled by delegation, continue to next CQE.
+                        // The taking of op_details happens based on should_take_op_details_after_delegation.
+                        if should_take_op_details_after_delegation {
+                            if internal_ops.take_op_details(cqe_user_data).is_none() {
+                                warn!("[CQE Processor] Post-delegation: Failed to take details for ud {}, op_type {:?}. Already taken or logic error?", cqe_user_data, op_type_for_op);
+                            }
+                        }
+                        continue; 
+                    }
+                } else {
+                    warn!("CQE Processor: Handler for FD {} (op_type {:?}) not found for multishot/cancel delegation.", handler_fd_for_op, op_type_for_op);
+                    // If handler is gone, the op is orphaned. We should clean its details.
+                }
+            }
         }
 
         // --- 2. If not External, it must be an Internal Operation Completion ---
@@ -284,6 +434,7 @@ pub(crate) fn process_all_cqes(
                                          default_bgid_val_from_worker,
                                          fds_to_initiate_close_queue,
                                         pending_sqe_retry_queue,
+                                        handler_manager,
                                      );
                                      // sq_for_accept_initial_ops drops
                                 }
@@ -456,6 +607,7 @@ pub(crate) fn process_all_cqes(
                             default_bgid_val_from_worker,
                             fds_to_initiate_close_queue,
                             pending_sqe_retry_queue,
+                            handler_manager,
                         );
                         // sq_for_handler_resp_ops drops
                     } else { // Handler not found for this FD
@@ -482,6 +634,8 @@ pub(crate) fn process_all_cqes(
                     }
                     // The poller, if it handled it, would have set up for the next poll.
                 }
+                InternalOpType::RingReadMultishot => { warn!("CQE Processor: RingReadMultishot ud {} fell through. Should be handled by MultishotReader delegation.", cqe_user_data); }
+                InternalOpType::AsyncCancel => { warn!("CQE Processor: AsyncCancel ud {} fell through. Should be handled by MultishotReader delegation.", cqe_user_data); }
             } // End match op_type
         } else { // user_data did not match an external or internal op
             warn!("Worker: CQE for UNKNOWN user_data: {} (result: {}, flags: {:x}) - Not external or mapped internal op. CQE Ignored.", cqe_user_data, cqe_result, cqe_flags);

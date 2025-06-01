@@ -13,13 +13,23 @@ use bytes::Bytes; // For HandlerSqeBlueprint::RequestSend
 // --- Blueprints for SQEs requested by handlers ---
 #[derive(Debug, Clone)]
 pub enum HandlerSqeBlueprint {
-    /// Request a ring-buffered read for the handler's FD.
-    /// The UringWorker will use the default_buffer_ring_group_id.
-    RequestRingRead,
-    /// Request to send data. The UringWorker will build a Send SQE.
-    RequestSend { data: Bytes }, // Bytes is cheap to clone
-    /// Request to close the handler's FD. The UringWorker will build a Close SQE.
-    RequestClose,
+  /// Request a ring-buffered read for the handler's FD.
+  /// The UringWorker will use the default_buffer_ring_group_id.
+  RequestRingRead,
+  /// Request to send data. The UringWorker will build a Send SQE.
+  RequestSend { data: Bytes }, // Bytes is cheap to clone
+  /// Request to close the handler's FD. The UringWorker will build a Close SQE.
+  RequestClose,/// Request a multishot ring-buffered read for the handler's FD.
+  /// Signals intent to start a multishot read. Worker will generate UserData.
+  RequestNewRingReadMultishot {
+    fd: RawFd,
+    bgid: u16,
+  },
+  /// Signals intent to cancel an operation. Worker will generate UserData for the cancel op.
+  RequestNewAsyncCancel {
+    fd: RawFd,                  // For context, and to find the MultishotReader
+    target_user_data: UserData, // UserData of the operation to be cancelled
+  },
     // Potentially others: RequestPollAdd, RequestTimeout, etc.
 }
 
@@ -140,6 +150,38 @@ pub trait UringConnectionHandler: Send {
     /// Final notification that the FD has been closed by the worker.
     /// Handler should perform any final cleanup.
     fn fd_has_been_closed(&mut self);
+
+  
+  /// Called by `cqe_processor` to delegate a CQE that might belong to this handler's
+  /// `MultishotReader` (if it has one).
+  ///
+  /// Returns:
+  /// - `Some(Ok((HandlerIoOps, bool)))`: If handled by the multishot reader.
+  ///   - `HandlerIoOps`: Operations requested by the handler after processing the data/event.
+  ///   - `bool (should_cleanup_active_op_ud)`: True if the UserData associated with the
+  ///     *original multishot RECV_MULTISHOT operation* should now be cleaned up from the
+  ///     InternalOpTracker (e.g., MORE flag not set, or error).
+  ///     For an AsyncCancel CQE, this bool refers to the cleanup of the AsyncCancel's *own* UserData.
+  /// - `Some(Err(ZmqError))`: If an error occurred within the multishot reader's processing.
+  /// - `None`: If this handler doesn't use multishot for this CQE, or the CQE wasn't for its reader.
+  fn delegate_cqe_to_multishot_reader(
+    &mut self,
+    cqe: &io_uring::cqueue::Entry, 
+    buffer_manager: &BufferRingManager, 
+    worker_interface: &UringWorkerInterface<'_>, 
+    internal_op_tracker: &mut InternalOpTracker, 
+  ) -> Option<Result<(HandlerIoOps, bool), ZmqError>>;
+
+
+  /// Called by `cqe_processor` (specifically `process_handler_blueprints`) after it successfully
+  /// submits an SQE that was initiated by this handler's `MultishotReader` (either a new
+  /// multishot read or a cancellation for one).
+  ///
+  /// `op_user_data`: The `UserData` assigned by the worker to the submitted SQE.
+  /// `is_cancel_op`: True if the submitted SQE was an `AsyncCancel`.
+  /// `target_op_data_if_cancel`: If `is_cancel_op` is true, this is the `UserData` of the
+  ///                             multishot operation that was targeted for cancellation.
+  fn inform_multishot_reader_op_submitted(&mut self, op_user_data: UserData, is_cancel_op: bool, target_op_data_if_cancel: Option<UserData>);
 }
 
 pub trait ProtocolHandlerFactory: Send + Sync + 'static {
@@ -163,4 +205,6 @@ pub struct WorkerIoConfig {
 // UserData re-export from ops.rs
 pub use crate::io_uring_backend::ops::UserData;
 
+use super::buffer_manager::BufferRingManager;
 use super::ops::ProtocolConfig;
+use super::worker::InternalOpTracker;

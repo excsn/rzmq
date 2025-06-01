@@ -6,6 +6,7 @@ use crate::io_uring_backend::connection_handler::{
 };
 use crate::io_uring_backend::ops::ProtocolConfig;
 
+use crate::io_uring_backend::worker::MultishotReader;
 use crate::protocol::zmtp::{
     greeting::{ZmtpGreeting, GREETING_LENGTH, MECHANISM_LENGTH},
     command::{ZmtpCommand, ZmtpReady},
@@ -29,6 +30,9 @@ use std::time::{Instant, Duration};
 use std::collections::{VecDeque, HashMap};
 use std::any::Any;
 use tracing::{debug, error, info, trace, warn};
+
+use super::buffer_manager::BufferRingManager;
+use super::worker::InternalOpTracker;
 
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -74,7 +78,8 @@ pub struct ZmtpUringHandler {
     peer_identity_from_ready: Option<Blob>,    
     final_peer_identity: Option<Blob>,         
     
-    last_sent_was_ping: bool, 
+    last_sent_was_ping: bool,
+    multishot_reader: Option<MultishotReader>,
 }
 
 impl ZmtpUringHandler {
@@ -113,6 +118,7 @@ impl ZmtpUringHandler {
             peer_identity_from_ready: None,
             final_peer_identity: None,
             last_sent_was_ping: false,
+            multishot_reader: None, 
         }
     }
 
@@ -134,22 +140,27 @@ impl ZmtpUringHandler {
         }
     }
 
-    fn ensure_read_is_pending(&mut self, ops: &mut HandlerIoOps, interface: &UringWorkerInterface<'_>) {
+    /// Ensures a standard (single-shot) ring read is requested if conditions are met.
+    fn ensure_standard_read_is_pending(&mut self, ops: &mut HandlerIoOps, interface: &UringWorkerInterface<'_>) {
+        if self.multishot_reader.is_some() && self.multishot_reader.as_ref().unwrap().is_active() {
+            // Multishot is active, don't submit a standard read.
+            return;
+        }
         if !self.read_is_pending && !matches!(self.phase, ZmtpHandlerPhase::Closed | ZmtpHandlerPhase::Error) {
             if interface.default_buffer_group_id().is_some() {
                 ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestRingRead);
                 self.read_is_pending = true;
-                trace!(fd = self.fd, "ZmtpUringHandler: Requested RingRead.");
+                trace!(fd = self.fd, "ZmtpUringHandler: Requested standard RingRead.");
             } else {
-                error!(fd = self.fd, "ZmtpUringHandler: Critical - Cannot request read, no default_bgid configured for worker. Handler requires ring reads.");
-                let err = ZmqError::Internal("Ring read required by handler but not configured in worker (no default_bgid).".into());
+                error!(fd = self.fd, "ZmtpUringHandler: Critical - Cannot request standard read, no default_bgid configured for worker.");
+                let err = ZmqError::Internal("Standard read required but not configured in worker (no default_bgid).".into());
                 let mut temp_ops = std::mem::take(ops);
                 self.transition_to_error(&mut temp_ops, err, interface); 
                 *ops = temp_ops;
             }
         }
     }
-    
+
     fn transition_to_error(&mut self, ops: &mut HandlerIoOps, error: ZmqError, _interface: &UringWorkerInterface<'_>) {
         if self.phase == ZmtpHandlerPhase::Error || self.phase == ZmtpHandlerPhase::Closed {
             return;
@@ -595,6 +606,20 @@ impl UringConnectionHandler for ZmtpUringHandler {
         self.handshake_timeout_deadline = Instant::now() + self.handshake_timeout; 
         let mut ops = HandlerIoOps::new();
 
+         if self.zmtp_config.use_recv_multishot { // Assuming ZmtpEngineConfig has this field
+            if let Some(bgid) = interface.default_buffer_group_id() {
+                self.multishot_reader = Some(MultishotReader::new(self.fd, bgid));
+                tracing::debug!("[ZmtpUringHandler FD={}] MultishotReader initialized. Initial read will be requested via prepare_sqes.", self.fd);
+                // The actual RequestRingReadMultishot blueprint will be added by prepare_sqes.
+            } else {
+                tracing::error!("[ZmtpUringHandler FD={}] Multishot configured (use_recv_multishot=true) but no default_bgid available from worker interface! Falling back to standard reads.", self.fd);
+                // Fallback: ensure standard read is requested if multishot setup fails
+                self.ensure_standard_read_is_pending(&mut ops, interface);
+            }
+        } else {
+            self.ensure_standard_read_is_pending(&mut ops, interface);
+        }
+
         if self.is_server {
             self.phase = ZmtpHandlerPhase::ServerWaitClientGreeting;
         } else { 
@@ -604,7 +629,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
             ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: greeting_to_send_buf.freeze() });
             self.phase = ZmtpHandlerPhase::ClientSendGreeting;
         }
-        self.ensure_read_is_pending(&mut ops, interface);
+        self.ensure_standard_read_is_pending(&mut ops, interface);
         ops
     }
 
@@ -618,6 +643,19 @@ impl UringConnectionHandler for ZmtpUringHandler {
             let original_phase_eof = self.phase;
             info!(fd = self.fd, ?original_phase_eof, "Peer closed connection (EOF received on read).");
             let eof_err = ZmqError::ConnectionClosed;
+
+            if let Some(reader) = &mut self.multishot_reader {
+                if reader.is_active() {
+                    // The `interface` doesn't easily provide `InternalOpTracker` here.
+                    // `prepare_cancel_blueprint` in MultishotReader needs it.
+                    // This suggests that either `process_ring_read_data` needs the tracker,
+                    // or cancellation due to EOF is handled differently (e.g. by `cqe_processor`
+                    // which *can* call `reader.prepare_cancel_blueprint` with the tracker).
+                    // For now, we'll just transition to error and let `close_initiated` handle cancel.
+                    tracing::info!("[ZmtpUringHandler FD={}] EOF received, multishot was active. Will be cancelled during close_initiated.", self.fd);
+                }
+            }
+
             let mut temp_ops = std::mem::take(&mut ops); self.transition_to_error(&mut temp_ops, eof_err, interface); ops = temp_ops;
             return ops; 
         }
@@ -632,7 +670,12 @@ impl UringConnectionHandler for ZmtpUringHandler {
                  let mut temp_ops = std::mem::take(&mut ops); self.transition_to_error(&mut temp_ops, e, interface); ops = temp_ops;
             }
         }
-        self.ensure_read_is_pending(&mut ops, interface);
+        
+        
+        if self.multishot_reader.as_ref().map_or(true, |r| !r.is_active()) {
+            self.ensure_standard_read_is_pending(&mut ops, interface);
+        }
+
         ops
     }
 
@@ -721,22 +764,38 @@ impl UringConnectionHandler for ZmtpUringHandler {
                 }
             }
         }
-        self.ensure_read_is_pending(&mut ops, interface);
+        
+        if self.multishot_reader.as_ref().map_or(true, |r| !r.is_active()) {
+            self.ensure_standard_read_is_pending(&mut ops, interface);
+        }
+
         ops
     }
 
     fn prepare_sqes(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
         let mut ops = HandlerIoOps::new();
-        self.ensure_read_is_pending(&mut ops, interface);
+        self.ensure_standard_read_is_pending(&mut ops, interface);
 
         if Instant::now() > self.handshake_timeout_deadline &&
            !matches!(self.phase, ZmtpHandlerPhase::DataPhase | ZmtpHandlerPhase::Error | ZmtpHandlerPhase::Closed) {
             warn!(fd = self.fd, current_phase=?self.phase, "Overall handshake timeout occurred in prepare_sqes.");
             let err = ZmqError::Timeout;
             let mut temp_ops = std::mem::take(&mut ops); self.transition_to_error(&mut temp_ops, err.clone(), interface); ops = temp_ops;
-            return ops; 
+            return ops;
         }
         
+        if let Some(reader) = &mut self.multishot_reader {
+            if !reader.is_active() { // Use the reader's state
+                if let Some(blueprint) = reader.prepare_recv_multi_intent() {
+                    ops.sqe_blueprints.push(blueprint);
+                }
+            }
+        } else if !self.read_is_pending {
+            // Fallback to standard read - interface is needed for default_buffer_group_id
+            // Let's pass interface to ensure_standard_read_is_pending
+            self.ensure_standard_read_is_pending(&mut ops, interface);
+        }
+
         if self.phase == ZmtpHandlerPhase::DataPhase {
             if ops.sqe_blueprints.is_empty() { 
                 if let Some(msg_to_send) = self.outgoing_app_messages.pop_front() {
@@ -842,7 +901,11 @@ impl UringConnectionHandler for ZmtpUringHandler {
                 error!(fd = self.fd, "ZmtpUringHandler received non-Msg app data via handle_outgoing_app_data. Ignoring.");
             }
         }
-        self.ensure_read_is_pending(&mut ops, interface);
+        
+        if self.multishot_reader.as_ref().map_or(true, |r| !r.is_active()) {
+            self.ensure_standard_read_is_pending(&mut ops, interface);
+        }
+
         ops
     }
 
@@ -850,6 +913,18 @@ impl UringConnectionHandler for ZmtpUringHandler {
         info!(fd = self.fd, "ZmtpUringHandler: close_initiated called.");
         let mut ops = HandlerIoOps::new(); 
         let previous_phase_on_close = self.phase; 
+
+        if self.zmtp_config.use_recv_multishot { 
+            if let Some(bgid) = interface.default_buffer_group_id() {
+                self.multishot_reader = Some(MultishotReader::new(self.fd, bgid));
+                tracing::debug!("[ZmtpUringHandler FD={}] MultishotReader initialized. Initial read will be requested via prepare_sqes.", self.fd);
+            } else {
+                tracing::error!("[ZmtpUringHandler FD={}] Multishot configured (use_recv_multishot=true) but no default_bgid available from worker interface! Falling back to standard reads.", self.fd);
+                self.ensure_standard_read_is_pending(&mut ops, interface);
+            }
+        } else {
+            self.ensure_standard_read_is_pending(&mut ops, interface);
+        }
         
         self.phase = ZmtpHandlerPhase::Closed;
         self.outgoing_app_messages.clear(); 
@@ -869,6 +944,71 @@ impl UringConnectionHandler for ZmtpUringHandler {
     fn fd_has_been_closed(&mut self) {
         info!(fd = self.fd, "ZmtpUringHandler: fd_has_been_closed notification received.");
         self.phase = ZmtpHandlerPhase::Closed;
+    }
+
+     fn delegate_cqe_to_multishot_reader(
+        &mut self,
+        cqe: &io_uring::cqueue::Entry, // Pass the full CQE
+        buffer_manager: &BufferRingManager, 
+        worker_interface: &UringWorkerInterface<'_>, 
+        internal_op_tracker: &mut InternalOpTracker, 
+    ) -> Option<Result<(HandlerIoOps, bool), ZmqError>> { // bool is should_cleanup_active_op_ud
+        let cqe_user_data = cqe.user_data();
+        
+        // Immutable check first to see if the reader exists and if the UserData might match.
+        let reader_might_handle = self.multishot_reader
+            .as_ref()
+            .map_or(false, |r| r.matches_cqe_user_data(cqe_user_data));
+
+        if reader_might_handle {
+            // If it might handle, take the reader mutably to process the CQE.
+            // This pattern (take, process, put_back) is crucial to avoid borrow checker issues
+            // when `MultishotReader::process_cqe` calls `self.process_ring_read_data`.
+            if let Some(mut reader) = self.multishot_reader.take() {
+                let result_tuple = reader.process_cqe(
+                    cqe,
+                    buffer_manager,
+                    self, // `self` (ZmtpUringHandler) is passed as `owner_handler`
+                    worker_interface,
+                    internal_op_tracker,
+                );
+                // Put the reader back after processing
+                self.multishot_reader = Some(reader);
+                return Some(result_tuple);
+            } else {
+                // This case should ideally not be reached if `reader_might_handle` was true
+                // and `self.multishot_reader` was Some. It implies a logic error or race if
+                // another part of the code could also `take()` the reader.
+                tracing::error!(
+                    "[ZmtpUringHandler FD={}] Inconsistent state in delegate_cqe_to_multishot_reader: \
+                    reader_might_handle was true, but multishot_reader was None on take(). CQE UserData: {}",
+                    self.fd, cqe_user_data
+                );
+                // Fall through to return None, indicating CQE was not handled by multishot logic here.
+            }
+        }
+        None // CQE not for an active multishot reader of this handler, or no reader.
+    }
+
+    fn inform_multishot_reader_op_submitted(
+        &mut self, 
+        op_user_data: UserData, 
+        is_cancel_op: bool, 
+        target_op_data_if_cancel: Option<UserData>
+    ) {
+        if let Some(reader) = &mut self.multishot_reader {
+            if is_cancel_op {
+                if let Some(target_ud) = target_op_data_if_cancel {
+                    reader.mark_cancellation_submitted(op_user_data, target_ud);
+                } else {
+                    tracing::warn!("[ZmtpHandler FD={}] inform_multishot_reader_op_submitted called for cancel_op but target_op_data_if_cancel is None.", self.fd);
+                }
+            } else {
+                reader.mark_operation_submitted(op_user_data);
+            }
+        } else {
+            tracing::warn!("[ZmtpHandler FD={}] inform_multishot_reader_op_submitted called but no multishot_reader exists.", self.fd);
+        }
     }
 }
 

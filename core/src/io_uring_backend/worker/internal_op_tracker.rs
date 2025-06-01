@@ -15,6 +15,8 @@ pub(crate) enum InternalOpType {
   CloseFd,
   GenericHandlerOp,
   EventFdPoll,
+  RingReadMultishot,
+  AsyncCancel,
 }
 
 /// Payload associated with an internal operation, e.g., buffer for send.
@@ -22,6 +24,7 @@ pub(crate) enum InternalOpType {
 pub(crate) enum InternalOpPayload {
   None,
   SendBuffer(Bytes), // Stores the Bytes object for a send operation
+  CancelTarget { target_user_data: UserData },
 }
 
 impl Default for InternalOpPayload {
