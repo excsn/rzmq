@@ -8,7 +8,9 @@ use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::state::EndpointInfo;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::options::ROUTER_MANDATORY;
-use crate::socket::patterns::{incoming_orchestrator::IncomingMessageOrchestrator, RouterMap, WritePipeCoordinator};
+use crate::socket::patterns::{
+    incoming_orchestrator::IncomingMessageOrchestrator, RouterMap, WritePipeCoordinator,
+};
 use crate::socket::{ISocket, SourcePipeReadId};
 
 // Removed: use std::collections::HashMap; // If only used for pipe_to_identity_shared_map
@@ -141,7 +143,9 @@ impl ISocket for RouterSocket {
 
         let active_target_uri_if_fragmenting: Option<String> = {
             let guard = self.current_send_target.lock().await;
-            guard.as_ref().map(|active_info| active_info.target_endpoint_uri.clone())
+            guard
+                .as_ref()
+                .map(|active_info| active_info.target_endpoint_uri.clone())
         };
 
         if let Some(target_uri_for_payload) = active_target_uri_if_fragmenting {
@@ -159,7 +163,9 @@ impl ISocket for RouterSocket {
                     let mut clear_target_guard = self.current_send_target.lock().await;
                     *clear_target_guard = None;
                     return if router_mandatory_opt {
-                        Err(ZmqError::HostUnreachable("Peer for fragmented send disappeared".into()))
+                        Err(ZmqError::HostUnreachable(
+                            "Peer for fragmented send disappeared".into(),
+                        ))
                     } else {
                         Ok(())
                     };
@@ -179,7 +185,9 @@ impl ISocket for RouterSocket {
                 Err(e) => {
                     if router_mandatory_opt {
                         Err(if matches!(e, ZmqError::ConnectionClosed) {
-                            ZmqError::HostUnreachable("Peer disconnected during payload send".into())
+                            ZmqError::HostUnreachable(
+                                "Peer disconnected during payload send".into(),
+                            )
                         } else {
                             e
                         })
@@ -201,7 +209,11 @@ impl ISocket for RouterSocket {
                 ));
             }
 
-            let target_endpoint_uri = match self.router_map_for_send.get_uri_for_identity(&destination_id).await {
+            let target_endpoint_uri = match self
+                .router_map_for_send
+                .get_uri_for_identity(&destination_id)
+                .await
+            {
                 Some(uri) => uri,
                 None => {
                     return if router_mandatory_opt {
@@ -215,18 +227,32 @@ impl ISocket for RouterSocket {
                 }
             };
 
-            let (conn_iface_for_identity, conn_id_for_identity): (Option<Arc<dyn ISocketConnection>>, Option<usize>) =
-                self.core.core_state.read().endpoints.get(&target_endpoint_uri).map_or(
-                    (None, None),
-                    |ep_info| (Some(ep_info.connection_iface.clone()), Some(ep_info.handle_id)),
-                );
+            let (conn_iface_for_identity, conn_id_for_identity): (
+                Option<Arc<dyn ISocketConnection>>,
+                Option<usize>,
+            ) = self
+                .core
+                .core_state
+                .read()
+                .endpoints
+                .get(&target_endpoint_uri)
+                .map_or((None, None), |ep_info| {
+                    (
+                        Some(ep_info.connection_iface.clone()),
+                        Some(ep_info.handle_id),
+                    )
+                });
 
             let (conn_iface, conn_id) = match (conn_iface_for_identity, conn_id_for_identity) {
                 (Some(iface), Some(id)) => (iface, id),
                 _ => {
-                    self.router_map_for_send.remove_peer_by_identity(&destination_id).await;
+                    self.router_map_for_send
+                        .remove_peer_by_identity(&destination_id)
+                        .await;
                     return if router_mandatory_opt {
-                        Err(ZmqError::HostUnreachable("Peer connection for identity disappeared".into()))
+                        Err(ZmqError::HostUnreachable(
+                            "Peer connection for identity disappeared".into(),
+                        ))
                     } else {
                         Ok(())
                     };
@@ -255,7 +281,9 @@ impl ISocket for RouterSocket {
                         Err(e) => {
                             if router_mandatory_opt {
                                 Err(if matches!(e, ZmqError::ConnectionClosed) {
-                                    ZmqError::HostUnreachable("Peer disconnected during delimiter send".into())
+                                    ZmqError::HostUnreachable(
+                                        "Peer disconnected during delimiter send".into(),
+                                    )
                                 } else {
                                     e
                                 })
@@ -268,7 +296,9 @@ impl ISocket for RouterSocket {
                 Err(e) => {
                     if router_mandatory_opt {
                         Err(if matches!(e, ZmqError::ConnectionClosed) {
-                            ZmqError::HostUnreachable("Peer disconnected during identity send".into())
+                            ZmqError::HostUnreachable(
+                                "Peer disconnected during identity send".into(),
+                            )
                         } else {
                             e
                         })
@@ -298,8 +328,9 @@ impl ISocket for RouterSocket {
             ));
         }
 
-        let mut destination_identity_frame = frames.remove(0);
-        let destination_id_blob = Blob::from_bytes(destination_identity_frame.data_bytes().unwrap_or_default());
+        let mut destination_identity_msg = frames.remove(0);
+        let destination_id_blob =
+            Blob::from_bytes(destination_identity_msg.data_bytes().unwrap_or_default());
         if destination_id_blob.is_empty() {
             return Err(ZmqError::InvalidMessage(
                 "First frame (destination identity) cannot be empty.".into(),
@@ -339,9 +370,13 @@ impl ISocket for RouterSocket {
         let (conn_iface, conn_id) = match conn_iface_and_id_opt {
             Some((iface, id)) => (iface, id),
             None => {
-                self.router_map_for_send.remove_peer_by_identity(&destination_id_blob).await;
+                self.router_map_for_send
+                    .remove_peer_by_identity(&destination_id_blob)
+                    .await;
                 return if router_mandatory_opt {
-                    Err(ZmqError::HostUnreachable("Peer connection for identity disappeared".into()))
+                    Err(ZmqError::HostUnreachable(
+                        "Peer connection for identity disappeared".into(),
+                    ))
                 } else {
                     Ok(())
                 };
@@ -371,38 +406,51 @@ impl ISocket for RouterSocket {
                 }
             })?;
 
+        // Now, assemble the ZMTP frames to send on the wire:
+        // [Identity_Frame_MORE, Empty_Delimiter_Frame_MORE_if_payload_else_NOMORE, Payload_Frames...]
+        let mut zmtp_wire_frames: Vec<Msg> = Vec::new();
 
-        destination_identity_frame.set_flags(MsgFlags::MORE);
-        if let Err(e) = conn_iface.send_message(destination_identity_frame).await {
-            return if router_mandatory_opt { Err(e) } else { Ok(()) };
-        }
+        // 1. Identity Frame (from user, ensure MORE is set)
+        destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
+        zmtp_wire_frames.push(destination_identity_msg);
 
+        // 2. Empty Delimiter Frame
         let mut delimiter_frame = Msg::new();
-        delimiter_frame.set_flags(MsgFlags::MORE);
-        if let Err(e) = conn_iface.send_message(delimiter_frame).await {
-            return if router_mandatory_opt { Err(e) } else { Ok(()) };
+        if !frames.is_empty() {
+            // `frames` now only contains payload parts
+            delimiter_frame.set_flags(MsgFlags::MORE);
+        } else {
+            delimiter_frame.set_flags(delimiter_frame.flags() & !MsgFlags::MORE);
+        }
+        zmtp_wire_frames.push(delimiter_frame);
+
+        // 3. Payload Frames (adjust MORE flags)
+        let num_payload_frames = frames.len();
+        for (i, mut frame) in frames.into_iter().enumerate() {
+            if i < num_payload_frames - 1 {
+                frame.set_flags(frame.flags() | MsgFlags::MORE);
+            } else {
+                frame.set_flags(frame.flags() & !MsgFlags::MORE);
+            }
+            zmtp_wire_frames.push(frame);
         }
 
-        let num_payload_frames = frames.len();
-        if num_payload_frames == 0 {
-            // Send a single empty frame if the original payload was empty after identity
-            let last_empty_frame = Msg::new(); // Already has MORE=false by default
-            if let Err(e) = conn_iface.send_message(last_empty_frame).await {
-                return if router_mandatory_opt { Err(e) } else { Ok(()) };
-            }
-        } else {
-            for (i, mut frame) in frames.into_iter().enumerate() {
-                if i < num_payload_frames - 1 {
-                    frame.set_flags(frame.flags() | MsgFlags::MORE);
+        // Call ISocketConnection::send_multipart once with all prepared ZMTP wire frames
+        match conn_iface.send_multipart(zmtp_wire_frames).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Permit is dropped automatically here.
+                if router_mandatory_opt {
+                    Err(if matches!(e, ZmqError::ConnectionClosed) {
+                        ZmqError::HostUnreachable("Peer disconnected during multipart send".into())
+                    } else {
+                        e
+                    })
                 } else {
-                    frame.set_flags(frame.flags() & !MsgFlags::MORE);
-                }
-                if let Err(e) = conn_iface.send_message(frame).await {
-                    return if router_mandatory_opt { Err(e) } else { Ok(()) };
+                    Ok(()) // Silently drop if not mandatory
                 }
             }
         }
-        Ok(())
     }
 
     async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
@@ -410,7 +458,9 @@ impl ISocket for RouterSocket {
             return Err(ZmqError::InvalidState("Socket is closing".into()));
         }
         let rcvtimeo_opt: Option<Duration> = { self.core_state_read().options.rcvtimeo };
-        self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await
+        self.incoming_orchestrator
+            .recv_logical_message(rcvtimeo_opt)
+            .await
     }
 
     async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -440,7 +490,9 @@ impl ISocket for RouterSocket {
     async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
         match event {
             Command::PipeMessageReceived { mut msg, .. } => {
-                msg.metadata_mut().insert_typed(SourcePipeReadId(pipe_read_id)).await;
+                msg.metadata_mut()
+                    .insert_typed(SourcePipeReadId(pipe_read_id))
+                    .await;
                 if let Some(raw_zmtp_message_vec) = self
                     .incoming_orchestrator
                     .accumulate_pipe_frame(pipe_read_id, msg)?
@@ -475,19 +527,32 @@ impl ISocket for RouterSocket {
     }
     // The timed version of handle_pipe_event is omitted for brevity but would follow the same logic changes.
 
-    async fn pipe_attached(&self, pipe_read_id: usize, _pipe_write_id: usize, peer_identity_opt: Option<&[u8]>) {
+    async fn pipe_attached(
+        &self,
+        pipe_read_id: usize,
+        _pipe_write_id: usize,
+        peer_identity_opt: Option<&[u8]>,
+    ) {
         let (endpoint_uri_opt, connection_id_opt) = {
             let core_s_read = self.core_state_read();
-            let uri_opt = core_s_read.pipe_read_id_to_endpoint_uri.get(&pipe_read_id).cloned();
-            let conn_id_opt = uri_opt
-                .as_ref()
-                .and_then(|uri| core_s_read.endpoints.get(uri).map(|ep_info| ep_info.handle_id));
+            let uri_opt = core_s_read
+                .pipe_read_id_to_endpoint_uri
+                .get(&pipe_read_id)
+                .cloned();
+            let conn_id_opt = uri_opt.as_ref().and_then(|uri| {
+                core_s_read
+                    .endpoints
+                    .get(uri)
+                    .map(|ep_info| ep_info.handle_id)
+            });
             (uri_opt, conn_id_opt)
         };
 
         if let (Some(endpoint_uri), Some(connection_id)) = (endpoint_uri_opt, connection_id_opt) {
             let identity_to_use = match peer_identity_opt {
-                Some(id_bytes) if !id_bytes.is_empty() => Blob::from_bytes(Bytes::copy_from_slice(id_bytes)),
+                Some(id_bytes) if !id_bytes.is_empty() => {
+                    Blob::from_bytes(Bytes::copy_from_slice(id_bytes))
+                }
                 _ => Self::pipe_id_to_placeholder_identity(pipe_read_id),
             };
 
@@ -496,7 +561,8 @@ impl ISocket for RouterSocket {
                 .add_peer(identity_to_use.clone(), pipe_read_id, endpoint_uri)
                 .await;
             // Use DashMap API
-            self.pipe_to_identity_shared_map.insert(pipe_read_id, identity_to_use);
+            self.pipe_to_identity_shared_map
+                .insert(pipe_read_id, identity_to_use);
             self.pipe_send_coordinator.add_pipe(connection_id).await;
         } else {
             tracing::warn!(
@@ -525,7 +591,8 @@ impl ISocket for RouterSocket {
                 .update_peer_identity(pipe_read_id, new_identity.clone(), &endpoint_uri)
                 .await;
             // Use DashMap API
-            self.pipe_to_identity_shared_map.insert(pipe_read_id, new_identity);
+            self.pipe_to_identity_shared_map
+                .insert(pipe_read_id, new_identity);
         } else {
             tracing::warn!(
                 handle = self.core.handle,
@@ -536,18 +603,30 @@ impl ISocket for RouterSocket {
     }
 
     async fn pipe_detached(&self, pipe_read_id: usize) {
-        tracing::debug!(handle = self.core.handle, pipe_read_id, "ROUTER detaching pipe");
+        tracing::debug!(
+            handle = self.core.handle,
+            pipe_read_id,
+            "ROUTER detaching pipe"
+        );
 
         let (endpoint_uri_opt, connection_id_opt) = {
             let core_s_read = self.core_state_read();
-            let uri_opt = core_s_read.pipe_read_id_to_endpoint_uri.get(&pipe_read_id).cloned();
-            let conn_id_opt = uri_opt
-                .as_ref()
-                .and_then(|uri| core_s_read.endpoints.get(uri).map(|ep_info| ep_info.handle_id));
+            let uri_opt = core_s_read
+                .pipe_read_id_to_endpoint_uri
+                .get(&pipe_read_id)
+                .cloned();
+            let conn_id_opt = uri_opt.as_ref().and_then(|uri| {
+                core_s_read
+                    .endpoints
+                    .get(uri)
+                    .map(|ep_info| ep_info.handle_id)
+            });
             (uri_opt, conn_id_opt)
         };
 
-        self.router_map_for_send.remove_peer_by_read_pipe(pipe_read_id).await;
+        self.router_map_for_send
+            .remove_peer_by_read_pipe(pipe_read_id)
+            .await;
         // Use DashMap API
         self.pipe_to_identity_shared_map.remove(&pipe_read_id);
 
@@ -563,6 +642,8 @@ impl ISocket for RouterSocket {
                 }
             }
         }
-        self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await;
+        self.incoming_orchestrator
+            .clear_pipe_state(pipe_read_id)
+            .await;
     }
 }
