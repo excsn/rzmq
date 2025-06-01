@@ -164,7 +164,7 @@ impl Socket {
     self.inner.close().await
   }
 
-  /// Creates a monitoring channel for this socket.
+  /// Creates a monitoring channel for this socket. Must be called BEFORE connect.
   ///
   /// Events detailing the socket's internal state changes (e.g., connections established,
   /// disconnections, bind failures, handshake events) will be sent to the returned `MonitorReceiver`.

@@ -249,10 +249,10 @@ impl IpcListener {
             let context_clone = context.clone();
             let socket_options_clone = socket_options.clone();
             let monitor_tx_clone = monitor_tx.clone();
-            let endpoint_uri_listener_clone = endpoint_uri.clone();
             let handle_source_clone = handle_source.clone();
-            let connection_specific_uri_for_task_clone = connection_specific_uri.clone();
-
+            let actual_connected_uri_ipc = connection_specific_uri.clone();
+            let logical_uri = endpoint_uri.clone();
+            
             async move {
               let _permit_scoped_for_task = _permit_guard;
 
@@ -262,7 +262,8 @@ impl IpcListener {
 
               let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
                 session_hdl_id,
-                connection_specific_uri_for_task_clone.clone(),
+                actual_connected_uri_ipc.clone(),
+                logical_uri.clone(),
                 monitor_tx_clone.clone(),
                 context_clone.clone(),
                 parent_socket_core_id,
@@ -302,8 +303,8 @@ impl IpcListener {
 
                 let event = SystemEvent::NewConnectionEstablished {
                   parent_core_id: parent_socket_core_id,
-                  endpoint_uri: connection_specific_uri_for_task_clone.clone(),
-                  target_endpoint_uri: endpoint_uri_listener_clone.clone(),
+                  endpoint_uri: actual_connected_uri_ipc.clone(),
+                  target_endpoint_uri: logical_uri.clone(),
                   connection_iface: None, // SocketCore will create the SessionConnection
                   interaction_model,
                   managing_actor_task_id: managing_actor_task_id_val,
@@ -311,14 +312,14 @@ impl IpcListener {
                 if context_clone.event_bus().publish(event).is_err() {
                   tracing::error!(
                     "Failed to publish NewConnectionEstablished for IPC {}",
-                    connection_specific_uri_for_task_clone
+                    actual_connected_uri_ipc
                   );
                   session_task_hdl.abort();
                 }
               } else {
                 tracing::warn!(
                   "IPC Connection setup failed for {}, NewConnectionEstablished not published.",
-                  connection_specific_uri_for_task_clone
+                  actual_connected_uri_ipc
                 );
               }
             }
@@ -459,12 +460,13 @@ impl IpcConnecter {
 
               let session_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
               let engine_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-              let connection_specific_uri = format!("ipc://{}", peer_addr_str);
+              let actual_connected_uri_ipc = format!("ipc://{}", peer_addr_str);
+              let logical_uri = endpoint_uri_clone.clone(); 
 
               // <<< REMOVED [Pipe creation and AttachPipe send from here] >>>
 
               let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
-                session_hdl_id, connection_specific_uri.clone(), monitor_tx.clone(),
+                session_hdl_id, actual_connected_uri_ipc.clone(), logical_uri.clone(), monitor_tx.clone(),
                 self.context.clone(), self.parent_socket_id,
               );
               let managing_actor_task_id_val = Some(session_task_hdl.id());
@@ -492,7 +494,7 @@ impl IpcConnecter {
                   session_actor_handle_id: session_hdl_id,
                 };
                 let event = SystemEvent::NewConnectionEstablished {
-                  parent_core_id: self.parent_socket_id, endpoint_uri: connection_specific_uri.clone(),
+                  parent_core_id: self.parent_socket_id, endpoint_uri: actual_connected_uri_ipc.clone(),
                   target_endpoint_uri: endpoint_uri_clone.clone(),
                   connection_iface: None, // SocketCore will construct SessionConnection
                   interaction_model,

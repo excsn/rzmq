@@ -270,7 +270,8 @@ impl TcpListener {
             let monitor_tx_clone = monitor_tx.clone();
             let endpoint_uri_listener = endpoint_uri.clone(); 
             let handle_source_clone = handle_source.clone();
-            let connection_specific_uri_for_task = connection_specific_uri.clone();
+            let actual_connected_uri = connection_specific_uri.clone();
+            let logical_uri = endpoint_uri_listener.to_string(); // e.g., "tcp://127.0.0.1:5558"
 
             async move {
               let _permit_scoped_for_task = _permit_guard; 
@@ -354,7 +355,7 @@ impl TcpListener {
                   let engine_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                   let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
-                    session_hdl_id, connection_specific_uri_for_task.clone(), 
+                    session_hdl_id, actual_connected_uri.clone(),  logical_uri.clone(),
                     monitor_tx_clone.clone(), context_clone.clone(), parent_socket_core_id,
                   );
 
@@ -386,14 +387,14 @@ impl TcpListener {
                 if let Some(inter_model) = interaction_model_for_event {
                   let event = SystemEvent::NewConnectionEstablished {
                     parent_core_id: parent_socket_core_id, 
-                    endpoint_uri: connection_specific_uri_for_task.clone(), 
-                    target_endpoint_uri: endpoint_uri_listener.clone(), 
+                    endpoint_uri: actual_connected_uri.clone(), 
+                    target_endpoint_uri: logical_uri.clone(), 
                     connection_iface: connection_iface_for_event, // Will be None for ViaSessionActor here
                     interaction_model: inter_model,
                     managing_actor_task_id: managing_actor_task_id_for_event,
                   };
                   if context_clone.event_bus().publish(event).is_err() {
-                    tracing::error!("Failed to publish NewConnectionEstablished for {}", connection_specific_uri_for_task);
+                    tracing::error!("Failed to publish NewConnectionEstablished for {}", actual_connected_uri);
                     // If session was spawned, it needs to be aborted
                     if let Some(task_id) = managing_actor_task_id_for_event {
                         // This is tricky, we don't have the JoinHandle here directly if it was session path.
@@ -403,10 +404,10 @@ impl TcpListener {
                     }
                   }
                 } else {
-                  tracing::error!("Inconsistent state: setup_successful true but interaction model missing for {}", connection_specific_uri_for_task);
+                  tracing::error!("Inconsistent state: setup_successful true but interaction model missing for {}", actual_connected_uri);
                 }
               } else {
-                tracing::warn!("Connection setup failed for {}, NewConnectionEstablished not published.", connection_specific_uri_for_task);
+                tracing::warn!("Connection setup failed for {}, NewConnectionEstablished not published.", actual_connected_uri);
               }
             } 
           }); 
@@ -632,6 +633,13 @@ impl TcpConnecter {
           }).await.map_err(|je| ZmqError::Internal(format!("Blocking connect join error: {}", je)))?;
           
           let peer_addr_actual = std_stream.peer_addr().map_err(ZmqError::from)?;
+
+          if let Some(ref mon_tx) = monitor_tx {
+              let _ = mon_tx.try_send(SocketEvent::Connected {
+                  endpoint: endpoint_uri_original.to_string(),
+                  peer_addr: format!("tcp://{}", peer_addr_actual),
+              });
+          }
           apply_tcp_socket_options_to_std(&std_stream, &self.config)?; 
           let raw_fd = std_stream.into_raw_fd(); 
 
@@ -684,8 +692,20 @@ impl TcpConnecter {
       } else { // Standard path for SessionBase
         let std_tokio_stream = underlying_std_net::TcpStream::connect(target_socket_addr)
           .await.map_err(|e| ZmqError::from_io_endpoint(e, endpoint_uri_original))?;
-        apply_tcp_socket_options_to_tokio(&std_tokio_stream, &self.config)?;
+
         let peer_addr_actual = std_tokio_stream.peer_addr().map_err(ZmqError::from)?;
+
+        if let Some(ref mon_tx) = monitor_tx {
+                let _ = mon_tx.try_send(SocketEvent::Connected {
+                    endpoint: endpoint_uri_original.to_string(),
+                    peer_addr: format!("tcp://{}", peer_addr_actual),
+                });
+            }
+            
+        apply_tcp_socket_options_to_tokio(&std_tokio_stream, &self.config)?;
+        
+        let actual_connected_uri = format!("tcp://{}", peer_addr_actual);
+        let logical_uri_for_monitor = endpoint_uri_original.to_string();
 
         let session_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let engine_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -693,7 +713,7 @@ impl TcpConnecter {
         // <<< REMOVED [Pipe creation and AttachPipe send from here for standard path] >>>
 
         let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
-          session_hdl_id, format!("tcp://{}", peer_addr_actual), 
+          session_hdl_id, actual_connected_uri, logical_uri_for_monitor, 
           monitor_tx.clone(), 
           self.context.clone(), self.parent_socket_id,
         );

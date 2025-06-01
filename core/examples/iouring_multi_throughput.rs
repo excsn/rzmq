@@ -1,23 +1,36 @@
 // examples/dealer_router_iouring_throughput.rs
 
-use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
-use rzmq::socket::{events::SocketEvent, options as zmq_opts}; // Added SocketEvent
+use rzmq::{Context, Msg, MsgFlags, Socket, SocketType, ZmqError};
+use rzmq::socket::{events::SocketEvent, options as zmq_opts};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures::future::join_all;
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex as TokioMutex, Semaphore, OwnedSemaphorePermit};
+
+mod common;
 
 // --- Configuration Constants ---
 const ROUTER_IO_URING_ENABLED: bool = true;
 const DEALER_IO_URING_ENABLED: bool = true;
-const TCP_CORK_ENABLED: u32 = 0; // 0 for false, 1 for true
+const TCP_CORK_ENABLED: u32 = 1; // 0 for false, 1 for true
 const NUM_DEALER_TASKS: usize = 2;
-const NUM_MESSAGES_PER_DEALER: u64 = 100;
-const PAYLOAD_SIZE_BYTES: usize = 1024; // 1KB payload (excluding sequence number)
+const MAX_CONCURRENT_REQUESTS: usize = 1500;
+const NUM_MESSAGES_PER_DEALER: u64 = 10000; // Reverted for full test
+const PAYLOAD_SIZE_BYTES: usize = 1024;
 const ROUTER_ENDPOINT: &'static str = "tcp://127.0.0.1:5558";
-const CLIENT_PIPELINE_DEPTH: usize = 15000;
-const HANDSHAKE_TIMEOUT_MS: u64 = 5000; // Timeout for waiting for handshake
-const ROUTER_RECV_TIMEOUT_MS: u64 = 10000; // Router waits 10s for a message before timing out
+
+const HANDSHAKE_TIMEOUT_MS: u64 = 5000;
+const ROUTER_RECV_TIMEOUT_MS: u64 = 10000; // Router timeout for individual recvs
+// Timeout for the central receiver to wait for replies after all sends are done.
+const CENTRAL_RECEIVER_OVERALL_TIMEOUT_MS: u64 = 30000;
+// Timeout for central receiver if it's idle (no messages received) for this duration.
+const CENTRAL_RECEIVER_IDLE_TIMEOUT_MS: u64 = 5000;
+// Timeout on the dealer socket for the central receiver's recv_multipart() calls.
+// Should be short to allow periodic checks of other conditions (e.g. overall timeout).
+const CENTRAL_RECEIVER_SOCKET_RECV_TIMEOUT_MS: u64 = 200;
+
 
 const TOTAL_MESSAGES_EXPECTED_BY_ROUTER: u64 = (NUM_DEALER_TASKS as u64) * NUM_MESSAGES_PER_DEALER;
 
@@ -26,323 +39,319 @@ const PRINT_PER_TASK_SUMMARY: bool = true;
 const PRINT_INDIVIDUAL_MESSAGES: bool = false;
 const PRINT_HANDSHAKE_EVENTS: bool = true;
 
-// Helper to prepend sequence number
-fn create_payload_with_seq(seq: u64, template: &Bytes) -> Bytes {
-    let mut full_payload = Vec::with_capacity(8 + template.len());
-    full_payload.extend_from_slice(&seq.to_be_bytes());
-    full_payload.extend_from_slice(template);
-    Bytes::from(full_payload)
+type RequestId = u64;
+type PendingRequestsMap = Arc<TokioMutex<HashMap<RequestId, OwnedSemaphorePermit>>>;
+
+fn generate_request_id(dealer_id: usize, message_seq_num: u64) -> RequestId {
+  ((dealer_id as u64) << 32) | (message_seq_num & 0xFFFFFFFF)
 }
 
-// Helper to extract sequence number
-fn extract_seq_from_payload(payload: &[u8]) -> Option<u64> {
-    if payload.len() >= 8 {
-        let seq_bytes: [u8; 8] = payload[0..8].try_into().ok()?;
-        Some(u64::from_be_bytes(seq_bytes))
-    } else {
-        None
+fn create_request_frames(request_id: RequestId, payload_template: &Bytes) -> Vec<Msg> {
+  let mut req_id_msg = Msg::from_bytes(Bytes::copy_from_slice(&request_id.to_be_bytes()));
+  req_id_msg.set_flags(MsgFlags::MORE);
+  
+  let mut payload_msg = Msg::from_bytes(payload_template.clone());
+  payload_msg.set_flags(MsgFlags::empty());
+
+  vec![req_id_msg, payload_msg]
+}
+
+fn extract_reply_data(mut frames: Vec<Msg>) -> Option<(RequestId, Vec<Msg>)> {
+    if frames.is_empty() {
+        if PRINT_INDIVIDUAL_MESSAGES { eprintln!("[DEALER Central Receiver] extract_reply_data: Received empty frame list.");}
+        return None;
     }
-}
+    if frames[0].size() == 0 { // ZMTP empty delimiter prepended by ROUTER socket logic
+        if PRINT_INDIVIDUAL_MESSAGES { println!("[DEALER Central Receiver] extract_reply_data: Consuming leading empty delimiter frame from ROUTER."); }
+        frames.remove(0);
+        if frames.is_empty() {
+             if PRINT_INDIVIDUAL_MESSAGES { eprintln!("[DEALER Central Receiver] extract_reply_data: No frames after empty delimiter."); }
+            return None;
+        }
+    }
+    if frames.is_empty() {
+        if PRINT_INDIVIDUAL_MESSAGES { eprintln!("[DEALER Central Receiver] extract_reply_data: No request_id frame found after delimiter processing."); }
+        return None;
+    }
 
+    let request_id_frame = frames.remove(0); // This should be the request_id echoed by the router
+    let request_id_bytes = match request_id_frame.data() {
+        Some(d) => d,
+        None => {
+            if PRINT_INDIVIDUAL_MESSAGES { eprintln!("[DEALER Central Receiver] extract_reply_data: request_id_frame has no data."); }
+            return None;
+        }
+    };
+    if request_id_bytes.len() != 8 {
+        if PRINT_INDIVIDUAL_MESSAGES {
+            eprintln!("[DEALER Central Receiver] Malformed reply: request_id frame wrong size (expected 8, got {}). Content (hex): {:02x?}",
+            request_id_bytes.len(), request_id_bytes);
+        }
+        return None;
+    }
+    let id = u64::from_be_bytes(request_id_bytes.try_into().ok()?);
+    Some((id, frames)) // Remaining frames are the echoed payload
+}
 
 // --- ROUTER Task (Server Side) ---
 async fn run_router_task(
-    ctx: Context,
+    router_socket: Socket,
     endpoint: &'static str,
     total_expected_messages: u64,
-) -> Result<(u64, u64, u64), ZmqError> { // Added timeouts_occurred
-    let router_socket = ctx.socket(SocketType::Router)?;
-    router_socket.set_option(zmq_opts::IO_URING_SESSION_ENABLED, ROUTER_IO_URING_ENABLED).await?;
-    router_socket.set_option(zmq_opts::IO_URING_RCVMULTISHOT, ROUTER_IO_URING_ENABLED).await?;
-    router_socket.set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED).await?;
-    router_socket.set_option(zmq_opts::RCVHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
-    router_socket.set_option(zmq_opts::SNDHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
-    // Set RCVTIMEO for the router
-    router_socket.set_option(zmq_opts::RCVTIMEO, ROUTER_RECV_TIMEOUT_MS as i32).await?;
+) -> Result<(u64, u64, u64), ZmqError> { // Returns (echoed_msgs, echoed_bytes, timeouts)
 
-
-    println!("[ROUTER] Binding to {}...", endpoint);
-    router_socket.bind(endpoint).await?;
     println!("[ROUTER] Bound successfully. Expecting {} total messages.", total_expected_messages);
-
     let mut messages_echoed = 0u64;
     let mut bytes_echoed = 0u64;
     let mut timeouts_occurred = 0u64;
-    let mut received_count = 0u64; // Track how many we've actually received
+    let mut received_count = 0u64;
 
-    // Loop until we've processed the expected number or too many timeouts
     while received_count < total_expected_messages {
         match router_socket.recv_multipart().await {
             Ok(mut received_parts) => {
                 received_count += 1;
-                if received_parts.is_empty() {
-                    eprintln!("[ROUTER] Received empty multipart message (recv_idx {}), ignoring.", received_count -1);
+                if received_parts.len() < 2 {
+                    if PRINT_INDIVIDUAL_MESSAGES {
+                        eprintln!(
+                            "[ROUTER] Received malformed message ({} parts), expecting at least 2 (identity, request_id, ...). Received count {}. Ignoring. Parts: {:?}",
+                            received_parts.len(), received_count, received_parts.iter().map(|m| m.size()).collect::<Vec<_>>()
+                        );
+                    }
                     continue;
                 }
                 let client_identity_frame = received_parts.remove(0);
-                
-                // Extract sequence number from the first payload part
-                let original_seq = if let Some(first_payload) = received_parts.first() {
-                    extract_seq_from_payload(first_payload.data().unwrap_or_default())
-                } else { None };
-
                 if PRINT_INDIVIDUAL_MESSAGES {
-                     println!(
-                        "[ROUTER] Received (idx {}): Identity='{:?}', Seq={:?}, {} payload parts. First part size: {}",
-                        received_count - 1,
-                        String::from_utf8_lossy(client_identity_frame.data().unwrap_or_default()),
-                        original_seq,
-                        received_parts.len(),
-                        received_parts.first().map_or(0, |p| p.size())
+                    let request_id_from_payload = if !received_parts.is_empty() && received_parts[0].data().map_or(0, |d| d.len()) == 8 {
+                        let id_bytes: [u8; 8] = received_parts[0].data().unwrap()[0..8].try_into().unwrap();
+                        Some(u64::from_be_bytes(id_bytes))
+                    } else { None };
+                    println!(
+                        "[ROUTER] Received (idx {}): Identity='{:?}', RequestId={:?}, AppPayloadParts (after req_id)={}",
+                        received_count - 1, String::from_utf8_lossy(client_identity_frame.data().unwrap_or_default()),
+                        request_id_from_payload, received_parts.len().saturating_sub(1)
                     );
                 }
-
-                let mut reply_to_send = Vec::with_capacity(1 + received_parts.len());
-                let mut id_reply_frame = client_identity_frame; // Use the original identity frame
+                let mut reply_to_send: Vec<Msg> = Vec::with_capacity(1 + received_parts.len());
+                let mut id_reply_frame = client_identity_frame;
                 if !received_parts.is_empty() {
                     id_reply_frame.set_flags(id_reply_frame.flags() | MsgFlags::MORE);
-                } else { // Should not happen if we expect payload
+                } else {
                     id_reply_frame.set_flags(id_reply_frame.flags() & !MsgFlags::MORE);
                 }
                 reply_to_send.push(id_reply_frame);
-
-                let num_payload_parts = received_parts.len();
+                let num_app_frames_to_echo = received_parts.len();
                 for (idx, mut part) in received_parts.into_iter().enumerate() {
                     bytes_echoed += part.size() as u64;
-                    if idx < num_payload_parts - 1 {
+                    if idx < num_app_frames_to_echo - 1 {
                         part.set_flags(part.flags() | MsgFlags::MORE);
                     } else {
                         part.set_flags(part.flags() & !MsgFlags::MORE);
                     }
                     reply_to_send.push(part);
                 }
-
                 if let Err(e) = router_socket.send_multipart(reply_to_send).await {
-                    eprintln!("[ROUTER] Error sending reply for recv_idx {}: {}", received_count -1, e);
-                    return Err(e); // Break on send error
+                    eprintln!("[ROUTER] Error sending reply for received message #{}: {}", received_count, e);
+                    return Err(e);
                 }
                 messages_echoed += 1;
             }
             Err(ZmqError::Timeout) => {
                 timeouts_occurred += 1;
-                eprintln!("[ROUTER] Recv timeout (total timeouts: {}). Still expecting {} messages.", timeouts_occurred, total_expected_messages - received_count);
-                if timeouts_occurred > (total_expected_messages / 1000).max(10) { // Example: if 0.1% or at least 10 timeouts occur
-                    eprintln!("[ROUTER] Too many timeouts. Terminating echo task.");
+                if PRINT_INDIVIDUAL_MESSAGES || timeouts_occurred % 100 == 0 {
+                    eprintln!("[ROUTER] Recv timeout (total timeouts: {}). Still expecting {} of {} total messages.",
+                        timeouts_occurred, total_expected_messages.saturating_sub(received_count), total_expected_messages);
+                }
+                if timeouts_occurred > (total_expected_messages / 100).max(20) && received_count < total_expected_messages {
+                    eprintln!("[ROUTER] Excessive timeouts ({}). Terminating echo task prematurely. Received {}/{} messages.",
+                        timeouts_occurred, received_count, total_expected_messages);
                     break;
                 }
-                // Continue waiting for more messages
             }
             Err(ZmqError::InvalidState(ref msg)) if msg.contains("Socket is closing") => {
-                println!("[ROUTER] Socket closing, terminating echo task (after {} received).", received_count);
+                println!("[ROUTER] Socket is closing, terminating echo task. Received {} messages.", received_count);
                 break;
             }
             Err(e) => {
-                eprintln!("[ROUTER] recv_multipart error (after {} received): {}, terminating echo task.", received_count, e);
+                eprintln!("[ROUTER] recv_multipart error after receiving {} messages: {}. Terminating echo task.", received_count, e);
                 return Err(e);
             }
         }
     }
-    println!("[ROUTER] Echo task finished. Total Received: {}. Echoed: {}. Timeouts: {}. Bytes Echoed: {}.",
-             received_count, messages_echoed, timeouts_occurred, bytes_echoed);
+    println!(
+        "[ROUTER] Echo task finished. Total Actually Received: {}. Messages Echoed: {}. Timeouts During Recv: {}. Bytes Echoed: {}.",
+        received_count, messages_echoed, timeouts_occurred, bytes_echoed
+    );
     Ok((messages_echoed, bytes_echoed, timeouts_occurred))
 }
 
-// --- DEALER Task (Client Side Worker) ---
+// --- DEALER Side ---
+
 #[derive(Debug)]
 struct DealerTaskStats {
     id: usize,
     messages_sent: u64,
     bytes_sent: u64,
-    messages_received: u64,
-    bytes_received: u64,
-    duration: Duration,
     send_errors: u64,
-    recv_errors: u64,
-    seq_errors: u64,
+    duration: Duration,
 }
 
-async fn run_dealer_task(
+async fn run_dealer_central_receiver(
     dealer_socket: rzmq::Socket,
+    pending_requests_map: PendingRequestsMap,
+    total_expected_replies: u64,
+) -> (u64, u64, u64, Option<Instant>) { // (replies_processed, bytes_replied, extraction_errors, last_reply_timestamp)
+    println!("[DEALER Central Receiver] Task started. Expecting up to {} replies.", total_expected_replies);
+    let mut replies_processed = 0u64;
+    let mut bytes_replied = 0u64;
+    let mut extraction_errors = 0u64;
+    let mut last_message_activity_time = Instant::now();
+    let mut last_valid_reply_timestamp: Option<Instant> = None;
+
+    while replies_processed + extraction_errors < total_expected_replies {
+        match dealer_socket.recv_multipart().await {
+            Ok(mut frames_from_dealer_socket) => {
+                last_message_activity_time = Instant::now();
+                if PRINT_INDIVIDUAL_MESSAGES {
+                    println!("[DEALER Central Receiver] Raw frames from socket (count: {}): sizes {:?}",
+                       frames_from_dealer_socket.len(),
+                       frames_from_dealer_socket.iter().map(|f| f.size()).collect::<Vec<_>>());
+                }
+                if let Some((request_id, reply_payload_parts)) = extract_reply_data(frames_from_dealer_socket) {
+                    if PRINT_INDIVIDUAL_MESSAGES {
+                        println!("[DEALER Central Receiver] Extracted RequestId: {}, with {} payload parts.", request_id, reply_payload_parts.len());
+                    }
+                    let mut map_guard = pending_requests_map.lock().await;
+                    if let Some(_permit_to_drop) = map_guard.remove(&request_id) {
+                        drop(map_guard);
+                        replies_processed += 1;
+                        for part in &reply_payload_parts {
+                            bytes_replied += part.size() as u64;
+                        }
+                        last_valid_reply_timestamp = Some(Instant::now());
+                        if PRINT_INDIVIDUAL_MESSAGES {
+                            println!("[DEALER Central Receiver] Processed reply for RequestId {}, permit released.", request_id);
+                        }
+                    } else {
+                        drop(map_guard);
+                         if PRINT_INDIVIDUAL_MESSAGES {
+                            println!("[DEALER Central Receiver] No pending permit for RequestId {} (already timed out by main logic or late/duplicate reply).", request_id);
+                         }
+                    }
+                } else {
+                    if PRINT_INDIVIDUAL_MESSAGES { eprintln!("[DEALER Central Receiver] Failed to extract RequestId from reply. Frames might be malformed."); }
+                    extraction_errors += 1;
+                }
+            }
+            Err(ZmqError::InvalidState(ref msg)) if msg.contains("Socket is closing") => {
+                println!("[DEALER Central Receiver] Main DEALER socket closing (likely signaled by main). Terminating receiver task.");
+                break;
+            }
+            Err(ZmqError::Timeout) => {
+                if PRINT_INDIVIDUAL_MESSAGES { println!("[DEALER Central Receiver] Main DEALER socket recv timed out."); }
+                if last_message_activity_time.elapsed() > Duration::from_millis(CENTRAL_RECEIVER_IDLE_TIMEOUT_MS) &&
+                   (replies_processed + extraction_errors < total_expected_replies) { // Only break if idle AND still expecting more
+                    println!("[DEALER Central Receiver] Idle for over {}ms. Processed {} of {} expected replies. Terminating.",
+                        CENTRAL_RECEIVER_IDLE_TIMEOUT_MS, replies_processed + extraction_errors, total_expected_replies);
+                    break;
+                }
+                if replies_processed + extraction_errors >= total_expected_replies { // All expected accounted for
+                     println!("[DEALER Central Receiver] Socket recv timed out, but all expected replies/errors accounted for. Terminating.");
+                    break;
+                }
+                // Otherwise, continue waiting if still expecting replies and not idle for too long.
+            }
+            Err(e) => {
+                eprintln!("[DEALER Central Receiver] Error receiving from main DEALER socket: {}. Terminating.", e);
+                break;
+            }
+        }
+    }
+    println!("[DEALER Central Receiver] Task finished. Replies processed: {}, Bytes replied: {}, Extraction Errors: {}", replies_processed, bytes_replied, extraction_errors);
+    (replies_processed, bytes_replied, extraction_errors, last_valid_reply_timestamp)
+}
+
+
+async fn run_dealer_task(
+    dealer_socket_shared_clone: rzmq::Socket,
     dealer_id: usize,
     num_messages_for_this_task: u64,
     message_payload_template: Bytes,
+    pending_requests_map_clone: PendingRequestsMap,
+    shared_semaphore: Arc<Semaphore>,
 ) -> Result<DealerTaskStats, ZmqError> {
     let mut task_messages_sent = 0u64;
     let mut task_bytes_sent = 0u64;
-    let mut task_messages_received = 0u64;
-    let mut task_bytes_received = 0u64;
-    let task_start_time = Instant::now();
     let mut send_errors = 0u64;
-    let mut recv_errors = 0u64;
-    let mut seq_errors = 0u64;
+    let task_start_time = Instant::now();
 
-    if PRINT_INDIVIDUAL_MESSAGES {
-        println!("[DEALER {}] Task started, will send {} messages.", dealer_id, num_messages_for_this_task);
+    for j in 0..num_messages_for_this_task {
+        let permit = match shared_semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("[DEALER {}] Shared semaphore closed while acquiring for send (idx {}). Aborting task.", dealer_id, j);
+                send_errors += num_messages_for_this_task - j;
+                break;
+            }
+        };
+
+        let request_id = generate_request_id(dealer_id, j);
+        pending_requests_map_clone.lock().await.insert(request_id, permit);
+
+        let app_frames_to_send = create_request_frames(request_id, &message_payload_template);
+        let current_payload_total_size: u64 = app_frames_to_send.iter().map(|m| m.size() as u64).sum();
+
+        if PRINT_INDIVIDUAL_MESSAGES {
+            println!("[DEALER {}] Sending RequestId: {}", dealer_id, request_id);
+        }
+
+        match dealer_socket_shared_clone.send_multipart(app_frames_to_send).await {
+            Ok(_) => {
+                task_messages_sent += 1;
+                task_bytes_sent += current_payload_total_size;
+            }
+            Err(e) => {
+                eprintln!("[DEALER {}] Send error for RequestId {}: {}", dealer_id, request_id, e);
+                send_errors += 1;
+                if let Some(permit_to_drop) = pending_requests_map_clone.lock().await.remove(&request_id) {
+                    drop(permit_to_drop);
+                     if PRINT_INDIVIDUAL_MESSAGES { println!("[DEALER {}] Send error path: Permit for RequestId {} released.", dealer_id, request_id); }
+                } else {
+                     if PRINT_INDIVIDUAL_MESSAGES { println!("[DEALER {}] Send error path: No permit found in map for failed RequestId {}.", dealer_id, request_id); }
+                }
+            }
+        }
     }
 
-    let (permit_tx, mut permit_rx) = tokio::sync::mpsc::channel(CLIENT_PIPELINE_DEPTH);
-    for _ in 0..CLIENT_PIPELINE_DEPTH {
-        permit_tx.send(()).await.expect("Failed to fill permit channel");
+    if PRINT_INDIVIDUAL_MESSAGES && task_messages_sent == num_messages_for_this_task {
+        println!("[DEALER {}] All {} sends initiated by this task.", dealer_id, task_messages_sent);
     }
-
-    let sender_socket_clone = dealer_socket.clone();
-    let sender_payload_template_clone = message_payload_template.clone();
-
-    let sender_handle: JoinHandle<Result<(u64, u64, u64), ZmqError>> = tokio::spawn(async move {
-        let mut s_sent = 0u64;
-        let mut b_sent = 0u64;
-        let mut s_errors = 0u64;
-        for j in 0..num_messages_for_this_task {
-            if permit_rx.recv().await.is_none() {
-                 eprintln!("[DEALER {} Sender] Permit channel closed. Stopping sends.", dealer_id);
-                 break;
-            }
-
-            let payload_with_seq = create_payload_with_seq(j, &sender_payload_template_clone);
-            let payload_size_with_seq = payload_with_seq.len();
-            let msg_to_send = Msg::from_bytes(payload_with_seq);
-
-            if PRINT_INDIVIDUAL_MESSAGES {
-                // println!("[DEALER {}] Sending msg #{} (Seq: {})", dealer_id, j, j);
-            }
-            match sender_socket_clone.send(msg_to_send).await {
-                Ok(_) => {
-                    s_sent += 1;
-                    b_sent += payload_size_with_seq as u64;
-                }
-                Err(e) => {
-                    eprintln!("[DEALER {} Sender] Send error on message #{} (Seq {}): {}", dealer_id, j, j, e);
-                    s_errors += 1;
-                    // Don't return permit on error, let receiver side timeout or error out
-                    // to prevent deadlock if send fails persistently.
-                    // Alternatively, could try to return permit and let receiver handle less replies.
-                    // For this test, we'll assume sender stops and receiver eventually times out or errors.
-                    return Err(e);
-                }
-            }
-        }
-        if PRINT_INDIVIDUAL_MESSAGES {
-            println!("[DEALER {} Sender] All sends initiated. Total errors: {}", dealer_id, s_errors);
-        }
-        Ok((s_sent, b_sent, s_errors))
-    });
-
-    let receiver_handle: JoinHandle<Result<(u64, u64, u64, u64), ZmqError>> = tokio::spawn(async move {
-        let mut r_received = 0u64;
-        let mut b_received = 0u64;
-        let mut r_errors = 0u64;
-        let mut s_errors_local = 0u64; // Sequence errors
-
-        // Receiver attempts to receive one reply for each message the sender *intended* to send
-        for i in 0..num_messages_for_this_task {
-            match dealer_socket.recv().await {
-                Ok(reply_msg) => {
-                    if PRINT_INDIVIDUAL_MESSAGES {
-                        // println!("[DEALER {} Receiver] Received reply for sent_idx #{} (Size: {})", dealer_id, i, reply_msg.size());
-                    }
-                    let reply_payload = reply_msg.data().unwrap_or_default();
-                    let received_seq = extract_seq_from_payload(reply_payload);
-
-                    // Basic check: does reply payload seem to contain our original payload?
-                    // This is a bit simplified; a robust check would compare entire content after seq.
-                    let expected_size_with_seq = 8 + message_payload_template.len();
-                    if reply_msg.size() == expected_size_with_seq {
-                        if received_seq == Some(i) { // Simple in-order check for this dealer's stream
-                            r_received += 1;
-                            b_received += reply_msg.size() as u64;
-                        } else {
-                            eprintln!(
-                                "[DEALER {} Receiver] Reply for sent_idx #{} has unexpected sequence. Expected: Some({}), Got: {:?}.",
-                                dealer_id, i, i, received_seq
-                            );
-                            s_errors_local += 1;
-                            // Still count as received for pipeline permit
-                        }
-                    } else {
-                        eprintln!(
-                            "[DEALER {} Receiver] Reply for sent_idx #{} unexpected size. Expected: {}, Got: {}.",
-                            dealer_id, i, expected_size_with_seq, reply_msg.size()
-                        );
-                        s_errors_local += 1; // Count as a form of sequence/payload error
-                    }
-
-                    if permit_tx.send(()).await.is_err() {
-                        eprintln!("[DEALER {} Receiver] Failed to return permit, sender task may have exited early.", dealer_id);
-                        break;
-                    }
-                }
-                Err(ZmqError::Timeout) => {
-                    eprintln!("[DEALER {} Receiver] Recv timeout on reply for sent_idx #{}. Assuming message lost or router slow.", dealer_id, i);
-                    r_errors +=1;
-                    // We MUST return the permit here, otherwise the sender will deadlock if it's still sending.
-                    if permit_tx.send(()).await.is_err() {
-                        eprintln!("[DEALER {} Receiver] Failed to return permit after timeout, sender task may have exited early.", dealer_id);
-                        break;
-                    }
-                    // continue to try receiving next expected message
-                }
-                Err(e) => {
-                    eprintln!("[DEALER {} Receiver] Recv error on reply for sent_idx #{}: {}", dealer_id, i, e);
-                    r_errors += 1;
-                    // Do not return permit here, as the send loop might be broken.
-                    // If sender is fine, it will block. If sender also errored, both stop.
-                    return Err(e);
-                }
-            }
-        }
-        if PRINT_INDIVIDUAL_MESSAGES {
-            println!("[DEALER {} Receiver] All expected replies processed (or loop terminated). Errors: {}, Seq Errors: {}",
-                     dealer_id, r_errors, s_errors_local);
-        }
-        Ok((r_received, b_received, r_errors, s_errors_local))
-    });
-
-    let (sent_res, recvd_res) = tokio::try_join!(sender_handle, receiver_handle)
-        .map_err(|je| ZmqError::Internal(format!("Dealer task join error: {}", je)))?; // Handle JoinError
-
-    let (s_sent, b_sent, s_errors_from_sender) = sent_res?;
-    let (r_recvd, b_recvd, r_errors_from_receiver, s_errors_from_receiver) = recvd_res?;
-
-    task_messages_sent = s_sent;
-    task_bytes_sent = b_sent;
-    send_errors = s_errors_from_sender;
-    task_messages_received = r_recvd;
-    task_bytes_received = b_recvd;
-    recv_errors = r_errors_from_receiver;
-    seq_errors = s_errors_from_receiver;
 
     let task_duration = task_start_time.elapsed();
-    if PRINT_PER_TASK_SUMMARY || task_messages_sent != task_messages_received || send_errors > 0 || recv_errors > 0 || seq_errors > 0 {
+    if PRINT_PER_TASK_SUMMARY || send_errors > 0 {
         println!(
-            "[DEALER {}] Task finished. Duration: {:?}. Sent: {} (err:{}). Received: {} (err:{}, seq_err:{}). Rate: {:.2} req/s",
+            "[DEALER {}] Task finished sending. Duration: {:?}. Sent: {} (err:{}). Rate (sent): {:.2} req/s",
             dealer_id,
             task_duration,
             task_messages_sent, send_errors,
-            task_messages_received, recv_errors, seq_errors,
-            task_messages_sent as f64 / task_duration.as_secs_f64() // Rate based on successful sends
+            task_messages_sent as f64 / task_duration.as_secs_f64().max(1e-9)
         );
     }
-
     Ok(DealerTaskStats {
         id: dealer_id,
         messages_sent: task_messages_sent,
         bytes_sent: task_bytes_sent,
-        messages_received: task_messages_received,
-        bytes_received: task_bytes_received,
-        duration: task_duration,
         send_errors,
-        recv_errors,
-        seq_errors,
+        duration: task_duration,
     })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "warn,rzmq=warn");
+        std::env::set_var("RUST_LOG", "warn,rzmq=info");
     }
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::INFO)
         .with_thread_ids(true)
         .with_thread_names(true)
         .with_target(true)
@@ -350,100 +359,101 @@ async fn main() -> Result<(), ZmqError> {
         .init();
 
     println!(
-        "Starting DEALER-ROUTER Throughput Example ({} DEALER tasks, {} msgs/task)...",
-        NUM_DEALER_TASKS, NUM_MESSAGES_PER_DEALER
+        "Starting DEALER-ROUTER Throughput Example ({} DEALER tasks, {} msgs/task, {} max concurrent requests)...",
+        NUM_DEALER_TASKS, NUM_MESSAGES_PER_DEALER, MAX_CONCURRENT_REQUESTS
     );
 
     let ctx = Context::new().expect("Failed to create rzmq context");
 
-    let router_ctx_clone = ctx.clone();
+    let router_socket = ctx.socket(SocketType::Router)?;
+    router_socket.set_option(zmq_opts::IO_URING_SESSION_ENABLED, ROUTER_IO_URING_ENABLED).await?;
+    router_socket.set_option(zmq_opts::IO_URING_RCVMULTISHOT, ROUTER_IO_URING_ENABLED).await?;
+    router_socket.set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED).await?;
+    router_socket.set_option(zmq_opts::RCVHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32).max(5000)).await?;
+    router_socket.set_option(zmq_opts::SNDHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32).max(5000)).await?;
+    router_socket.set_option(zmq_opts::RCVTIMEO, ROUTER_RECV_TIMEOUT_MS as i32).await?;
+
+    let router_monitor_rx = router_socket.monitor_default().await?;
+    println!("[ROUTER] Binding to {}...", ROUTER_ENDPOINT);
+    router_socket.bind(ROUTER_ENDPOINT).await?;
     let router_join_handle = tokio::spawn(run_router_task(
-        router_ctx_clone,
+        router_socket,
         ROUTER_ENDPOINT,
         TOTAL_MESSAGES_EXPECTED_BY_ROUTER,
     ));
 
-    // Give router a moment to bind
-    tokio::time::sleep(Duration::from_millis(200)).await; // Slightly longer for OS to release port if run back-to-back
+    tokio::time::sleep(Duration::from_millis(200)).await; // Give router time to bind
 
     let dealer_socket_main = ctx.socket(SocketType::Dealer)?;
     dealer_socket_main.set_option(zmq_opts::IO_URING_SESSION_ENABLED, DEALER_IO_URING_ENABLED).await?;
     dealer_socket_main.set_option(zmq_opts::IO_URING_RCVMULTISHOT, DEALER_IO_URING_ENABLED).await?;
     dealer_socket_main.set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED).await?;
-    dealer_socket_main.set_option(zmq_opts::SNDHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
-    dealer_socket_main.set_option(zmq_opts::RCVHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32 / 2).max(5000)).await?;
-    // Set a SNDTIMEO for the dealer's send operations
-    dealer_socket_main.set_option(zmq_opts::SNDTIMEO, 5000i32).await?; // 5 second send timeout
-    // Set a RCVTIMEO for the dealer's recv operations
-    dealer_socket_main.set_option(zmq_opts::RCVTIMEO, 5000i32).await?; // 5 second receive timeout
+    let hwm_val = (MAX_CONCURRENT_REQUESTS * NUM_DEALER_TASKS * 2).max(5000) as i32; // Ensure HWM is generous
+    dealer_socket_main.set_option(zmq_opts::SNDHWM, hwm_val).await?;
+    dealer_socket_main.set_option(zmq_opts::RCVHWM, hwm_val).await?;
+    dealer_socket_main.set_option(zmq_opts::SNDTIMEO, 5000i32).await?;
+    dealer_socket_main.set_option(zmq_opts::RCVTIMEO, CENTRAL_RECEIVER_SOCKET_RECV_TIMEOUT_MS as i32).await?;
 
 
+    let dealer_monitor_rx = dealer_socket_main.monitor_default().await?;
     println!("[DEALER Main] Connecting to {}...", ROUTER_ENDPOINT);
     dealer_socket_main.connect(ROUTER_ENDPOINT).await?;
     println!("[DEALER Main] Connect call returned. Waiting for handshake...");
 
-    // Create and wait for monitor event for handshake
-    let mut monitor_rx = dealer_socket_main.monitor_default().await?;
-    let handshake_wait_start = Instant::now();
-    let mut handshake_succeeded = false;
-    loop {
-        match tokio::time::timeout(Duration::from_millis(HANDSHAKE_TIMEOUT_MS), monitor_rx.recv()).await {
-            Ok(Ok(event)) => {
-                if PRINT_HANDSHAKE_EVENTS {
-                    println!("[DEALER Main Monitor] Received event: {:?}", event);
-                }
-                if let SocketEvent::HandshakeSucceeded { endpoint } = event {
-                    if endpoint == ROUTER_ENDPOINT {
-                        println!("[DEALER Main] HandshakeSucceeded for {} after {:?}.", ROUTER_ENDPOINT, handshake_wait_start.elapsed());
-                        handshake_succeeded = true;
-                        break;
-                    }
-                }
-            }
-            Ok(Err(_)) => { // Channel closed
-                eprintln!("[DEALER Main Monitor] Monitor channel closed before handshake. Error.");
-                return Err(ZmqError::Internal("Monitor channel closed".into()));
-            }
-            Err(_) => { // Timeout
-                eprintln!("[DEALER Main Monitor] Timeout waiting for HandshakeSucceeded event after {:?}.", handshake_wait_start.elapsed());
-                return Err(ZmqError::Timeout);
-            }
-        }
-    }
+    common::wait_for_handshake_events(
+        vec![
+            (router_monitor_rx, ROUTER_ENDPOINT.to_string(), String::from("ROUTER MAIN")),
+            (dealer_monitor_rx, ROUTER_ENDPOINT.to_string(), String::from("DEALER MAIN")),
+        ],
+        Duration::from_millis(HANDSHAKE_TIMEOUT_MS),
+        true,
+    ).await;
+    println!("[DEALER Main] All expected handshakes complete.");
 
-    if !handshake_succeeded {
-        return Err(ZmqError::Internal("Handshake did not succeed with router.".into()));
-    }
+    let pending_requests_map: PendingRequestsMap = Arc::new(TokioMutex::new(HashMap::new()));
+    let shared_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
+
+    let central_receiver_dealer_socket_clone = dealer_socket_main.clone();
+    let central_receiver_map_clone = pending_requests_map.clone();
+    // total_expected_replies will be updated after dealer tasks finish sending.
+    let central_receiver_handle = tokio::spawn(run_dealer_central_receiver(
+        central_receiver_dealer_socket_clone,
+        central_receiver_map_clone,
+        TOTAL_MESSAGES_EXPECTED_BY_ROUTER, // Initial high estimate, actual passed later or logic adapted
+    ));
 
     let message_payload_template = Bytes::from(vec![0u8; PAYLOAD_SIZE_BYTES]);
     let mut dealer_task_handles = Vec::new();
     println!(
-        "[Main] Spawning {} DEALER tasks, each sending {} messages of {} bytes (excluding seq num).",
-        NUM_DEALER_TASKS, NUM_MESSAGES_PER_DEALER, PAYLOAD_SIZE_BYTES
+        "[Main] Spawning {} DEALER tasks, each sending {} messages of {} bytes (app payload). Max concurrent requests (total): {}.",
+        NUM_DEALER_TASKS, NUM_MESSAGES_PER_DEALER, PAYLOAD_SIZE_BYTES, MAX_CONCURRENT_REQUESTS
     );
 
-    let overall_start_time = Instant::now();
+    let benchmark_active_phase_start_time = Instant::now();
 
     for i in 0..NUM_DEALER_TASKS {
-        let task_dealer_socket = dealer_socket_main.clone();
+        let task_dealer_socket_clone = dealer_socket_main.clone();
         let task_payload_template_clone = message_payload_template.clone();
+        let task_pending_map_clone = pending_requests_map.clone();
+        let task_shared_semaphore_clone = shared_semaphore.clone();
+
         let handle = tokio::spawn(run_dealer_task(
-            task_dealer_socket,
+            task_dealer_socket_clone,
             i,
             NUM_MESSAGES_PER_DEALER,
             task_payload_template_clone,
+            task_pending_map_clone,
+            task_shared_semaphore_clone,
         ));
         dealer_task_handles.push(handle);
     }
 
     let mut total_messages_sent_agg = 0u64;
     let mut total_bytes_sent_agg = 0u64;
-    let mut total_messages_received_agg = 0u64;
-    let mut total_bytes_received_agg = 0u64;
     let mut successful_dealer_tasks = 0;
     let mut total_send_errors_agg = 0u64;
-    let mut total_recv_errors_agg = 0u64;
-    let mut total_seq_errors_agg = 0u64;
+    let mut max_dealer_task_send_finish_time: Option<Instant> = None;
+
 
     let all_dealer_results = join_all(dealer_task_handles).await;
 
@@ -452,17 +462,17 @@ async fn main() -> Result<(), ZmqError> {
             Ok(Ok(stats)) => {
                 total_messages_sent_agg += stats.messages_sent;
                 total_bytes_sent_agg += stats.bytes_sent;
-                total_messages_received_agg += stats.messages_received;
-                total_bytes_received_agg += stats.bytes_received;
                 total_send_errors_agg += stats.send_errors;
-                total_recv_errors_agg += stats.recv_errors;
-                total_seq_errors_agg += stats.seq_errors;
                 successful_dealer_tasks += 1;
-                if stats.messages_sent != stats.messages_received || stats.send_errors > 0 || stats.recv_errors > 0 || stats.seq_errors > 0 {
+                // Calculate absolute finish time for this task's sending phase
+                let task_absolute_finish_time = benchmark_active_phase_start_time + stats.duration;
+                if max_dealer_task_send_finish_time.map_or(true, |max_t| task_absolute_finish_time > max_t) {
+                    max_dealer_task_send_finish_time = Some(task_absolute_finish_time);
+                }
+                if stats.send_errors > 0 && PRINT_PER_TASK_SUMMARY {
                     eprintln!(
-                        "[DEALER {} SUMMARY] Sent: {} (err:{}), Received: {} (err:{}, seq_err:{})",
+                        "[DEALER {} SUMMARY] Sent: {} (err:{})",
                         stats.id, stats.messages_sent, stats.send_errors,
-                        stats.messages_received, stats.recv_errors, stats.seq_errors
                     );
                 }
             }
@@ -470,63 +480,116 @@ async fn main() -> Result<(), ZmqError> {
             Err(e) => eprintln!("[DEALER {}] Task panicked: {}", idx, e),
         }
     }
+    let total_messages_successfully_sent = total_messages_sent_agg - total_send_errors_agg;
+    println!("[DEALER Main] All dealer tasks finished SENDING. Total successfully sent: {}", total_messages_successfully_sent);
 
-    let overall_duration = overall_start_time.elapsed();
-    println!("\n--- Overall DEALER Results ---");
-    println!("Duration: {:?}", overall_duration);
-    println!("Successful DEALER tasks: {}/{}", successful_dealer_tasks, NUM_DEALER_TASKS);
-    println!("Total messages sent (aggregate): {} (errors: {})", total_messages_sent_agg, total_send_errors_agg);
-    println!("Total messages received (aggregate): {} (errors: {}, seq_errors: {})", total_messages_received_agg, total_recv_errors_agg, total_seq_errors_agg);
+    // Wait for central receiver to process replies or for an overall timeout.
+    let mut central_replies_processed = 0u64;
+    let mut central_bytes_replied = 0u64;
+    let mut central_extraction_errors = 0u64;
+    let mut last_reply_timestamp_from_central: Option<Instant> = None;
+    
+    let overall_receive_timeout_duration = Duration::from_millis(CENTRAL_RECEIVER_OVERALL_TIMEOUT_MS);
+    let receive_phase_monitor_start_time = Instant::now();
 
-    let seconds = overall_duration.as_secs_f64();
-    if seconds > 0.0 && successful_dealer_tasks > 0 {
-        let agg_send_msg_rate = total_messages_sent_agg as f64 / seconds;
-        let agg_send_byte_rate_mb = (total_bytes_sent_agg as f64 / seconds) / (1024.0 * 1024.0);
-        println!(
-            "Aggregate Send Rate (based on successful sends by dealers): {:.2} msgs/sec, {:.2} MB/sec",
-            agg_send_msg_rate, agg_send_byte_rate_mb
-        );
-
-        let agg_recv_msg_rate = total_messages_received_agg as f64 / seconds;
-        let agg_recv_byte_rate_mb = (total_bytes_received_agg as f64 / seconds) / (1024.0 * 1024.0);
-        println!(
-            "Aggregate Recv Rate (based on successful receives by dealers): {:.2} msgs/sec, {:.2} MB/sec",
-            agg_recv_msg_rate, agg_recv_byte_rate_mb
-        );
+    if total_messages_successfully_sent > 0 {
+        loop {
+            let num_pending_now = pending_requests_map.lock().await.len();
+            if num_pending_now == 0 {
+                 println!("[Main] All {} successfully sent requests have been accounted for (0 pending in map).", total_messages_successfully_sent);
+                break;
+            }
+            if receive_phase_monitor_start_time.elapsed() >= overall_receive_timeout_duration {
+                println!("[Main] Overall receive timeout ({}ms) reached. Pending requests: {}",
+                    overall_receive_timeout_duration.as_millis(), num_pending_now);
+                break;
+            }
+            if central_receiver_handle.is_finished() { // Check if central receiver exited early
+                println!("[Main] Central receiver task finished while main was monitoring. Pending requests: {}", num_pending_now);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await; // Poll status
+        }
+    } else {
+        println!("[Main] No messages were successfully sent by dealers. Skipping receive wait phase.");
     }
-     if total_messages_sent_agg != total_messages_received_agg || total_send_errors_agg > 0 || total_recv_errors_agg > 0 || total_seq_errors_agg > 0 {
-        eprintln!("WARNING: AGGREGATE counts show discrepancies or errors.");
-    }
 
-    println!("[DEALER Main] Closing main dealer socket...");
+    println!("[DEALER Main] Signaling central receiver to stop by closing main dealer socket...");
     if let Err(e) = dealer_socket_main.close().await {
         eprintln!("[DEALER Main] Error closing main dealer socket: {}", e);
     }
-    println!("[DEALER Main] Main dealer socket closed.");
+    println!("[DEALER Main] Main dealer socket close call returned.");
+
+    match central_receiver_handle.await {
+        Ok((replies, bytes, errors, last_ts)) => {
+            central_replies_processed = replies;
+            central_bytes_replied = bytes;
+            central_extraction_errors = errors;
+            last_reply_timestamp_from_central = last_ts;
+        }
+        Err(e) => {
+            eprintln!("[Main] DEALER Central Receiver task panicked or was cancelled: {}", e);
+        }
+    };
+
+    let active_phase_end_time = last_reply_timestamp_from_central
+        .or(max_dealer_task_send_finish_time) // If no replies, end is when last send task finished
+        .unwrap_or_else(|| benchmark_active_phase_start_time + overall_receive_timeout_duration); // Fallback
+
+    let active_phase_duration = if active_phase_end_time > benchmark_active_phase_start_time {
+        active_phase_end_time.duration_since(benchmark_active_phase_start_time)
+    } else {
+        // If no activity, use a small default to avoid division by zero in rates.
+        // This can happen if benchmark_active_phase_start_time itself is the "latest" time.
+        Duration::from_nanos(1)
+    };
+    let active_seconds = active_phase_duration.as_secs_f64().max(1e-9);
+
+
+    println!("\n--- Overall Combined Results (Active Phase Duration: {:?}) ---", active_phase_duration);
+    println!("Benchmark Full Duration (incl. setup/teardown): {:?}", benchmark_active_phase_start_time.elapsed());
+    println!("Successful DEALER tasks (for sending): {}/{}", successful_dealer_tasks, NUM_DEALER_TASKS);
+    println!("Total messages initiated by dealers: {} (send errors: {})", total_messages_sent_agg, total_send_errors_agg);
+    println!("Total messages successfully sent by dealers: {}", total_messages_successfully_sent);
+    println!("Total replies processed by central receiver: {}", central_replies_processed);
+    println!("Total reply extraction errors by central receiver: {}", central_extraction_errors);
+
+    let final_num_pending = pending_requests_map.lock().await.len();
+    println!("Requests still pending in map at benchmark end: {}", final_num_pending);
+    let lost_messages = total_messages_successfully_sent
+        .saturating_sub(central_replies_processed)
+        .saturating_sub(final_num_pending as u64);
+    println!("Implied lost/timed-out messages (successfully_sent - replied - pending_at_end): {}", lost_messages);
+
+    if successful_dealer_tasks > 0 && active_seconds > 0.0 {
+        let agg_send_msg_rate = total_messages_successfully_sent as f64 / active_seconds;
+        let agg_send_byte_rate_mb = (total_bytes_sent_agg as f64 / active_seconds) / (1024.0 * 1024.0);
+        println!( "Aggregate Send Rate (during active phase): {:.2} msgs/sec, {:.2} MB/sec", agg_send_msg_rate, agg_send_byte_rate_mb );
+        let agg_recv_msg_rate = central_replies_processed as f64 / active_seconds;
+        let agg_recv_byte_rate_mb = (central_bytes_replied as f64 / active_seconds) / (1024.0 * 1024.0);
+        println!( "Effective System Recv Rate (during active phase): {:.2} msgs/sec, {:.2} MB/sec", agg_recv_msg_rate, agg_recv_byte_rate_mb );
+    }
+     if total_messages_successfully_sent != central_replies_processed || total_send_errors_agg > 0 || central_extraction_errors > 0 || final_num_pending > 0 {
+        eprintln!("WARNING: AGGREGATE counts show discrepancies, errors, or pending messages.");
+    }
 
     println!("[Main] Waiting for ROUTER task to complete...");
     match router_join_handle.await {
         Ok(Ok((router_msgs_echoed, router_bytes_echoed, router_timeouts))) => {
-            println!(
-                "[ROUTER] Task completed. Messages echoed: {}. Bytes echoed: {}. Timeouts: {}",
-                router_msgs_echoed, router_bytes_echoed, router_timeouts
-            );
-            if seconds > 0.0 {
-                 let router_echo_msg_rate = router_msgs_echoed as f64 / seconds;
-                 let router_echo_byte_rate_mb = (router_bytes_echoed as f64 / seconds) / (1024.0 * 1024.0);
-                 println!("[ROUTER]: Effective echo rate: {:.2} msgs/sec, {:.2} MB/sec", router_echo_msg_rate, router_echo_byte_rate_mb);
+            println!( "[ROUTER] Task completed. Msgs echoed: {}. Bytes: {}. Timeouts: {}", router_msgs_echoed, router_bytes_echoed, router_timeouts );
+            if active_seconds > 0.0 {
+                 let router_echo_msg_rate = router_msgs_echoed as f64 / active_seconds;
+                 let router_echo_byte_rate_mb = (router_bytes_echoed as f64 / active_seconds) / (1024.0 * 1024.0);
+                 println!("[ROUTER]: Effective echo rate (during active phase): {:.2} msgs/sec, {:.2} MB/sec", router_echo_msg_rate, router_echo_byte_rate_mb);
             }
-            if router_msgs_echoed != total_messages_sent_agg { // Compare with dealer sends
-                eprintln!("[ROUTER] WARNING: Router echoed {} msgs, but dealers sent {} msgs in total.", router_msgs_echoed, total_messages_sent_agg);
-            }
+            if router_msgs_echoed != total_messages_successfully_sent { eprintln!("[ROUTER] WARNING: Router echoed {} msgs, dealers successfully sent {}.", router_msgs_echoed, total_messages_successfully_sent); }
+            if router_msgs_echoed != central_replies_processed { eprintln!("[ROUTER] WARNING: Router echoed {} msgs, central dealer received {} replies.", router_msgs_echoed, central_replies_processed); }
         }
         Ok(Err(e)) => eprintln!("[ROUTER] Task failed with ZmqError: {}", e),
-        Err(e) => eprintln!("[ROUTER] Task panicked or was cancelled: {}", e),
+        Err(e) => eprintln!("[ROUTER] Task panicked: {}", e),
     }
-
     println!("[Main] Terminating context...");
     ctx.term().await?;
     println!("[Main] Context terminated. Example finished.");
-
     Ok(())
 }
