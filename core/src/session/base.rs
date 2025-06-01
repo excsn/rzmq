@@ -87,7 +87,7 @@ impl SessionBase {
   }
 
   async fn try_publish_peer_identity_established_if_ready(&mut self, session_handle: usize, endpoint_uri_clone: &str, pending_peer_identity: &mut Option<Blob>,) {
-    println!("{} {}, {} {}", self.engine_ready, self.pipe_attached, pending_peer_identity.is_some(), self.pipe_write_id.is_some());
+
     // Check general readiness flags and if specific data is available (and not yet consumed for publication)
     if self.engine_ready &&
        self.pipe_attached && // Identity is present and not yet taken for publishing
@@ -120,7 +120,6 @@ impl SessionBase {
         );
       }
 
-      println!("HANDSHAKE");
       self.send_monitor_event(SocketEvent::HandshakeSucceeded { endpoint: endpoint_uri_clone.to_string() }).await;
     }
   }
@@ -269,7 +268,6 @@ impl SessionBase {
                 self.pipe_write_id = Some(pipe_write_id);
                 self.pipe_attached = true;
 
-                println!("ATTACHED");
                 self.try_publish_peer_identity_established_if_ready(session_handle, &endpoint_uri_for_monitor_event, &mut peer_identity_from_engine).await;
               }
               Command::Stop => {
@@ -312,10 +310,9 @@ impl SessionBase {
               Command::EngineReady { peer_identity: received_identity } => {
                 tracing::debug!(handle = session_handle, uri = %endpoint_uri_for_monitor_event, peer_id = ?received_identity, "Session received EngineReady");
                 self.engine_ready = true;
-                println!("RECV {:?}", received_identity);
+                
                 peer_identity_from_engine = received_identity.clone();
 
-                println!("ENGINEREADY");
                 self.try_publish_peer_identity_established_if_ready(session_handle, &endpoint_uri_for_monitor_event, &mut peer_identity_from_engine).await;
               }
               Command::EngineStopped => {
