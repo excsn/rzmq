@@ -16,8 +16,8 @@ const ROUTER_IO_URING_ENABLED: bool = true;
 const DEALER_IO_URING_ENABLED: bool = true;
 const TCP_CORK_ENABLED: u32 = 1; // 0 for false, 1 for true
 const NUM_DEALER_TASKS: usize = 2;
-const MAX_CONCURRENT_REQUESTS: usize = 15000;
-const NUM_MESSAGES_PER_DEALER: u64 = 100000; // Reverted for full test
+const MAX_CONCURRENT_REQUESTS: usize = 1000000;
+const NUM_MESSAGES_PER_DEALER: u64 = 500000; // Reverted for full test
 const PAYLOAD_SIZE_BYTES: usize = 1024;
 const ROUTER_ENDPOINT: &'static str = "tcp://127.0.0.1:5558";
 
@@ -406,7 +406,7 @@ async fn main() -> Result<(), ZmqError> {
             (dealer_monitor_rx, ROUTER_ENDPOINT.to_string(), String::from("DEALER MAIN")),
         ],
         Duration::from_millis(HANDSHAKE_TIMEOUT_MS),
-        true,
+        PRINT_HANDSHAKE_EVENTS,
     ).await;
     println!("[DEALER Main] All expected handshakes complete.");
 
