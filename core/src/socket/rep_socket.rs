@@ -34,7 +34,6 @@ enum RepState {
 #[derive(Debug)]
 pub(crate) struct RepSocket {
   core: Arc<SocketCore>,
-  // <<< REVERTED: RepSocket uses its own FairQueue directly, not via orchestrator >>>
   incoming_request_queue: FairQueue,
   state: TokioMutex<RepState>,
   pipe_read_id_to_endpoint_uri: RwLock<HashMap<usize, String>>,
@@ -93,110 +92,14 @@ impl ISocket for RepSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
-    let peer_to_reply_to = {
-      let mut current_state_guard = self.state.lock().await;
-      match std::mem::replace(&mut *current_state_guard, RepState::ReadyToReceive) {
-        RepState::ReceivedRequest(info) => info,
-        RepState::ReadyToReceive => {
-          *current_state_guard = RepState::ReadyToReceive;
-          return Err(ZmqError::InvalidState(
-            "REP socket must call recv() before sending a reply",
-          ));
-        }
-      }
-    };
-
-    let conn_iface: Arc<dyn ISocketConnection> = {
-      let core_s_read = self.core_state_read();
-      match core_s_read.endpoints.get(&peer_to_reply_to.target_endpoint_uri) {
-        Some(ep_info) => ep_info.connection_iface.clone(),
-        None => {
-          tracing::error!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP send: ISocketConnection not found for target URI. Peer likely disconnected.");
-          return Err(ZmqError::HostUnreachable(
-            "Peer disconnected before reply could be sent".into(),
-          ));
-        }
-      }
-    };
-
-    msg.set_flags(msg.flags() & !MsgFlags::MORE);
-
-    let mut frames_to_send: Vec<Msg> = Vec::with_capacity(peer_to_reply_to.routing_prefix.len() + 1);
-    for mut prefix_msg_part in peer_to_reply_to.routing_prefix.into_iter() {
-      prefix_msg_part.set_flags(prefix_msg_part.flags() | MsgFlags::MORE);
-      frames_to_send.push(prefix_msg_part);
+    // REP application message should not have MORE flag set by user.
+    // If it does, we clear it as it's the last part of the app payload.
+    if msg.is_more() {
+      msg.set_flags(msg.flags() & !MsgFlags::MORE);
     }
-    frames_to_send.push(msg);
-
-    for frame_to_send in frames_to_send {
-      if let Err(e) = conn_iface.send_message(frame_to_send).await {
-        tracing::warn!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, error = %e, "REP send failed during multi-part reply.");
-        return Err(e);
-      }
-    }
-    tracing::trace!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP sent complete reply.");
-    Ok(())
-  }
-
-  async fn send_multipart(&self, payload_frames: Vec<Msg>) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
-      return Err(ZmqError::InvalidState("Socket is closing".into()));
-    }
-
-    let mut user_payload_frames = payload_frames;
-    if user_payload_frames.is_empty() {
-      user_payload_frames.push(Msg::new());
-    }
-
-    let peer_to_reply_to = {
-      let mut current_state_guard = self.state.lock().await;
-      match std::mem::replace(&mut *current_state_guard, RepState::ReadyToReceive) {
-        RepState::ReceivedRequest(info) => info,
-        RepState::ReadyToReceive => {
-          *current_state_guard = RepState::ReadyToReceive;
-          return Err(ZmqError::InvalidState(
-            "REP socket must recv() a request before sending a reply",
-          ));
-        }
-      }
-    };
-
-    let conn_iface: Arc<dyn ISocketConnection> = {
-      let core_s_read = self.core_state_read();
-      match core_s_read.endpoints.get(&peer_to_reply_to.target_endpoint_uri) {
-        Some(ep_info) => ep_info.connection_iface.clone(),
-        None => {
-          tracing::error!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP send_multipart: ISocketConnection not found. Peer likely disconnected.");
-          return Err(ZmqError::HostUnreachable(
-            "Peer disconnected before reply could be sent".into(),
-          ));
-        }
-      }
-    };
-
-    let mut frames_to_send: Vec<Msg> =
-      Vec::with_capacity(peer_to_reply_to.routing_prefix.len() + user_payload_frames.len());
-    frames_to_send.extend(peer_to_reply_to.routing_prefix);
-    frames_to_send.extend(user_payload_frames);
-
-    let num_total_frames = frames_to_send.len();
-    if num_total_frames == 0 {
-      return Ok(());
-    }
-
-    for (i, mut frame) in frames_to_send.into_iter().enumerate() {
-      if i < num_total_frames - 1 {
-        frame.set_flags(frame.flags() | MsgFlags::MORE);
-      } else {
-        frame.set_flags(frame.flags() & !MsgFlags::MORE);
-      }
-      if let Err(e) = conn_iface.send_message(frame).await {
-        tracing::warn!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, error = %e, "REP send_multipart: Send failed.");
-        return Err(e);
-      }
-    }
-    tracing::trace!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP send_multipart: Sent complete reply.");
-    Ok(())
+    
+    // Delegate to send_multipart with a single payload frame
+    self.send_multipart(vec![msg]).await
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
@@ -214,6 +117,80 @@ impl ISocket for RepSocket {
       Ok(frames.into_iter().last().unwrap())
     } else {
       Ok(frames.into_iter().next().unwrap())
+    }
+  }
+
+  async fn send_multipart(&self, payload_frames: Vec<Msg>) -> Result<(), ZmqError> {
+    if !self.core.is_running().await {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
+
+    let mut user_payload_frames = payload_frames;
+    if user_payload_frames.is_empty() { // ZMQ REP must send at least one frame (can be empty)
+      user_payload_frames.push(Msg::new());
+    }
+
+    let peer_to_reply_to = {
+      let mut current_state_guard = self.state.lock().await;
+      match std::mem::replace(&mut *current_state_guard, RepState::ReadyToReceive) {
+        RepState::ReceivedRequest(info) => info,
+        RepState::ReadyToReceive => {
+          // Restore state as we didn't consume it
+          *current_state_guard = RepState::ReadyToReceive; 
+          return Err(ZmqError::InvalidState(
+            "REP socket must recv() a request before sending a reply",
+          ));
+        }
+      }
+    }; // current_state_guard is dropped
+
+    let conn_iface: Arc<dyn ISocketConnection> = {
+      let core_s_read = self.core_state_read();
+      match core_s_read.endpoints.get(&peer_to_reply_to.target_endpoint_uri) {
+        Some(ep_info) => ep_info.connection_iface.clone(),
+        None => {
+          tracing::error!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP send_multipart: ISocketConnection not found. Peer likely disconnected.");
+          return Err(ZmqError::HostUnreachable(
+            "Peer disconnected before reply could be sent".into(),
+          ));
+        }
+      }
+    }; // core_s_read is dropped
+
+    // Assemble all ZMTP frames for the wire: routing_prefix + user_payload_frames
+    let mut zmtp_wire_frames: Vec<Msg> = Vec::with_capacity(
+      peer_to_reply_to.routing_prefix.len() + user_payload_frames.len()
+    );
+    zmtp_wire_frames.extend(peer_to_reply_to.routing_prefix); // routing_prefix frames should already have MORE flags set correctly from when they were received.
+    zmtp_wire_frames.extend(user_payload_frames);
+
+    // Ensure MORE flags are set correctly for the entire sequence
+    let num_total_frames = zmtp_wire_frames.len();
+    if num_total_frames == 0 { // Should not happen if user_payload_frames is guaranteed non-empty
+      return Ok(());
+    }
+
+    for (i, frame) in zmtp_wire_frames.iter_mut().enumerate() {
+      if i < num_total_frames - 1 {
+        frame.set_flags(frame.flags() | MsgFlags::MORE);
+      } else {
+        frame.set_flags(frame.flags() & !MsgFlags::MORE); // Last frame of the logical message
+      }
+    }
+    
+    // Call ISocketConnection::send_multipart once with all prepared ZMTP wire frames
+    match conn_iface.send_multipart(zmtp_wire_frames).await {
+      Ok(()) => {
+        tracing::trace!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP send_multipart: Sent complete reply.");
+        Ok(())
+      }
+      Err(e) => {
+        tracing::warn!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, error = %e, "REP send_multipart: Send failed.");
+        // If send failed, the REP socket should ideally revert to ReadyToReceive state,
+        // which it already did when `peer_to_reply_to` was taken.
+        // The error should be propagated.
+        Err(e)
+      }
     }
   }
 

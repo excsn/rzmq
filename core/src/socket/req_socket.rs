@@ -97,14 +97,17 @@ impl ISocket for ReqSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
+    // REQ application message should not have MORE flag set by user.
+    // If it does, we clear it for the payload part of the ZMTP message.
     if msg.is_more() {
-      msg.set_flags(msg.flags() & !MsgFlags::MORE);
+      msg.set_flags(msg.flags() & !MsgFlags::MORE); 
       tracing::trace!(
         handle = self.core.handle,
-        "REQ send: Cleared MORE flag from outgoing message."
+        "REQ send: Cleared MORE flag from user-provided message (payload part)."
       );
     }
 
+    // Check and update REQ state
     {
       let current_state_internal_guard = self.state.lock().await;
       if !matches!(current_state_internal_guard.state, ReqState::ReadyToSend) {
@@ -112,11 +115,11 @@ impl ISocket for ReqSocket {
           "REQ socket must call recv() before sending again",
         ));
       }
+      // State will be updated to ExpectingReply *after* successful send.
     }
 
     let timeout_opt: Option<Duration> = self.core_state_read().options.sndtimeo;
 
-    // Peer selection loop - RETAINED FROM YOUR ORIGINAL PROVIDED CODE
     let endpoint_uri_to_send_to = loop {
       if let Some(uri) = self.load_balancer.get_next_connection_uri() {
         if self.core_state_read().endpoints.contains_key(&uri) {
@@ -124,22 +127,23 @@ impl ISocket for ReqSocket {
         } else {
           self.load_balancer.remove_connection(&uri);
         }
-      } else {
-        if !self.core.is_running().await {
-          return Err(ZmqError::InvalidState(
-            "Socket terminated while waiting for peer".into(),
-          ));
+      } else { // No peer available from load balancer
+        if !self.core.is_running().await { // Check if socket is closing
+          return Err(ZmqError::InvalidState("Socket terminated while waiting for peer".into()));
         }
+        // Handle SNDTIMEO for peer selection
         match timeout_opt {
-          Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
-          None => {
+          Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached), // No peer and non-blocking
+          None => { // Infinite wait for a peer
             self.load_balancer.wait_for_connection().await;
-            continue;
+            continue; // Retry getting a peer
           }
-          Some(duration) => match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
-            Ok(()) => continue,
-            Err(_) => return Err(ZmqError::Timeout),
-          },
+          Some(duration) => { // Timed wait for a peer
+            match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
+              Ok(()) => continue, // Peer became available, retry getting it
+              Err(_) => return Err(ZmqError::Timeout), // Timeout waiting for peer
+            }
+          }
         }
       }
     };
@@ -148,40 +152,40 @@ impl ISocket for ReqSocket {
       let core_s_read = self.core_state_read();
       match core_s_read.endpoints.get(&endpoint_uri_to_send_to) {
         Some(ep_info) => ep_info.connection_iface.clone(),
-        None => {
+        None => { // Peer disappeared after selection from LB but before getting EndpointInfo
           self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
           return Err(ZmqError::HostUnreachable(format!(
-            "Peer at {} disappeared before send",
+            "REQ: Peer at {} disappeared before send",
             endpoint_uri_to_send_to
           )));
         }
       }
     };
 
-    // Standard ZMTP REQ->REP: send [<empty_frame_MORE>, <data_frame_NOMORE>]
+    // Construct ZMTP frames for REQ: [empty_delimiter_MORE, payload_NOMORE]
     let mut empty_delimiter = Msg::new();
-    empty_delimiter.set_flags(MsgFlags::MORE);
+    empty_delimiter.set_flags(MsgFlags::MORE); // Delimiter is MORE
 
-    let send_delimiter_result = conn_iface.send_message(empty_delimiter).await;
+    // The user's `msg` becomes the payload part, already has NOMORE (or cleared above)
+    let zmtp_frames_to_send = vec![empty_delimiter, msg];
 
-    let final_send_result = if send_delimiter_result.is_ok() {
-      msg.set_flags(msg.flags() & !MsgFlags::MORE);
-      conn_iface.send_message(msg).await
-    } else {
-      send_delimiter_result
-    };
+    // Use send_multipart on the connection interface
+    let send_result = conn_iface.send_multipart(zmtp_frames_to_send).await;
 
-    match final_send_result {
+    match send_result {
       Ok(()) => {
+        // Successfully sent, update state
         let mut current_state_internal_guard = self.state.lock().await;
+        // Double-check state before updating, though it should be ReadyToSend
         match current_state_internal_guard.state {
           ReqState::ReadyToSend => {
             current_state_internal_guard.state = ReqState::ExpectingReply {
               target_endpoint_uri: endpoint_uri_to_send_to.clone(),
             };
           }
-          ReqState::ExpectingReply { .. } => {
+          ReqState::ExpectingReply { .. } => { // Should not happen if initial check was correct
             tracing::error!(handle = self.core.handle, state = ?current_state_internal_guard.state, "REQ state was not ReadyToSend after successful send. Protocol violation likely.");
+            // Force state update anyway
             current_state_internal_guard.state = ReqState::ExpectingReply {
               target_endpoint_uri: endpoint_uri_to_send_to.clone(),
             };
@@ -191,12 +195,12 @@ impl ISocket for ReqSocket {
       }
       Err(e @ ZmqError::ConnectionClosed) => {
         self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-        Err(ZmqError::HostUnreachable(format!(
-          "Connection to {} closed during send",
+        Err(ZmqError::HostUnreachable(format!( // More specific error for REQ
+          "REQ: Connection to {} closed during send",
           endpoint_uri_to_send_to
         )))
       }
-      Err(e) => Err(e),
+      Err(e) => Err(e), // Propagate other errors (Timeout, ResourceLimitReached from conn_iface)
     }
   }
 
