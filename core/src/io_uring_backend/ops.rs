@@ -2,16 +2,18 @@
 
 #![cfg(feature = "io-uring")]
 
+use crate::message::Msg;
 use super::one_shot_sender::OneShotSender;
 use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
-use std::net::{SocketAddr}; // Removed SocketAddrV6, Ipv6Addr as they are not directly used by ops.rs
+
+use std::net::{SocketAddr};
 use std::os::unix::io::RawFd;
 use std::fmt;
 use std::any::Any;
 use std::sync::Arc;
 
-#[derive(Clone, Debug)] // Ensure Debug and Clone are derivable
+#[derive(Clone, Debug)]
 pub enum ProtocolConfig {
     Zmtp(Arc<ZmtpEngineConfig>),
     // Example: Http(Arc<HttpConfig>),
@@ -70,6 +72,12 @@ pub enum UringOpRequest {
       app_data: Arc<dyn Any + Send + Sync>,
       reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
   },
+  SendDataMultipartViaHandler {
+    user_data: UserData,
+    fd: RawFd,
+    app_data_parts: Arc<Vec<Msg>>,
+    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+  },
   ShutdownConnectionHandler {
     user_data: UserData,
     fd: RawFd,
@@ -89,6 +97,7 @@ impl UringOpRequest {
             Self::RegisterExternalFd { user_data, .. } |
             Self::StartFdReadLoop { user_data, .. } |
             Self::SendDataViaHandler { user_data, .. } |
+            Self::SendDataMultipartViaHandler { user_data, .. } |
             Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
         }
     }
@@ -104,6 +113,7 @@ impl UringOpRequest {
             Self::RegisterExternalFd { .. } => "RegisterExternalFd".to_string(),
             Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
             Self::SendDataViaHandler { .. } => "SendDataViaHandler".to_string(),
+            Self::SendDataMultipartViaHandler { .. } => "SendDataMultipartViaHandler".to_string(),
             Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
         }
     }
@@ -119,6 +129,7 @@ impl UringOpRequest {
             Self::Connect { reply_tx, .. } |
             Self::StartFdReadLoop { reply_tx, .. } |
             Self::SendDataViaHandler { reply_tx, .. } |
+            Self::SendDataMultipartViaHandler { reply_tx, .. } |
             Self::ShutdownConnectionHandler { reply_tx, .. } => reply_tx,
         }
     }
@@ -165,6 +176,11 @@ impl fmt::Debug for UringOpRequest {
                 .field("user_data", user_data).field("fd", fd)
                 .field("app_data_type", &(*app_data).type_id())
                 .finish_non_exhaustive(),
+            UringOpRequest::SendDataMultipartViaHandler { user_data, fd, app_data_parts, .. } => f
+              .debug_struct("SendDataMultipartViaHandler")
+              .field("user_data", user_data).field("fd", fd)
+              .field("num_parts", &app_data_parts.len())
+              .finish_non_exhaustive(),
             UringOpRequest::ShutdownConnectionHandler { user_data, fd, .. } => f
                 .debug_struct("ShutdownConnectionHandler")
                 .field("user_data", user_data).field("fd", fd)
@@ -173,7 +189,6 @@ impl fmt::Debug for UringOpRequest {
     }
 }
 
-// ... (UringOpCompletion and its Debug impl as before) ...
 pub enum UringOpCompletion {
   NopSuccess { user_data: UserData },
   InitializeBufferRingSuccess { user_data: UserData, bgid: u16 },

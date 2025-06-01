@@ -7,18 +7,20 @@ use super::{
     cqe_processor, sqe_builder,
 };
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
-use crate::io_uring_backend::ops::{UringOpRequest, UringOpCompletion}; // UserData implicitly used via ops
-use crate::io_uring_backend::connection_handler::{HandlerIoOps, UringWorkerInterface, HandlerSqeBlueprint};
+use crate::io_uring_backend::ops::{UringOpRequest, UringOpCompletion};
+use crate::io_uring_backend::connection_handler::{HandlerIoOps, UringWorkerInterface,};
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType};
 use crate::profiler::LoopProfiler;
 use crate::ZmqError;
-use io_uring::{opcode, types, squeue, Parameters};
+use io_uring::{opcode, types};
+use std::any::Any;
 use std::collections::VecDeque;
-use std::os::fd::AsRawFd; // ADDED for as_raw_fd()
+use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
-use kanal::{ReceiveError as KanalReceiveError, ReceiveErrorTimeout as KanalReceiveErrorTimeout};
+use kanal::ReceiveError as KanalReceiveError;
 
 
 impl UringWorker {
@@ -147,7 +149,7 @@ impl UringWorker {
                                      .user_data(accept_ud);
                 
                 let mut sq = unsafe { self.ring.submission_shared() };
-                let submitted_accept_sqe_ok = if !unsafe { sq.is_full() } {
+                let submitted_accept_sqe_ok = if !sq.is_full() {
                     match unsafe { sq.push(&accept_sqe) } {
                         Ok(_) => {
                             trace!("UringWorker: Queued first Accept SQE (ud:{}) for listener_fd {}", accept_ud, socket_fd);
@@ -216,7 +218,7 @@ impl UringWorker {
                         });
                         
                         let mut sq = unsafe { self.ring.submission_shared() };
-                        if !unsafe { sq.is_full() } {
+                        if !sq.is_full() {
                             match unsafe { sq.push(&sqe) } {
                                 Ok(_) => Ok(true), 
                                 Err(e) => { 
@@ -261,7 +263,7 @@ impl UringWorker {
                             listener_fd: None, target_fd_for_shutdown: None,
                         });
                         let mut sq = unsafe { self.ring.submission_shared() };
-                        if !unsafe { sq.is_full() } {
+                        if !sq.is_full() {
                             if unsafe{ sq.push(&sqe) }.is_ok() { Ok(true) }
                             else { 
                                 self.external_op_tracker.take_op(user_data);
@@ -430,6 +432,55 @@ impl UringWorker {
                     Ok(false) 
                 }
             }
+
+            UringOpRequest::SendDataMultipartViaHandler { user_data, fd, app_data_parts, reply_tx } => {
+        let op_name_for_error = "SendDataMultipartViaHandler";
+        if let Some(handler) = self.handler_manager.get_mut(fd) {
+          let interface = UringWorkerInterface::new(
+            fd,
+            &self.worker_io_config,
+            self.buffer_manager.as_ref(),
+            self.default_buffer_ring_group_id_val,
+          );
+          // UringConnectionHandler::handle_outgoing_app_data expects Arc<dyn Any + Send + Sync>
+          // We pass the Arc<Vec<Msg>> as the Arc<dyn Any...>. The handler will downcast.
+          let ops_output_from_handler = handler.handle_outgoing_app_data(app_data_parts as Arc<dyn Any + Send + Sync>, &interface);
+          
+          let mut local_fds_to_close_queue_multi = VecDeque::new();
+          
+          let mut sq_for_multi_blueprints = unsafe { self.ring.submission_shared() };
+          cqe_processor::process_handler_blueprints(
+            fd,
+            ops_output_from_handler,
+            &mut self.internal_op_tracker,
+            &mut sq_for_multi_blueprints,
+            self.default_buffer_ring_group_id_val,
+            &mut local_fds_to_close_queue_multi,
+            &mut self.pending_sqe_retry_queue,
+            &mut self.handler_manager,
+          );
+          drop(sq_for_multi_blueprints);
+
+          for fd_to_close in local_fds_to_close_queue_multi {
+            if !self.fds_needing_close_initiated_pass.contains(&fd_to_close) {
+              self.fds_needing_close_initiated_pass.push_back(fd_to_close);
+            }
+          }
+          
+          // Use SendDataViaHandlerAck for multipart too
+          if reply_tx.take_and_send_sync(Ok(UringOpCompletion::SendDataViaHandlerAck{user_data, fd})).is_none() {
+            tracing::warn!("UringWorker: Reply_tx for SendDataMultipartViaHandler (ud {}) was already taken.", user_data);
+          }
+          Ok(true) 
+        } else {
+          warn!("UringWorker: SendDataMultipartViaHandler for unknown fd {}", fd);
+          if reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError{user_data, op_name: op_name_for_error.to_string(), error: ZmqError::InvalidArgument(format!("FD {} not managed for SendDataMultipartViaHandler", fd))})).is_none() {
+            tracing::warn!("UringWorker: Reply_tx for SendDataMultipartViaHandler error (ud {}) was already taken.", user_data);
+          }
+          Ok(false)
+        }
+      }
+      
             UringOpRequest::ShutdownConnectionHandler { user_data, fd, reply_tx: _ } => { 
                  if let Some(handler) = self.handler_manager.get_mut(fd) {
                     let interface = crate::io_uring_backend::connection_handler::UringWorkerInterface::new(
@@ -506,7 +557,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         // --- PHASE 0: Process Pending SQE Retry Queue ---
 
         // Only attempt if SQ is not full and queue has items.
-        let mut items_to_process_from_sqe_retry_queue = worker.pending_sqe_retry_queue.len();
+        let items_to_process_from_sqe_retry_queue = worker.pending_sqe_retry_queue.len();
         if items_to_process_from_sqe_retry_queue > 0 {
           trace!("UringWorker: Processing SQE retry queue ({} items)", items_to_process_from_sqe_retry_queue);
           user_space_activity_this_cycle = true;
@@ -606,7 +657,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 user_space_activity_this_cycle = true;
                 let mut sq_for_handler_blueprints = unsafe { worker.ring.submission_shared() };
                 for (fd, handler_ops) in handler_io_ops_list {
-                    if !handler_ops.sqe_blueprints.is_empty() && unsafe { sq_for_handler_blueprints.is_full() } {
+                    if !handler_ops.sqe_blueprints.is_empty() && sq_for_handler_blueprints.is_full() {
                         warn!("UringWorker: SQ full for HandlerIoOps for FD {}.", fd);
                         
                         // Requeue blueprints from handler if SQ is full
@@ -632,7 +683,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         profiler.mark_segment_end_and_start_new("process_fds_to_close");
         // 1d. Process FDs flagged for close
         if !worker.shutdown_requested {
-            let mut fds_to_process_this_close_cycle = worker.fds_needing_close_initiated_pass.len();
+            let fds_to_process_this_close_cycle = worker.fds_needing_close_initiated_pass.len();
              if fds_to_process_this_close_cycle > 0 { user_space_activity_this_cycle = true; }
             for _ in 0..fds_to_process_this_close_cycle {
                 if unsafe { worker.ring.submission_shared().is_full() } { break; }

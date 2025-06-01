@@ -5,8 +5,8 @@ use crate::io_uring_backend::connection_handler::{
     WorkerIoConfig, ProtocolHandlerFactory, HandlerUpstreamEvent,
 };
 use crate::io_uring_backend::ops::ProtocolConfig;
-
 use crate::io_uring_backend::worker::MultishotReader;
+use crate::message::{Msg, MsgFlags};
 use crate::protocol::zmtp::{
     greeting::{ZmtpGreeting, GREETING_LENGTH, MECHANISM_LENGTH},
     command::{ZmtpCommand, ZmtpReady},
@@ -19,21 +19,19 @@ use crate::security::{
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
 use crate::socket::options::ZmtpEngineConfig;
-use crate::message::{Msg, MsgFlags};
 use crate::{Blob, ZmqError};
+use super::buffer_manager::BufferRingManager;
+use super::worker::InternalOpTracker;
 
-use bytes::{BytesMut, Bytes, BufMut};
-use tokio_util::codec::Encoder;
 use std::sync::Arc;
 use std::os::unix::io::RawFd;
 use std::time::{Instant, Duration};
 use std::collections::{VecDeque, HashMap};
 use std::any::Any;
+
+use bytes::{BytesMut, Bytes, BufMut};
+use tokio_util::codec::Encoder;
 use tracing::{debug, error, info, trace, warn};
-
-use super::buffer_manager::BufferRingManager;
-use super::worker::InternalOpTracker;
-
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ZmtpHandlerPhase {
@@ -69,6 +67,7 @@ pub struct ZmtpUringHandler {
     heartbeat_timeout_duration: Duration,
 
     outgoing_app_messages: VecDeque<Msg>, 
+    outgoing_multipart_app_messages: VecDeque<Vec<Msg>>,
     
     handshake_timeout: Duration,
     handshake_timeout_deadline: Instant,
@@ -111,6 +110,7 @@ impl ZmtpUringHandler {
             heartbeat_ivl: heartbeat_ivl_val,
             heartbeat_timeout_duration: heartbeat_timeout_val,
             outgoing_app_messages: VecDeque::new(),
+            outgoing_multipart_app_messages: VecDeque::new(),
             handshake_timeout: handshake_timeout_duration,
             handshake_timeout_deadline: Instant::now() + handshake_timeout_duration,
             read_is_pending: false,
@@ -127,6 +127,20 @@ impl ZmtpUringHandler {
         let mut dst_buffer = BytesMut::new();
         temp_codec.encode(msg.clone(), &mut dst_buffer)?;
         Ok(dst_buffer.freeze())
+    }
+
+    /// Encodes a Vec<Msg> (representing ZMTP frames) into a Vec<Bytes> (wire frames).
+    /// Applies encryption if a data_cipher is active.
+    fn zmtp_encode_and_encrypt_frames(&mut self, zmtp_frames: Vec<Msg>) -> Result<Vec<Bytes>, ZmqError> {
+      let mut wire_frames = Vec::with_capacity(zmtp_frames.len());
+      for frame in zmtp_frames {
+        // ZMTP encode individual frame (already has its flags)
+        let zmtp_encoded_bytes = Self::zmtp_encode_msg_to_bytes(&frame)?;
+        // Encrypt if needed
+        let wire_frame_bytes = Self::apply_encryption_if_needed(self.data_cipher.as_mut(), zmtp_encoded_bytes)?;
+        wire_frames.push(wire_frame_bytes);
+      }
+      Ok(wire_frames)
     }
     
     fn apply_encryption_if_needed(
@@ -709,7 +723,6 @@ impl UringConnectionHandler for ZmtpUringHandler {
             ZmtpHandlerPhase::ServerSendGreeting => {
                 self.phase = ZmtpHandlerPhase::SecurityExchange;
                 if let Some(sec_mech) = self.security_mechanism.as_mut() {
-                    // <<< MODIFIED START [Removed is_my_turn(), rely on produce_token()] >>>
                     if let Ok(Some(token_vec)) = sec_mech.produce_token() { // produce_token() decides if it's turn.
                          let token_msg = Msg::from_vec(token_vec).with_flags(MsgFlags::COMMAND);
                          if let Ok(bytes) = Self::zmtp_encode_msg_to_bytes(&token_msg) {
@@ -719,7 +732,6 @@ impl UringConnectionHandler for ZmtpUringHandler {
                              let mut temp_ops = std::mem::take(&mut ops); self.transition_to_error(&mut temp_ops, err, interface); ops = temp_ops; return ops;
                          }
                     }
-                    // <<< MODIFIED END >>>
                 }
             }
             ZmtpHandlerPhase::SecurityExchange => { }
@@ -738,7 +750,25 @@ impl UringConnectionHandler for ZmtpUringHandler {
                     debug!(fd=self.fd, "PING send acknowledged by kernel. Now waiting for PONG reply.");
                     self.last_sent_was_ping = false; 
                 }
-                if let Some(next_msg) = self.outgoing_app_messages.pop_front() {
+
+                if let Some(multipart_msg_parts) = self.outgoing_multipart_app_messages.pop_front() {
+                  match self.zmtp_encode_and_encrypt_frames(multipart_msg_parts) {
+                    Ok(wire_frames_to_send) => {
+                      for wire_frame in wire_frames_to_send {
+                        ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: wire_frame });
+                      }
+                    }
+                    Err(e) => {
+                      error!(fd = self.fd, "Failed to encode/encrypt multipart message from queue: {}", e);
+                      // Re-queueing is complex here if some parts were already blueprint-ed.
+                      // For now, transition to error.
+                      let mut temp_ops = std::mem::take(&mut ops);
+                      self.transition_to_error(&mut temp_ops, e, interface);
+                      ops = temp_ops;
+                      return ops;
+                    }
+                  }
+                } else if let Some(next_msg) = self.outgoing_app_messages.pop_front() {
                     match Self::zmtp_encode_msg_to_bytes(&next_msg) {
                         Ok(zmtp_frame_bytes) => { 
                             match Self::apply_encryption_if_needed(self.data_cipher.as_mut(), zmtp_frame_bytes) {
@@ -809,7 +839,22 @@ impl UringConnectionHandler for ZmtpUringHandler {
 
         if self.phase == ZmtpHandlerPhase::DataPhase {
             if ops.sqe_blueprints.is_empty() { 
-                if let Some(msg_to_send) = self.outgoing_app_messages.pop_front() {
+                if let Some(multipart_msg_parts) = self.outgoing_multipart_app_messages.front().cloned() { // Peek
+                  self.outgoing_multipart_app_messages.pop_front(); // Now pop
+                  match self.zmtp_encode_and_encrypt_frames(multipart_msg_parts) {
+                    Ok(wire_frames_to_send) => {
+                      for wire_frame in wire_frames_to_send {
+                        ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: wire_frame });
+                      }
+                    }
+                    Err(e) => {
+                      error!(fd = self.fd, "Failed to encode/encrypt multipart message from queue in prepare_sqes: {}", e);
+                      let mut temp_ops = std::mem::take(&mut ops);
+                      self.transition_to_error(&mut temp_ops, e, interface);
+                      ops = temp_ops;
+                    }
+                  }
+                } else if let Some(msg_to_send) = self.outgoing_app_messages.pop_front() {
                     match Self::zmtp_encode_msg_to_bytes(&msg_to_send) {
                         Ok(zmtp_frame_bytes) => {
                             match Self::apply_encryption_if_needed(self.data_cipher.as_mut(), zmtp_frame_bytes) {
@@ -881,43 +926,71 @@ impl UringConnectionHandler for ZmtpUringHandler {
     }
 
     fn handle_outgoing_app_data(&mut self, data: Arc<dyn Any + Send + Sync>, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
-        let mut ops = HandlerIoOps::new();
-        match DowncastArcAny::downcast_arc::<Msg>(data) {
-            Ok(msg_arc) => {
-                let msg_to_send = (*msg_arc).clone(); 
-                if self.phase == ZmtpHandlerPhase::DataPhase && self.outgoing_app_messages.is_empty() {
-                    match Self::zmtp_encode_msg_to_bytes(&msg_to_send) {
-                        Ok(zmtp_frame_bytes) => { 
-                            match Self::apply_encryption_if_needed(self.data_cipher.as_mut(), zmtp_frame_bytes) {
-                                Ok(final_bytes_to_send) => {
-                                    ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend{ data: final_bytes_to_send });
-                                }
-                                Err(enc_err) => {
-                                    warn!(fd=self.fd, "Encryption failed for direct send of app data: {}. Queuing message.", enc_err);
-                                    self.outgoing_app_messages.push_back(msg_to_send);
-                                }
-                            }
-                        }
-                        Err(encode_err) => {
-                            error!(fd=self.fd, "Failed to ZMTP encode outgoing app message for immediate send: {}. Queuing.", encode_err);
-                            self.outgoing_app_messages.push_back(msg_to_send);
-                        }
-                    }
-                } else {
-                    trace!(fd = self.fd, phase = ?self.phase, queue_len=self.outgoing_app_messages.len(), "Queuing outgoing app data.");
-                    self.outgoing_app_messages.push_back(msg_to_send);
+      let mut ops = HandlerIoOps::new();
+      
+      // Try to downcast to Arc<Vec<Msg>> first (for multipart)
+      match DowncastArcAny::downcast_arc::<Vec<Msg>>(data.clone()) { // Clone Arc for this attempt
+        Ok(app_data_parts_arc) => {
+          // It's a multipart message
+          let app_data_parts = (*app_data_parts_arc).clone(); // Get Vec<Msg>
+          if self.phase == ZmtpHandlerPhase::DataPhase && self.outgoing_app_messages.is_empty() && self.outgoing_multipart_app_messages.is_empty() {
+            // Try to send immediately if no other messages are queued
+            match self.zmtp_encode_and_encrypt_frames(app_data_parts) {
+              Ok(wire_frames_to_send) => {
+                for wire_frame in wire_frames_to_send {
+                  ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: wire_frame });
                 }
+              }
+              Err(e) => {
+                error!(fd = self.fd, "Failed to encode/encrypt outgoing multipart app data: {}. Queuing.", e);
+                self.outgoing_multipart_app_messages.push_back((*app_data_parts_arc).clone());
+                // Transition to error if encoding/encryption itself fails critically?
+                // For now, just queue it.
+              }
             }
-            Err(_original_arc_any) => {
-                error!(fd = self.fd, "ZmtpUringHandler received non-Msg app data via handle_outgoing_app_data. Ignoring.");
+          } else {
+            trace!(fd = self.fd, phase = ?self.phase, "Queuing outgoing multipart app data ({} parts).", app_data_parts_arc.len());
+            self.outgoing_multipart_app_messages.push_back((*app_data_parts_arc).clone());
+          }
+        }
+        Err(original_arc_any) => { // Not Arc<Vec<Msg>>, try Arc<Msg> (single part)
+          match DowncastArcAny::downcast_arc::<Msg>(original_arc_any) {
+            Ok(msg_arc) => {
+              let msg_to_send = (*msg_arc).clone();
+              if self.phase == ZmtpHandlerPhase::DataPhase && self.outgoing_app_messages.is_empty() && self.outgoing_multipart_app_messages.is_empty() {
+                match Self::zmtp_encode_msg_to_bytes(&msg_to_send) {
+                  Ok(zmtp_frame_bytes) => {
+                    match Self::apply_encryption_if_needed(self.data_cipher.as_mut(), zmtp_frame_bytes) {
+                      Ok(final_bytes_to_send) => {
+                        ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend { data: final_bytes_to_send });
+                      }
+                      Err(enc_err) => {
+                        warn!(fd = self.fd, "Encryption failed for direct send of app data: {}. Queuing message.", enc_err);
+                        self.outgoing_app_messages.push_back(msg_to_send);
+                      }
+                    }
+                  }
+                  Err(encode_err) => {
+                    error!(fd = self.fd, "Failed to ZMTP encode outgoing app message for immediate send: {}. Queuing.", encode_err);
+                    self.outgoing_app_messages.push_back(msg_to_send);
+                  }
+                }
+              } else {
+                trace!(fd = self.fd, phase = ?self.phase, "Queuing outgoing single-part app data.");
+                self.outgoing_app_messages.push_back(msg_to_send);
+              }
             }
+            Err(_unhandled_arc_any) => {
+              error!(fd = self.fd, "ZmtpUringHandler received unknown app data type via handle_outgoing_app_data. Ignoring.");
+            }
+          }
         }
-        
-        if self.multishot_reader.as_ref().map_or(true, |r| !r.is_active()) {
-            self.ensure_standard_read_is_pending(&mut ops, interface);
-        }
-
-        ops
+      }
+      
+      if self.multishot_reader.as_ref().map_or(true, |r| !r.is_active()) {
+        self.ensure_standard_read_is_pending(&mut ops, interface);
+      }
+      ops
     }
 
     fn close_initiated(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {

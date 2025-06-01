@@ -32,6 +32,7 @@ use tokio::sync::oneshot as tokio_oneshot;
 #[async_trait]
 pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
   async fn send_message(&self, msg: Msg) -> Result<(), ZmqError>;
+  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError>;
   async fn close_connection(&self) -> Result<(), ZmqError>;
   fn get_connection_id(&self) -> usize;
   fn as_any(&self) -> &dyn Any;
@@ -45,12 +46,19 @@ impl ISocketConnection for DummyConnection {
   async fn send_message(&self, _msg: Msg) -> Result<(), ZmqError> {
     Err(ZmqError::UnsupportedFeature("DummyConnection cannot send".into()))
   }
+
+  async fn send_multipart(&self, _msgs: Vec<Msg>) -> Result<(), ZmqError> {
+    Err(ZmqError::UnsupportedFeature("DummyConnection cannot send multipart".into()))
+  }
+
   async fn close_connection(&self) -> Result<(), ZmqError> {
     Ok(())
   }
+
   fn get_connection_id(&self) -> usize {
     0
   }
+
   fn as_any(&self) -> &dyn Any {
     self
   }
@@ -180,7 +188,16 @@ impl ISocketConnection for SessionConnection {
       }
     }
   }
-  // <<< MODIFIED END >>>
+  
+  // For SessionConnection, send_multipart sends each part individually.
+  // ZMTP framing for the logical message happens at a higher level (e.g., in specific ISocket impls).
+  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+    for msg_part in msgs {
+      // Use the existing send_message logic which respects SNDTIMEO
+      self.send_message(msg_part).await?;
+    }
+    Ok(())
+  }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
     // ... (close_connection remains the same)
@@ -295,6 +312,64 @@ impl ISocketConnection for UringFdConnection {
       }
     }
   }
+
+  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+    let (reply_tx, reply_rx) = tokio_oneshot::channel();
+    let unique_user_data = self.context.inner().next_handle() as u64;
+    
+    // Create the new request variant
+    let req = UringOpRequest::SendDataMultipartViaHandler {
+      user_data: unique_user_data,
+      fd: self.fd,
+      app_data_parts: Arc::new(msgs), // Wrap Vec<Msg> in Arc
+      reply_tx: WorkerOneShotSender::new(reply_tx),
+    };
+
+    self.worker_op_tx.send(req).await.map_err(|e| {
+      tracing::error!(
+        fd = self.fd,
+        "Failed to send SendDataMultipartViaHandler request to UringWorker: {}",
+        e
+      );
+      ZmqError::Internal(format!("UringWorker op channel error for multipart send: {}", e))
+    })?;
+
+    // Timeout logic remains similar to send_message
+    let ack_timeout = self.socket_options.sndtimeo.unwrap_or(Duration::from_secs(5));
+    let effective_ack_timeout = if ack_timeout.is_zero() {
+      Duration::from_millis(1) 
+    } else {
+      ack_timeout
+    };
+
+    match tokio_timeout(effective_ack_timeout, reply_rx).await {
+      Ok(Ok(Ok(_completion))) => Ok(()), // Assumes SendDataViaHandlerAck is used for multipart too
+      Ok(Ok(Err(e))) => {
+        tracing::warn!(fd = self.fd, "UringWorker reported error for SendDataMultipartViaHandler: {}", e);
+        Err(e)
+      }
+      Ok(Err(oneshot_err)) => {
+        tracing::error!(
+          fd = self.fd,
+          "OneShot channel error waiting for SendDataMultipartViaHandler ack: {}",
+          oneshot_err
+        );
+        Err(ZmqError::Internal("UringWorker reply channel error for multipart send".into()))
+      }
+      Err(_timeout_elapsed) => {
+        tracing::error!(
+          fd = self.fd,
+          "Timeout waiting for SendDataMultipartViaHandler ack from UringWorker (timeout: {:?}).",
+          effective_ack_timeout
+        );
+        if self.socket_options.sndtimeo == Some(Duration::ZERO) {
+          Err(ZmqError::ResourceLimitReached)
+        } else {
+          Err(ZmqError::Timeout)
+        }
+      }
+    }
+  }
   
   async fn close_connection(&self) -> Result<(), ZmqError> {
     let (reply_tx, reply_rx) = tokio_oneshot::channel();
@@ -401,7 +476,6 @@ impl InprocConnection {
 
 #[async_trait]
 impl ISocketConnection for InprocConnection {
-  // <<< MODIFIED START [send_message now uses stored socket_options for SNDTIMEO] >>>
   async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
     let timeout_opt = self.socket_options.sndtimeo; // Get SNDTIMEO from stored options
 
@@ -434,9 +508,14 @@ impl ISocketConnection for InprocConnection {
       }
     }
   }
-  // <<< MODIFIED END >>>
 
-  // ... (close_connection, get_connection_id, as_any for InprocConnection remain the same)
+  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+    for msg_part in msgs {
+      self.send_message(msg_part).await?;
+    }
+    Ok(())
+  }
+
   async fn close_connection(&self) -> Result<(), ZmqError> {
     tracing::debug!(
       conn_id = self.connection_id,

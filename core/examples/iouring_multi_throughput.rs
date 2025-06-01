@@ -12,7 +12,7 @@ use tokio::sync::{Mutex as TokioMutex, Semaphore, OwnedSemaphorePermit};
 mod common;
 
 // --- Configuration Constants ---
-const ROUTER_IO_URING_ENABLED: bool = false;
+const ROUTER_IO_URING_ENABLED: bool = true;
 const DEALER_IO_URING_ENABLED: bool = true;
 const TCP_CORK_ENABLED: u32 = 1; // 0 for false, 1 for true
 const NUM_DEALER_TASKS: usize = 2;

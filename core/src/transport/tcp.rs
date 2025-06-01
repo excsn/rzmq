@@ -4,10 +4,17 @@ use crate::context::Context;
 use crate::engine::zmtp_tcp::create_and_spawn_tcp_engine;
 use crate::error::ZmqError;
 use crate::runtime::{
-  self, mailbox, ActorDropGuard, ActorType, Command, SystemEvent, 
+  mailbox, ActorDropGuard, ActorType, Command, SystemEvent, 
   MailboxSender as GenericMailboxSender, MailboxReceiver as GenericMailboxReceiver,
   system_events::ConnectionInteractionModel, 
 };
+use crate::runtime::command::EngineConnectionType as CommandEngineConnectionType; 
+use crate::session::SessionBase; 
+use crate::socket::connection_iface::ISocketConnection;
+use crate::socket::events::{MonitorSender, SocketEvent};
+use crate::socket::options::{SocketOptions, TcpTransportConfig, ZmtpEngineConfig};
+use crate::socket::DEFAULT_RECONNECT_IVL_MS;
+
 #[cfg(feature = "io-uring")]
 use crate::runtime::global_uring_state;
 #[cfg(feature = "io-uring")]
@@ -21,19 +28,7 @@ use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSend
 #[cfg(feature = "io-uring")]
 use tokio::sync::oneshot as tokio_oneshot;
 #[cfg(feature = "io-uring")]
-use std::os::unix::io::{IntoRawFd, FromRawFd, RawFd};
-
-// <<< MODIFIED [No longer need SessionConnection here for standard path, ISocketConnection needed for UringFdConnection] >>>
-#[cfg(feature = "io-uring")]
-use crate::socket::connection_iface::UringFdConnection;
-use crate::socket::connection_iface::ISocketConnection; // Still needed for Arc<dyn ISocketConnection> in event
-
-use crate::runtime::command::EngineConnectionType as CommandEngineConnectionType; 
-
-use crate::session::{self, SessionBase}; 
-use crate::socket::events::{MonitorSender, SocketEvent};
-use crate::socket::options::{SocketOptions, TcpTransportConfig, ZmtpEngineConfig};
-use crate::socket::DEFAULT_RECONNECT_IVL_MS;
+use std::os::unix::io::{IntoRawFd, AsRawFd};
 
 use std::io;
 use std::net::SocketAddr as StdSocketAddr;
@@ -41,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
-use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, Semaphore};
 use tokio::task::{JoinHandle, Id as TaskId}; 
 use tokio::time::sleep;
 use tracing::{info, warn, error, debug, trace};
@@ -276,11 +271,9 @@ impl TcpListener {
             async move {
               let _permit_scoped_for_task = _permit_guard; 
 
-              // <<< MODIFIED START [Centralize ConnectionInterface and InteractionModel setup] >>>
               let mut connection_iface_for_event: Option<Arc<dyn ISocketConnection>> = None;
               let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
               let mut managing_actor_task_id_for_event: Option<TaskId> = None;
-              // <<< MODIFIED END >>>
               let mut setup_successful = true;
 
               if use_io_uring_for_session {
@@ -288,6 +281,16 @@ impl TcpListener {
                 {
                   match tokio_tcp_stream.into_std() {
                     Ok(std_stream) => {
+
+                      if socket_options_clone.tcp_cork {
+                        tracing::debug!(handle = accept_loop_handle, fd = std_stream.as_raw_fd(), "TcpListener: Applying TCP_CORK to accepted connection FD for IO URing.");
+                        let sock_ref = socket2::SockRef::from(&std_stream);
+                        if let Err(e) = sock_ref.set_cork(true) {
+                          tracing::error!(handle = accept_loop_handle, fd = std_stream.as_raw_fd(), error = %e, "TcpListener: Failed to set TCP_CORK for IO URing FD. Proceeding without.");
+                          // Not making this fatal for the connection, it will proceed without CORK.
+                        }
+                      }
+
                       if let Err(e) = apply_tcp_socket_options_to_std(&std_stream, &transport_config_clone) {
                         tracing::error!("Opt apply failed (std stream) for {}: {}. Dropping.", peer_addr_str, e);
                         setup_successful = false; 
@@ -433,16 +436,13 @@ impl TcpListener {
 
 
 // --- TcpConnecter Actor ---
-// ... (UnifiedConnectOutcome definition remains the same)
 type UnifiedConnectOutcome = (
-  // <<< MODIFIED [connection_iface is Option here, SocketCore will finalize for Session path] >>>
-  Option<Arc<dyn ISocketConnection>>, // Arc<dyn ISocketConnection>,       
+  Option<Arc<dyn ISocketConnection>>,      
   ConnectionInteractionModel,       
   Option<TaskId>, // managing_actor_task_id                   
   String, // actual_peer_uri                         
 );
 
-// ... (TcpConnecter struct definition remains the same)
 #[derive(Debug)]
 pub(crate) struct TcpConnecter { 
   handle: usize,
@@ -477,8 +477,7 @@ impl TcpConnecter {
     task_join_handle
   }
   
-  // ... (run_connect_loop remains similar, focusing on logic for trying connections)
-  async fn run_connect_loop(mut self, monitor_tx: Option<MonitorSender>) { 
+  async fn run_connect_loop(self, monitor_tx: Option<MonitorSender>) { 
     let connecter_handle = self.handle;
     let actor_type = ActorType::Connecter;
     let endpoint_uri_clone = self.endpoint.clone(); 
@@ -557,7 +556,6 @@ impl TcpConnecter {
         .await;
 
       match single_attempt_outcome {
-        // <<< MODIFIED [connection_iface is now Option in UnifiedConnectOutcome] >>>
         Ok((connection_iface_opt, interaction_model, managing_actor_task_id, actual_peer_uri)) => {
           tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, actual_peer = %actual_peer_uri, "Connecter: TCP connect successful.");
           let event = SystemEvent::NewConnectionEstablished {
@@ -627,9 +625,23 @@ impl TcpConnecter {
           let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).map_err(ZmqError::from)?;
           apply_socket2_options_pre_connect(&socket, &self.config)?;
 
+          // Apply TCP_CORK before connect if enabled in context_options
+          if self.context_options.tcp_cork {
+            tracing::debug!(handle = self.handle, "TcpConnecter: Applying TCP_CORK to outgoing connection FD before connect for IO URing.");
+            // Apply to socket2::Socket before connect()
+            if let Err(e) = socket.set_cork(true) { // socket2::Socket has set_cork
+              tracing::error!(handle = self.handle, error = %e, "TcpConnecter: Failed to set TCP_CORK (socket2) for IO URing FD. Proceeding without.");
+              // Optionally, make this fatal:
+              // return Err(ZmqError::IoError { kind: e.kind(), message: format!("Failed to set TCP_CORK: {}", e) });
+            }
+          }
+
           let std_stream: std::net::TcpStream = tokio::task::spawn_blocking({
             let addr_clone = *target_socket_addr;
-            move || { socket.connect(&addr_clone.into()); socket.into() }
+            move || {
+              let _ = socket.connect(&addr_clone.into());
+              socket.into()
+            }
           }).await.map_err(|je| ZmqError::Internal(format!("Blocking connect join error: {}", je)))?;
           
           let peer_addr_actual = std_stream.peer_addr().map_err(ZmqError::from)?;
@@ -662,7 +674,6 @@ impl TcpConnecter {
             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. })) if returned_fd == raw_fd => {
               info!("Successfully registered connected FD {} with UringWorker.", raw_fd);
               
-              let connection_iface: Arc<dyn ISocketConnection> = Arc::new(UringFdConnection::new(raw_fd, self.context_options.clone(), self.context.clone()));
               let connection_iface = None;
               let interaction_model = ConnectionInteractionModel::ViaUringFd { fd: raw_fd };
               Ok((
@@ -710,15 +721,11 @@ impl TcpConnecter {
         let session_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let engine_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // <<< REMOVED [Pipe creation and AttachPipe send from here for standard path] >>>
-
         let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
           session_hdl_id, actual_connected_uri, logical_uri_for_monitor, 
           monitor_tx.clone(), 
           self.context.clone(), self.parent_socket_id,
         );
-
-        // <<< REMOVED [AttachPipe Command send from here] >>>
         
         // Attach Engine
         let (engine_mb, engine_task_hdl) = create_and_spawn_tcp_engine(

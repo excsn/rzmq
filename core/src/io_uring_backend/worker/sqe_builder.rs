@@ -104,6 +104,7 @@ pub(crate) fn build_sqe_for_external_request(
         UringOpRequest::RegisterExternalFd { .. } |
         UringOpRequest::StartFdReadLoop { .. } |
         UringOpRequest::SendDataViaHandler { .. } |
+        UringOpRequest::SendDataMultipartViaHandler { .. } |
         UringOpRequest::ShutdownConnectionHandler { .. } => {
             tracing::trace!(
                 "build_sqe_for_external_request: Op '{}' does not produce a direct SQE from this function.",
