@@ -83,7 +83,7 @@ async fn configure_server_socket_for_test( // Renamed from configure_router_for_
 // --- Test Cases ---
 // PUSH/PULL and REQ/REP tests also need to call the locally defined helpers.
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
     let endpoint = generate_multi_reconnect_endpoint(0); // Changed function name
@@ -141,7 +141,7 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
     Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
     let endpoint = generate_multi_reconnect_endpoint(1); // Changed function name
@@ -210,7 +210,7 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
 }
 
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), ZmqError> {
     let endpoint = generate_multi_reconnect_endpoint(0); // Re-used offset 0, ensure it's unique if running all tests

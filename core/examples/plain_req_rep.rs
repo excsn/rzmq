@@ -12,7 +12,7 @@ fn print_msg_parts(msg_type: &str, msg: &Msg) {
   );
 }
 
-#[rzmq::main]
+#[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   // --- Configuration ---
   let bind_addr = "tcp://127.0.0.1:5555";

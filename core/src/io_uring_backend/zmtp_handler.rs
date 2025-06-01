@@ -2,7 +2,7 @@
 
 use crate::io_uring_backend::connection_handler::{
     UringConnectionHandler, UringWorkerInterface, HandlerIoOps, HandlerSqeBlueprint, UserData,
-    WorkerIoConfig, ProtocolHandlerFactory,
+    WorkerIoConfig, ProtocolHandlerFactory, HandlerUpstreamEvent,
 };
 use crate::io_uring_backend::ops::ProtocolConfig;
 
@@ -13,13 +13,13 @@ use crate::protocol::zmtp::{
     manual_parser::ZmtpManualParser,
 };
 use crate::security::{
-    self, negotiate_security_mechanism, IDataCipher, Mechanism, MechanismStatus, NullMechanism,
+    negotiate_security_mechanism, IDataCipher, Mechanism, NullMechanism,
     PlainMechanism,
 };
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
 use crate::socket::options::ZmtpEngineConfig;
-use crate::message::{Msg, MsgFlags, Metadata};
+use crate::message::{Msg, MsgFlags};
 use crate::{Blob, ZmqError};
 
 use bytes::{BytesMut, Bytes, BufMut};
@@ -154,14 +154,15 @@ impl ZmtpUringHandler {
             } else {
                 error!(fd = self.fd, "ZmtpUringHandler: Critical - Cannot request standard read, no default_bgid configured for worker.");
                 let err = ZmqError::Internal("Standard read required but not configured in worker (no default_bgid).".into());
+
                 let mut temp_ops = std::mem::take(ops);
-                self.transition_to_error(&mut temp_ops, err, interface); 
+                self.transition_to_error(&mut temp_ops, err.clone(), interface);
                 *ops = temp_ops;
             }
         }
     }
 
-    fn transition_to_error(&mut self, ops: &mut HandlerIoOps, error: ZmqError, _interface: &UringWorkerInterface<'_>) {
+    fn transition_to_error(&mut self, ops: &mut HandlerIoOps, error: ZmqError, interface: &UringWorkerInterface<'_>) {
         if self.phase == ZmtpHandlerPhase::Error || self.phase == ZmtpHandlerPhase::Closed {
             return;
         }
@@ -174,9 +175,12 @@ impl ZmtpUringHandler {
             ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestClose);
         }
 
+        // Signal error upstream using the new HandlerUpstreamEvent
         if !matches!(previous_phase, ZmtpHandlerPhase::DataPhase | ZmtpHandlerPhase::Error | ZmtpHandlerPhase::Closed) {
              warn!(fd=self.fd, "Signaling handshake failure upstream due to error: {}", error);
-             let _ = _interface.worker_io_config.parsed_msg_tx_zmtp.try_send((self.fd, Err(error)));
+             let _ = interface.worker_io_config.upstream_event_tx.try_send(
+                 (self.fd, HandlerUpstreamEvent::Error(error))
+             );
         }
     }
 
@@ -201,18 +205,15 @@ impl ZmtpUringHandler {
 
         info!(fd=self.fd, final_peer_id=?self.final_peer_identity, "ZmtpUringHandler: Signaling ZMTP handshake completion upstream.");
         
-        let signal_content = format!(
-            "ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_{}_PEER_ID_{:?}", 
-            self.fd,
-            self.final_peer_identity.as_ref().map(|id_blob| String::from_utf8_lossy(id_blob.as_ref()))
-        );
-        // example: "ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_8_PEER_ID_None"
-        // or:      "ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_8_PEER_ID_Some(\"peer_id_content\")"
+        // Use the new HandlerUpstreamEvent to signal completion
+        let event = HandlerUpstreamEvent::HandshakeComplete {
+            peer_identity: self.final_peer_identity.clone(),
+        };
 
-        interface.worker_io_config.parsed_msg_tx_zmtp.try_send(
-            (self.fd, Err(ZmqError::Internal(signal_content))) 
+        interface.worker_io_config.upstream_event_tx.try_send(
+            (self.fd, event)
         ).map_err(|e| {
-            error!(fd=self.fd, "Failed to send ZMTP_HANDSHAKE_COMPLETE signal upstream: {:?}", e);
+            error!(fd=self.fd, "Failed to send HandshakeComplete signal upstream: {:?}", e);
             ZmqError::Internal("Failed to signal handshake completion".into())
         }).map(|_| ())
     }
@@ -557,7 +558,8 @@ impl ZmtpUringHandler {
                                         _ => { warn!(fd = self.fd, "DataPhase: Received unhandled ZMTP command: {:?}", msg.data()); }
                                     }
                                 } else { // Data message
-                                    if let Err(send_err) = interface.worker_io_config.parsed_msg_tx_zmtp.try_send((self.fd, Ok(msg))) {
+                                    let upstream_event = HandlerUpstreamEvent::Data(msg);
+                                    if let Err(send_err) = interface.worker_io_config.upstream_event_tx.try_send((self.fd, upstream_event)) {
                                         error!(fd = self.fd, "DataPhase: Failed to send ZMTP data msg upstream: {:?}", send_err);
                                         let err = ZmqError::Internal("Upstream channel error for ZMTP data".into());
                                         self.transition_to_error(ops, err.clone(), interface); return Err(err);
@@ -656,7 +658,16 @@ impl UringConnectionHandler for ZmtpUringHandler {
                 }
             }
 
-            let mut temp_ops = std::mem::take(&mut ops); self.transition_to_error(&mut temp_ops, eof_err, interface); ops = temp_ops;
+            let mut temp_ops = std::mem::take(&mut ops);
+            self.transition_to_error(&mut temp_ops, eof_err.clone(), interface); // Pass clone
+            ops = temp_ops;
+            // Also ensure the error is sent upstream if transition_to_error didn't send it (e.g., if already in DataPhase)
+            if matches!(original_phase_eof, ZmtpHandlerPhase::DataPhase) {
+                 let _ = interface.worker_io_config.upstream_event_tx.try_send(
+                     (self.fd, HandlerUpstreamEvent::Error(eof_err))
+                 );
+            }
+            
             return ops; 
         }
         

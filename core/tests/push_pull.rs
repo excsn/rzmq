@@ -11,7 +11,7 @@ const SEND_PEER_WAIT_TIMEOUT: Duration = Duration::from_millis(150);
 
 // --- TCP Tests ---
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_push_pull_tcp_basic_messaging() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   let push = ctx.socket(SocketType::Push)?;
@@ -40,7 +40,7 @@ async fn test_push_pull_tcp_basic_messaging() -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_push_pull_tcp_multiple_messages() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   let push = ctx.socket(SocketType::Push)?;
@@ -73,7 +73,7 @@ async fn test_push_pull_tcp_multiple_messages() -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_push_pull_tcp_connect_before_bind() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   let push = ctx.socket(SocketType::Push)?;
@@ -100,7 +100,7 @@ async fn test_push_pull_tcp_connect_before_bind() -> Result<(), ZmqError> {
 // --- IPC Tests (Feature Gated) ---
 
 #[cfg(feature = "ipc")]
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_push_pull_ipc_basic_messaging() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   let push = ctx.socket(SocketType::Push)?;
@@ -132,7 +132,7 @@ async fn test_push_pull_ipc_basic_messaging() -> Result<(), ZmqError> {
 // --- Inproc Tests (Feature Gated) ---
 
 #[cfg(feature = "inproc")]
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_push_pull_inproc_basic_messaging() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   let push = ctx.socket(SocketType::Push)?;
@@ -156,7 +156,7 @@ async fn test_push_pull_inproc_basic_messaging() -> Result<(), ZmqError> {
 }
 
 #[cfg(feature = "inproc")]
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_push_pull_inproc_multiple_clients() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   let pull = ctx.socket(SocketType::Pull)?;
@@ -200,7 +200,7 @@ async fn test_push_pull_inproc_multiple_clients() -> Result<(), ZmqError> {
 // --- Test: PUSH HWM and SNDTIMEO=0 ---
 
 // Keep the SNDTIMEO=0 test as it works correctly
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_push_pull_hwm_sndtimeo_0() -> Result<(), ZmqError> {
   println!("Starting test_push_pull_hwm_sndtimeo_0...");
   let ctx = common::test_context();
@@ -266,7 +266,7 @@ async fn test_push_pull_hwm_sndtimeo_0() -> Result<(), ZmqError> {
 }
 
 // --- Test: PUSH times out with SNDTIMEO > 0 when no peer is available ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_push_sndtimeo_positive_no_peer() -> Result<(), ZmqError> {
   println!("Starting test_push_sndtimeo_positive_no_peer...");
   let ctx = common::test_context();
@@ -349,7 +349,7 @@ async fn test_push_sndtimeo_positive_no_peer() -> Result<(), ZmqError> {
 }
 
 // --- Test: PULL RCVTIMEO ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_pull_rcvtimeo() -> Result<(), ZmqError> {
   println!("Starting test_pull_rcvtimeo...");
   let ctx = common::test_context();

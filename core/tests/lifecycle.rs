@@ -13,7 +13,7 @@ const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 const MONITOR_EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 // --- Test: Context termination closes sockets and allows exit ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_context_term_closes_sockets() -> Result<(), ZmqError> {
   println!("Starting test_context_term_closes_sockets...");
   let ctx = common::test_context();
@@ -115,7 +115,7 @@ async fn test_context_term_closes_sockets() -> Result<(), ZmqError> {
 }
 
 // --- Test: Explicit socket close stops activity ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_socket_close_stops_connection() -> Result<(), ZmqError> {
   println!("Starting test_socket_close_stops_connection...");
   let ctx = common::test_context();
@@ -172,7 +172,7 @@ async fn test_socket_close_stops_connection() -> Result<(), ZmqError> {
 }
 
 // --- Test: Closing socket handle triggers cleanup ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Result<()> {
   println!("Starting test_socket_explicit_close_triggers_disconnect_event...");
   let ctx = common::test_context();
@@ -311,7 +311,7 @@ async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Resul
 
 // --- Test: Concurrent Context Termination and Socket Operation ---
 // This test is a bit more complex, aiming to catch race conditions during shutdown.
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_concurrent_term_and_op() -> Result<(), ZmqError> {
   println!("Starting test_concurrent_term_and_op...");
   let ctx = common::test_context();

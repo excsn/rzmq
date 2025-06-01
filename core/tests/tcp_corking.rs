@@ -36,7 +36,7 @@ async fn setup_pair_with_cork(
   Ok((sender, receiver))
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_tcp_cork_single_part_message_cork_enabled() -> Result<(), ZmqError> {
   println!("\n--- Starting test_tcp_cork_single_part_message_cork_enabled ---");
   let ctx = common::test_context();
@@ -60,7 +60,7 @@ async fn test_tcp_cork_single_part_message_cork_enabled() -> Result<(), ZmqError
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_tcp_cork_single_part_message_cork_disabled() -> Result<(), ZmqError> {
   println!("\n--- Starting test_tcp_cork_single_part_message_cork_disabled ---");
   let ctx = common::test_context();
@@ -84,7 +84,7 @@ async fn test_tcp_cork_single_part_message_cork_disabled() -> Result<(), ZmqErro
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_tcp_cork_multi_part_message_cork_enabled() -> Result<(), ZmqError> {
   println!("\n--- Starting test_tcp_cork_multi_part_message_cork_enabled ---");
   let ctx = common::test_context();
@@ -131,7 +131,7 @@ async fn test_tcp_cork_multi_part_message_cork_enabled() -> Result<(), ZmqError>
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_tcp_cork_multi_part_message_cork_disabled() -> Result<(), ZmqError> {
   println!("\n--- Starting test_tcp_cork_multi_part_message_cork_disabled ---");
   let ctx = common::test_context();
@@ -168,7 +168,7 @@ async fn test_tcp_cork_multi_part_message_cork_disabled() -> Result<(), ZmqError
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_tcp_cork_ping_pong_interaction() -> Result<(), ZmqError> {
   println!("\n--- Starting test_tcp_cork_ping_pong_interaction ---");
   let ctx = common::test_context();
@@ -230,7 +230,7 @@ async fn test_tcp_cork_ping_pong_interaction() -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_tcp_cork_state_management_with_more_flag() -> Result<(), ZmqError> {
     println!("\n--- Starting test_tcp_cork_state_management_with_more_flag ---");
     let ctx = common::test_context();

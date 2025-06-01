@@ -237,9 +237,11 @@ pub(crate) async fn process_socket_command(
               socket_logic_strong
                   .update_peer_identity(s_read_id, peer_identity)
                   .await;
-              // Optionally, SocketCore could also update its EndpointInfo if needed,
-              // though peer identity is primarily for the pattern logic.
-              // No error is generated here; this is a successful handshake step.
+                
+              // Emit HandshakeSucceeded monitor event for io_uring path
+              core_arc.core_state.read().send_monitor_event(
+                  SocketEvent::HandshakeSucceeded { endpoint: uri.clone() }
+              );
           } else {
               tracing::warn!(
                   handle = core_handle, %fd, %uri,

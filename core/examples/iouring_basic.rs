@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use rzmq::{Context, Msg, SocketType, ZmqError};
 
-// User's main async function
-#[rzmq::main] // This might expand to tokio_uring::main
+#[tokio::main]
 async fn main() -> Result<(), ZmqError> {
     let ctx = Context::new()?; // Or Context::with_io_uring_options(...)
 
@@ -18,9 +17,8 @@ async fn main() -> Result<(), ZmqError> {
             let req_parts = rep.recv_multipart().await.unwrap();
             // REP echoes the payload
             let mut reply_parts = Vec::new();
-            reply_parts.push(req_parts[0].clone()); // Identity
             reply_parts.push(Msg::from_static(b"")); // Delimiter
-            reply_parts.push(req_parts[2].clone()); // Echo payload
+            reply_parts.push(req_parts[0].clone()); // Echo payload
             rep.send_multipart(reply_parts).await.unwrap();
         }
     });

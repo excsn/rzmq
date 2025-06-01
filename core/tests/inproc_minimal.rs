@@ -6,7 +6,7 @@ mod common;
 
 const LONG_TIMEOUT: Duration = Duration::from_secs(5); // Increased timeout slightly
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_inproc_minimal_pipe() -> Result<(), ZmqError> {
   println!("Starting minimal inproc test...");
   let ctx = common::test_context();

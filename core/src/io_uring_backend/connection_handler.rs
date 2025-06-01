@@ -3,12 +3,21 @@
 #![cfg(feature = "io-uring")]
 
 use crate::message::Msg;
-use crate::ZmqError;
+use crate::{Blob, ZmqError};
+
 use std::any::Any;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
+
 use kanal::Sender as KanalSender;
-use bytes::Bytes; // For HandlerSqeBlueprint::RequestSend
+use bytes::Bytes;
+
+// UserData re-export from ops.rs
+pub use crate::io_uring_backend::ops::UserData;
+
+use super::buffer_manager::BufferRingManager;
+use super::ops::ProtocolConfig;
+use super::worker::InternalOpTracker;
 
 // --- Blueprints for SQEs requested by handlers ---
 #[derive(Debug, Clone)]
@@ -197,14 +206,22 @@ pub trait ProtocolHandlerFactory: Send + Sync + 'static {
     ) -> Result<Box<dyn UringConnectionHandler + Send>, String>;
 }
 
-#[derive(Clone)]
-pub struct WorkerIoConfig {
-   pub parsed_msg_tx_zmtp: KanalSender<(RawFd, Result<Msg, ZmqError>)>,
+/// Events sent upstream from a UringConnectionHandler to the UringUpstreamProcessor.
+#[derive(Debug, Clone)] // Clone might be needed if it's ever peeked from a channel
+pub enum HandlerUpstreamEvent {
+  /// A complete ZMTP data message.
+  Data(Msg),
+  /// ZMTP handshake (including security) completed successfully.
+  HandshakeComplete {
+    peer_identity: Option<Blob>,
+    // Could add local_addr/peer_addr if needed for ISocketConnection later
+  },
+  /// A non-recoverable error occurred in the handler.
+  Error(ZmqError),
+  // Potentially other signals like ConnectionClosedByPeer, etc.
 }
 
-// UserData re-export from ops.rs
-pub use crate::io_uring_backend::ops::UserData;
-
-use super::buffer_manager::BufferRingManager;
-use super::ops::ProtocolConfig;
-use super::worker::InternalOpTracker;
+#[derive(Clone)]
+pub struct WorkerIoConfig {
+   pub upstream_event_tx: KanalSender<(RawFd, HandlerUpstreamEvent)>,
+}

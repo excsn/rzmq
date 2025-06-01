@@ -66,7 +66,7 @@ async fn run_subscriber(ctx: Context, identity: &str, topic_to_subscribe: &str) 
   Ok(())
 }
 
-#[rzmq::main]
+#[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 

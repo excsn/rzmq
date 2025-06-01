@@ -59,7 +59,7 @@ use std::time::Duration;
 
 // On Linux with "io-uring" feature for rzmq:
 // #[cfg(all(target_os = "linux", feature = "io-uring"))]
-// #[rzmq::main]
+// #[tokio::main]
 // async fn main() -> Result<(), ZmqError> { ... }
 
 // Otherwise (or if io-uring feature is not used):
@@ -102,7 +102,7 @@ A client sends a request and waits for a reply from a server.
 use rzmq::{Context, SocketType, Msg, ZmqError};
 use std::time::Duration;
 
-// #[rzmq::main] // if io-uring
+// #[tokio::main] // if io-uring
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
     let ctx = Context::with_capacity(Some(128))?; // Example: specify mailbox capacity
@@ -410,12 +410,12 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
     [dependencies]
     rzmq = { version = "...", features = ["io-uring"] } # Or git source
     ```
-2.  **Use `#[rzmq::main]`**: Modify your application's `main` function to use the `#[rzmq::main]` attribute instead of `#[tokio::main]`.
+2.  **Use `#[tokio::main]`**: Modify your application's `main` function to use the `#[tokio::main]` attribute instead of `#[tokio::main]`.
     ```rust
     // In your main.rs or lib.rs if re-exporting from a library
     // pub use rzmq::main as rzmq_main_attr; // Optional rename if `main` is ambiguous
 
-    #[rzmq::main] // Or #[rzmq_main_attr]
+    #[tokio::main] // Or #[rzmq_main_attr]
     async fn main() -> Result<(), rzmq::ZmqError> {
         // Your rzmq application code...
         let ctx = rzmq::Context::new()?;
@@ -426,7 +426,7 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
         Ok(())
     }
     ```
-    The `#[rzmq::main]` macro automatically configures the Tokio runtime to use `tokio-uring` when the conditions are met. If not on Linux or the `io-uring` feature is disabled, it defaults to `#[tokio::main]`.
+    The `#[tokio::main]` macro automatically configures the Tokio runtime to use `tokio-uring` when the conditions are met. If not on Linux or the `io-uring` feature is disabled, it defaults to `#[tokio::main]`.
 
 3.  **`io_uring` Specific Options**: (Optional)
     You can hint at `io_uring`-specific behaviors using socket options if the underlying transport uses them:

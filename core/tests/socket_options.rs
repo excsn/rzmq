@@ -8,7 +8,7 @@ use rzmq::{
 use std::time::Duration;
 mod common;
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_option_last_endpoint_tcp_ephemeral_port() -> Result<(), ZmqError> {
   println!("\n--- Starting test_option_last_endpoint_tcp_ephemeral_port ---");
   let ctx = common::test_context();
@@ -85,7 +85,7 @@ async fn test_option_last_endpoint_tcp_ephemeral_port() -> Result<(), ZmqError> 
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_option_last_endpoint_ipc() -> Result<(), ZmqError> {
   #[cfg(not(feature = "ipc"))]
   {
@@ -141,7 +141,7 @@ async fn test_option_last_endpoint_ipc() -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_option_last_endpoint_inproc() -> Result<(), ZmqError> {
   #[cfg(not(feature = "inproc"))]
   {

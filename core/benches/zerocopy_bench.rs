@@ -178,16 +178,7 @@ fn zerocopy_vs_standard_benchmarks(c: &mut Criterion<WallTime>) {
       dr_group.bench_function(BenchmarkId::new(&bench_id_str, desc_suffix), |b| {
         // Runtime selection is per-benchmark function, as it can change.
         // This `rt` instance is what `b.to_async` will use.
-        let rt = if try_zc && cfg!(all(target_os = "linux", feature = "io-uring")) {
-          println!("[Bench DR {}:{}] Using tokio-uring runtime for endpoint {}", bench_id_str, desc_suffix, endpoint);
-          #[cfg(all(target_os = "linux", feature = "io-uring"))] // Ensure tokio_uring is only referenced when available
-          { tokio_uring::builder().build().unwrap() }
-          #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-          unreachable!("Runtime selection logic error: Should have skipped ZC bench if not Linux/io-uring");
-        } else {
-          println!("[Bench DR {}:{}] Using standard Tokio runtime for endpoint {}", bench_id_str, desc_suffix, endpoint);
-          TokioBuilder::new_current_thread().enable_all().build().unwrap()
-        };
+        let rt = TokioBuilder::new_current_thread().enable_all().build().unwrap();
 
         // Setup sockets, ZMQ context, and message template ONCE for this BenchmarkId.
         // This block uses the `rt` chosen above.

@@ -53,7 +53,7 @@ async fn run_req_client(ctx: Context) -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[rzmq::main] // Or #[tokio::main]
+#[tokio::main] // Or #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   tracing_subscriber::fmt()
     .with_max_level(tracing::Level::INFO) // Use INFO for examples

@@ -11,9 +11,8 @@ use rzmq::{
   },
   Context, Msg, SocketType, ZmqError,
 };
-use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering}; // For unique ports
+use std::{sync::atomic::{AtomicU16, Ordering as AtomicOrdering}, time::Instant}; // For unique ports
 use std::time::Duration;
-use tokio_uring::runtime::Builder as UringBuilder;
 
 // --- Port Management for Benchmarks ---
 const BENCH_ENDPOINT_BASE_PORT_MS_RECV: u16 = 6300;
@@ -56,10 +55,10 @@ async fn setup_push_pull_for_recv_bench(
     println!("[Setup {}] Configuring PULL for Standard Receive", endpoint);
   }
   pull
-    .set_option(RCVHWM, &((NUM_MESSAGES_BENCH as i32 / 2).max(100)))
+    .set_option(RCVHWM, (NUM_MESSAGES_BENCH as i32 / 2).max(100))
     .await?;
   push
-    .set_option(SNDHWM, &((NUM_MESSAGES_BENCH as i32 / 2).max(1000)))
+    .set_option(SNDHWM, ((NUM_MESSAGES_BENCH as i32 / 2).max(1000)))
     .await?;
   push.set_option(SNDTIMEO, &(-1i32).to_ne_bytes()).await?;
 

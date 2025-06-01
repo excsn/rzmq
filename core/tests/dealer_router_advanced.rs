@@ -16,7 +16,7 @@ const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 const MONITOR_EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 // --- Test: Multiple Dealers ---
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_dealer_router_multiple_dealers() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_multiple_dealers...");
@@ -151,7 +151,7 @@ async fn test_dealer_router_multiple_dealers() -> Result<(), ZmqError> {
 }
 
 // --- Test: ROUTER_MANDATORY = false (Default) ---
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_dealer_router_router_sends_to_unknown_mandatory_false() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_router_sends_to_unknown_mandatory_false...");
@@ -234,7 +234,7 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_false() -> Result<
 }
 
 // --- Test: ROUTER_MANDATORY = true ---
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_dealer_router_router_sends_to_unknown_mandatory_true() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_router_sends_to_unknown_mandatory_true...");
@@ -290,7 +290,7 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_true() -> Result<(
 }
 
 // --- Test: Dealer disconnects, Router tries to send (Using Monitor) ---
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_dealer_disconnects_router_sends (Monitor)...");
@@ -394,7 +394,7 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
 }
 
 // --- Test: Multi-part message from Dealer -> Router ---
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_dealer_router_multi_part_dealer_to_router() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_multi_part_dealer_to_router...");
@@ -455,7 +455,7 @@ async fn test_dealer_router_multi_part_dealer_to_router() -> Result<(), ZmqError
 }
 
 // --- Test: Multi-part message from Router -> Dealer ---
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_dealer_router_multi_part_router_to_dealer() -> Result<(), ZmqError> {
   println!("Starting test_dealer_router_multi_part_router_to_dealer...");

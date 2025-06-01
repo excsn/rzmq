@@ -26,7 +26,6 @@ inproc = []
 bench_external_clients = []
 
 [dependencies]
-rzmq_macros = { version = "^0", path = "../macros" }
 
 # --- Core Async Runtime & Concurrency ---
 async-channel = "^2"

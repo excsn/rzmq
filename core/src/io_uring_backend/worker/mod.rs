@@ -12,11 +12,10 @@ mod sqe_builder;
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
-    ProtocolHandlerFactory, WorkerIoConfig, HandlerSqeBlueprint,
+    ProtocolHandlerFactory, WorkerIoConfig, HandlerSqeBlueprint, HandlerUpstreamEvent
 };
 use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
-use crate::message::Msg;
 use crate::ZmqError;
 
 use std::collections::VecDeque;
@@ -82,14 +81,14 @@ impl UringWorker {
     ring_entries: u32, // Number of entries for the io_uring SQ/CQ
     factories: Vec<Arc<dyn ProtocolHandlerFactory>>,
     // Provide the pre-created sender for parsed ZMTP messages
-    parsed_msg_tx_zmtp: KanalSyncSender<(RawFd, Result<Msg, ZmqError>)>,
+    upstream_event_tx: KanalSyncSender<(RawFd, HandlerUpstreamEvent)>,
   ) -> Result<(SignalingOpSender, std::thread::JoinHandle<Result<(), ZmqError>>), ZmqError> {
 
     let (op_tx_sync, op_rx) = kanal::unbounded::<UringOpRequest>();
     let op_tx_async_for_signaler: KanalAsyncSender<UringOpRequest> = op_tx_sync.to_async();
 
     let worker_io_config = Arc::new(WorkerIoConfig {
-        parsed_msg_tx_zmtp,
+        upstream_event_tx,
     });
 
     let event_fd_master_instance = eventfd::EventFD::new(

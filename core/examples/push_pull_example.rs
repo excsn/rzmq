@@ -70,7 +70,7 @@ async fn run_pull_worker(ctx: Context, worker_id: usize) -> Result<(), ZmqError>
   Ok(())
 }
 
-#[rzmq::main]
+#[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 

@@ -36,7 +36,7 @@ Provides a `Context` for managing sockets and a `Socket` handle with async metho
 *   **`inproc`**: In-process communication between threads within the same application (requires `inproc` feature).
 
 ### Performance Enhancements (Optional)
-*   **`io_uring` Backend (Linux-only)**: (Requires `io-uring` feature) Enables an `io_uring`-based backend for TCP transport via `tokio-uring`. This can offer higher performance and lower latency by leveraging Linux's advanced asynchronous I/O interface. Requires using the `#[rzmq::main]` attribute on the application's main function.
+*   **`io_uring` Backend (Linux-only)**: (Requires `io-uring` feature) Enables an `io_uring`-based backend for TCP transport via `tokio-uring`. This can offer higher performance and lower latency by leveraging Linux's advanced asynchronous I/O interface. Requires using the `#[tokio::main]` attribute on the application's main function.
 *   **TCP Corking (Linux-only)**: When enabled via the `TCP_CORK_OPT` socket option, attempts to batch smaller ZMTP frames by setting the `TCP_CORK` socket option on the underlying TCP stream. This can reduce the number of TCP segments sent, potentially improving efficiency for multi-part messages or frequent small messages.
 *   **Zerocopy Send (Experimental, with `io_uring`)**: (Requires `io-uring` feature and `IO_URING_SNDZEROCOPY` option, Linux-only) Aims to reduce CPU usage and improve throughput for message sending by using `sendmsg` with `MSG_ZEROCOPY` or `send_vectored_zc` (via `tokio-uring`), minimizing data copies from userspace to the kernel for network transmission.
 *   **Multishot Receive (Experimental, with `io_uring`)**: (Requires `io-uring` feature and `IO_URING_RCVMULTISHOT` option, Linux-only) Leverages `io_uring`'s multishot receive operations (`IORING_OP_RECVMSG_MULTISHOT` or `IORING_OP_RECV_MULTISHOT`) to submit multiple receive buffers to the kernel at once, potentially reducing syscall overhead for high-message-rate scenarios. Buffer pool size and individual buffer capacity are configurable via `IO_URING_RECV_BUFFER_COUNT` and `IO_URING_RECV_BUFFER_SIZE` options.
@@ -90,7 +90,7 @@ tokio = { version = "1", features = ["full"] } # "full" feature recommended for 
 *   `ipc`: Enables the `ipc://` transport (Unix-like systems only).
 *   `inproc`: Enables the `inproc://` transport.
 *   `curve`: Enables basic infrastructure for CURVE security (requires `libsodium-rs`). The implementation is experimental.
-*   `io-uring`: (Linux-only) Enables the `io_uring` backend for TCP transport and related optimizations like Zerocopy Send and Multishot Receive. Requires using `#[rzmq::main]` (see [Usage Guide (README.USAGE.md)](README.USAGE.md#using-io_uring-linux-specific)). This feature also makes `TCP_CORK_OPT`, `IO_URING_SNDZEROCOPY`, `IO_URING_RCVMULTISHOT`, `IO_URING_RECV_BUFFER_COUNT`, and `IO_URING_RECV_BUFFER_SIZE` options available.
+*   `io-uring`: (Linux-only) Enables the `io_uring` backend for TCP transport and related optimizations like Zerocopy Send and Multishot Receive. Requires using `#[tokio::main]` (see [Usage Guide (README.USAGE.md)](README.USAGE.md#using-io_uring-linux-specific)). This feature also makes `TCP_CORK_OPT`, `IO_URING_SNDZEROCOPY`, `IO_URING_RCVMULTISHOT`, `IO_URING_RECV_BUFFER_COUNT`, and `IO_URING_RECV_BUFFER_SIZE` options available.
 
 **Prerequisites:**
 
@@ -116,7 +116,7 @@ use std::time::Duration;
 
 // On Linux with "io-uring" feature for rzmq:
 // #[cfg(all(target_os = "linux", feature = "io-uring"))]
-// #[rzmq::main]
+// #[tokio::main]
 // async fn main() -> Result<(), ZmqError> { /* ... */ }
 
 // Otherwise (or if io-uring feature is not used):

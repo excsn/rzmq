@@ -9,7 +9,7 @@ const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 
 // --- TCP Tests ---
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_req_rep_tcp_basic() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   {
@@ -59,7 +59,7 @@ async fn test_req_rep_tcp_basic() -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_req_rep_tcp_connect_before_bind() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   {
@@ -94,7 +94,7 @@ async fn test_req_rep_tcp_connect_before_bind() -> Result<(), ZmqError> {
 
 // --- IPC Tests ---
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[cfg(feature = "ipc")]
 async fn test_req_rep_ipc_basic() -> Result<(), ZmqError> {
   let ctx = common::test_context();
@@ -123,7 +123,7 @@ async fn test_req_rep_ipc_basic() -> Result<(), ZmqError> {
 
 // --- Inproc Tests ---
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[cfg(feature = "inproc")]
 async fn test_req_rep_inproc_basic() -> Result<(), ZmqError> {
   let ctx = common::test_context();

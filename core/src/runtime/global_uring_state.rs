@@ -3,6 +3,7 @@
 #![cfg(feature = "io-uring")]
 
 use crate::error::ZmqError;
+use crate::io_uring_backend::connection_handler::HandlerUpstreamEvent;
 use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSender;
 use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
@@ -31,8 +32,8 @@ use tracing::{debug, error, info, warn, trace};
 static URING_WORKER_OP_TX: OnceCell<SignalingOpSender> = OnceCell::new();
 static URING_WORKER_JOIN_HANDLE: OnceCell<StdThreadJoinHandle<Result<(), ZmqError>>> = OnceCell::new();
 
-static PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR: OnceCell<KanalSyncSender<(RawFd, Result<Msg, ZmqError>)>> = OnceCell::new();
-static PARSED_MSG_RX_FOR_PROCESSOR: OnceCell<KanalReceiver<(RawFd, Result<Msg, ZmqError>)>> = OnceCell::new();
+static PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR: OnceCell<KanalSyncSender<(RawFd, HandlerUpstreamEvent)>> = OnceCell::new();
+static PARSED_MSG_RX_FOR_PROCESSOR: OnceCell<KanalReceiver<(RawFd, HandlerUpstreamEvent)>> = OnceCell::new();
 static URING_UPSTREAM_PROCESSOR_JOIN_HANDLE: OnceCell<TokioTaskJoinHandle<()>> = OnceCell::new();
 
 static URING_FD_TO_SOCKET_CORE_MAILBOX_MAP: OnceCell<Arc<RwLock<HashMap<RawFd, SocketCoreMailboxSender>>>> = OnceCell::new();
@@ -44,7 +45,7 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
   });
 
   PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR.get_or_try_init(|| {
-    let (tx, rx) = kanal::unbounded::<(RawFd, Result<Msg, ZmqError>)>();
+    let (tx, rx) = kanal::unbounded::<(RawFd, HandlerUpstreamEvent)>();
     PARSED_MSG_RX_FOR_PROCESSOR.set(rx)
         .map_err(|_| ZmqError::Internal("Failed to set PARSED_MSG_RX_FOR_PROCESSOR more than once".into()))?;
     debug!("GlobalUringState: Initialized upstream message channel (PARSED_MSG_TX/RX).");
@@ -57,14 +58,14 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
     let factories: Vec<Arc<dyn crate::io_uring_backend::connection_handler::ProtocolHandlerFactory>> =
         vec![Arc::new(ZmtpHandlerFactory {})];
     
-    let parsed_msg_tx_for_worker = PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR.get()
+    let upstream_event_tx_for_worker = PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR.get()
         .expect("PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR should be initialized by now")
         .clone();
 
     let (signaling_op_tx_internal, join_handle_internal) = UringWorker::spawn(
-        256, //TODO This hsould be modifiable
+        256, //TODO This should be modifiable
         factories,
-        parsed_msg_tx_for_worker,
+        upstream_event_tx_for_worker,
     )?; 
 
     if URING_WORKER_JOIN_HANDLE.set(join_handle_internal).is_err() {
@@ -197,105 +198,61 @@ pub(crate) fn unregister_uring_fd_socket_core_mailbox(fd: RawFd) {
 }
 
 async fn run_global_uring_upstream_processor(
-  msg_rx: KanalReceiver<(RawFd, Result<Msg, ZmqError>)>,
+  msg_rx: KanalReceiver<(RawFd, HandlerUpstreamEvent)>, // Changed type
   fd_to_mailbox_map: Arc<RwLock<HashMap<RawFd, SocketCoreMailboxSender>>>,
 ) {
   info!("Global io_uring upstream message processor task started.");
   loop {
-    
     match msg_rx.as_async().recv().await {
-      Ok((fd, Ok(msg))) => {
-        trace!(raw_fd = fd, msg_size = msg.size(), "UringUpstreamProcessor: Received data Msg for FD.");
-        let socket_core_mailbox_clone: Option<SocketCoreMailboxSender> = {
-            let map_read = fd_to_mailbox_map.read();
-            map_read.get(&fd).cloned() // Clone the MailboxSender if found
-        }; // map_read (RwLockReadGuard) is dropped here
-
-        
-        if let Some(socket_core_mailbox) = socket_core_mailbox_clone {
-          //  println!("[UpstreamProc] Sent cmd to SocketCore {} mailbox; new_len: {}, cap: {:?}", fd, socket_core_mailbox.len(), socket_core_mailbox.capacity()); //TODO Remove Logging?
-          let cmd = Command::UringFdMessage { fd, msg };
-          if let Err(e) = socket_core_mailbox.send(cmd).await { 
-            error!(raw_fd = fd, "UringUpstreamProcessor:s Failed to send UringFdMessage to SocketCore for FD {}: {}. Unregistering FD.", fd, e);
-            fd_to_mailbox_map.write().remove(&fd); 
-          }
-        } else {
-          warn!(raw_fd = fd, "UringUpstreamProcessor: Received message for unregistered FD. Discarding.");
-        }
-      }
-      Ok((fd, Err(original_zmq_error))) => {
-        info!(raw_fd = fd, error = %original_zmq_error, "UringUpstreamProcessor: Received Error/Signal for FD.");
-        
-        let command_to_send_to_core: Command; 
-        let error_message_content = original_zmq_error.to_string(); // Bind to a variable with longer lifetime
-
-        debug!(raw_fd = fd, "Checking error_message_content: '{}'", error_message_content);
-        if error_message_content.contains("ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_") {
-          // It's our special signal, extract details
-          let signal_part = error_message_content
-              .split("ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_")
-              .nth(1) // Get the part after the prefix
-              .unwrap_or(""); // Should always exist if contains worked
-
-          let parts: Vec<&str> = signal_part.split("_PEER_ID_").collect();
-          // The first part after "ZMTP_HANDSHAKE_COMPLETE_SIGNAL_FD_" should be the FD, 
-          // but we already have `fd`. We are interested in the PEER_ID part.
-          let peer_id_str_opt = parts.get(1).map(|s| s.trim_end_matches(')')); 
-          
-          let peer_identity: Option<Blob> = peer_id_str_opt.and_then(|s| {
-              if s == "None" { // Explicitly check for "None" string from Debug format of Option<Blob>
-                  None
-              } else {
-                  // Attempt to strip "Some(" and potential quote variants if Blob's Debug includes them
-                  let inner_id_str = s
-                      .trim_start_matches("Some(\"")
-                      .trim_start_matches("Some(b\"")
-                      .trim_end_matches('\"')
-                      .trim_end_matches(')'); // Also trim closing parenthesis from Some(...)
-                  
-                  if inner_id_str.is_empty() && s != "None" { // If after stripping it's empty, but wasn't "None" string
-                      Some(Blob::new()) 
-                  } else if s != "None" { // If it wasn't "None" and isn't empty after stripping
-                      Some(Blob::from(inner_id_str.as_bytes().to_vec()))
-                  } else { // Was "None" or became empty in a way that implies None
-                      None
-                  }
-              }
-          });
-
-          debug!(raw_fd = fd, ?peer_identity, parsed_signal_part = signal_part, "UringUpstreamProcessor: Parsed HANDSHAKE_COMPLETE signal for FD.");
-          command_to_send_to_core = Command::UringFdHandshakeComplete { fd, peer_identity };
-
-      } else {
-          // This is a genuine error from ZmtpUringHandler, not our signal
-          warn!(raw_fd = fd, error = %original_zmq_error, "UringUpstreamProcessor: Forwarding genuine ZmqError for FD.");
-          command_to_send_to_core = Command::UringFdError { fd, error: original_zmq_error };
-      }
+      Ok((fd, upstream_event)) => { // Renamed variable for clarity
+        trace!(raw_fd = fd, event_type = ?upstream_event_variant_name(&upstream_event), "UringUpstreamProcessor: Received event for FD.");
 
         let socket_core_mailbox_clone: Option<SocketCoreMailboxSender> = {
             let map_read = fd_to_mailbox_map.read();
             map_read.get(&fd).cloned()
         };
+
         if let Some(socket_core_mailbox) = socket_core_mailbox_clone {
-              // Use try_send for signals/errors to avoid blocking processor if SocketCore mailbox is full
-              if socket_core_mailbox.try_send(command_to_send_to_core).is_err() { 
-                warn!(raw_fd=fd, "UringUpstreamProcessor: Failed to send command (HandshakeComplete/Error) to SocketCore for FD {}. Mailbox might be full or closed.", fd);
-                // If SocketCore mailbox is closed, its entry should eventually be removed from the map.
-              }
+          let command_to_send_to_core: Option<Command> = match upstream_event {
+            HandlerUpstreamEvent::Data(msg) => {
+              Some(Command::UringFdMessage { fd, msg })
+            }
+            HandlerUpstreamEvent::HandshakeComplete { peer_identity } => {
+              Some(Command::UringFdHandshakeComplete { fd, peer_identity })
+            }
+            HandlerUpstreamEvent::Error(error) => {
+              Some(Command::UringFdError { fd, error })
+            }
+          };
+
+          if let Some(cmd) = command_to_send_to_core {
+            if let Err(e) = socket_core_mailbox.send(cmd).await {
+              error!(raw_fd = fd, "UringUpstreamProcessor: Failed to send Command to SocketCore for FD {}: {}. Unregistering FD.", fd, e);
+              fd_to_mailbox_map.write().remove(&fd);
+            }
+          }
         } else {
-            warn!(raw_fd=fd, "UringUpstreamProcessor: Received signal/error for unregistered FD {}. Discarding signal.", fd);
+          warn!(raw_fd = fd, "UringUpstreamProcessor: Received event for unregistered FD. Discarding.");
         }
-        
       }
-      Err(KanalReceiveError::Closed) => { 
+      Err(KanalReceiveError::Closed) => {
         info!("UringUpstreamProcessor: Upstream message channel (msg_rx) closed because all senders dropped. Terminating task.");
         break;
       }
-      Err(KanalReceiveError::SendClosed) => { 
+      Err(KanalReceiveError::SendClosed) => {
         info!("UringUpstreamProcessor: Upstream message channel (msg_rx) explicitly closed by sender. Terminating task.");
         break;
       }
     }
   }
   warn!("Global io_uring upstream message processor task has exited.");
+}
+
+// Helper function to get a string name for HandlerUpstreamEvent variant (for logging)
+fn upstream_event_variant_name(event: &HandlerUpstreamEvent) -> &'static str {
+  match event {
+    HandlerUpstreamEvent::Data(_) => "Data",
+    HandlerUpstreamEvent::HandshakeComplete { .. } => "HandshakeComplete",
+    HandlerUpstreamEvent::Error(_) => "Error",
+  }
 }

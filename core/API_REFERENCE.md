@@ -22,14 +22,14 @@ This document provides a reference to the public API components of the `rzmq` li
 *   **`rzmq::Context::new()`**: Creates a new communication context with default internal capacities.
 *   **`rzmq::Context::with_capacity(actor_mailbox_capacity: Option<usize>)`**: Creates a new communication context, allowing specification of internal actor mailbox capacities.
 *   **`rzmq::Context::socket(socket_type: SocketType)`**: Creates a socket of a specific pattern.
-*   **`#[rzmq::main]` (Attribute Macro)**:
+*   **`#[tokio::main]` (Attribute Macro)**:
     This attribute macro should be used on your `async main` function.
     *   If the `io-uring` feature is enabled for `rzmq` (and the target OS is Linux), this macro expands to `#[tokio_uring::main]`, automatically configuring the Tokio runtime to use `io-uring` for enhanced performance.
     *   Otherwise (if `io-uring` feature is not enabled or not on Linux), it defaults to `#[tokio::main]`.
 
     *Usage:*
     ```rust
-    #[rzmq::main]
+    #[tokio::main]
     async fn main() {
         // Your rzmq application code here
     }

@@ -46,7 +46,7 @@ impl Keypair {
   }
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_noise_xx_push_pull_basic_encrypted_exchange() -> Result<(), ZmqError> {
     println!("\n--- Starting test_noise_xx_push_pull_basic_encrypted_exchange ---");
@@ -155,7 +155,7 @@ async fn test_noise_xx_push_pull_basic_encrypted_exchange() -> Result<(), ZmqErr
     Ok(())
 }
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_noise_xx_client_auth_server_pk_mismatch() -> Result<(), ZmqError> {
   println!("\n--- Starting test_noise_xx_client_auth_server_pk_mismatch ---");

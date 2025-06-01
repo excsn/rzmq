@@ -7,7 +7,7 @@ const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
 const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 
 // --- Test: REQ sending twice ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_req_rep_req_send_without_recv() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_req_send_without_recv...");
   let ctx = common::test_context();
@@ -80,7 +80,7 @@ async fn test_req_rep_req_send_without_recv() -> Result<(), ZmqError> {
 }
 
 // --- Test: REP receiving before request ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_req_rep_rep_recv_without_request() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_rep_recv_without_request...");
   let ctx = common::test_context();
@@ -133,7 +133,7 @@ async fn test_req_rep_rep_recv_without_request() -> Result<(), ZmqError> {
 }
 
 // --- Test: REP sending before request ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_req_rep_rep_send_without_request() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_rep_send_without_request...");
   let ctx = common::test_context();
@@ -171,7 +171,7 @@ async fn test_req_rep_rep_send_without_request() -> Result<(), ZmqError> {
 }
 
 // --- Test: REP disconnects while REQ is waiting for reply ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_req_rep_rep_disconnects_while_req_waiting() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_rep_disconnects_while_req_waiting...");
   let ctx = common::test_context();
@@ -254,7 +254,7 @@ async fn test_req_rep_rep_disconnects_while_req_waiting() -> Result<(), ZmqError
 }
 
 // --- Test: REQ disconnects before REP sends reply ---
-#[rzmq_macros::test]
+#[tokio::test]
 async fn test_req_rep_req_disconnects_before_reply() -> Result<(), ZmqError> {
   println!("Starting test_req_rep_req_disconnects_before_reply...");
   let ctx = common::test_context();

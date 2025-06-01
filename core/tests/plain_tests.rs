@@ -56,7 +56,7 @@ async fn setup_client(
 }
 
 // Test 1: Successful PLAIN Handshake
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_plain_successful_handshake() {
   let ctx = common::test_context();
@@ -122,7 +122,7 @@ async fn test_plain_successful_handshake() {
 
 // Test 2: PLAIN Client connecting to NULL Server (should fail)
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_plain_client_to_null_server_fails() {
   let ctx = common::test_context();
@@ -192,7 +192,7 @@ async fn test_plain_client_to_null_server_fails() {
 
 // Test 3: NULL Client connecting to PLAIN Server (should fail)
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_null_client_to_plain_server_fails() {
   let ctx = common::test_context();
@@ -253,7 +253,7 @@ async fn test_null_client_to_plain_server_fails() {
 
 // Test 4: PLAIN Client with no credentials (should still "succeed" ZMTP handshake for now)
 
-#[rzmq_macros::test]
+#[tokio::test]
 #[serial]
 async fn test_plain_client_no_credentials() {
   let ctx = common::test_context();
