@@ -16,7 +16,7 @@ use crate::socket::options::{SocketOptions, TcpTransportConfig, ZmtpEngineConfig
 use crate::socket::DEFAULT_RECONNECT_IVL_MS;
 
 #[cfg(feature = "io-uring")]
-use crate::runtime::global_uring_state;
+use crate::uring;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::{
   UringOpRequest as WorkerUringOpRequest,
@@ -232,6 +232,12 @@ impl TcpListener {
     parent_socket_core_id: usize,
     connection_limiter: Arc<Semaphore>,
   ) {
+
+    #[cfg(feature = "io-uring")]
+    if socket_options.io_uring.session_enabled {
+      uring::global_state::get_global_uring_worker_op_tx().expect("URING HAS NOT BEEN INITIALIZED!");
+    }
+
     let accept_loop_actor_type = ActorType::AcceptLoop;
     let actor_drop_guard = ActorDropGuard::new(
       context.clone(), accept_loop_handle, accept_loop_actor_type, Some(endpoint_uri.clone()),
@@ -297,7 +303,7 @@ impl TcpListener {
                       } else {
                         let raw_fd = std_stream.into_raw_fd();
                         
-                        let worker_op_tx = global_uring_state::get_global_uring_worker_op_tx();
+                        let worker_op_tx = uring::global_state::get_global_uring_worker_op_tx().unwrap();
                         let protocol_config = WorkerProtocolConfig::Zmtp(Arc::new(ZmtpEngineConfig::from(&*socket_options_clone)));
                         let user_data_for_op = context_clone.inner().next_handle() as u64;
                         let (reply_tx_for_op, reply_rx_for_op) = tokio_oneshot::channel();
@@ -655,7 +661,7 @@ impl TcpConnecter {
           apply_tcp_socket_options_to_std(&std_stream, &self.config)?; 
           let raw_fd = std_stream.into_raw_fd(); 
 
-          let worker_op_tx = global_uring_state::get_global_uring_worker_op_tx();
+          let worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
           let protocol_config = WorkerProtocolConfig::Zmtp(Arc::new(ZmtpEngineConfig::from(&*self.context_options)));
           let user_data_for_op = self.context.inner().next_handle() as u64;
           let (reply_tx_for_op, reply_rx_for_op) = tokio_oneshot::channel();
@@ -875,10 +881,6 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       use_send_zerocopy: options.io_uring.send_zerocopy, 
       use_recv_multishot: options.io_uring.recv_multishot, 
       use_cork: options.tcp_cork, 
-      #[cfg(feature = "io-uring")] 
-      recv_multishot_buffer_count: options.io_uring.recv_buffer_count,
-      #[cfg(feature = "io-uring")]
-      recv_multishot_buffer_capacity: options.io_uring.recv_buffer_size,
       #[cfg(feature = "noise_xx")]
       use_noise_xx: options.noise_xx_options.enabled,
       #[cfg(feature = "noise_xx")]

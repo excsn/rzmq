@@ -13,11 +13,7 @@ use std::time::Duration;
 use tracing::warn;
 
 #[cfg(feature = "io-uring")]
-use crate::runtime::global_uring_state;
-#[cfg(feature = "io-uring")]
-use crate::io_uring_backend::ops::UringOpRequest;
-#[cfg(feature = "io-uring")]
-use kanal::Sender as KanalSender;
+use crate::uring::global_state;
 #[cfg(feature = "io-uring")]
 use std::os::fd::RawFd;
 
@@ -73,9 +69,8 @@ impl ContextInner {
 
     #[cfg(feature = "io-uring")]
     let uring_op_tx_for_this_context = {
-      global_uring_state::ensure_global_uring_systems_started()?;
-      // Get a clone of the global sender.
-      Some(global_uring_state::get_global_uring_worker_op_tx())
+      global_state::ensure_global_uring_systems_started()?;
+      Some(global_state::get_global_uring_worker_op_tx()?)
     };
     
     Ok(Self {
@@ -233,16 +228,16 @@ impl ContextInner {
     self.uring_worker_op_tx.clone()
   }
 
-  // Registration/unregistration for FD -> SocketCore mailbox map now delegates to global_uring_state
+  // Registration/unregistration for FD -> SocketCore mailbox map now delegates to global_state
   #[cfg(feature = "io-uring")]
   pub(crate) fn register_uring_fd_for_socket_core(fd: RawFd, core_mailbox: MailboxSender) {
 
-      global_uring_state::register_uring_fd_socket_core_mailbox(fd, core_mailbox);
+      global_state::register_uring_fd_socket_core_mailbox(fd, core_mailbox);
   }
 
   #[cfg(feature = "io-uring")]
   pub(crate) fn unregister_uring_fd(fd: RawFd) {
-      global_uring_state::unregister_uring_fd_socket_core_mailbox(fd);
+      global_state::unregister_uring_fd_socket_core_mailbox(fd);
   }
 }
 
@@ -303,13 +298,6 @@ impl Context {
   pub async fn term(&self) -> Result<(), ZmqError> {
     self.inner.shutdown().await; // Ensure shutdown is initiated.
     self.inner.wait_for_termination().await; // Wait using the WG.
-
-    // This is complex. For now, the global worker keeps running.
-    // A proper shutdown of global systems would require tracking active Context instances.
-    // if Arc::strong_count(&self.inner) == 1 && Arc::weak_count(&self.inner) == 0 {
-    //    #[cfg(feature = "io-uring")]
-    //    global_uring_state::shutdown_global_uring_systems();
-    // }
 
     Ok(())
   }

@@ -56,9 +56,6 @@ pub const TCP_CORK: i32 = 1172;
 #[cfg(feature = "io-uring")]
 pub const IO_URING_RECV_BUFFER_COUNT: i32 = 1173;
 
-/// Socket option (i32): Size of each buffer (in bytes) in the io_uring multishot receive pool.
-/// Only effective if `IO_URING_RCVMULTISHOT` (the boolean flag) is also enabled.
-/// Default: 65536 (64KB). Min: 1024.
 #[cfg(feature = "io-uring")]
 pub const IO_URING_RECV_BUFFER_SIZE: i32 = 1174;
 
@@ -68,17 +65,6 @@ pub const IO_URING_SESSION_ENABLED: i32 = 1175;
 pub const IO_URING_SND_BUFFER_COUNT: i32 = 1176;
 #[cfg(feature = "io-uring")]
 pub const IO_URING_SND_BUFFER_SIZE: i32 = 1177;
-
-#[cfg(feature = "io-uring")]
-pub const DEFAULT_IO_URING_SND_BUFFER_COUNT: usize = 16;
-#[cfg(feature = "io-uring")]
-pub const DEFAULT_IO_URING_SND_BUFFER_SIZE: usize = 65536; 
-
-#[cfg(feature = "io-uring")]
-pub const DEFAULT_IO_URING_RECV_BUFFER_COUNT: usize = 16;
-/// Default size (in bytes) for each buffer in the io_uring multishot receive pool.
-#[cfg(feature = "io-uring")]
-pub const DEFAULT_IO_URING_RECV_BUFFER_SIZE: usize = 65536; // 64KB
 
 pub const DEFAULT_RECONNECT_IVL_MS: u64 = 1000;
 
@@ -166,14 +152,6 @@ impl Default for SocketOptions {
 pub struct IOURingSocketOptions {
   pub send_zerocopy: bool,
   pub recv_multishot: bool,
-  #[cfg(feature = "io-uring")]
-  pub recv_buffer_count: usize,
-  #[cfg(feature = "io-uring")]
-  pub recv_buffer_size: usize,
-  #[cfg(feature = "io-uring")]
-  pub send_buffer_count: usize,
-  #[cfg(feature = "io-uring")]
-  pub send_buffer_size: usize,
   pub session_enabled: bool,
 }
 
@@ -183,14 +161,6 @@ impl Default for IOURingSocketOptions {
       session_enabled: false,
       send_zerocopy: false,
       recv_multishot: false,
-      #[cfg(feature = "io-uring")]
-      recv_buffer_count: DEFAULT_IO_URING_RECV_BUFFER_COUNT,
-      #[cfg(feature = "io-uring")]
-      recv_buffer_size: DEFAULT_IO_URING_RECV_BUFFER_SIZE,
-      #[cfg(feature = "io-uring")]
-      send_buffer_count: DEFAULT_IO_URING_SND_BUFFER_COUNT,
-      #[cfg(feature = "io-uring")]
-      send_buffer_size: DEFAULT_IO_URING_SND_BUFFER_SIZE,
     }
   }
 }
@@ -240,10 +210,6 @@ pub(crate) struct ZmtpEngineConfig {
   pub use_recv_multishot: bool,
   // TCP Corking
   pub use_cork: bool,
-  #[cfg(feature = "io-uring")]
-  pub recv_multishot_buffer_count: usize,
-  #[cfg(feature = "io-uring")]
-  pub recv_multishot_buffer_capacity: usize,
   #[cfg(feature = "noise_xx")]
   pub use_noise_xx: bool, // Derived from noise_xx_options.enabled
   #[cfg(feature = "noise_xx")]
@@ -476,17 +442,9 @@ pub(crate) fn apply_core_option_value(
 
         #[cfg(feature = "io-uring")]
         IO_URING_SNDZEROCOPY => options.io_uring.send_zerocopy = parse_bool_option(value)?,
-        #[cfg(feature = "io-uring")]
-        IO_URING_SND_BUFFER_COUNT => options.io_uring.send_buffer_count = parse_i32_option(value)?.max(1) as usize,
-        #[cfg(feature = "io-uring")]
-        IO_URING_SND_BUFFER_SIZE => options.io_uring.send_buffer_size = parse_i32_option(value)?.max(1024) as usize, 
 
         #[cfg(feature = "io-uring")]
         IO_URING_RCVMULTISHOT => options.io_uring.recv_multishot = parse_bool_option(value)?,
-        #[cfg(feature = "io-uring")]
-        IO_URING_RECV_BUFFER_COUNT => options.io_uring.recv_buffer_count = parse_i32_option(value)?.max(1) as usize,
-        #[cfg(feature = "io-uring")]
-        IO_URING_RECV_BUFFER_SIZE => options.io_uring.recv_buffer_size = parse_i32_option(value)?.max(1024) as usize,
 
         // Options handled by pattern logic (ISocket) or read-only, or not applicable for set_option
         SUBSCRIBE | UNSUBSCRIBE | LAST_ENDPOINT  /* Pattern specific */ | ROUTER_MANDATORY |
@@ -540,17 +498,9 @@ pub(crate) fn retrieve_core_option_value(
         
         #[cfg(feature = "io-uring")]
         IO_URING_SNDZEROCOPY => Ok((options.io_uring.send_zerocopy as i32).to_ne_bytes().to_vec()),
-        #[cfg(feature = "io-uring")]
-        IO_URING_SND_BUFFER_COUNT => Ok((options.io_uring.send_buffer_count as i32).to_ne_bytes().to_vec()),
-        #[cfg(feature = "io-uring")]
-        IO_URING_SND_BUFFER_SIZE => Ok((options.io_uring.send_buffer_size as i32).to_ne_bytes().to_vec()),
 
         #[cfg(feature = "io-uring")]
         IO_URING_RCVMULTISHOT => Ok((options.io_uring.recv_multishot as i32).to_ne_bytes().to_vec()),
-        #[cfg(feature = "io-uring")]
-        IO_URING_RECV_BUFFER_COUNT => Ok((options.io_uring.recv_buffer_count as i32).to_ne_bytes().to_vec()),
-        #[cfg(feature = "io-uring")]
-        IO_URING_RECV_BUFFER_SIZE => Ok((options.io_uring.recv_buffer_size as i32).to_ne_bytes().to_vec()),
 
         // Options handled by pattern logic or read-only by nature
         16 /* ZMQ_TYPE */ => Ok((core_s_reader.socket_type as i32).to_ne_bytes().to_vec()),

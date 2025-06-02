@@ -162,7 +162,7 @@ pub enum Command {
     error: ZmqError,
   },
   #[cfg(feature = "io-uring")]
-  UringFdHandshakeComplete { // Used by global_uring_state processor to inform SocketCore
+  UringFdHandshakeComplete { // Used by uring::global_state processor to inform SocketCore
     fd: RawFd,
     peer_identity: Option<Blob>,
   },

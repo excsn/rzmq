@@ -195,7 +195,7 @@ pub(crate) async fn process_socket_command(
 
         // 3. Clean up SocketCore's state for this endpoint/FD
         //    This will remove EndpointInfo, pipe_read_id_to_uri, uring_fd_to_uri,
-        //    and unregister from global_uring_state.
+        //    and unregister from uring::global_state.
         //    The 'stopped_child_actor_id' is fd as usize.
         //    'actor_type' is conceptually Session.
         //    'error_opt' is Some(&error).

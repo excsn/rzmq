@@ -9,7 +9,7 @@ use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSend
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::UringOpRequest;
 #[cfg(feature = "io-uring")]
-use crate::runtime::global_uring_state;
+use crate::uring;
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
 use crate::socket::SocketEvent;
@@ -243,7 +243,7 @@ impl UringFdConnection {
     context: Context,) -> Self {
     Self {
       fd,
-      worker_op_tx: global_uring_state::get_global_uring_worker_op_tx(),
+      worker_op_tx: uring::global_state::get_global_uring_worker_op_tx().unwrap(),
       socket_options,
       context,
     }

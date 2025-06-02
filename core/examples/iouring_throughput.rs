@@ -1,5 +1,6 @@
 // examples/dealer_router_iouring_throughput.rs
 
+use rzmq::uring::{initialize_uring_backend, UringConfig};
 use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
 use rzmq::socket::options as zmq_opts; // For socket option constants
 use std::time::{Duration, Instant};
@@ -26,6 +27,25 @@ async fn main() -> Result<(), ZmqError> {
     .init();
 
   println!("Starting DEALER-ROUTER example (potential io_uring usage)...");
+
+  let uring_config = UringConfig {
+      default_send_zerocopy: false,
+      ring_entries: 1024,
+      default_recv_multishot: true,
+      default_recv_buffer_count: 64,
+      default_recv_buffer_size: 4096,
+      default_send_buffer_count: 64,  // For ZC pool if default_send_zerocopy is true
+      default_send_buffer_size: 4096, // For ZC pool
+  };
+  match initialize_uring_backend(uring_config) {
+      Ok(_) => println!("io_uring backend initialized explicitly."),
+      Err(ZmqError::InvalidState(msg)) if msg.contains("already initialized") => {
+          println!("io_uring backend was already initialized (perhaps by another test or context).");
+      }
+      Err(e) => {
+          eprintln!("Failed to initialize io_uring backend: {:?}. Falling back.", e);
+      }
+  }
 
   let ctx = Context::new().expect("Failed to create rzmq context");
 
@@ -269,6 +289,13 @@ async fn main() -> Result<(), ZmqError> {
   
   println!("Terminating context...");
   ctx.term().await?;
+
+
+  match shutdown_uring_backend() {
+    Ok(_) => println!("io_uring backend shutdown."),
+    Err(e) => eprintln!("Error shutting down io_uring backend: {:?}", e),
+  }
+
   println!("Context terminated. Example finished.");
 
   Ok(())

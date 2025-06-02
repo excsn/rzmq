@@ -1,5 +1,6 @@
 // examples/dealer_router_iouring_throughput.rs
 
+use rzmq::uring::{initialize_uring_backend, shutdown_uring_backend, UringConfig};
 use rzmq::{Context, Msg, MsgFlags, Socket, SocketType, ZmqError};
 use rzmq::socket::{events::SocketEvent, options as zmq_opts};
 use std::collections::HashMap;
@@ -364,6 +365,25 @@ async fn main() -> Result<(), ZmqError> {
         NUM_DEALER_TASKS, NUM_MESSAGES_PER_DEALER, MAX_CONCURRENT_REQUESTS
     );
 
+    let uring_config = UringConfig {
+        default_send_zerocopy: SNDZEROCPY_IO_URING_ENABLED && (DEALER_IO_URING_ENABLED || ROUTER_IO_URING_ENABLED),
+        ring_entries: 1024,
+        default_recv_multishot: true,
+        default_recv_buffer_count: 64,
+        default_recv_buffer_size: 4096,
+        default_send_buffer_count: 64,  // For ZC pool if default_send_zerocopy is true
+        default_send_buffer_size: 4096, // For ZC pool
+    };
+    match initialize_uring_backend(uring_config) {
+        Ok(_) => println!("io_uring backend initialized explicitly."),
+        Err(ZmqError::InvalidState(msg)) if msg.contains("already initialized") => {
+            println!("io_uring backend was already initialized (perhaps by another test or context).");
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize io_uring backend: {:?}. Falling back.", e);
+        }
+    }
+
     let ctx = Context::new().expect("Failed to create rzmq context");
 
     let router_socket = ctx.socket(SocketType::Router)?;
@@ -591,8 +611,16 @@ async fn main() -> Result<(), ZmqError> {
         Ok(Err(e)) => eprintln!("[ROUTER] Task failed with ZmqError: {}", e),
         Err(e) => eprintln!("[ROUTER] Task panicked: {}", e),
     }
+    
     println!("[Main] Terminating context...");
+
     ctx.term().await?;
+
+    match shutdown_uring_backend() {
+        Ok(_) => println!("io_uring backend shutdown."),
+        Err(e) => eprintln!("Error shutting down io_uring backend: {:?}", e),
+    }
+
     println!("[Main] Context terminated. Example finished.");
     Ok(())
 }

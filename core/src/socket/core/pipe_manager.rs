@@ -293,7 +293,7 @@ pub(crate) async fn cleanup_stopped_child_resources(
       {
         let fd = ep_info.handle_id as std::os::unix::io::RawFd;
         core_arc.core_state.write().uring_fd_to_endpoint_uri.remove(&fd);
-        crate::runtime::global_uring_state::unregister_uring_fd_socket_core_mailbox(fd);
+        crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd);
         tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, %fd, "Unregistered UringFD state for stopped child.");
       }
     }
@@ -419,7 +419,7 @@ pub(crate) async fn cleanup_session_state_by_uri(
       {
         let fd = ep_info_to_remove.handle_id as RawFd;
         core_s_write.uring_fd_to_endpoint_uri.remove(&fd);
-        crate::runtime::global_uring_state::unregister_uring_fd_socket_core_mailbox(fd);
+        crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd);
         tracing::debug!(handle = core_handle, uri=%endpoint_uri, %fd, "Unregistered UringFD state for proactively cleaned up session.");
       }
 
@@ -513,7 +513,7 @@ pub(crate) async fn cleanup_session_state_by_pipe(
       #[cfg(feature = "io-uring")]
       if let Some(fd_to_unregister) = fd_to_unregister_opt {
         core_s_write.uring_fd_to_endpoint_uri.remove(&fd_to_unregister);
-        crate::runtime::global_uring_state::unregister_uring_fd_socket_core_mailbox(fd_to_unregister);
+        crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd_to_unregister);
       }
       if let (Some(ep_type), Some(ep_uri_event)) = (removed_ep_type, removed_ep_uri_for_event) {
         let event = match ep_type {

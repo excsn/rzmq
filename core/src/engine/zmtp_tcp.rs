@@ -34,10 +34,6 @@ pub(crate) fn create_and_spawn_tcp_engine(
     use_send_zerocopy: options.io_uring.send_zerocopy,
     use_recv_multishot: options.io_uring.recv_multishot,
     use_cork: options.tcp_cork,
-    #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_count: options.io_uring.recv_buffer_count,
-    #[cfg(feature = "io-uring")]
-    recv_multishot_buffer_capacity: options.io_uring.recv_buffer_size,
     #[cfg(feature = "noise_xx")]
     use_noise_xx: options.noise_xx_options.enabled,
     #[cfg(feature = "noise_xx")]

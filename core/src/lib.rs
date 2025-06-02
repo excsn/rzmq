@@ -33,6 +33,8 @@ pub(crate) mod profiler;
 
 #[cfg(feature = "io-uring")]
 pub mod io_uring_backend;
+#[cfg(feature = "io-uring")]
+pub mod uring;
 
 // Re-export core types for user convenience, making them accessible directly
 // from the crate root (e.g., `rzmq::ZmqError`, `rzmq::Socket`).

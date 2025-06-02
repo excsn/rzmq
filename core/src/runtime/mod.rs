@@ -5,8 +5,6 @@
 pub mod actor_drop_guard;
 pub mod command;
 pub mod event_bus;
-#[cfg(feature = "io-uring")]
-pub mod global_uring_state;
 pub mod latch;
 pub mod mailbox;
 pub mod one_shot_sender;

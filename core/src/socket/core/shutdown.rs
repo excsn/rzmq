@@ -541,7 +541,7 @@ pub(crate) async fn perform_final_pipe_cleanup(
     #[cfg(feature = "io-uring")]
     {
       for fd_to_unreg in core_arc.core_state.read().uring_fd_to_endpoint_uri.keys() {
-        crate::runtime::global_uring_state::unregister_uring_fd_socket_core_mailbox(*fd_to_unreg);
+        crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(*fd_to_unreg);
       }
       core_arc.core_state.write().uring_fd_to_endpoint_uri.clear();
     }

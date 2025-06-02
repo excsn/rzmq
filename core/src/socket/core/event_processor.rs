@@ -3,10 +3,8 @@
 use crate::error::ZmqError;
 use crate::runtime::{Command, SystemEvent};
 #[cfg(feature = "io-uring")]
-use crate::runtime::global_uring_state;
+use crate::uring;
 use crate::runtime::system_events::ConnectionInteractionModel;
-#[cfg(feature = "inproc")]
-use crate::socket::connection_iface::InprocConnection;
 use crate::socket::connection_iface::{ISocketConnection, SessionConnection};
 #[cfg(feature = "io-uring")]
 use crate::socket::connection_iface::UringFdConnection;
@@ -14,8 +12,6 @@ use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
 use crate::socket::core::{command_processor, pipe_manager, shutdown, SocketCore};
 use crate::socket::ISocket;
 
-#[cfg(feature = "io-uring")]
-use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::task::Id as TaskId;
 
@@ -378,7 +374,7 @@ async fn handle_new_connection_established(
         connection_iface: final_connection_iface.clone(),
       };
 
-      global_uring_state::register_uring_fd_socket_core_mailbox(fd, core_arc.command_sender());
+      uring::global_state::register_uring_fd_socket_core_mailbox(fd, core_arc.command_sender());
 
       {
         let mut core_s = core_arc.core_state.write();
