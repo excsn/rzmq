@@ -1,6 +1,4 @@
 use crate::error::{ZmqError, ZmqResult};
-#[cfg(feature = "io-uring")]
-use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::runtime::{ActorType, EventBus, MailboxSender, SystemEvent, WaitGroup, DEFAULT_MAILBOX_CAPACITY};
 use crate::socket::{Socket, SocketType};
 
@@ -14,8 +12,6 @@ use tracing::warn;
 
 #[cfg(feature = "io-uring")]
 use crate::uring::global_state;
-#[cfg(feature = "io-uring")]
-use std::os::fd::RawFd;
 
 /// Information stored in the inproc registry for a bound endpoint.
 /// This is used by in-process connectors to find the binder.
@@ -53,9 +49,6 @@ pub(crate) struct ContextInner {
   /// Used to prevent redundant shutdown operations and to signal actors.
   pub(crate) shutdown_initiated: AtomicBool,
   actor_mailbox_capacity: usize,
-
-  #[cfg(feature = "io-uring")]
-  pub(crate) uring_worker_op_tx: Option<SignalingOpSender>,
 }
 
 impl ContextInner {
@@ -66,12 +59,12 @@ impl ContextInner {
     let event_bus = Arc::new(EventBus::new());
     let actor_wait_group = WaitGroup::new();
 
-
+    // Auto initialize io uring if cfg enabled
     #[cfg(feature = "io-uring")]
-    let uring_op_tx_for_this_context = {
+    {
       global_state::ensure_global_uring_systems_started()?;
-      Some(global_state::get_global_uring_worker_op_tx()?)
-    };
+      global_state::get_global_uring_worker_op_tx()?;
+    }
     
     Ok(Self {
       next_handle: Arc::new(std::sync::atomic::AtomicUsize::new(1)), // Start handle IDs from 1.
@@ -82,8 +75,6 @@ impl ContextInner {
       actor_wait_group,
       shutdown_initiated: AtomicBool::new(false),
       actor_mailbox_capacity,
-      #[cfg(feature = "io-uring")]
-      uring_worker_op_tx: uring_op_tx_for_this_context,
     })
   }
 
@@ -221,23 +212,6 @@ impl ContextInner {
   /// Provides access to the shared `EventBus` instance Arc.
   pub(crate) fn event_bus(&self) -> Arc<EventBus> {
     self.event_bus.clone()
-  }
-
-  #[cfg(feature = "io-uring")]
-  pub(crate) fn get_uring_worker_op_tx(&self) -> Option<SignalingOpSender> {
-    self.uring_worker_op_tx.clone()
-  }
-
-  // Registration/unregistration for FD -> SocketCore mailbox map now delegates to global_state
-  #[cfg(feature = "io-uring")]
-  pub(crate) fn register_uring_fd_for_socket_core(fd: RawFd, core_mailbox: MailboxSender) {
-
-      global_state::register_uring_fd_socket_core_mailbox(fd, core_mailbox);
-  }
-
-  #[cfg(feature = "io-uring")]
-  pub(crate) fn unregister_uring_fd(fd: RawFd) {
-      global_state::unregister_uring_fd_socket_core_mailbox(fd);
   }
 }
 
