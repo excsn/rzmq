@@ -67,7 +67,7 @@ async fn setup_push_pull(ctx: &Context) -> Result<(rzmq::Socket, rzmq::Socket), 
   push.connect(BIND_ADDR).await?;
 
   wait_for_event(&pull_monitor, |e| {
-    matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+    matches!(e, SocketEvent::HandshakeSucceeded { .. })
   })
   .await
   .map_err(|e| ZmqError::Internal(format!("PULL Connection event error: {}", e)))?;

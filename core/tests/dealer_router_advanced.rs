@@ -329,7 +329,7 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
 
     println!("ROUTER waiting for Accepted/Handshake event...");
     let connected_event = wait_for_monitor_event(&monitor_rx, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
-      matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+      matches!(e, SocketEvent::HandshakeSucceeded { .. })
     })
     .await
     .map_err(|e| ZmqError::Internal(format!("Connect event wait failed: {}", e)))?;

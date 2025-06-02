@@ -73,7 +73,7 @@ async fn setup_push_pull_for_race_test(
 
   // println!("[Setup {}] Waiting for connection confirmation...", endpoint);
   wait_for_event(&pull_monitor, |e| {
-    matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+    matches!(e, SocketEvent::HandshakeSucceeded { .. })
   })
   .await
   .map_err(|e| ZmqError::Internal(format!("[{}] PULL Connection event error: {}", endpoint, e)))?;
@@ -583,7 +583,7 @@ async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
     }
     // Wait for the next connection event
     match wait_for_event_tcp(&pull_monitor, |e| {
-      matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+      matches!(e, SocketEvent::HandshakeSucceeded { .. })
     })
     .await
     {

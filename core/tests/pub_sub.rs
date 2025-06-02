@@ -110,7 +110,7 @@ async fn test_pub_sub_tcp_multiple_subs() -> Result<(), ZmqError> {
 
     // Wait for SUB1 to connect (from PUB's perspective)
     common::wait_for_monitor_event(&pub_monitor_rx, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
-      matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+      matches!(e, SocketEvent::HandshakeSucceeded { .. })
     })
     .await
     .map_err(|e| ZmqError::Internal(format!("SUB1 connect event: {}", e)))?;
@@ -118,7 +118,7 @@ async fn test_pub_sub_tcp_multiple_subs() -> Result<(), ZmqError> {
 
     // Wait for SUB2 to connect (from PUB's perspective)
     common::wait_for_monitor_event(&pub_monitor_rx, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
-      matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+      matches!(e, SocketEvent::HandshakeSucceeded { .. })
     })
     .await
     .map_err(|e| ZmqError::Internal(format!("SUB2 connect event: {}", e)))?;

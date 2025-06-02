@@ -63,7 +63,7 @@ async fn setup_req_rep(ctx: &Context) -> Result<(rzmq::Socket, rzmq::Socket), Zm
 
   req.connect(BIND_ADDR_REQ_REP).await?;
   wait_for_event_req_rep(&rep_monitor, |e| {
-    matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+    matches!(e, SocketEvent::HandshakeSucceeded { .. })
   })
   .await
   .map_err(|e| ZmqError::Internal(format!("REP Connection event error: {}", e)))?;

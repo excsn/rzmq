@@ -50,20 +50,22 @@ async fn setup_pub_sub(ctx: &Context) -> Result<(rzmq::Socket, rzmq::Socket), Zm
   pub_socket.set_option(SNDHWM, &BENCH_HWM_PUB_SUB.to_ne_bytes()).await?;
   sub_socket.set_option(RCVHWM, &BENCH_HWM_PUB_SUB.to_ne_bytes()).await?;
 
-  let pub_monitor = pub_socket.monitor_default().await?; // Monitor PUB to see SUB connect
+  let pub_monitor = pub_socket.monitor_default().await?;
+  let sub_monitor = sub_socket.monitor_default().await?;
 
   pub_socket.bind(BIND_ADDR_PUB_SUB).await?;
-  wait_for_event_pub_sub(
-    &pub_monitor,
-    |e| matches!(e, SocketEvent::Listening { endpoint: ep } if ep == BIND_ADDR_PUB_SUB),
-  )
-  .await
-  .map_err(|e| ZmqError::Internal(format!("PUB Listening event error: {}", e)))?;
-
   sub_socket.connect(BIND_ADDR_PUB_SUB).await?;
+  
   wait_for_event_pub_sub(&pub_monitor, |e| {
     // Wait for PUB to see SUB
-    matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+    matches!(e, SocketEvent::HandshakeSucceeded { .. })
+  })
+  .await
+  .map_err(|e| ZmqError::Internal(format!("PUB Connection event error: {}", e)))?;
+
+  wait_for_event_pub_sub(&sub_monitor, |e| {
+    // Wait for PUB to see SUB
+    matches!(e, SocketEvent::HandshakeSucceeded { .. })
   })
   .await
   .map_err(|e| ZmqError::Internal(format!("PUB Connection event error: {}", e)))?;

@@ -210,7 +210,7 @@ async fn test_socket_explicit_close_triggers_disconnect_event() -> anyhow::Resul
 
     println!("Expecting Accepted/Handshake event...");
     let event2 = common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
-      matches!(e, SocketEvent::Accepted { .. } | SocketEvent::HandshakeSucceeded { .. })
+      matches!(e, SocketEvent::HandshakeSucceeded { .. })
     })
     .await
     .map_err(|e| anyhow::anyhow!("Accepted/Handshake event wait failed: {}", e))?;
