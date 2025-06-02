@@ -50,21 +50,7 @@ pub const IO_URING_RCVMULTISHOT: i32 = 1171;
 /// Value is i32 (0 or 1).
 pub const TCP_CORK: i32 = 1172;
 
-/// Socket option (i32): Number of buffers to use in the io_uring multishot receive pool.
-/// Only effective if `IO_URING_RCVMULTISHOT` (the boolean flag) is also enabled.
-/// Default: 16. Min: 1.
-#[cfg(feature = "io-uring")]
-pub const IO_URING_RECV_BUFFER_COUNT: i32 = 1173;
-
-#[cfg(feature = "io-uring")]
-pub const IO_URING_RECV_BUFFER_SIZE: i32 = 1174;
-
 pub const IO_URING_SESSION_ENABLED: i32 = 1175;
-
-#[cfg(feature = "io-uring")]
-pub const IO_URING_SND_BUFFER_COUNT: i32 = 1176;
-#[cfg(feature = "io-uring")]
-pub const IO_URING_SND_BUFFER_SIZE: i32 = 1177;
 
 pub const DEFAULT_RECONNECT_IVL_MS: u64 = 1000;
 
