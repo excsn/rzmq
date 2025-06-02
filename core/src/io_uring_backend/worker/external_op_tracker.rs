@@ -85,4 +85,8 @@ impl ExternalOpTracker {
   pub fn drain_all(&mut self) -> Vec<(UserData, ExternalOpContext)> {
       self.in_flight.drain().collect()
   }
+
+  pub(crate) fn get_op_context_ref(&self, user_data: UserData) -> Option<&ExternalOpContext> {
+    self.in_flight.get(&user_data)
+  }
 }

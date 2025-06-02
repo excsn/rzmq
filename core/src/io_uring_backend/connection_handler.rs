@@ -26,7 +26,16 @@ pub enum HandlerSqeBlueprint {
   /// The UringWorker will use the default_buffer_ring_group_id.
   RequestRingRead,
   /// Request to send data. The UringWorker will build a Send SQE.
-  RequestSend { data: Bytes }, // Bytes is cheap to clone
+  RequestSend {
+    data: Bytes,
+    send_op_flags: i32,
+    originating_app_op_ud: UserData,
+  },
+  RequestSendZeroCopy {
+    data_to_send: Bytes, // Data the handler wants to send via ZC
+    send_op_flags: i32,  // For MSG_MORE
+    originating_app_op_ud: UserData,
+  },
   /// Request to close the handler's FD. The UringWorker will build a Close SQE.
   RequestClose,/// Request a multishot ring-buffered read for the handler's FD.
   /// Signals intent to start a multishot read. Worker will generate UserData.
@@ -90,6 +99,10 @@ pub struct UringWorkerInterface<'cfg_life> {
     pub worker_io_config: &'cfg_life WorkerIoConfig,
     pub buffer_manager: Option<&'cfg_life super::buffer_manager::BufferRingManager>,
     pub default_bgid_for_handler_use: Option<u16>,
+    // UserData of the external UringOpRequest (e.g. SendDataViaHandler) that
+    // triggered the current handler action (e.g., handle_outgoing_app_data).
+    // This is needed by the handler to correctly populate blueprints.
+    pub current_external_op_ud: UserData,
 }
 
 impl<'cfg_life> UringWorkerInterface<'cfg_life> {
@@ -97,9 +110,10 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
         fd: RawFd,
         worker_io_config: &'cfg_life WorkerIoConfig,
         buffer_manager: Option<&'cfg_life super::buffer_manager::BufferRingManager>,
-        default_bgid_for_handler_use: Option<u16>, 
+        default_bgid_for_handler_use: Option<u16>,
+        current_external_op_ud: UserData,
     ) -> Self {
-        Self { fd, worker_io_config, buffer_manager, default_bgid_for_handler_use }
+        Self { fd, worker_io_config, buffer_manager, default_bgid_for_handler_use, current_external_op_ud, }
     }
     // Methods for handlers to get info, but not to directly queue ops.
     pub fn fd(&self) -> RawFd { self.fd }

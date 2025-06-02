@@ -8,7 +8,7 @@ use crate::io_uring_backend::{
         HandlerIoOps, ProtocolHandlerFactory, UringConnectionHandler, UringWorkerInterface,
         WorkerIoConfig,
     },
-    ops::ProtocolConfig, // Import the ProtocolConfig enum
+    ops::ProtocolConfig, UserData, // Import the ProtocolConfig enum
 };
 
 use std::collections::HashMap;
@@ -56,6 +56,7 @@ impl HandlerManager {
         is_server: bool,                  // Indicates if this handler is for server-side (accepted)
         buffer_manager_for_interface: Option<&'a BufferRingManager>,
         default_bgid_val_from_worker: Option<u16>,
+    originating_op_ud_for_connection: UserData, // UD of Connect/RegisterExternalFd, or sentinel for accept
     ) -> Result<HandlerIoOps, String> {
         if self.handlers.contains_key(&fd) {
             let err_msg = format!("HandlerManager: Handler for FD {} already exists. Cannot create new one with factory '{}'.", fd, factory_id);
@@ -88,6 +89,7 @@ impl HandlerManager {
             &self.worker_io_config,
             buffer_manager_for_interface,
             default_bgid_val_from_worker,
+            originating_op_ud_for_connection,
         );
 
         let initial_ops = handler_box.connection_ready(&interface_for_ready);
@@ -122,12 +124,15 @@ impl HandlerManager {
         default_bgid_val_from_worker: Option<u16>,
     ) -> Vec<(RawFd, HandlerIoOps)> {
         let mut all_ops = Vec::new();
+        const PREPARE_SQES_SENTINEL_UD: UserData = 0; // Sentinel for general polling
+
         for (fd, handler) in self.handlers.iter_mut() {
             let interface = UringWorkerInterface::new(
                 *fd,
                 &self.worker_io_config,
                 buffer_manager_for_interface,
                 default_bgid_val_from_worker,
+                PREPARE_SQES_SENTINEL_UD,
             );
             trace!("HandlerManager: Calling prepare_sqes for FD {}", fd);
             let handler_output = handler.prepare_sqes(&interface);

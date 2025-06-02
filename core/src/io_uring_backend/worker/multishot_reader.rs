@@ -14,7 +14,7 @@ use io_uring::{squeue, types, cqueue::Entry as CqeResult};
 use std::fmt;
 use std::os::unix::io::RawFd;
 
-pub const IORING_CQE_F_MORE: u32 = 1 << 1;
+pub const IOURING_CQE_F_MORE: u32 = 1 << 1;
 
 #[derive(Debug)]
 pub(crate) struct MultishotReader {
@@ -143,7 +143,7 @@ impl MultishotReader {
       }
       
       // Check IORING_CQE_F_MORE flag
-      if (cqe_flags & IORING_CQE_F_MORE) == 0 || bytes_read == 0 { // Terminate on EOF too
+      if (cqe_flags & IOURING_CQE_F_MORE) == 0 || bytes_read == 0 { // Terminate on EOF too
         tracing::debug!("[MultishotReader FD={}] Multishot read (ud {}) finished (no MORE flag or EOF). Bytes read: {}", self.fd, cqe_ud, bytes_read);
         // This specific multishot op instance is done.
         // The cqe_processor will call internal_op_tracker.take_op_details(self.active_op_user_data.unwrap()).

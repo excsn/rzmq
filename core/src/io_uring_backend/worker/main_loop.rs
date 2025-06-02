@@ -322,6 +322,7 @@ impl UringWorker {
                     is_server_role,
                     self.buffer_manager.as_ref(),
                     self.default_buffer_ring_group_id_val,
+                    user_data,
                 ) {
                     Ok(initial_ops_from_handler) => {
                         debug!(
@@ -338,6 +339,9 @@ impl UringWorker {
                             &mut self.fds_needing_close_initiated_pass,
                             &mut self.pending_sqe_retry_queue,
                             &mut self.handler_manager,
+                            self.cfg_send_zerocopy_enabled,
+                            &self.send_buffer_pool,
+                            &self.external_op_tracker,
                         );
                         if !self.fds_needing_close_initiated_pass.is_empty() {
                             warn!("UringWorker: RegisterExternalFd for FD {} generated unexpected close requests immediately.", fd);
@@ -396,6 +400,7 @@ impl UringWorker {
                         &self.worker_io_config,
                         self.buffer_manager.as_ref(),
                         self.default_buffer_ring_group_id_val,
+                        user_data,
                     );
                     let ops_output_from_handler = handler.handle_outgoing_app_data(app_data, &interface);
                     
@@ -411,6 +416,9 @@ impl UringWorker {
                         &mut local_fds_to_close_queue,
                         &mut self.pending_sqe_retry_queue,
                         &mut self.handler_manager,
+                        self.cfg_send_zerocopy_enabled,
+                        &self.send_buffer_pool,
+                        &self.external_op_tracker,
                     );
                     drop(sq_for_blueprints);
 
@@ -441,6 +449,7 @@ impl UringWorker {
             &self.worker_io_config,
             self.buffer_manager.as_ref(),
             self.default_buffer_ring_group_id_val,
+            user_data,
           );
           // UringConnectionHandler::handle_outgoing_app_data expects Arc<dyn Any + Send + Sync>
           // We pass the Arc<Vec<Msg>> as the Arc<dyn Any...>. The handler will downcast.
@@ -458,6 +467,9 @@ impl UringWorker {
             &mut local_fds_to_close_queue_multi,
             &mut self.pending_sqe_retry_queue,
             &mut self.handler_manager,
+            self.cfg_send_zerocopy_enabled,
+            &self.send_buffer_pool,
+            &self.external_op_tracker,
           );
           drop(sq_for_multi_blueprints);
 
@@ -485,7 +497,8 @@ impl UringWorker {
                  if let Some(handler) = self.handler_manager.get_mut(fd) {
                     let interface = crate::io_uring_backend::connection_handler::UringWorkerInterface::new(
                         fd, &self.worker_io_config, self.buffer_manager.as_ref(),
-                        self.default_buffer_ring_group_id_val, 
+                        self.default_buffer_ring_group_id_val,
+            user_data, 
                     );
                     let ops_to_queue = handler.close_initiated(&interface);
                     self.external_op_tracker.add_op(user_data, ExternalOpContext{
@@ -500,6 +513,9 @@ impl UringWorker {
                         &mut self.fds_needing_close_initiated_pass, // Pass mutable reference
                             &mut self.pending_sqe_retry_queue,
                             &mut self.handler_manager,
+                            self.cfg_send_zerocopy_enabled,
+                            &self.send_buffer_pool,
+                            &self.external_op_tracker,
                     );
                     drop(sq_for_shutdown_blueprints);
                  } else { 
@@ -586,7 +602,10 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                     worker.default_buffer_ring_group_id_val,
                     &mut worker.fds_needing_close_initiated_pass,
                     &mut worker.pending_sqe_retry_queue, // Pass it back in case SQ is still full
-                    &mut worker.handler_manager
+                    &mut worker.handler_manager,
+                    worker.cfg_send_zerocopy_enabled,
+                    &worker.send_buffer_pool,
+                    &worker.external_op_tracker,
                 );
                 // sq_for_retry_blueprint is dropped
             } else { break; } // Should not happen if len > 0
@@ -674,7 +693,10 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                         &mut sq_for_handler_blueprints, worker.default_buffer_ring_group_id_val,
                         &mut worker.fds_needing_close_initiated_pass,
                         &mut worker.pending_sqe_retry_queue,
-                        &mut worker.handler_manager
+                        &mut worker.handler_manager,
+                    worker.cfg_send_zerocopy_enabled,
+                    &worker.send_buffer_pool,
+                    &worker.external_op_tracker,
                     );
                 }
             }
@@ -689,11 +711,18 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 if unsafe { worker.ring.submission_shared().is_full() } { break; }
                 if let Some(fd_to_close) = worker.fds_needing_close_initiated_pass.pop_front() {
                     if let Some(handler) = worker.handler_manager.get_mut(fd_to_close) {
-                        let interface_for_close = UringWorkerInterface::new(fd_to_close, &worker.worker_io_config, worker.buffer_manager.as_ref(), worker.default_buffer_ring_group_id_val);
+                        // For close_initiated not directly tied to an external op reply,
+                        // pass a sentinel UserData or a conventionally understood "internal" UD.
+                        // 0 is often used for internal/unspecific ops if not otherwise reserved.
+                        const INTERNAL_OP_SENTINEL_UD: u64 = 0; 
+                        let interface_for_close = UringWorkerInterface::new(fd_to_close, &worker.worker_io_config, worker.buffer_manager.as_ref(), worker.default_buffer_ring_group_id_val, INTERNAL_OP_SENTINEL_UD);
                         let close_io_ops = handler.close_initiated(&interface_for_close);
                         let mut sq_for_close_blueprints = unsafe { worker.ring.submission_shared() };
                         cqe_processor::process_handler_blueprints(fd_to_close, close_io_ops, &mut worker.internal_op_tracker, &mut sq_for_close_blueprints, worker.default_buffer_ring_group_id_val, &mut worker.fds_needing_close_initiated_pass,
-                            &mut worker.pending_sqe_retry_queue, &mut worker.handler_manager);
+                            &mut worker.pending_sqe_retry_queue, &mut worker.handler_manager,
+                    worker.cfg_send_zerocopy_enabled,
+                    &worker.send_buffer_pool,
+                    &worker.external_op_tracker,);
                     }
                 } else { break; } 
             }
@@ -727,11 +756,19 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         // worker.ring.completion().sync(); // Not strictly needed if iterating directly after submit
         
         if let Err(e) = cqe_processor::process_all_cqes(
-            &mut worker.ring, &mut worker.external_op_tracker, &mut worker.internal_op_tracker,
-            &mut worker.handler_manager, worker.buffer_manager.as_ref(), &worker.worker_io_config,
-            worker.default_buffer_ring_group_id_val, &mut worker.fds_needing_close_initiated_pass,
-                            &mut worker.pending_sqe_retry_queue,
+            
+            &mut worker.ring, 
+            &mut worker.external_op_tracker, 
+            &mut worker.internal_op_tracker,
+            &mut worker.handler_manager, 
+            worker.buffer_manager.as_ref(),
+            &worker.send_buffer_pool,     
+            &worker.worker_io_config,
+            worker.default_buffer_ring_group_id_val, 
+            &mut worker.fds_needing_close_initiated_pass,
+            &mut worker.pending_sqe_retry_queue,
             &mut worker.event_fd_poller,
+            worker.cfg_send_zerocopy_enabled,
         ) { 
             
             profiler.log_and_reset_for_next_loop();

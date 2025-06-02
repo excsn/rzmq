@@ -3,6 +3,7 @@
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::ops::UserData;
+use crate::io_uring_backend::send_buffer_pool::RegisteredSendBufferId;
 use bytes::Bytes; // For storing send buffer
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -17,14 +18,24 @@ pub(crate) enum InternalOpType {
   EventFdPoll,
   RingReadMultishot,
   AsyncCancel,
+  SendZeroCopy,
 }
 
 /// Payload associated with an internal operation, e.g., buffer for send.
 #[derive(Debug, Clone)] // Clone is needed if InternalOpDetails is Clone. Bytes is cheap to clone.
 pub(crate) enum InternalOpPayload {
   None,
-  SendBuffer(Bytes), // Stores the Bytes object for a send operation
+  SendBuffer {
+    buffer: Bytes, // Data being sent (if not ZC)
+    app_op_ud: Option<UserData>, // UserData of the originating UringOpRequest (e.g., SendDataViaHandler)
+    app_op_name: Option<String>, // Name of the app-level operation
+  },
   CancelTarget { target_user_data: UserData },
+  SendZeroCopy {
+    send_buf_id: RegisteredSendBufferId, // ID from SendBufferPool
+    app_op_ud: UserData,                 // UserData of the originating UringOpRequest
+    app_op_name: String,                 // Name of the app-level operation
+  },
 }
 
 impl Default for InternalOpPayload {

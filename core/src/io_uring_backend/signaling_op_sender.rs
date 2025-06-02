@@ -3,12 +3,11 @@
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::ops::UringOpRequest;
-use kanal::{AsyncSender as KanalAsyncSender, SendError as KanalSendError, SendError as KanalTrySendError};
-use std::os::{fd::AsRawFd, unix::io::RawFd}; // Only for logging event_fd_raw if needed, EventFD handles it.
+use kanal::{AsyncSender as KanalAsyncSender, SendError as KanalSendError};
+use std::os::fd::AsRawFd;
 
-// <<< MODIFIED START: Definition of SignalingOpSender >>>
 #[derive(Clone)] // EventFD is Cloneable
-pub(crate) struct SignalingOpSender {
+pub struct SignalingOpSender {
   op_tx: KanalAsyncSender<UringOpRequest>, // Store the async sender directly
   event_fd: eventfd::EventFD,            // Clone of the UringWorker's EventFD
 }

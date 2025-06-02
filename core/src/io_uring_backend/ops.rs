@@ -13,6 +13,8 @@ use std::fmt;
 use std::any::Any;
 use std::sync::Arc;
 
+pub const HANDLER_INTERNAL_SEND_OP_UD: UserData = 0;
+
 #[derive(Clone, Debug)]
 pub enum ProtocolConfig {
     Zmtp(Arc<ZmtpEngineConfig>),

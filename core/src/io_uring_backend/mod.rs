@@ -7,6 +7,7 @@ pub mod connection_handler;
 pub mod ops;
 pub mod worker;
 pub mod one_shot_sender;
+pub mod send_buffer_pool;
 pub mod signaling_op_sender;
 pub mod zmtp_handler;
 

@@ -16,6 +16,11 @@ use crate::io_uring_backend::connection_handler::{
 };
 use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
+use crate::io_uring_backend::send_buffer_pool::{SendBufferPool, RegisteredSendBufferId};
+use crate::socket::options::{
+    DEFAULT_IO_URING_SND_BUFFER_COUNT,
+    DEFAULT_IO_URING_SND_BUFFER_SIZE
+};
 use crate::ZmqError;
 
 use std::collections::VecDeque;
@@ -57,6 +62,11 @@ pub struct UringWorker {
     // Stores (FD to operate on, Blueprint of the SQE to retry)
     pending_sqe_retry_queue: VecDeque<(RawFd, HandlerSqeBlueprint)>,
     pub(crate) event_fd_poller: EventFdPoller,
+    send_buffer_pool: Option<Arc<SendBufferPool>>, // For zero-copy sends
+    // Configuration values passed at spawn time or from global settings
+    cfg_send_zerocopy_enabled: bool,
+    cfg_send_buffer_count: usize,
+    cfg_send_buffer_size: usize,
 }
 
 impl fmt::Debug for UringWorker {
@@ -118,6 +128,30 @@ impl UringWorker {
                 &mut internal_tracker,
             );
 
+            let temp_cfg_send_zc_enabled = true; // Placeholder: get from actual config
+            let temp_cfg_sbc = DEFAULT_IO_URING_SND_BUFFER_COUNT; // Placeholder
+            let temp_cfg_sbs = DEFAULT_IO_URING_SND_BUFFER_SIZE;   // Placeholder
+
+            let mut worker_send_buffer_pool: Option<Arc<SendBufferPool>> = None;
+            if temp_cfg_send_zc_enabled && temp_cfg_sbc > 0 && temp_cfg_sbs > 0 {
+                // TODO: Check RLIMIT_MEMLOCK here or before this.
+                // Adjust temp_cfg_sbc * temp_cfg_sbs if it exceeds the limit.
+                // If adjusted_count or adjusted_size becomes 0, then ZC is effectively disabled.
+                match SendBufferPool::new(&ring, temp_cfg_sbc, temp_cfg_sbs) {
+                    Ok(pool) => {
+                    info!("UringWorker: SendBufferPool initialized successfully for zero-copy send.");
+                    worker_send_buffer_pool = Some(Arc::new(pool));
+                    }
+                    Err(e) => {
+                    error!("UringWorker: Failed to initialize SendBufferPool: {}. Zero-copy send will be disabled.", e);
+                    // Proceed without ZC send capability
+                    }
+                }
+            } else {
+                info!("UringWorker: Zero-copy send not enabled or pool config is zero. ZC send disabled.");
+            }
+
+            
             let mut worker = UringWorker {
               ring,
               op_rx,
@@ -131,12 +165,17 @@ impl UringWorker {
               fds_needing_close_initiated_pass: VecDeque::new(),
               shutdown_requested: false,
               pending_sqe_retry_queue: VecDeque::new(),
+              send_buffer_pool: worker_send_buffer_pool,
+              cfg_send_zerocopy_enabled: temp_cfg_send_zc_enabled, // Store the actual config used
+              cfg_send_buffer_count: temp_cfg_sbc,
+              cfg_send_buffer_size: temp_cfg_sbs,
             };
             
             let loop_result = main_loop::run_worker_loop(&mut worker);
             
             // --- Graceful Shutdown of Handlers and Ring ---
             info!("UringWorker (PID: {}) run_loop exited. Performing final cleanup.", std::process::id());
+
             // 1. Inform all handlers their FDs are being closed (if not already done)
             //    and attempt to queue Close SQEs for any remaining active FDs.
             //    This is tricky because the main loop might have exited due to an error
@@ -159,11 +198,13 @@ impl UringWorker {
             let mut sq_cleanup = unsafe { worker.ring.submission_shared() };
             for fd in active_fds {
                 if let Some(handler) = worker.handler_manager.get_mut(fd) {
+                    const WORKER_SHUTDOWN_SENTINEL_UD: u64 = 0; 
                      let interface = crate::io_uring_backend::connection_handler::UringWorkerInterface::new(
                         fd,
                         &worker.worker_io_config,
                         worker.buffer_manager.as_ref(),
                         worker.default_buffer_ring_group_id_val,
+                        WORKER_SHUTDOWN_SENTINEL_UD,
                     );
                     let close_blueprints = handler.close_initiated(&interface);
                     // Attempt to submit close SQEs
@@ -191,6 +232,15 @@ impl UringWorker {
                 handler_box.fd_has_been_closed(); // Final notification
             }
 
+
+            // In the cleanup section of spawn, after run_worker_loop finishes:
+            if let Some(pool_arc) = &worker.send_buffer_pool {
+                unsafe {
+                    if let Err(e) = pool_arc.unregister_all(&worker.ring) {
+                        error!("UringWorker: Error unregistering send buffers on shutdown: {}", e);
+                    }
+                }
+            }
 
             // BufferRingManager's Drop will unregister buffers if it holds the ring ref,
             // but IoUringBufRing unregisters on its own Drop.
