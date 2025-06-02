@@ -42,7 +42,8 @@ pub const MAX_CONNECTIONS: i32 = 1000;
 
 // IO Uring Options
 #[cfg(feature = "io-uring")]
-pub const IO_URING_SNDZEROCOPY: i32 = 1170;
+const IO_URING_SNDZEROCOPY: i32 = 1170; // Not Implemented, Not sure if it is worth it given the privilege escalation needed.
+
 #[cfg(feature = "io-uring")]
 pub const IO_URING_RCVMULTISHOT: i32 = 1171;
 
