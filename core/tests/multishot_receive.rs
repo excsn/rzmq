@@ -4,8 +4,6 @@
 // They should only be compiled and run when 'io-uring' feature is enabled and on Linux.
 #![cfg(all(target_os = "linux", feature = "io-uring"))]
 
-use rzmq_macros::test; // Assuming this sets up tokio-uring runtime when features match
-
 use rzmq::{
   socket::options::{
     IO_URING_RCVMULTISHOT,      // Boolean toggle for the feature
@@ -73,7 +71,7 @@ async fn setup_push_pull_for_multishot_recv(
   Ok((push_socket, pull_socket))
 }
 
-#[test]
+#[tokio::test]
 async fn test_multishot_recv_single_small_message() -> Result<(), ZmqError> {
   println!("\n--- test_multishot_recv_single_small_message ---");
   let ctx = common::test_context();
@@ -99,7 +97,7 @@ async fn test_multishot_recv_single_small_message() -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[test]
+#[tokio::test]
 async fn test_multishot_recv_multiple_small_messages() -> Result<(), ZmqError> {
   println!("\n--- test_multishot_recv_multiple_small_messages ---");
   let ctx = common::test_context();
@@ -143,7 +141,7 @@ async fn test_multishot_recv_multiple_small_messages() -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[test]
+#[tokio::test]
 async fn test_multishot_recv_message_spanning_uring_buffers() -> Result<(), ZmqError> {
   println!("\n--- test_multishot_recv_message_spanning_uring_buffers ---");
   let ctx = common::test_context();
@@ -180,7 +178,7 @@ async fn test_multishot_recv_message_spanning_uring_buffers() -> Result<(), ZmqE
   Ok(())
 }
 
-#[test]
+#[tokio::test]
 async fn test_multishot_recv_multi_part_zmtp_message() -> Result<(), ZmqError> {
   println!("\n--- test_multishot_recv_multi_part_zmtp_message ---");
   let ctx = common::test_context();
@@ -215,7 +213,7 @@ async fn test_multishot_recv_multi_part_zmtp_message() -> Result<(), ZmqError> {
 // Test to ensure PING/PONG still works when multishot receive is active
 // This implicitly tests that the engine can still send (PONGs) while also
 // managing multishot receives.
-#[test]
+#[tokio::test]
 async fn test_multishot_recv_with_ping_pong_activity() -> Result<(), ZmqError> {
   println!("\n--- test_multishot_recv_with_ping_pong_activity ---");
   let ctx = common::test_context();

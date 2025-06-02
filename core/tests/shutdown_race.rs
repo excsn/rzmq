@@ -221,7 +221,7 @@ async fn run_single_pair(ctx: Arc<Context>, endpoint: String) -> Result<(), Stri
   Ok(())
 }
 
-#[rzmq_macros::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_push_pull_concurrent_shutdown_race() {
   println!("\n--- Starting test_push_pull_concurrent_shutdown_race ---");
   let ctx = Arc::new(common::test_context());
@@ -276,7 +276,7 @@ const NUM_PUSHERS: usize = 2;
 const NUM_PULLERS: usize = 2;
 const FINAL_TERM_TIMEOUT: Duration = Duration::from_secs(5); // Timeout for ctx.term() itself
 
-#[rzmq_macros::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_chaotic_shutdown() -> Result<(), ZmqError> {
   println!("\n--- Starting test_chaotic_shutdown (Inproc N-PUSH -> 1-PULL) ---");
   let ctx = common::test_context(); // Owned context
@@ -497,7 +497,7 @@ async fn wait_for_event_tcp(
   }
 }
 
-#[rzmq_macros::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
   println!("\n--- Starting test_chaotic_shutdown_tcp (TCP N-PUSH -> 1-PULL) ---");
   let ctx = common::test_context(); // Owned context

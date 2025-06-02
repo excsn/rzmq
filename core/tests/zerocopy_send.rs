@@ -1,7 +1,5 @@
 // tests/zerocopy_send.rs
 
-use rzmq_macros::test;
-
 #[cfg(target_os = "linux")]
 use rzmq::socket::options::IO_URING_SNDZEROCOPY;
 
@@ -58,7 +56,7 @@ async fn setup_zc_pair(
 }
 
 // Test 1: Basic single-part message send with ZC enabled
-#[test]
+#[tokio::test]
 #[cfg(all(target_os = "linux", feature = "io-uring"))] // Zerocopy test is Linux & io-uring specific
 async fn test_zerocopy_send_single_part_message() -> Result<(), ZmqError> {
   println!("\n--- Starting test_zerocopy_send_single_part_message ---");
@@ -86,7 +84,7 @@ async fn test_zerocopy_send_single_part_message() -> Result<(), ZmqError> {
 }
 
 // Test 2: Basic single-part message send with ZC disabled (fallback to standard)
-#[test]
+#[tokio::test]
 #[cfg(target_os = "linux")] // Still run on Linux to compare with ZC version
 async fn test_standard_send_single_part_message_zc_flag_off() -> Result<(), ZmqError> {
   println!("\n--- Starting test_standard_send_single_part_message_zc_flag_off ---");
@@ -113,7 +111,7 @@ async fn test_standard_send_single_part_message_zc_flag_off() -> Result<(), ZmqE
 }
 
 // Test 3: Multi-part message send with ZC enabled
-#[test]
+#[tokio::test]
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn test_zerocopy_send_multi_part_message() -> Result<(), ZmqError> {
   println!("\n--- Starting test_zerocopy_send_multi_part_message ---");
@@ -157,7 +155,7 @@ async fn test_zerocopy_send_multi_part_message() -> Result<(), ZmqError> {
 }
 
 // Test 4: Zerocopy send combined with TCP Corking
-#[test]
+#[tokio::test]
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn test_zerocopy_send_with_corking() -> Result<(), ZmqError> {
   println!("\n--- Starting test_zerocopy_send_with_corking ---");
@@ -207,7 +205,7 @@ async fn test_zerocopy_send_with_corking() -> Result<(), ZmqError> {
 }
 
 // Test 5: Behavior when send_vectored_zc reports a partial send (currently an error)
-#[test]
+#[tokio::test]
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 async fn test_zerocopy_partial_send_is_error() -> Result<(), ZmqError> {
   println!("\n--- Starting test_zerocopy_partial_send_is_error ---");
