@@ -36,7 +36,7 @@ pub enum UringOpRequest {
     buffer_capacity: usize,
     reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
   },
-  RegisterRawBuffers { // This variant was missing from the previous handle_external_op_request_submission match
+  RegisterRawBuffers {
     user_data: UserData,
     buffers: Vec<Vec<u8>>,
     reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,

@@ -33,7 +33,7 @@ use bytes::{BytesMut, Bytes, BufMut};
 use tokio_util::codec::Encoder;
 use tracing::{debug, error, info, trace, warn};
 
-const ZC_SEND_THRESHOLD: usize = 1024;
+const ZC_SEND_THRESHOLD: usize = 4096;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ZmtpHandlerPhase {

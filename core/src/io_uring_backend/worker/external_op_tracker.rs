@@ -8,6 +8,12 @@ use crate::io_uring_backend::ops::{ProtocolConfig, UringOpCompletion, UserData};
 use crate::io_uring_backend::one_shot_sender::OneShotSender;
 use crate::ZmqError; // For the Result in OneShotSender
 
+#[derive(Debug, Default)]
+pub(crate) struct MultipartSendState {
+  pub total_parts: usize,
+  pub completed_parts: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct ExternalOpContext {
   pub reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
@@ -17,6 +23,7 @@ pub(crate) struct ExternalOpContext {
   pub fd_created_for_connect_op: Option<RawFd>,    // For Connect, FD before CQE
   pub listener_fd: Option<RawFd>,                  // For Listen, the FD of the successfully created listener
   pub target_fd_for_shutdown: Option<RawFd>,       // For ShutdownConnectionHandler
+  pub multipart_state: Option<MultipartSendState>,
 }
 
 #[derive(Debug)]
@@ -59,6 +66,12 @@ impl ExternalOpTracker {
 
   pub fn take_op(&mut self, user_data: UserData) -> Option<ExternalOpContext> {
     self.in_flight.remove(&user_data)
+  }
+
+  /// Gets a mutable reference to an operation's context.
+  /// Used for updating multipart send state.
+  pub(crate) fn get_op_context_mut(&mut self, user_data: UserData) -> Option<&mut ExternalOpContext> {
+    self.in_flight.get_mut(&user_data)
   }
 
   /// Takes an operation if it's a ShutdownConnectionHandler targeting the specified FD.

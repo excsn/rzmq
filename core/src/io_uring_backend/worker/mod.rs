@@ -128,7 +128,7 @@ impl UringWorker {
                 &mut internal_tracker,
             );
 
-            let temp_cfg_send_zc_enabled = true; // Placeholder: get from actual config
+            let temp_cfg_send_zc_enabled = false; // Placeholder: get from actual config
             let temp_cfg_sbc = DEFAULT_IO_URING_SND_BUFFER_COUNT; // Placeholder
             let temp_cfg_sbs = DEFAULT_IO_URING_SND_BUFFER_SIZE;   // Placeholder
 

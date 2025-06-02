@@ -112,10 +112,10 @@ pub(crate) fn process_handler_blueprints(
                             submitted_via_zc_path = true;
                             trace!("CQE Processor: Prepared SendZeroCopy SQE for FD {} (payload set for tracker).", fd_from_handler_iteration);
                         } else {
-                            trace!("CQE Processor: ZC Send - Failed to acquire/prep registered buffer for FD {}. Falling back.", fd_from_handler_iteration);
+                            warn!("CQE Processor: ZC Send - Failed to acquire/prep registered buffer for FD {}. Falling back.", fd_from_handler_iteration);
                         }
                     } else {
-                        trace!("CQE Processor: ZC Send - SendBufferPool not available for FD {}. Falling back.", fd_from_handler_iteration);
+                        warn!("CQE Processor: ZC Send - SendBufferPool not available for FD {}. Falling back.", fd_from_handler_iteration);
                     }
                 }
 
@@ -524,6 +524,7 @@ pub(crate) fn process_all_cqes(
                            cqe_user_data, handler_fd, cqe_result, (cqe_flags & CQE_F_NOTIFY_FLAG) != 0);
 
                     if let InternalOpPayload::SendZeroCopy { send_buf_id, app_op_ud, ref app_op_name, .. } = op_details.payload {
+                      // println!("ZEROCOPY");
                         if let Some(pool_arc) = send_buffer_pool {
                             pool_arc.release_buffer(send_buf_id);
                             trace!("[CQE Proc] Released ZC send_buf_id {:?} for ud:{}", send_buf_id, cqe_user_data);
@@ -532,20 +533,82 @@ pub(crate) fn process_all_cqes(
                         }
 
                         if app_op_ud != HANDLER_INTERNAL_SEND_OP_UD {
-                            if let Some(ext_op_ctx) = external_ops.take_op(app_op_ud) {
-                                let completion_result = if cqe_result >= 0 {
-                                    Ok(UringOpCompletion::SendDataViaHandlerAck { user_data: app_op_ud, fd: handler_fd })
-                                } else {
-                                    let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
-                                    error!("[CQE Proc] Error in SendZeroCopy finalization (ud:{}, app_op_ud:{}, name:{}): {}", cqe_user_data, app_op_ud, app_op_name, zmq_err);
-                                    Ok(UringOpCompletion::OpError { user_data: app_op_ud, op_name: app_op_name.clone(), error: zmq_err })
-                                };
-                                if ext_op_ctx.reply_tx.take_and_send_sync(completion_result).is_none() {
-                                    warn!("[CQE Proc] ZC Final: Reply_tx for app_op_ud {} already taken.", app_op_ud);
+
+                          if worker_cfg_send_zerocopy_enabled {
+                              let mut should_reply_and_take_op = false;
+                              let mut completion_to_send_opt: Option<Result<UringOpCompletion, ZmqError>> = None;
+
+                              if let Some(ext_op_ctx_mut) = external_ops.get_op_context_mut(app_op_ud) {
+                                if let Some(multi_state) = &mut ext_op_ctx_mut.multipart_state {
+                                  multi_state.completed_parts += 1;
+                                  if multi_state.completed_parts >= multi_state.total_parts {
+                                    should_reply_and_take_op = true;
+                                    completion_to_send_opt = Some(
+                                      if cqe_result >= 0 { // Assuming overall success if last part is ok
+                                        Ok(UringOpCompletion::SendDataViaHandlerAck { user_data: app_op_ud, fd: handler_fd })
+                                      } else {
+                                        let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
+                                        Ok(UringOpCompletion::OpError { user_data: app_op_ud, op_name: app_op_name.clone(), error: zmq_err })
+                                      }
+                                    );
+                                  }
+                                } else { // Single part send
+                                  should_reply_and_take_op = true;
+                                  completion_to_send_opt = Some(
+                                    if cqe_result >= 0 {
+                                      Ok(UringOpCompletion::SendDataViaHandlerAck { user_data: app_op_ud, fd: handler_fd })
+                                    } else {
+                                      let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
+                                      Ok(UringOpCompletion::OpError { user_data: app_op_ud, op_name: app_op_name.clone(), error: zmq_err })
+                                    }
+                                  );
                                 }
-                            } else {
-                                warn!("[CQE Proc] ZC Final: ExternalOp for app_op_ud {} not found.", app_op_ud);
+                              } else { // ext_op_ctx_mut not found - already taken or never added
+                                warn!("[CQE Proc] ZC Final: ExternalOp for app_op_ud {} (name: {}) not found during get_op_context_mut. No reply possible.", app_op_ud, app_op_name);
+                              }
+
+                              if should_reply_and_take_op {
+                                if let Some(completion_to_send) = completion_to_send_opt {
+                                  // Now take the context to send reply
+                                  if let Some(ext_op_ctx_final) = external_ops.take_op(app_op_ud) {
+                                    if ext_op_ctx_final.reply_tx.take_and_send_sync(completion_to_send).is_none() {
+                                      warn!("[CQE Proc] ZC Final: Reply_tx for app_op_ud {} (name: {}) was already taken/dropped.", app_op_ud, app_op_name);
+                                    }
+                                  } else {
+                                    // This case should be rare now if get_op_context_mut found it, unless a race.
+                                    warn!("[CQE Proc] ZC Final: ExternalOp for app_op_ud {} (name: {}) not found on take_op, though was present before. No reply.", app_op_ud, app_op_name);
+                                  }
+                                }
+                              } else {
+                                  warn!("[CQE Proc] ZC Final: ExternalOp for app_op_ud {} not found.", app_op_ud);
+                              }
+                          } else {
+                            // ZC is disabled system-wide. The ACK was sent immediately.
+                            // Clean up ExternalOpContext if it wasn't already (e.g. by client timeout).
+                            if external_ops.take_op(app_op_ud).is_some() {
+                                trace!("[CQE Proc] ZC Final (sys ZC disabled): Cleaned up ExternalOpContext for app_op_ud {} (ACK was immediate).", app_op_ud);
                             }
+                            if cqe_result < 0 {
+                                error!("[CQE Proc] ZC Final (sys ZC disabled): Underlying send for app_op_ud {} (name: {}) FAILED (errno {}), but ACK was already sent.", app_op_ud, app_op_name, -cqe_result);
+                                // <<<MODIFIED START>>>
+                                // Inform handler about the failure of this specific send part
+                                if let Some(handler) = handler_manager.get_mut(handler_fd) {
+                                    let interface = UringWorkerInterface::new(handler_fd, worker_io_config, recv_buffer_manager, default_bgid_val_from_worker, cqe_user_data);
+                                    let handler_blueprints_on_error = handler.handle_internal_sqe_completion(cqe_user_data, cqe_result, cqe_flags, &interface);
+                                    if !handler_blueprints_on_error.sqe_blueprints.is_empty() || handler_blueprints_on_error.initiate_close_due_to_error {
+                                        let mut sq_for_handler_error_ops = unsafe { ring.submission_shared() };
+                                        process_handler_blueprints(
+                                            handler_fd, handler_blueprints_on_error, internal_ops,
+                                            &mut sq_for_handler_error_ops, default_bgid_val_from_worker,
+                                            fds_to_initiate_close_queue, pending_sqe_retry_queue, handler_manager,
+                                            worker_cfg_send_zerocopy_enabled, send_buffer_pool, external_ops,
+                                        );
+                                    }
+                                } else {
+                                    warn!("[CQE Proc] ZC Final (sys ZC disabled): Handler for FD {} not found to report send error for app_op_ud {}.", handler_fd, app_op_ud);
+                                }
+                              }
+                          }
                         } else {
                             trace!("[CQE Proc] ZC Final: Send for internal handler op (ud:{}, app_op_ud:{}) completed. No external reply needed.", cqe_user_data, app_op_ud);
                         }
@@ -554,36 +617,98 @@ pub(crate) fn process_all_cqes(
                     }
                 }
                 InternalOpType::Send => {
+                      // println!("NOZEROCOPY");
                     trace!("[CQE Proc] Normal Send completion (ud:{}, fd:{}, res:{})", cqe_user_data, handler_fd, cqe_result);
                     if let InternalOpPayload::SendBuffer { app_op_ud: Some(app_op_ud_val), app_op_name: Some(ref app_op_name), .. } = op_details.payload {
                             
                         if app_op_ud_val != HANDLER_INTERNAL_SEND_OP_UD {
-                            if let Some(ext_op_ctx) = external_ops.take_op(app_op_ud_val) {
-                                let completion_result = if cqe_result >= 0 {
+
+                          if worker_cfg_send_zerocopy_enabled {
+                            let mut should_reply_and_take_op = false;
+                            let mut completion_to_send_opt: Option<Result<UringOpCompletion, ZmqError>> = None;
+
+                            if let Some(ext_op_ctx_mut) = external_ops.get_op_context_mut(app_op_ud_val) {
+                              if let Some(multi_state) = &mut ext_op_ctx_mut.multipart_state {
+                                multi_state.completed_parts += 1;
+                                if multi_state.completed_parts >= multi_state.total_parts {
+                                  should_reply_and_take_op = true;
+                                  completion_to_send_opt = Some(
+                                    if cqe_result >= 0 {
+                                      Ok(UringOpCompletion::SendDataViaHandlerAck { user_data: app_op_ud_val, fd: handler_fd })
+                                    } else {
+                                      let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
+                                      Ok(UringOpCompletion::OpError { user_data: app_op_ud_val, op_name: app_op_name.clone(), error: zmq_err })
+                                    }
+                                  );
+                                }
+                              } else { // Single part send
+                                should_reply_and_take_op = true;
+                                completion_to_send_opt = Some(
+                                  if cqe_result >= 0 {
                                     Ok(UringOpCompletion::SendDataViaHandlerAck { user_data: app_op_ud_val, fd: handler_fd })
-                                } else {
+                                  } else {
                                     let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
                                     Ok(UringOpCompletion::OpError { user_data: app_op_ud_val, op_name: app_op_name.clone(), error: zmq_err })
-                                };
-                                if ext_op_ctx.reply_tx.take_and_send_sync(completion_result).is_none() {
-                                    warn!("[CQE Proc] Normal Send: Reply_tx for app_op_ud {} already taken.", app_op_ud_val);
-                                }
+                                  }
+                                );
+                              }
                             } else {
                                 warn!("[CQE Proc] Normal Send: ExternalOp for app_op_ud {} not found. Calling handler.handle_internal_sqe_completion.", app_op_ud_val);
+                                if cqe_result < 0 { // Still inform handler if this specific send failed
+                                  if let Some(handler) = handler_manager.get_mut(handler_fd) {
+                                      let interface = UringWorkerInterface::new(handler_fd, worker_io_config, recv_buffer_manager, default_bgid_val_from_worker, cqe_user_data);
+                                      let handler_output = handler.handle_internal_sqe_completion(cqe_user_data, cqe_result, cqe_flags, &interface);
+                                      if !handler_output.sqe_blueprints.is_empty() || handler_output.initiate_close_due_to_error {
+                                          let mut sq_for_handler_resp = unsafe { ring.submission_shared() };
+                                          process_handler_blueprints(
+                                              handler_fd, handler_output, internal_ops, &mut sq_for_handler_resp,
+                                              default_bgid_val_from_worker, fds_to_initiate_close_queue,
+                                              pending_sqe_retry_queue, handler_manager,
+                                              worker_cfg_send_zerocopy_enabled, send_buffer_pool, external_ops,
+                                          );
+                                      }
+                                  } else { warn!("[CQE Proc] Handler for FD {} not found for internal send completion (ud:{}).", handler_fd, cqe_user_data); }
+                                }
+                            }
+
+                            if should_reply_and_take_op {
+                              if let Some(completion_to_send) = completion_to_send_opt {
+                                if let Some(ext_op_ctx_final) = external_ops.take_op(app_op_ud_val) {
+                                  if ext_op_ctx_final.reply_tx.take_and_send_sync(completion_to_send).is_none() {
+                                    warn!("[CQE Proc] Normal Send: Reply_tx for app_op_ud {} (name: {}) was already taken/dropped.", app_op_ud_val, app_op_name);
+                                  }
+                                } else {
+                                  warn!("[CQE Proc] Normal Send: ExternalOp for app_op_ud {} (name: {}) not found on take_op, though was present before. No reply.", app_op_ud_val, app_op_name);
+                                }
+                              }
+                            }
+                          } else {
+                            // ZC is disabled system-wide. The ACK was sent immediately.
+                            // Clean up ExternalOpContext if not already done by client timeout.
+                            if external_ops.take_op(app_op_ud_val).is_some() {
+                                trace!("[CQE Proc] Normal Send (sys ZC disabled): Cleaned up ExternalOpContext for app_op_ud {} (ACK was immediate).", app_op_ud_val);
+                            }
+                            if cqe_result < 0 {
+                                error!("[CQE Proc] Normal Send (sys ZC disabled): Underlying send for app_op_ud {} (name: {}) FAILED (errno {}), but ACK was already sent.", app_op_ud_val, app_op_name, -cqe_result);
+                                // <<<MODIFIED START>>>
+                                // Inform handler about the failure of this specific send part
                                 if let Some(handler) = handler_manager.get_mut(handler_fd) {
                                     let interface = UringWorkerInterface::new(handler_fd, worker_io_config, recv_buffer_manager, default_bgid_val_from_worker, cqe_user_data);
-                                    let handler_output = handler.handle_internal_sqe_completion(cqe_user_data, cqe_result, cqe_flags, &interface);
-                                    if !handler_output.sqe_blueprints.is_empty() || handler_output.initiate_close_due_to_error {
-                                        let mut sq_for_handler_resp = unsafe { ring.submission_shared() };
+                                    let handler_blueprints_on_error = handler.handle_internal_sqe_completion(cqe_user_data, cqe_result, cqe_flags, &interface);
+                                    if !handler_blueprints_on_error.sqe_blueprints.is_empty() || handler_blueprints_on_error.initiate_close_due_to_error {
+                                        let mut sq_for_handler_error_ops = unsafe { ring.submission_shared() };
                                         process_handler_blueprints(
-                                            handler_fd, handler_output, internal_ops, &mut sq_for_handler_resp,
-                                            default_bgid_val_from_worker, fds_to_initiate_close_queue,
-                                            pending_sqe_retry_queue, handler_manager,
+                                            handler_fd, handler_blueprints_on_error, internal_ops,
+                                            &mut sq_for_handler_error_ops, default_bgid_val_from_worker,
+                                            fds_to_initiate_close_queue, pending_sqe_retry_queue, handler_manager,
                                             worker_cfg_send_zerocopy_enabled, send_buffer_pool, external_ops,
                                         );
                                     }
-                                } else { warn!("[CQE Proc] Handler for FD {} not found for internal send completion (ud:{}).", handler_fd, cqe_user_data); }
-                            }
+                                } else {
+                                    warn!("[CQE Proc] Normal Send (sys ZC disabled): Handler for FD {} not found to report send error for app_op_ud {}.", handler_fd, app_op_ud_val);
+                                }
+                              }
+                          }
                         } else { // app_op_ud_val == HANDLER_INTERNAL_SEND_OP_UD
                             trace!("[CQE Proc] Normal Send: Send for internal handler op (ud:{}, app_op_ud:{}) completed. Notifying handler if error.", cqe_user_data, app_op_ud_val);
                             // If an internal send (like PING) fails, the handler might want to know.

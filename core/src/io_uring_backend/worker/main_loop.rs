@@ -9,6 +9,7 @@ use super::{
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::ops::{UringOpRequest, UringOpCompletion};
 use crate::io_uring_backend::connection_handler::{HandlerIoOps, UringWorkerInterface,};
+use crate::io_uring_backend::worker::external_op_tracker::MultipartSendState;
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType};
 use crate::profiler::LoopProfiler;
 use crate::ZmqError;
@@ -41,12 +42,12 @@ impl UringWorker {
     ) -> Result<bool, UringOpRequest> {
         let user_data_from_req = request.get_user_data_ref();
         let op_name_str = request.op_name_str();
-        let reply_tx = request.get_reply_tx_ref().clone(); // Clone for local use, original stays with request for retry
+        let original_request_reply_tx = request.get_reply_tx_ref().clone(); // Clone for local use, original stays with request for retry
 
         trace!("UringWorker: Handling external op request: {}, ud: {}", op_name_str, user_data_from_req);
 
         match request {
-            UringOpRequest::InitializeBufferRing { user_data, bgid, num_buffers, buffer_capacity, reply_tx: _ } => {
+            UringOpRequest::InitializeBufferRing { user_data, bgid, num_buffers, buffer_capacity, reply_tx } => {
                 if self.buffer_manager.is_some() {
                     warn!("UringWorker: BufferRingManager already initialized. Ignoring InitializeBufferRing (ud: {})", user_data);
                     let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
@@ -75,13 +76,13 @@ impl UringWorker {
                 }
                 Ok(false)
             }
-            UringOpRequest::RegisterRawBuffers { user_data, ref buffers, reply_tx: _ } => {
+            UringOpRequest::RegisterRawBuffers { user_data, ref buffers, reply_tx, } => {
                 warn!("UringWorker: RegisterRawBuffers direct ring call not fully implemented. Sending placeholder ack.");
                 // Real implementation: self.ring.register_buffers(buffers_as_ioslices_or_vecs).map_err...
                 let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::RegisterRawBuffersSuccess { user_data }));
                 Ok(false)
             }
-            UringOpRequest::Listen { user_data, addr, ref protocol_handler_factory_id, protocol_config, reply_tx: _ } => {
+            UringOpRequest::Listen { user_data, addr, ref protocol_handler_factory_id, protocol_config, reply_tx, } => {
                 let socket_fd = match addr {
                     std::net::SocketAddr::V4(_) => unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) },
                     std::net::SocketAddr::V6(_) => unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) },
@@ -136,6 +137,7 @@ impl UringWorker {
                     fd_created_for_connect_op: None,
                     listener_fd: Some(socket_fd), 
                     target_fd_for_shutdown: None,
+                    multipart_state: None, 
                 });
                 
                 self.handler_manager.add_listener_metadata(socket_fd, protocol_handler_factory_id.clone(), protocol_config);
@@ -188,7 +190,7 @@ impl UringWorker {
                 Ok(submitted_accept_sqe_ok)
             }
 
-            UringOpRequest::Connect { user_data, target_addr, ref protocol_handler_factory_id, protocol_config, reply_tx: _original_reply_tx_in_req } => {
+            UringOpRequest::Connect { user_data, target_addr, ref protocol_handler_factory_id, protocol_config, reply_tx } => {
                 let mut fd_created_for_connect_op: Option<RawFd> = None;
                 let ring_has_ext_arg = self.ring.params().is_feature_ext_arg();
 
@@ -215,6 +217,7 @@ impl UringWorker {
                             protocol_config: Some(protocol_config.clone()),
                             fd_created_for_connect_op, 
                             listener_fd: None, target_fd_for_shutdown: None,
+                            multipart_state: None, 
                         });
                         
                         let mut sq = unsafe { self.ring.submission_shared() };
@@ -249,7 +252,7 @@ impl UringWorker {
                     }
                 }
             }
-            UringOpRequest::Nop { user_data, reply_tx: _ } => {
+            UringOpRequest::Nop { user_data, reply_tx, } => {
                 let mut fd_created_dummy : Option<RawFd> = None; // Not used for Nop
                  match sqe_builder::build_sqe_for_external_request(
                     &UringOpRequest::Nop { user_data, reply_tx: reply_tx.clone() }, // Reconstruct
@@ -261,6 +264,7 @@ impl UringWorker {
                             reply_tx: reply_tx.clone(), op_name: op_name_str.clone(),
                             protocol_handler_factory_id: None, protocol_config: None, fd_created_for_connect_op: None,
                             listener_fd: None, target_fd_for_shutdown: None,
+                            multipart_state: None, 
                         });
                         let mut sq = unsafe { self.ring.submission_shared() };
                         if !sq.is_full() {
@@ -292,7 +296,7 @@ impl UringWorker {
                 protocol_handler_factory_id,
                 protocol_config,
                 is_server_role,
-                reply_tx: _, // Original reply_tx from request, use cloned `reply_tx` from outer scope
+                reply_tx, // Original reply_tx from request, use cloned `reply_tx` from outer scope
             } => {
                 info!(
                     "UringWorker: Received RegisterExternalFd (ud: {}, fd: {}, factory: {}, server_role: {})",
@@ -312,6 +316,7 @@ impl UringWorker {
                         fd_created_for_connect_op: None, // FD is provided, not created by worker
                         listener_fd: None,
                         target_fd_for_shutdown: Some(fd), // For potential shutdown later
+                        multipart_state: None, 
                     },
                 );
 
@@ -382,7 +387,7 @@ impl UringWorker {
                 }
             }
 
-            UringOpRequest::StartFdReadLoop { user_data, fd, reply_tx: _ } => { 
+            UringOpRequest::StartFdReadLoop { user_data, fd, reply_tx, } => { 
                 if self.handler_manager.contains_handler_for(fd) {
                     trace!("UringWorker: Received StartFdReadLoop for fd {}. Handler will manage reads via prepare_sqes.", fd);
                     let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::StartFdReadLoopAck{user_data, fd}));
@@ -394,6 +399,18 @@ impl UringWorker {
             }
             UringOpRequest::SendDataViaHandler { user_data, fd, app_data, reply_tx } => { // reply_tx is moved here
                 let op_name_for_error = "SendDataViaHandler"; // Local const string for errors
+
+                self.external_op_tracker.add_op(user_data, ExternalOpContext {
+                    reply_tx,
+                    op_name: op_name_str.clone(), // op_name_str was derived from request.op_name_str()
+                    protocol_handler_factory_id: None, // Not relevant for this op type
+                    protocol_config: None,             // Not relevant
+                    fd_created_for_connect_op: None,   // Not relevant
+                    listener_fd: None,                 // Not relevant
+                    target_fd_for_shutdown: Some(fd),  // Associate with the FD for context
+                    multipart_state: None, 
+                });
+
                 if let Some(handler) = self.handler_manager.get_mut(fd) {
                     let interface = UringWorkerInterface::new( // Ensure correct module path
                         fd,
@@ -422,78 +439,110 @@ impl UringWorker {
                     );
                     drop(sq_for_blueprints);
 
-                    for fd_to_close in local_fds_to_close_queue {
-                        if !self.fds_needing_close_initiated_pass.contains(&fd_to_close) {
-                            self.fds_needing_close_initiated_pass.push_back(fd_to_close);
+                    // Ensure local_fds_to_close_queue is processed even if we don't send an immediate ACK here
+                    self.fds_needing_close_initiated_pass.extend(local_fds_to_close_queue);
+        
+                    if !self.cfg_send_zerocopy_enabled {
+                      // If zero-copy is OFF, ACK immediately.
+                      // The ExternalOpContext's reply_tx is consumed here.
+                      // cqe_processor will later find no (or already used) reply_tx for this app_op_ud.
+                      if let Some(ctx_for_immediate_ack) = self.external_op_tracker.take_op(user_data) {
+                        if ctx_for_immediate_ack.reply_tx.take_and_send_sync(Ok(UringOpCompletion::SendDataViaHandlerAck{user_data, fd})).is_none() {
+                            tracing::warn!("UringWorker (No ZC): Reply_tx for SendDataViaHandler (ud {}) was already taken before immediate ACK.", user_data);
                         }
+                      } else {
+                          // Should ideally not happen if add_op above succeeded.
+                          tracing::error!("UringWorker (No ZC): ExternalOpContext not found for immediate ACK for SendDataViaHandler (ud {}).", user_data);
+                      }
                     }
-                    
-                    if reply_tx.take_and_send_sync(Ok(UringOpCompletion::SendDataViaHandlerAck{user_data, fd})).is_none() {
-                        tracing::warn!("UringWorker: Reply_tx for SendDataViaHandler (ud {}) was already taken.", user_data);
-                    }
-                    Ok(true) 
+
+                    Ok(true)
                 } else { 
                     warn!("UringWorker: SendDataViaHandler for unknown fd {}", fd);
-                    if reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError{user_data, op_name: op_name_for_error.to_string(), error: ZmqError::InvalidArgument(format!("FD {} not managed for SendDataViaHandler", fd))})).is_none() {
-                        tracing::warn!("UringWorker: Reply_tx for SendDataViaHandler error (ud {}) was already taken.", user_data);
+                    // Clean up external op tracker if handler not found, and reply with error
+                    if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
+                        let _ = ctx.reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError{user_data, op_name: op_name_for_error.to_string(), error: ZmqError::InvalidArgument(format!("FD {} not managed for SendDataViaHandler", fd))}));
                     }
                     Ok(false) 
                 }
             }
 
             UringOpRequest::SendDataMultipartViaHandler { user_data, fd, app_data_parts, reply_tx } => {
-        let op_name_for_error = "SendDataMultipartViaHandler";
-        if let Some(handler) = self.handler_manager.get_mut(fd) {
-          let interface = UringWorkerInterface::new(
-            fd,
-            &self.worker_io_config,
-            self.buffer_manager.as_ref(),
-            self.default_buffer_ring_group_id_val,
-            user_data,
-          );
-          // UringConnectionHandler::handle_outgoing_app_data expects Arc<dyn Any + Send + Sync>
-          // We pass the Arc<Vec<Msg>> as the Arc<dyn Any...>. The handler will downcast.
-          let ops_output_from_handler = handler.handle_outgoing_app_data(app_data_parts as Arc<dyn Any + Send + Sync>, &interface);
-          
-          let mut local_fds_to_close_queue_multi = VecDeque::new();
-          
-          let mut sq_for_multi_blueprints = unsafe { self.ring.submission_shared() };
-          cqe_processor::process_handler_blueprints(
-            fd,
-            ops_output_from_handler,
-            &mut self.internal_op_tracker,
-            &mut sq_for_multi_blueprints,
-            self.default_buffer_ring_group_id_val,
-            &mut local_fds_to_close_queue_multi,
-            &mut self.pending_sqe_retry_queue,
-            &mut self.handler_manager,
-            self.cfg_send_zerocopy_enabled,
-            &self.send_buffer_pool,
-            &self.external_op_tracker,
-          );
-          drop(sq_for_multi_blueprints);
+                let op_name_for_error = "SendDataMultipartViaHandler";
 
-          for fd_to_close in local_fds_to_close_queue_multi {
-            if !self.fds_needing_close_initiated_pass.contains(&fd_to_close) {
-              self.fds_needing_close_initiated_pass.push_back(fd_to_close);
+                let num_parts = app_data_parts.len();
+                self.external_op_tracker.add_op(user_data, ExternalOpContext {
+                    reply_tx, // Clone the OneShotSender for the tracker
+                    op_name: op_name_str.clone(), // op_name_str was derived from request.op_name_str()
+                    protocol_handler_factory_id: None, // Not relevant for this op type
+                    protocol_config: None,             // Not relevant
+                    fd_created_for_connect_op: None,   // Not relevant
+                    listener_fd: None,                 // Not relevant
+                    target_fd_for_shutdown: Some(fd),  // Associate with the FD for context
+                    multipart_state: if self.cfg_send_zerocopy_enabled { // Only track multipart if ZC is on
+                      Some(MultipartSendState {
+                        total_parts: num_parts,
+                        completed_parts: 0,
+                      })
+                    } else {
+                      None // No multipart state tracking needed if ZC is off (immediate ACK)
+                    },
+                });
+                if let Some(handler) = self.handler_manager.get_mut(fd) {
+                let interface = UringWorkerInterface::new(
+                    fd,
+                    &self.worker_io_config,
+                    self.buffer_manager.as_ref(),
+                    self.default_buffer_ring_group_id_val,
+                    user_data,
+                );
+                // UringConnectionHandler::handle_outgoing_app_data expects Arc<dyn Any + Send + Sync>
+                // We pass the Arc<Vec<Msg>> as the Arc<dyn Any...>. The handler will downcast.
+                let ops_output_from_handler = handler.handle_outgoing_app_data(app_data_parts as Arc<dyn Any + Send + Sync>, &interface);
+                
+                let mut local_fds_to_close_queue_multi = VecDeque::new();
+                
+                let mut sq_for_multi_blueprints = unsafe { self.ring.submission_shared() };
+                cqe_processor::process_handler_blueprints(
+                    fd,
+                    ops_output_from_handler,
+                    &mut self.internal_op_tracker,
+                    &mut sq_for_multi_blueprints,
+                    self.default_buffer_ring_group_id_val,
+                    &mut local_fds_to_close_queue_multi,
+                    &mut self.pending_sqe_retry_queue,
+                    &mut self.handler_manager,
+                    self.cfg_send_zerocopy_enabled,
+                    &self.send_buffer_pool,
+                    &self.external_op_tracker,
+                );
+                drop(sq_for_multi_blueprints);
+                
+                // Ensure local_fds_to_close_queue is processed
+                self.fds_needing_close_initiated_pass.extend(local_fds_to_close_queue_multi);
+
+                if !self.cfg_send_zerocopy_enabled {
+                  // If zero-copy is OFF, ACK immediately for the whole multipart.
+                  if let Some(ctx_for_immediate_ack) = self.external_op_tracker.take_op(user_data) {
+                    if ctx_for_immediate_ack.reply_tx.take_and_send_sync(Ok(UringOpCompletion::SendDataViaHandlerAck{user_data, fd})).is_none() {
+                        tracing::warn!("UringWorker (No ZC): Reply_tx for SendDataMultipartViaHandler (ud {}) was already taken before immediate ACK.", user_data);
+                    }
+                  } else {
+                      tracing::error!("UringWorker (No ZC): ExternalOpContext not found for immediate ACK for SendDataMultipartViaHandler (ud {}).", user_data);
+                  }
+                }
+
+                Ok(true) 
+              } else {
+                  warn!("UringWorker: SendDataMultipartViaHandler for unknown fd {}", fd);
+                  if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
+                      let _ = ctx.reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError{user_data, op_name: op_name_for_error.to_string(), error: ZmqError::InvalidArgument(format!("FD {} not managed for SendDataMultipartViaHandler", fd))}));
+                  }
+                  Ok(false)
+              }
             }
-          }
-          
-          // Use SendDataViaHandlerAck for multipart too
-          if reply_tx.take_and_send_sync(Ok(UringOpCompletion::SendDataViaHandlerAck{user_data, fd})).is_none() {
-            tracing::warn!("UringWorker: Reply_tx for SendDataMultipartViaHandler (ud {}) was already taken.", user_data);
-          }
-          Ok(true) 
-        } else {
-          warn!("UringWorker: SendDataMultipartViaHandler for unknown fd {}", fd);
-          if reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError{user_data, op_name: op_name_for_error.to_string(), error: ZmqError::InvalidArgument(format!("FD {} not managed for SendDataMultipartViaHandler", fd))})).is_none() {
-            tracing::warn!("UringWorker: Reply_tx for SendDataMultipartViaHandler error (ud {}) was already taken.", user_data);
-          }
-          Ok(false)
-        }
-      }
       
-            UringOpRequest::ShutdownConnectionHandler { user_data, fd, reply_tx: _ } => { 
+            UringOpRequest::ShutdownConnectionHandler { user_data, fd, reply_tx, } => { 
                  if let Some(handler) = self.handler_manager.get_mut(fd) {
                     let interface = crate::io_uring_backend::connection_handler::UringWorkerInterface::new(
                         fd, &self.worker_io_config, self.buffer_manager.as_ref(),
@@ -505,6 +554,7 @@ impl UringWorker {
                         reply_tx: reply_tx.clone(), op_name: op_name_str,
                         protocol_handler_factory_id: None, protocol_config: None, fd_created_for_connect_op: None,
                         listener_fd: None, target_fd_for_shutdown: Some(fd),
+                        multipart_state: None, 
                     });
                     let mut sq_for_shutdown_blueprints = unsafe { self.ring.submission_shared() };
                     cqe_processor::process_handler_blueprints(

@@ -9,12 +9,7 @@ use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::mem;
 
-// Import the helper function from the parent module (worker/mod.rs)
-// This assumes worker/mod.rs will pub(crate) use it or define it there.
-// For now, let's assume it will be in `super`
 use super::socket_addr_to_sockaddr_storage;
-// If InternalOpTracker is needed here (e.g., for Listen's first Accept), it would also be `use super::internal_op_tracker::InternalOpTracker;`
-// However, as per our refined plan, Listen setup (including first Accept) is in UringWorker::handle_external_op_request_submission.
 
 /// Builds an SQE for an external UringOpRequest if it maps to a direct kernel call.
 ///

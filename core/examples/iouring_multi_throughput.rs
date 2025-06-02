@@ -14,10 +14,11 @@ mod common;
 // --- Configuration Constants ---
 const ROUTER_IO_URING_ENABLED: bool = true;
 const DEALER_IO_URING_ENABLED: bool = true;
+const SNDZEROCPY_IO_URING_ENABLED: bool = false;
 const TCP_CORK_ENABLED: u32 = 1; // 0 for false, 1 for true
-const NUM_DEALER_TASKS: usize = 2;
-const MAX_CONCURRENT_REQUESTS: usize = 40000;
-const NUM_MESSAGES_PER_DEALER: u64 = 50000; // Reverted for full test
+const NUM_DEALER_TASKS: usize = 8;
+const MAX_CONCURRENT_REQUESTS: usize = 10000;
+const NUM_MESSAGES_PER_DEALER: u64 = 5000000; // Reverted for full test
 const PAYLOAD_SIZE_BYTES: usize = 1024;
 const ROUTER_ENDPOINT: &'static str = "tcp://127.0.0.1:5558";
 
@@ -368,7 +369,7 @@ async fn main() -> Result<(), ZmqError> {
     let router_socket = ctx.socket(SocketType::Router)?;
     router_socket.set_option(zmq_opts::IO_URING_SESSION_ENABLED, ROUTER_IO_URING_ENABLED).await?;
     router_socket.set_option(zmq_opts::IO_URING_RCVMULTISHOT, ROUTER_IO_URING_ENABLED).await?;
-    // router_socket.set_option(zmq_opts::IO_URING_SNDZEROCOPY, ROUTER_IO_URING_ENABLED).await?;
+    router_socket.set_option(zmq_opts::IO_URING_SNDZEROCOPY, SNDZEROCPY_IO_URING_ENABLED && ROUTER_IO_URING_ENABLED).await?;
     router_socket.set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED).await?;
     router_socket.set_option(zmq_opts::RCVHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32).max(5000)).await?;
     router_socket.set_option(zmq_opts::SNDHWM, (TOTAL_MESSAGES_EXPECTED_BY_ROUTER as i32).max(5000)).await?;
@@ -388,7 +389,7 @@ async fn main() -> Result<(), ZmqError> {
     let dealer_socket_main = ctx.socket(SocketType::Dealer)?;
     dealer_socket_main.set_option(zmq_opts::IO_URING_SESSION_ENABLED, DEALER_IO_URING_ENABLED).await?;
     dealer_socket_main.set_option(zmq_opts::IO_URING_RCVMULTISHOT, DEALER_IO_URING_ENABLED).await?;
-    // dealer_socket_main.set_option(zmq_opts::IO_URING_SNDZEROCOPY, DEALER_IO_URING_ENABLED).await?;
+    dealer_socket_main.set_option(zmq_opts::IO_URING_SNDZEROCOPY, SNDZEROCPY_IO_URING_ENABLED && DEALER_IO_URING_ENABLED).await?;
     dealer_socket_main.set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED).await?;
     let hwm_val = (MAX_CONCURRENT_REQUESTS * NUM_DEALER_TASKS * 2).max(5000) as i32; // Ensure HWM is generous
     dealer_socket_main.set_option(zmq_opts::SNDHWM, hwm_val).await?;
