@@ -1,28 +1,23 @@
 use crate::error::ZmqError;
-use crate::message::Msg;
 use async_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 #[derive(Debug)]
-pub(crate) enum PushError {
-  Full(Msg),   // Queue was full, message is returned to the caller
-  Closed(Msg), // Queue was closed, message is returned to the caller
+pub(crate) enum PushError<T: Send + 'static> {
+  Full(T),
+  Closed(T),
 }
 
-/// Buffers incoming messages from multiple pipes in a single queue
-/// for fair consumption by the socket's `recv()` method.
+/// Buffers incoming items (generic T) from multiple sources in a single queue
+/// for fair consumption.
 #[derive(Debug)]
-pub(crate) struct FairQueue {
-  // Use an async channel internally. `recv()` will await on this.
-  // The capacity acts as the effective RCVHWM for the socket.
-  receiver: Receiver<Msg>,
-  sender: Sender<Msg>,
-  // Optional: Track attached pipes for debugging or specific logic?
-  // pipe_count: Arc<AtomicUsize>,
-  hwm: usize, // Store the HWM capacity
+pub(crate) struct FairQueue<T: Send + 'static> {
+  receiver: Receiver<T>,
+  sender: Sender<T>,
+  hwm: usize, 
 }
 
-impl FairQueue {
-  /// Creates a new fair queue with a specific capacity (RCVHWM).
+impl<T: Send + 'static> FairQueue<T> {
+  /// Creates a new fair queue with a specific capacity (HWM).
   pub fn new(capacity: usize) -> Self {
     let (sender, receiver) = async_channel::bounded(capacity.max(1));
     Self {
@@ -33,63 +28,47 @@ impl FairQueue {
   }
 
   /// Called when a pipe delivering messages to this queue is attached.
-  /// (Might not be strictly needed if just using the queue).
   pub fn pipe_attached(&self, pipe_read_id: usize) {
-    // self.pipe_count.fetch_add(1, Ordering::Relaxed);
     tracing::trace!(pipe_id = pipe_read_id, hwm = self.hwm, "FairQueue pipe attached");
   }
 
   /// Called when a pipe delivering messages to this queue is detached.
   pub fn pipe_detached(&self, pipe_read_id: usize) {
-    // self.pipe_count.fetch_sub(1, Ordering::Relaxed);
     tracing::trace!(pipe_id = pipe_read_id, "FairQueue pipe detached");
   }
 
-  /// Pushes a message received from a pipe reader task into the fair queue.
-  /// Called by the ISocket implementation's `handle_pipe_event` for `PipeMessageReceived`.
-  /// Returns error if queue is closed (shouldn't happen normally).
-  /// Note: `async-channel` handles backpressure via `send().await`. This call is async.
-  pub async fn push_message(&self, msg: Msg) -> Result<(), ZmqError> {
-    self.sender.send(msg).await.map_err(|e| {
+  /// Pushes an item into the fair queue.
+  pub async fn push_item(&self, item: T) -> Result<(), ZmqError> {
+    self.sender.send(item).await.map_err(|e| {
       tracing::error!("FairQueue send error (queue closed?): {:?}", e);
       ZmqError::Internal("FairQueue channel closed unexpectedly".into())
     })
   }
 
-  /// Pops the next available message from the queue for the user's `recv()` call.
-  /// Awaits if the queue is empty. Returns `None` if the queue is closed.
-  pub async fn pop_message(&self) -> Result<Option<Msg>, ZmqError> {
+  /// Pops the next available item from the queue.
+  pub async fn pop_item(&self) -> Result<Option<T>, ZmqError> {
     match self.receiver.recv().await {
-      Ok(msg) => Ok(Some(msg)),
+      Ok(item) => Ok(Some(item)),
       Err(async_channel::RecvError) => Ok(None), // Channel closed
     }
   }
 
-  /// Attempts to push a message into the fair queue without blocking.
-  ///
-  /// Returns:
-  /// - `Ok(())` if the message was successfully sent (Msg is consumed).
-  /// - `Err(PushError::Full(Msg))` if the queue was full; the original `Msg` is returned.
-  /// - `Err(PushError::Closed(Msg))` if the queue was closed; the original `Msg` is returned.
-  pub fn try_push_message(&self, msg: Msg) -> Result<(), PushError> {
-    match self.sender.try_send(msg) {
+  /// Attempts to push an item into the fair queue without blocking.
+  pub fn try_push_item(&self, item: T) -> Result<(), PushError<T>> {
+    match self.sender.try_send(item) {
       Ok(()) => Ok(()),
-      Err(TrySendError::Full(returned_msg)) => Err(PushError::Full(returned_msg)),
-      Err(TrySendError::Closed(returned_msg)) => {
-        // Log the error, as channel closure is usually unexpected here.
+      Err(TrySendError::Full(returned_item)) => Err(PushError::Full(returned_item)),
+      Err(TrySendError::Closed(returned_item)) => {
         tracing::error!("FairQueue try_send failed: Channel was closed.");
-        Err(PushError::Closed(returned_msg))
+        Err(PushError::Closed(returned_item))
       }
     }
   }
 
-  /// Attempts to pop a message without blocking.
-  /// Returns `Ok(Some(Msg))` if a message is available.
-  /// Returns `Ok(None)` if the queue is currently empty.
-  /// Returns `Err(ZmqError::Internal)` if the channel is closed.
-  pub fn try_pop_message(&self) -> Result<Option<Msg>, ZmqError> {
+  /// Attempts to pop an item without blocking.
+  pub fn try_pop_item(&self) -> Result<Option<T>, ZmqError> {
     match self.receiver.try_recv() {
-      Ok(msg) => Ok(Some(msg)),
+      Ok(item) => Ok(Some(item)),
       Err(TryRecvError::Empty) => Ok(None),
       Err(TryRecvError::Closed) => {
         tracing::error!("FairQueue try_recv error: Channel closed");
@@ -98,12 +77,12 @@ impl FairQueue {
     }
   }
 
-  /// Returns the capacity (RCVHWM) of the queue.
+  /// Returns the capacity (HWM) of the queue.
   pub fn capacity(&self) -> usize {
     self.hwm
   }
 
-  /// Returns the current number of messages in the queue.
+  /// Returns the current number of items in the queue.
   pub fn len(&self) -> usize {
     self.receiver.len()
   }

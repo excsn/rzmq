@@ -1,281 +1,238 @@
 use crate::error::ZmqError;
 use crate::message::{Msg, MsgFlags};
-use crate::socket::core::SocketCore;
+use crate::socket::core::SocketCore; // Not used in constructor anymore, core_handle is passed
 use crate::socket::patterns::fair_queue::{FairQueue, PushError};
-// use parking_lot::Mutex; // No longer needed if only used for partial_pipe_messages
-use dashmap::DashMap; // Added
+#[allow(unused_imports)] // Blob might not be directly used by generic orchestrator
+use crate::Blob;
+use dashmap::DashMap;
+use std::collections::VecDeque; // <<< ADDED [For current_recv_frames_buffer] >>>
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex as TokioMutex; // <<< ADDED [For current_recv_frames_buffer] >>>
 use tokio::time::timeout as tokio_timeout;
 
+// <<< MODIFIED START [Generic IncomingMessageOrchestrator<QItem> with internal buffering for recv()] >>>
 #[derive(Debug)]
-pub(crate) struct IncomingMessageOrchestrator {
-    socket_core_handle: usize,
-    main_incoming_queue: FairQueue,
-    queue_push_timeout: Option<Duration>, // Timeout for pushing to main_incoming_queue
-    partial_pipe_messages: DashMap<usize, Vec<Msg>>, // Changed from Mutex<HashMap<...>>
+pub(crate) struct IncomingMessageOrchestrator<QItem: Send + 'static> {
+  socket_core_handle: usize,
+  main_incoming_queue: FairQueue<QItem>,
+  queue_push_timeout: Option<Duration>,
+  partial_pipe_messages: DashMap<usize, Vec<Msg>>,
+  // Buffer for delivering frames of a single QItem one-by-one via recv_message()
+  current_recv_frames_buffer: TokioMutex<VecDeque<Msg>>,
 }
 
-impl IncomingMessageOrchestrator {
-    pub fn new(core: &Arc<SocketCore>) -> Self {
-        let rcvhwm = core.core_state.read().options.rcvhwm;
-        Self::new_with_hwm(&core, rcvhwm)
+impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
+  pub fn new(core_handle: usize, rcvhwm: usize) -> Self {
+    Self {
+      socket_core_handle: core_handle,
+      main_incoming_queue: FairQueue::new(rcvhwm.max(1)),
+      queue_push_timeout: Some(Duration::from_millis(1000)),
+      partial_pipe_messages: DashMap::new(),
+      current_recv_frames_buffer: TokioMutex::new(VecDeque::new()),
     }
+  }
 
-    pub(crate) fn new_with_hwm(core: &Arc<SocketCore>, rcvhwm: usize) -> Self {
-        Self {
-            socket_core_handle: core.handle,
-            main_incoming_queue: FairQueue::new(rcvhwm.max(1)),
-            queue_push_timeout: Some(Duration::from_millis(1000)),
-            partial_pipe_messages: DashMap::new(), // Changed
+  pub fn accumulate_pipe_frame(&self, pipe_read_id: usize, incoming_frame: Msg) -> Result<Option<Vec<Msg>>, ZmqError> {
+    let is_last_frame_of_zmtp_message = !incoming_frame.is_more();
+    if is_last_frame_of_zmtp_message {
+      let mut assembled_message = self
+        .partial_pipe_messages
+        .remove(&pipe_read_id)
+        .map(|(_key, val)| val)
+        .unwrap_or_else(Vec::new);
+      assembled_message.push(incoming_frame);
+      if assembled_message.is_empty() {
+        tracing::warn!(
+          "Orchestrator: Assembled an empty ZMTP message for pipe {}.",
+          pipe_read_id
+        );
+      }
+      Ok(Some(assembled_message))
+    } else {
+      let mut pipe_buffer_entry = self.partial_pipe_messages.entry(pipe_read_id).or_insert_with(Vec::new);
+      pipe_buffer_entry.value_mut().push(incoming_frame);
+      Ok(None)
+    }
+  }
+
+  pub async fn queue_item(&self, pipe_read_id_for_logging: usize, item_to_queue: QItem) -> Result<(), ZmqError> {
+    let push_result = match self.queue_push_timeout {
+      None => self.main_incoming_queue.push_item(item_to_queue).await,
+      Some(duration) if duration.is_zero() => match self.main_incoming_queue.try_push_item(item_to_queue) {
+        Ok(()) => Ok(()),
+        Err(PushError::Full(_returned_item)) => {
+          tracing::warn!(
+            handle = self.socket_core_handle,
+            pipe_id = pipe_read_id_for_logging,
+            "Orchestrator try_push item to main queue failed: Full. Item dropped."
+          );
+          Ok(())
         }
+        Err(PushError::Closed(_returned_item)) => {
+          tracing::error!(
+            handle = self.socket_core_handle,
+            pipe_id = pipe_read_id_for_logging,
+            "Orchestrator try_push item to main queue failed: Closed."
+          );
+          Err(ZmqError::Internal("Main incoming queue closed".into()))
+        }
+      },
+      Some(duration) => match tokio_timeout(duration, self.main_incoming_queue.push_item(item_to_queue)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_timeout_elapsed) => {
+          tracing::warn!(
+            handle = self.socket_core_handle,
+            pipe_id = pipe_read_id_for_logging,
+            "Orchestrator timed push of item to main queue failed: Timeout. Item dropped."
+          );
+          Ok(())
+        }
+      },
+    };
+
+    match push_result {
+      Ok(()) => Ok(()),
+      Err(ZmqError::Internal(ref msg)) if msg.contains("FairQueue channel closed") => Err(ZmqError::Internal(
+        "Main incoming queue channel unexpectedly closed".into(),
+      )),
+      Err(e) => {
+        tracing::error!(handle = self.socket_core_handle, pipe_id = pipe_read_id_for_logging, error = %e, "Orchestrator: Unexpected error pushing item.");
+        Err(e)
+      }
     }
+  }
 
-    pub fn accumulate_pipe_frame(
-        &self,
-        pipe_read_id: usize,
-        incoming_frame: Msg,
-    ) -> Result<Option<Vec<Msg>>, ZmqError> {
-        let is_last_frame_of_zmtp_message = !incoming_frame.is_more();
-
-        if is_last_frame_of_zmtp_message {
-            // This is the last frame.
-            // Atomically remove any existing partial message parts.
-            let mut assembled_message = self
-                .partial_pipe_messages
-                .remove(&pipe_read_id)
-                .map(|(_key, val)| val) // Extract the Vec<Msg> from (key, value) tuple
-                .unwrap_or_else(Vec::new); // If no prior parts, start with an empty Vec
-
-            assembled_message.push(incoming_frame); // Add the current (last) frame
-
-            // After pushing the current frame, the message should not be empty
-            // unless Msg::new() creates an "empty" message that Vec considers non-empty
-            // or if incoming_frame was somehow an "empty" frame representation.
-            if assembled_message.is_empty() {
-                tracing::warn!(
-                    "Orchestrator: Assembled an empty ZMTP message frame vector for pipe {}. This is unusual.",
-                    pipe_read_id
-                );
-            }
-            Ok(Some(assembled_message))
+  /// Helper to pop a QItem from the main FairQueue with timeout logic.
+  async fn recv_item_from_main_queue(&self, rcvtimeo_opt: Option<Duration>) -> Result<QItem, ZmqError> {
+    let pop_future = self.main_incoming_queue.pop_item();
+    match rcvtimeo_opt {
+      Some(duration) if !duration.is_zero() => match tokio_timeout(duration, pop_future).await {
+        Ok(Ok(Some(item))) => Ok(item),
+        Ok(Ok(None)) => Err(ZmqError::Internal(
+          "Orchestrator: Main receive queue closed while popping item".into(),
+        )),
+        Ok(Err(e)) => Err(e),
+        Err(_timeout_elapsed) => Err(ZmqError::Timeout),
+      },
+      _ => {
+        if rcvtimeo_opt == Some(Duration::ZERO) {
+          match self.main_incoming_queue.try_pop_item() {
+            Ok(Some(item)) => Ok(item),
+            Ok(None) => Err(ZmqError::ResourceLimitReached),
+            Err(e) => Err(e),
+          }
         } else {
-            // This is not the last frame, accumulate it.
-            // `entry` provides fine-grained locking for the specific key.
-            let mut pipe_buffer_entry = self
-                .partial_pipe_messages
-                .entry(pipe_read_id)
-                .or_insert_with(Vec::new);
-            pipe_buffer_entry.value_mut().push(incoming_frame);
-            // The lock on the entry is released when pipe_buffer_entry goes out of scope.
-            Ok(None)
+          // Infinite wait
+          match pop_future.await? {
+            Some(item) => Ok(item),
+            None => Err(ZmqError::Internal(
+              "Orchestrator: Main receive queue closed (inf wait)".into(),
+            )),
+          }
         }
+      }
+    }
+  }
+
+  /// For ISocket::recv_multipart(). Fetches the next logical item and transforms it.
+  pub async fn recv_logical_message(
+    &self,
+    rcvtimeo_opt: Option<Duration>,
+    // Closure to transform QItem into the Vec<Msg> the application expects for multipart.
+    // e.g., for Router: (Blob, Vec<Msg>) -> [identity_frame, payload_frames...]
+    qitem_to_app_frames: impl FnOnce(QItem) -> Vec<Msg>,
+  ) -> Result<Vec<Msg>, ZmqError> {
+    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
+    if !buffer_guard.is_empty() {
+      // A `recv_message()` sequence was in progress. Application is mixing API calls.
+      // Clear buffer and fetch a new full message.
+      tracing::warn!(
+        handle = self.socket_core_handle,
+        "recv_logical_message called while recv_message buffer was active. Clearing buffer."
+      );
+      *buffer_guard = VecDeque::new();
+    }
+    // Drop guard before await
+    drop(buffer_guard);
+
+    let q_item = self.recv_item_from_main_queue(rcvtimeo_opt).await?;
+    let app_frames = qitem_to_app_frames(q_item);
+    Ok(app_frames)
+  }
+
+  /// For ISocket::recv(). Fetches frames one by one for a logical message.
+  pub async fn recv_message(
+    &self,
+    rcvtimeo_opt: Option<Duration>,
+    // Closure to transform QItem into Vec<Msg> for buffering if buffer is empty.
+    qitem_to_app_frames: impl FnOnce(QItem) -> Vec<Msg>,
+  ) -> Result<Msg, ZmqError> {
+    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
+
+    if let Some(mut frame) = buffer_guard.pop_front() {
+      // Set MORE flag based on whether more frames remain *in this buffer*
+      if !buffer_guard.is_empty() {
+        frame.set_flags(frame.flags() | MsgFlags::MORE);
+      } else {
+        frame.set_flags(frame.flags() & !MsgFlags::MORE);
+      }
+      return Ok(frame);
     }
 
-    /// Queues a processed, application-level logical message.
-    /// Corrects MORE flags, then frames are pushed to the main_incoming_queue
-    /// with a timeout if the queue is full. Drops frames if timeout occurs.
-    pub async fn queue_application_message_frames(
-        &self,
-        pipe_read_id_for_logging: usize,
-        mut app_logical_message: Vec<Msg>,
-    ) -> Result<(), ZmqError> {
-        if app_logical_message.is_empty() {
-            tracing::trace!(
-                handle = self.socket_core_handle,
-                pipe_id = pipe_read_id_for_logging,
-                "Orchestrator: Processor returned empty logical message. Queueing a single empty frame."
-            );
-            app_logical_message.push(Msg::new());
-        }
+    // Buffer is empty, need to fetch and populate.
+    // Drop guard before await on recv_item_from_main_queue
+    drop(buffer_guard);
 
-        let num_frames = app_logical_message.len();
-        // This check ensures we don't panic on last_idx if num_frames is 0,
-        // though the above block ensures num_frames is at least 1.
-        if num_frames > 0 {
-            let last_idx = num_frames - 1;
-            for (i, frame) in app_logical_message.iter_mut().enumerate() {
-                if i < last_idx {
-                    frame.set_flags(frame.flags() | MsgFlags::MORE);
-                } else {
-                    frame.set_flags(frame.flags() & !MsgFlags::MORE);
-                }
-            }
-        }
+    let q_item = self.recv_item_from_main_queue(rcvtimeo_opt).await?;
+    let app_frames_vec = qitem_to_app_frames(q_item);
 
-        for (idx, frame_to_push) in app_logical_message.into_iter().enumerate() {
-            let push_result = match self.queue_push_timeout {
-                None => {
-                    // Infinite timeout (blocking send)
-                    self.main_incoming_queue.push_message(frame_to_push).await
-                }
-                Some(duration) if duration.is_zero() => {
-                    // Non-blocking send (try_send)
-                    match self.main_incoming_queue.try_push_message(frame_to_push) {
-                        Ok(()) => Ok(()),
-                        Err(PushError::Full(_returned_msg)) => {
-                            tracing::warn!(handle = self.socket_core_handle, pipe_id = pipe_read_id_for_logging, "Orchestrator try_push to main queue failed: Full (ResourceLimitReached).");
-                            Err(ZmqError::ResourceLimitReached)
-                        }
-                        Err(PushError::Closed(_returned_msg)) => {
-                            tracing::error!(handle = self.socket_core_handle, pipe_id = pipe_read_id_for_logging, "Orchestrator try_push to main queue failed: Closed.");
-                            Err(ZmqError::Internal("Main incoming queue closed".into()))
-                        }
-                    }
-                }
-                Some(duration) => {
-                    // Timed blocking send
-                    match tokio_timeout(duration, self.main_incoming_queue.push_message(frame_to_push)).await
-                    {
-                        Ok(Ok(())) => Ok(()), // Successfully sent within timeout
-                        Ok(Err(e)) => Err(e), // Error from push_message (e.g. closed queue)
-                        Err(_timeout_elapsed) => {
-                            // Timeout elapsed
-                            tracing::trace!(handle = self.socket_core_handle, pipe_id = pipe_read_id_for_logging, "Orchestrator timed push to main queue failed: Timeout.");
-                            Err(ZmqError::Timeout)
-                        }
-                    }
-                }
-            };
+    // Re-acquire lock to update buffer
+    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
 
-            match push_result {
-                Ok(()) => { /* Frame successfully pushed */ }
-                Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
-                    tracing::warn!(
-                        handle = self.socket_core_handle,
-                        pipe_id = pipe_read_id_for_logging,
-                        frame_index = idx,
-                        total_frames = num_frames,
-                        "Orchestrator: Main queue full/timeout when pushing frame. Dropping this and subsequent frames of the logical message."
-                    );
-                    // The remaining frames are implicitly dropped as we break the loop.
-                    return Ok(());
-                }
-                Err(e) => {
-                    // Other errors (e.g., queue closed)
-                    tracing::error!(
-                        handle = self.socket_core_handle,
-                        pipe_id = pipe_read_id_for_logging,
-                        error = %e,
-                        "Orchestrator: Error pushing to main queue. Dropping message and propagating error."
-                    );
-                    return Err(e);
-                }
-            }
-        }
-        Ok(())
+    if app_frames_vec.is_empty() {
+      // This indicates the QItem transformed into an empty Vec<Msg>, which is unusual
+      // unless it represents an intentionally empty message from the peer.
+      // ZMQ recv on an empty message might block or have specific behavior.
+      // For now, return error or a single empty Msg.
+      tracing::warn!(
+        handle = self.socket_core_handle,
+        "recv_message: Transformed QItem resulted in empty app_frames. Returning empty Msg."
+      );
+      // Or an error: return Err(ZmqError::InvalidMessage("Received an empty logical message".into()));
+      return Ok(Msg::new()); // Return a single empty message without MORE flag.
     }
 
-    /// Called by ISocket::recv(). Returns the next single application-level frame.
-    pub async fn recv_message(&self, rcvtimeo_opt: Option<Duration>) -> Result<Msg, ZmqError> {
-        let pop_future = self.main_incoming_queue.pop_message();
-        match rcvtimeo_opt {
-            Some(duration) if !duration.is_zero() => {
-                // Timed pop
-                match tokio_timeout(duration, pop_future).await {
-                    Ok(Ok(Some(msg))) => Ok(msg),
-                    Ok(Ok(None)) => Err(ZmqError::Internal(
-                        "Orchestrator: Main receive queue closed".into(),
-                    )),
-                    Ok(Err(e)) => Err(e), // Error from pop_message itself
-                    Err(_timeout_elapsed) => Err(ZmqError::Timeout),
-                }
-            }
-            // Handles None (infinite wait) and Some(Duration::ZERO).
-            // Note: If Duration::ZERO is passed, it currently results in an infinite wait
-            // unless FairQueue::pop_message() itself has special handling for zero duration
-            // or a FairQueue::try_pop_message() method is used for that case.
-            _ => {
-                // Infinite wait (or how FairQueue handles zero duration if passed)
-                match pop_future.await? {
-                    Some(msg) => Ok(msg),
-                    None => Err(ZmqError::Internal(
-                        "Orchestrator: Main receive queue closed (inf/zero wait)".into(),
-                    )),
-                }
-            }
-        }
+    let mut app_frames_deque = VecDeque::from(app_frames_vec);
+    let first_frame = app_frames_deque.pop_front().unwrap(); // Safe due to is_empty check above
+
+    *buffer_guard = app_frames_deque; // Store remaining frames
+
+    // The MORE flag on first_frame should have been set correctly by qitem_to_app_frames
+    // based on whether there were subsequent frames in *its* sequence.
+    Ok(first_frame)
+  }
+
+  /// Clears the internal buffer used by `recv_message`.
+  /// Should be called when the socket pattern knows that any partially consumed
+  /// message is no longer valid (e.g., REQ socket sending a new request).
+  pub async fn reset_recv_message_buffer(&self) {
+    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
+    if !buffer_guard.is_empty() {
+      tracing::trace!(handle = self.socket_core_handle, "Orchestrator: Resetting current_recv_frames_buffer.");
+      *buffer_guard = VecDeque::new();
     }
+  }
 
-    /// Called by ISocket::recv_multipart(). Returns all frames of one application-level logical message.
-    pub async fn recv_logical_message(
-        &self,
-        rcvtimeo_opt: Option<Duration>,
-    ) -> Result<Vec<Msg>, ZmqError> {
-        let mut message_parts = Vec::new();
-        let overall_deadline_opt = rcvtimeo_opt.map(|d| tokio::time::Instant::now() + d);
-
-        loop {
-            let current_part_rcvtimeo: Option<Duration> = {
-                if let Some(deadline) = overall_deadline_opt {
-                    let now = tokio::time::Instant::now();
-                    if now >= deadline {
-                        // Overall timeout for the logical message has been reached.
-                        if message_parts.is_empty() {
-                            return Err(ZmqError::Timeout); // Timeout before receiving any part.
-                        } else {
-                            // Timeout after receiving some parts. This is a protocol violation.
-                            tracing::warn!("Orchestrator: Timeout receiving subsequent part of multi-part message. Partial message ({} parts) will be discarded.", message_parts.len());
-                            return Err(ZmqError::ProtocolViolation(
-                                "Timeout during multi-part recv, discarding partial.".into(),
-                            ));
-                        }
-                    }
-                    Some(deadline - now) // Calculate remaining time for this part.
-                } else {
-                    None // No overall timeout, so no timeout for this part either (infinite).
-                }
-            };
-
-            match self.recv_message(current_part_rcvtimeo).await {
-                Ok(frame) => {
-                    let is_last_part = !frame.is_more();
-                    message_parts.push(frame);
-                    if is_last_part {
-                        return Ok(message_parts);
-                    }
-                    // If not the last part, loop to receive the next part.
-                    // The deadline logic will handle timeouts for subsequent parts.
-                }
-                Err(ZmqError::Timeout) => {
-                    // Timeout receiving a specific part.
-                    if message_parts.is_empty() {
-                        return Err(ZmqError::Timeout); // Timeout on the very first part.
-                    } else {
-                        // Timeout after receiving some parts. This is a protocol violation.
-                        tracing::warn!(
-                            "Orchestrator: Timeout receiving subsequent part of multi-part message. Discarding partial ({} frames).",
-                            message_parts.len()
-                        );
-                        return Err(ZmqError::ProtocolViolation(
-                            "Timeout during multi-part recv, discarding partial.".into(),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    // Other error receiving a part.
-                    if message_parts.is_empty() {
-                        return Err(e); // Error on the very first part.
-                    } else {
-                        // Error after receiving some parts. This is a protocol violation.
-                        tracing::warn!("Orchestrator: Error ({:?}) receiving subsequent part of multi-part message. Discarding partial ({} frames).", e, message_parts.len());
-                        return Err(ZmqError::ProtocolViolation(format!(
-                            "Error during multi-part recv: {}, discarding partial.",
-                            e
-                        )));
-                    }
-                }
-            }
-        }
+  pub async fn clear_pipe_state(&self, pipe_read_id: usize) {
+    if self.partial_pipe_messages.remove(&pipe_read_id).is_some() {
+      tracing::debug!(handle = self.socket_core_handle, pipe_id = pipe_read_id, "Orchestrator: Cleared partial ZMTP message buffer for detached pipe");
     }
-
-    /// Called by ISocket's `pipe_detached` to clean up.
-    pub async fn clear_pipe_state(&self, pipe_read_id: usize) {
-        if self.partial_pipe_messages.remove(&pipe_read_id).is_some() {
-            tracing::debug!(
-                "Orchestrator: Cleared partial message buffer for detached pipe {}",
-                pipe_read_id
-            );
-        }
-    }
+    // Also clear the main recv buffer if a pipe detaches.
+    // This is a simplification; a more advanced system might only clear if the buffered message
+    // originated from the detached pipe (would require QItem to carry pipe_id or similar context).
+    // For now, this ensures no stale data from a disconnected pipe is accidentally delivered.
+    self.reset_recv_message_buffer().await;
+  }
 }

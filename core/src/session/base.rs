@@ -339,7 +339,7 @@ impl SessionBase {
                 self.engine_ready = false;
                 let error_msg_for_monitor = format!("{}", error);
                 self.send_monitor_event(SocketEvent::HandshakeFailed {
-                  endpoint: endpoint_uri_for_monitor_event.clone(), error_msg: error_msg_for_monitor,
+                  endpoint: self.connected_endpoint_uri.clone(), error_msg: error_msg_for_monitor,
                 }).await;
                 if error_to_report_on_stop.is_none() {
                   error_to_report_on_stop = Some(error);

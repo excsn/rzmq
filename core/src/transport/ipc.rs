@@ -463,15 +463,11 @@ impl IpcConnecter {
               let actual_connected_uri_ipc = format!("ipc://{}", peer_addr_str);
               let logical_uri = endpoint_uri_clone.clone(); 
 
-              // <<< REMOVED [Pipe creation and AttachPipe send from here] >>>
-
               let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
                 session_hdl_id, actual_connected_uri_ipc.clone(), logical_uri.clone(), monitor_tx.clone(),
                 self.context.clone(), self.parent_socket_id,
               );
               let managing_actor_task_id_val = Some(session_task_hdl.id());
-
-              // <<< REMOVED [AttachPipe command send from here] >>>
 
               let mut setup_ok = true;
               let (engine_mb, engine_task_hdl) = create_and_spawn_ipc_engine(

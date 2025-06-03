@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use async_channel::{SendError, TrySendError};
 use async_trait::async_trait;
+use tokio::task::yield_now;
 use tokio::time::timeout as tokio_timeout;
 
 #[cfg(feature = "io-uring")]
@@ -123,6 +124,8 @@ impl ISocketConnection for SessionConnection {
           // pipe_id = self.pipe_to_session_tx.id_somehow(), // async_channel Sender doesn't expose an ID easily
           "SessionConnection: Sending message (blocking on HWM)"
         );
+        
+        // yield_now().await;
         self
           .pipe_to_session_tx
           .send(msg)
@@ -193,14 +196,12 @@ impl ISocketConnection for SessionConnection {
   // ZMTP framing for the logical message happens at a higher level (e.g., in specific ISocket impls).
   async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
     for msg_part in msgs {
-      // Use the existing send_message logic which respects SNDTIMEO
       self.send_message(msg_part).await?;
     }
     Ok(())
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
-    // ... (close_connection remains the same)
     if self.session_mailbox.send(Command::Stop).await.is_err() {
       tracing::warn!(conn_id = self.connection_id, "Failed to send Stop command to Session mailbox (already closed?). Connection might not clean up fully via this path.");
     }

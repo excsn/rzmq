@@ -1,15 +1,12 @@
-// core/src/socket/dealer_socket.rs
-
 use crate::delegate_to_core;
 use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::core::state::EndpointInfo;
 use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
 use crate::socket::patterns::LoadBalancer;
 use crate::socket::ISocket;
-use crate::socket::SourcePipeReadId;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -17,11 +14,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::RwLock as ParkingLotRwLock;
-use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit}; // TokioRwLock not used here anymore
+use parking_lot::RwLockReadGuard as ParkingLotRwLockReadGuard;
+use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tokio::time::timeout as tokio_timeout;
 
-use super::patterns::{IncomingMessageOrchestrator, WritePipeCoordinator};
+use super::patterns::WritePipeCoordinator;
 
 const MAX_DEALER_SEND_BUFFER_PARTS: usize = 128;
 
@@ -76,7 +74,6 @@ impl DealerSocketOutgoingProcessor {
           if !queue_guard.is_empty() && self.load_balancer.has_connections() {
             current_message_to_send_option = queue_guard.pop_front();
           }
-          // queue_guard dropped
         }
       }
 
@@ -87,8 +84,7 @@ impl DealerSocketOutgoingProcessor {
           zmtp_frames_for_logical_message.len()
         );
 
-        let options_arc = self.core_accessor.core_state.read().options.clone();
-        let snd_timeout_opt: Option<Duration> = options_arc.sndtimeo;
+        let snd_timeout_opt: Option<Duration> = { self.core_accessor.core_state.read().options.sndtimeo };
 
         let mut message_successfully_sent_to_a_peer = false;
         let mut attempts_this_message_cycle = 0;
@@ -100,15 +96,13 @@ impl DealerSocketOutgoingProcessor {
               "[DealerProc {}] Socket closing, stopping send attempts for current message from queue.",
               self.core_handle
             );
-            // Re-queue the message if the socket is closing to ensure it's not lost if the processor restarts (though it won't here)
-            // Or, just let it be dropped with the processor. For now, re-queue is safer if the pattern logic were different.
             self
               .pending_queue
               .lock()
               .await
               .push_front(zmtp_frames_for_logical_message.clone());
             self.queue_activity_notifier.notify_one();
-            break 'peer_send_loop; // Exit attempt loop for this message
+            break 'peer_send_loop;
           }
           attempts_this_message_cycle += 1;
 
@@ -126,45 +120,40 @@ impl DealerSocketOutgoingProcessor {
                 .acquire_send_permit(conn_id_for_coord, snd_timeout_opt)
                 .await
               {
-                Ok(_send_permit) => {
-                  match conn_iface.send_multipart(zmtp_frames_for_logical_message.clone()).await { // Clone because we might re-queue
-                    Ok(()) => {
-                      message_successfully_sent_to_a_peer = true;
+                Ok(_send_permit) => match conn_iface.send_multipart(zmtp_frames_for_logical_message.clone()).await {
+                  Ok(()) => {
+                    message_successfully_sent_to_a_peer = true;
+                  }
+                  Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
+                    tracing::warn!(
+                      "[DealerProc {}] HWM/Timeout on send_multipart to conn_id {}. Trying next peer.",
+                      self.core_handle,
+                      conn_id_for_coord
+                    );
+                  }
+                  Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::HostUnreachable(_)) => {
+                    tracing::warn!(
+                      "[DealerProc {}] Conn {} (URI {}) closed/unreachable for send_multipart: {}. Removing.",
+                      self.core_handle,
+                      conn_id_for_coord,
+                      endpoint_uri,
+                      e
+                    );
+                    self.load_balancer.remove_connection(&endpoint_uri);
+                    if let Some(sem) = self.pipe_send_coordinator.remove_pipe(conn_id_for_coord).await {
+                      sem.close();
                     }
-                    Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
-                      tracing::warn!(
-                        "[DealerProc {}] HWM/Timeout on send_multipart to conn_id {}. Trying next peer.",
-                        self.core_handle,
-                        conn_id_for_coord
-                      );
-                      // Permit dropped, try next peer
-                    }
-                    Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::HostUnreachable(_)) => {
-                      tracing::warn!(
-                        "[DealerProc {}] Conn {} (URI {}) closed/unreachable for send_multipart: {}. Removing.",
-                        self.core_handle,
-                        conn_id_for_coord,
-                        endpoint_uri,
-                        e
-                      );
-                      self.load_balancer.remove_connection(&endpoint_uri);
-                      if let Some(sem) = self.pipe_send_coordinator.remove_pipe(conn_id_for_coord).await {
-                        sem.close();
-                      }
-                      self.peer_availability_notifier.notify_waiters();
-                      // Permit dropped, try next peer
-                    }
-                    Err(e) => {
-                      tracing::error!(
+                    self.peer_availability_notifier.notify_waiters();
+                  }
+                  Err(e) => {
+                    tracing::error!(
                         "[DealerProc {}] Unexpected error on send_multipart to conn_id {}: {}. Re-queuing and stopping this message cycle.",
                         self.core_handle, conn_id_for_coord, e
                       );
-                      // Re-queue and stop trying for this message in this cycle
-                      message_successfully_sent_to_a_peer = false; 
-                      attempts_this_message_cycle = max_attempts; // Force break from peer_send_loop
-                    }
+                    message_successfully_sent_to_a_peer = false;
+                    attempts_this_message_cycle = max_attempts;
                   }
-                }
+                },
                 Err(e) => {
                   tracing::warn!(
                     "[DealerProc {}] Failed to acquire send permit for conn_id {} (URI {}): {}. Trying next peer.",
@@ -175,7 +164,6 @@ impl DealerSocketOutgoingProcessor {
                   );
                   if matches!(e, ZmqError::HostUnreachable(_)) {
                     self.load_balancer.remove_connection(&endpoint_uri);
-                    // If remove_pipe was also called by coordinator, it's fine.
                     self.peer_availability_notifier.notify_waiters();
                   }
                 }
@@ -196,7 +184,7 @@ impl DealerSocketOutgoingProcessor {
             );
             break 'peer_send_loop;
           }
-        } // End 'peer_send_loop
+        }
 
         if !message_successfully_sent_to_a_peer {
           tracing::debug!(
@@ -204,9 +192,12 @@ impl DealerSocketOutgoingProcessor {
             self.core_handle,
             attempts_this_message_cycle
           );
-          // Lock is acquired, used, and guard dropped.
-          self.pending_queue.lock().await.push_front(zmtp_frames_for_logical_message);
-          self.queue_activity_notifier.notify_one(); // Notify because we put it back
+          self
+            .pending_queue
+            .lock()
+            .await
+            .push_front(zmtp_frames_for_logical_message);
+          self.queue_activity_notifier.notify_one();
         }
       } else {
         tracing::trace!(
@@ -226,7 +217,7 @@ impl DealerSocketOutgoingProcessor {
 pub(crate) struct DealerSocket {
   core: Arc<SocketCore>,
   load_balancer: Arc<LoadBalancer>,
-  incoming_orchestrator: IncomingMessageOrchestrator,
+  incoming_orchestrator: IncomingMessageOrchestrator<Vec<Msg>>,
   pipe_read_to_endpoint_uri: ParkingLotRwLock<HashMap<usize, String>>,
   pending_outgoing_queue: Arc<TokioMutex<VecDeque<Vec<Msg>>>>,
   outgoing_queue_activity_notifier: Arc<Notify>,
@@ -235,6 +226,7 @@ pub(crate) struct DealerSocket {
   processor_stop_signal: Arc<Notify>,
   current_send_transaction: TokioMutex<DealerSendTransaction>,
   pipe_send_coordinator: Arc<WritePipeCoordinator>,
+  current_recv_buffer: TokioMutex<VecDeque<Msg>>,
 }
 
 impl DealerSocket {
@@ -258,7 +250,8 @@ impl DealerSocket {
     };
 
     let processor_jh = tokio::spawn(processor.run());
-    let orchestrator = IncomingMessageOrchestrator::new(&core);
+    let rcvhwm = { core.core_state.read().options.rcvhwm };
+    let orchestrator = IncomingMessageOrchestrator::new(core.handle, rcvhwm);
 
     Self {
       core,
@@ -272,30 +265,95 @@ impl DealerSocket {
       processor_stop_signal: stop_signal_arc,
       current_send_transaction: TokioMutex::new(DealerSendTransaction::Idle),
       pipe_send_coordinator: pipe_send_coordinator_arc,
+      current_recv_buffer: TokioMutex::new(VecDeque::new()),
     }
   }
 
-  fn process_raw_message_for_dealer(
-    _pipe_read_id: usize,
-    mut raw_zmtp_message: Vec<Msg>,
-    _ctx: (),
+  // <<< MODIFIED START [Corrected Dealer incoming message processing] >>>
+  fn process_incoming_zmtp_message_for_dealer(
+    &self,
+    pipe_read_id: usize,
+    mut frames: Vec<Msg>,
   ) -> Result<Vec<Msg>, ZmqError> {
-    if let Some(delimiter_pos) = raw_zmtp_message.iter().position(|frame| frame.size() == 0) {
-      let app_payload: Vec<Msg> = raw_zmtp_message.drain(delimiter_pos + 1..).collect();
-      Ok(app_payload)
-    } else {
+    tracing::trace!(
+      handle = self.core.handle,
+      pipe_id = pipe_read_id,
+      num_raw_frames = frames.len(),
+      "Dealer processing incoming ZMTP message"
+    );
+
+    if frames.is_empty() {
       tracing::warn!(
-        "Dealer processing: Raw ZMTP message received without an empty delimiter. Passing all frames as application payload."
+        handle = self.core.handle,
+        pipe_id = pipe_read_id,
+        "Dealer received empty ZMTP message. Returning as empty payload."
       );
-      Ok(raw_zmtp_message)
+      return Ok(frames);
     }
+
+    // A DEALER socket, when receiving from a ROUTER, expects the ZMTP message to be:
+    // [identity_of_this_dealer_M, empty_delimiter_M, app_payload_frames...]
+    // The DEALER application should only see the app_payload_frames.
+    //
+    // If receiving from another DEALER, the ZMTP message is:
+    // [empty_delimiter_M, app_payload_frames...]
+    // The DEALER application should see app_payload_frames.
+
+    // We need to determine if the first frame is an identity (non-empty) or a delimiter (empty).
+    // This is inherently ambiguous for a DEALER as it doesn't know its peer type.
+    // However, the ZMQ spec implies that the DEALER socket itself handles stripping
+    // its own identity if present, and always strips the first empty delimiter before payload.
+
+    // For rzmq, the 'identity_of_this_dealer' is a ZMTP routing detail.
+    // The ISocketConnection would have received it. If it's part of the `frames` here,
+    // it means it was part of the ZMTP message on the wire for this specific connection.
+    // Let's assume if the first frame is NOT empty, it's an identity from a ROUTER and should be stripped.
+    if frames[0].size() != 0 {
+      // Assume it's an identity frame sent by a ROUTER, discard it.
+      tracing::trace!(
+        handle = self.core.handle,
+        pipe_id = pipe_read_id,
+        "Dealer: Discarding first non-empty frame (assumed identity from ROUTER)."
+      );
+      frames.remove(0);
+      // After discarding the identity, the next frame *must* be an empty delimiter.
+      if frames.is_empty() || frames[0].size() != 0 {
+        tracing::warn!(handle = self.core.handle, pipe_id = pipe_read_id, "Dealer: Expected empty delimiter after presumed identity frame, but not found or no frames left. Message might be malformed from peer ROUTER.");
+        // Return what's left, which might be an error for the app or an unexpected payload.
+        return Ok(frames);
+      }
+      // Now frames[0] is the empty delimiter, discard it.
+      frames.remove(0);
+      tracing::trace!(
+        handle = self.core.handle,
+        pipe_id = pipe_read_id,
+        "Dealer: Stripped empty delimiter after presumed identity."
+      );
+    }
+    // If the first frame *was* empty (or became empty after stripping identity and the check above)
+    else if !frames.is_empty() && frames[0].size() == 0 {
+      // This handles the case of DEALER-to-DEALER (first frame is delimiter)
+      // OR the delimiter that followed an identity from a ROUTER (already handled by the `else if` above if identity was present).
+      // So, this specifically catches the DEALER-DEALER case now.
+      tracing::trace!(
+        handle = self.core.handle,
+        pipe_id = pipe_read_id,
+        "Dealer: Stripped leading empty ZMTP delimiter (likely from peer DEALER)."
+      );
+      frames.remove(0);
+    }
+    // `frames` now contains only the application payload parts.
+    Ok(frames)
   }
+  // <<< MODIFIED END >>>
 
   fn prepare_full_multipart_send_sequence(&self, user_frames: Vec<Msg>) -> Vec<Msg> {
     if user_frames.is_empty() {
       let mut delimiter = Msg::new();
       delimiter.set_flags(MsgFlags::MORE);
-      return vec![delimiter, Msg::new()];
+      let mut last_empty = Msg::new();
+      last_empty.set_flags(last_empty.flags() & !MsgFlags::MORE);
+      return vec![delimiter, last_empty];
     }
     let mut frames_to_send = Vec::with_capacity(user_frames.len() + 1);
     let mut delimiter = Msg::new();
@@ -346,7 +404,6 @@ impl ISocket for DealerSocket {
   }
   async fn close(&self) -> Result<(), ZmqError> {
     self.processor_stop_signal.notify_one();
-    // Lock is acquired and guard is dropped within the same synchronous scope if Some.
     if let Some(handle) = self.processor_task_handle.lock().await.take() {
       if let Err(e) = tokio_timeout(Duration::from_millis(100), handle).await {
         tracing::warn!(
@@ -425,30 +482,28 @@ impl ISocket for DealerSocket {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let sndtimeo_opt: Option<Duration> = self.core.core_state.read().options.sndtimeo;
+    let sndtimeo_opt = { self.core.core_state.read().options.sndtimeo };
 
-    // This loop handles waiting if a DealerSendTransaction::Buffering is active.
     loop {
       let mut transaction_guard = self.current_send_transaction.lock().await;
       match &*transaction_guard {
         DealerSendTransaction::Idle => {
-          // No other send operation is buffering parts, we can proceed.
-          drop(transaction_guard); // Release lock before async send_logical_message
-          
-          // Prepare ZMTP wire frames (delimiter + user_frames with corrected MORE flags)
+          drop(transaction_guard);
           let zmtp_wire_frames = self.prepare_full_multipart_send_sequence(user_frames);
           return self.send_logical_message(zmtp_wire_frames).await;
         }
-        DealerSendTransaction::Buffering { completion_notifier, .. } => {
-          // Another send operation is buffering parts. We must wait for it to complete.
+        DealerSendTransaction::Buffering {
+          completion_notifier, ..
+        } => {
           let notifier_clone = completion_notifier.clone();
-          drop(transaction_guard); // Release lock while waiting
+          drop(transaction_guard);
 
-          // Wait for the other transaction to complete or for timeout/shutdown.
-          let closing_signal_future = async { // Check if socket is closing while waiting
+          let closing_signal_future = async {
             loop {
-              if !self.core.is_running().await { break; }
-              tokio::time::sleep(Duration::from_millis(50)).await; // Re-check periodically
+              if !self.core.is_running().await {
+                break;
+              }
+              tokio::time::sleep(Duration::from_millis(50)).await;
             }
           };
 
@@ -456,27 +511,24 @@ impl ISocket for DealerSocket {
             Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
             Some(duration) => {
               tokio::select! {
-                biased; 
+                biased;
                 _ = closing_signal_future => return Err(ZmqError::InvalidState("Socket is closing while waiting for prior send tx".into())),
                 res = tokio_timeout(duration, notifier_clone.notified()) => {
                   if res.is_err() { return Err(ZmqError::Timeout); }
-                  // Notifier fired, loop again to check DealerSendTransaction state.
                 }
               }
             }
-            None => { // Infinite wait
+            None => {
               tokio::select! {
-                biased; 
+                biased;
                 _ = closing_signal_future => return Err(ZmqError::InvalidState("Socket is closing while waiting for prior send tx".into())),
-                _ = notifier_clone.notified() => {
-                  // Notifier fired, loop again.
-                }
+                _ = notifier_clone.notified() => { }
               }
             }
           }
         }
       }
-    } // End loop
+    }
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
@@ -484,14 +536,28 @@ impl ISocket for DealerSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = { self.core.core_state.read().options.rcvtimeo };
-    self.incoming_orchestrator.recv_message(rcvtimeo_opt).await
+    // For DEALER, QItem is Vec<Msg> (payload parts).
+    // The transform_fn tells orchestrator.recv_message how to convert QItem into app_frames.
+    // For DEALER, the QItem (payload Vec<Msg>) IS the app_frames for the orchestrator's buffer.
+    let transform_fn = |q_item: Vec<Msg>| q_item;
+    self
+      .incoming_orchestrator
+      .recv_message(rcvtimeo_opt, transform_fn)
+      .await
   }
+
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
+
     let rcvtimeo_opt: Option<Duration> = { self.core.core_state.read().options.rcvtimeo };
-    self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await
+    // For DEALER, QItem is Vec<Msg> (the payload parts). Transform is identity.
+    let transform_fn = |q_item: Vec<Msg>| q_item;
+    self
+      .incoming_orchestrator
+      .recv_logical_message(rcvtimeo_opt, transform_fn)
+      .await
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
@@ -500,6 +566,7 @@ impl ISocket for DealerSocket {
   async fn get_pattern_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     Err(ZmqError::UnsupportedOption(option))
   }
+
   async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
     Ok(false)
   }
@@ -508,12 +575,11 @@ impl ISocket for DealerSocket {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
         if let Some(raw_zmtp_message_vec) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
-          let dealer_ctx = ();
-          match Self::process_raw_message_for_dealer(pipe_read_id, raw_zmtp_message_vec, dealer_ctx) {
-            Ok(app_logical_message) => {
+          match self.process_incoming_zmtp_message_for_dealer(pipe_read_id, raw_zmtp_message_vec) {
+            Ok(payload_parts_vec) => {
               self
                 .incoming_orchestrator
-                .queue_application_message_frames(pipe_read_id, app_logical_message)
+                .queue_item(pipe_read_id, payload_parts_vec)
                 .await?;
             }
             Err(e) => {
@@ -533,7 +599,6 @@ impl ISocket for DealerSocket {
   }
 
   async fn pipe_attached(&self, pipe_read_id: usize, _pipe_write_id: usize, _peer_identity: Option<&[u8]>) {
-    // Lock is acquired and released within this scope.
     let (endpoint_uri_opt, connection_id_opt) = {
       let core_s_read = self.core.core_state.read();
       let uri = core_s_read.pipe_read_id_to_endpoint_uri.get(&pipe_read_id).cloned();
@@ -546,11 +611,7 @@ impl ISocket for DealerSocket {
     };
 
     if let Some(endpoint_uri) = endpoint_uri_opt {
-      tracing::debug!(
-        handle = self.core.handle, pipe_read_id, uri = %endpoint_uri,
-        conn_id = ?connection_id_opt, "DEALER attaching connection"
-      );
-      // Lock is acquired and released for this write.
+      tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, conn_id = ?connection_id_opt, "DEALER attaching connection");
       self
         .pipe_read_to_endpoint_uri
         .write()
@@ -560,10 +621,7 @@ impl ISocket for DealerSocket {
       if let Some(conn_id) = connection_id_opt {
         self.pipe_send_coordinator.add_pipe(conn_id).await;
       } else {
-        tracing::warn!(
-          handle = self.core.handle, pipe_read_id, uri = %endpoint_uri,
-          "DEALER pipe_attached: Could not find connection_id for URI. WritePipeCoordinator not updated."
-        );
+        tracing::warn!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "DEALER pipe_attached: Could not find connection_id for URI. WritePipeCoordinator not updated.");
       }
       self.peer_availability_notifier.notify_one();
       self.outgoing_queue_activity_notifier.notify_one();
@@ -577,7 +635,7 @@ impl ISocket for DealerSocket {
   }
 
   async fn update_peer_identity(&self, _pipe_read_id: usize, _identity: Option<Blob>) {
-    /* DEALER ignores */
+    /* DEALER ignores ZMTP identity from peer for its core logic */
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
@@ -586,13 +644,10 @@ impl ISocket for DealerSocket {
       self.core.handle,
       pipe_read_id
     );
-
-    // Lock is acquired and released for this write.
     let maybe_endpoint_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id);
 
     if let Some(endpoint_uri) = maybe_endpoint_uri {
       self.load_balancer.remove_connection(&endpoint_uri);
-
       let connection_id_to_remove_opt = {
         let core_s_read = self.core.core_state.read();
         core_s_read
@@ -600,23 +655,11 @@ impl ISocket for DealerSocket {
           .get(&endpoint_uri)
           .map(|ep_info| ep_info.handle_id)
       };
-
       if let Some(conn_id) = connection_id_to_remove_opt {
         if let Some(semaphore) = self.pipe_send_coordinator.remove_pipe(conn_id).await {
           semaphore.close();
         }
-      } else {
-        tracing::warn!(
-          handle = self.core.handle, pipe_read_id, uri = %endpoint_uri,
-          "DEALER pipe_detached: Could not find connection_id for URI to update WritePipeCoordinator."
-        );
       }
-    } else {
-      tracing::warn!(
-        handle = self.core.handle,
-        pipe_read_id,
-        "DEALER detach: Endpoint URI not found for pipe_read_id in local map."
-      );
     }
     self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await;
     self.peer_availability_notifier.notify_waiters();
@@ -624,22 +667,20 @@ impl ISocket for DealerSocket {
 }
 
 impl DealerSocket {
-  /// Sends a pre-prepared Vec<Msg> (which are ZMTP wire frames) to a chosen peer.
-  /// Handles peer selection, permit acquisition, and queuing if direct send fails.
   async fn send_logical_message(&self, zmtp_wire_frames: Vec<Msg>) -> Result<(), ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing or terminated".into()));
     }
-    let socket_options_arc = self.core.core_state.read().options.clone();
-    let global_sndtimeo: Option<Duration> = socket_options_arc.sndtimeo;
-    let global_sndhwm: usize = socket_options_arc.sndhwm.max(1);
+    let (global_sndtimeo, global_sndhwm) = {
+      let core_s_read = self.core.core_state.read();
+      (core_s_read.options.sndtimeo, core_s_read.options.sndhwm.max(1))
+    };
 
     let mut attempts_this_message_cycle = 0;
     let max_direct_send_attempts = self.load_balancer.connection_count().await.max(1);
 
     'direct_send_attempt_loop: loop {
       if attempts_this_message_cycle >= max_direct_send_attempts {
-        // Max attempts reached for direct send, try to queue
         return self
           .queue_message_or_error(zmtp_wire_frames, global_sndhwm, global_sndtimeo)
           .await;
@@ -652,15 +693,16 @@ impl DealerSocket {
 
       let endpoint_uri_to_send_to = match self.load_balancer.get_next_connection_uri() {
         Some(uri) => {
-          if self.core.core_state.read().endpoints.contains_key(&uri) {
+          let uri_exists = { self.core.core_state.read().endpoints.contains_key(&uri) };
+          if uri_exists {
             uri
           } else {
             self.load_balancer.remove_connection(&uri);
             self.peer_availability_notifier.notify_waiters();
-            continue 'direct_send_attempt_loop; // Try another peer
+            continue 'direct_send_attempt_loop;
           }
         }
-        None => { // No peers available
+        None => {
           return self
             .queue_message_or_error(zmtp_wire_frames, global_sndhwm, global_sndtimeo)
             .await;
@@ -668,13 +710,14 @@ impl DealerSocket {
       };
 
       let (connection_iface_arc, connection_id_for_coord) = {
-        let core_s = self.core.core_state.read(); 
+        let core_s = self.core.core_state.read();
         match core_s.endpoints.get(&endpoint_uri_to_send_to) {
           Some(ep_info) => (ep_info.connection_iface.clone(), ep_info.handle_id),
-          None => { // Peer disappeared between LB selection and getting EndpointInfo
+          None => {
+            drop(core_s);
             self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
             self.peer_availability_notifier.notify_waiters();
-            continue 'direct_send_attempt_loop; // Try another peer
+            continue 'direct_send_attempt_loop;
           }
         }
       };
@@ -684,59 +727,50 @@ impl DealerSocket {
         .acquire_send_permit(connection_id_for_coord, global_sndtimeo)
         .await
       {
-        Ok(_send_permit) => { // Permit acquired
-          // Use send_multipart on the connection interface
-          match connection_iface_arc.send_multipart(zmtp_wire_frames.clone()).await { // Clone as we might requeue
-            Ok(()) => {
-              return Ok(()); // Successfully sent all ZMTP frames for this logical message
-            }
-            Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
-              // HWM or timeout on this specific peer for the multipart send.
-              // Drop the permit, try the next peer (continue loop).
-              tracing::warn!(
-                "[Dealer {}] HWM/Timeout on send_multipart to conn_id {}. Trying next peer.",
-                self.core.handle, connection_id_for_coord
-              );
-              // Permit is dropped as _send_permit goes out of scope for this iteration
-              continue 'direct_send_attempt_loop;
-            }
-            Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::HostUnreachable(_)) => {
-              // Connection to this peer is gone. Remove it and try next.
-              self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-              if let Some(sem) = self.pipe_send_coordinator.remove_pipe(connection_id_for_coord).await {
-                sem.close();
-              }
-              self.peer_availability_notifier.notify_waiters();
-              tracing::warn!(
-                "[Dealer {}] Conn {} (URI {}) closed/unreachable for send_multipart: {}. Removed.",
-                self.core.handle, connection_id_for_coord, endpoint_uri_to_send_to, e
-              );
-              // Permit is dropped. Continue to try another peer.
-              continue 'direct_send_attempt_loop;
-            }
-            Err(e) => { // Other unexpected error during send_multipart
-              return Err(e);
-            }
+        Ok(_send_permit) => match connection_iface_arc.send_multipart(zmtp_wire_frames.clone()).await {
+          Ok(()) => {
+            return Ok(());
           }
-          // _send_permit is dropped here
-        }
+          Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
+            tracing::warn!(
+              "[Dealer {}] HWM/Timeout on send_multipart to conn_id {}. Trying next peer.",
+              self.core.handle,
+              connection_id_for_coord
+            );
+            continue 'direct_send_attempt_loop;
+          }
+          Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::HostUnreachable(_)) => {
+            self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
+            if let Some(sem) = self.pipe_send_coordinator.remove_pipe(connection_id_for_coord).await {
+              sem.close();
+            }
+            self.peer_availability_notifier.notify_waiters();
+            tracing::warn!(
+              "[Dealer {}] Conn {} (URI {}) closed/unreachable for send_multipart: {}. Removed.",
+              self.core.handle,
+              connection_id_for_coord,
+              endpoint_uri_to_send_to,
+              e
+            );
+            continue 'direct_send_attempt_loop;
+          }
+          Err(e) => {
+            return Err(e);
+          }
+        },
         Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
-          // Failed to acquire permit due to HWM/Timeout on *this* attempt.
-          // This means the outgoing processor queue for this peer is likely full or the pipe is slow.
-          // Behavior depends on global SNDTIMEO: if 0, EAGAIN (queue); if >0, Timeout (queue); if None, block (queue).
-          // The current logic will lead to queueing.
           return self
             .queue_message_or_error(zmtp_wire_frames, global_sndhwm, global_sndtimeo)
             .await;
         }
-        Err(ZmqError::HostUnreachable(_)) => { // From acquire_send_permit if pipe is unknown/detached
+        Err(ZmqError::HostUnreachable(_)) => {
           self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
           self.peer_availability_notifier.notify_waiters();
-          continue 'direct_send_attempt_loop; // Try another peer
+          continue 'direct_send_attempt_loop;
         }
-        Err(e) => return Err(e), // Other error from acquire_send_permit
+        Err(e) => return Err(e),
       }
-    } // End 'direct_send_attempt_loop
+    }
   }
 
   async fn queue_message_or_error(
@@ -750,19 +784,15 @@ impl DealerSocket {
       self.core.handle,
       full_message_parts.len()
     );
-
     loop {
       if !self.core.is_running().await {
         return Err(ZmqError::InvalidState("Socket is closing while trying to queue".into()));
       }
-
-      // Lock is acquired for len check, then potentially again for push_back.
       if self.pending_outgoing_queue.lock().await.len() < global_sndhwm {
         self.pending_outgoing_queue.lock().await.push_back(full_message_parts);
         self.outgoing_queue_activity_notifier.notify_one();
         return Ok(());
       }
-
       match global_sndtimeo {
         Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
         Some(duration) => {
@@ -778,7 +808,7 @@ impl DealerSocket {
                 return Err(ZmqError::InvalidState("Socket is closing while waiting for queue space".into()));
             }
             _ = self.outgoing_queue_activity_notifier.notified() => {}
-            _ = self.peer_availability_notifier.notified() => {} // Also listen for peer changes
+            _ = self.peer_availability_notifier.notified() => {}
           }
         }
       }
@@ -789,14 +819,11 @@ impl DealerSocket {
 impl Drop for DealerSocket {
   fn drop(&mut self) {
     self.processor_stop_signal.notify_one();
-    // Lock is acquired and released within this scope.
     if let Ok(mut guard) = self.processor_task_handle.try_lock() {
       if let Some(handle) = guard.take() {
         handle.abort();
       }
     }
-
-    // Lock is acquired and released within this scope.
     if let Ok(mut transaction_guard) = self.current_send_transaction.try_lock() {
       if let DealerSendTransaction::Buffering {
         completion_notifier, ..

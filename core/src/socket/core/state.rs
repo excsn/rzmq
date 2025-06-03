@@ -62,7 +62,7 @@ pub(crate) struct CoreState {
   pub options: Arc<SocketOptions>,
   pub socket_type: SocketType,
   // For Session-based path: Map Core's pipe_write_id -> async_channel Sender to Session's data pipe
-  pub pipes_tx: HashMap<usize, AsyncSender<Msg>>, // Stays async-channel for now
+  pub pipes_tx: HashMap<usize, AsyncSender<Msg>>,
   // For Session-based path: Map Core's pipe_read_id -> JoinHandle of PipeReaderTask
   pub pipe_reader_task_handles: HashMap<usize, JoinHandle<()>>,
   // Main map of active endpoints, keyed by resolved endpoint_uri

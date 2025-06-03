@@ -34,14 +34,13 @@ enum RepState {
 #[derive(Debug)]
 pub(crate) struct RepSocket {
   core: Arc<SocketCore>,
-  incoming_request_queue: FairQueue,
+  incoming_request_queue: FairQueue<Msg>,
   state: TokioMutex<RepState>,
   pipe_read_id_to_endpoint_uri: RwLock<HashMap<usize, String>>,
 }
 
 impl RepSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    // <<< REVERTED: Use rcvhwm for FairQueue capacity >>>
     let queue_capacity = core.core_state.read().options.rcvhwm.max(1);
     Self {
       core,
@@ -218,7 +217,7 @@ impl ISocket for RepSocket {
       // Loop to pop frames from FairQueue until a full logical request is assembled
       let frame_from_queue = match rcvtimeo_opt {
         Some(duration) if !duration.is_zero() => {
-          match timeout(duration, self.incoming_request_queue.pop_message()).await {
+          match timeout(duration, self.incoming_request_queue.pop_item()).await {
             Ok(Ok(Some(msg))) => msg,
             Ok(Ok(None)) => return Err(ZmqError::Internal("REP: Request queue closed".into())),
             Ok(Err(e)) => return Err(e),
@@ -229,14 +228,14 @@ impl ISocket for RepSocket {
           // RCVTIMEO = 0 or None
           if rcvtimeo_opt == Some(Duration::ZERO) {
             // Non-blocking
-            match self.incoming_request_queue.try_pop_message() {
+            match self.incoming_request_queue.try_pop_item() {
               Ok(Some(msg)) => msg,
               Ok(None) => return Err(ZmqError::ResourceLimitReached),
               Err(e) => return Err(e),
             }
           } else {
             // Infinite
-            match self.incoming_request_queue.pop_message().await? {
+            match self.incoming_request_queue.pop_item().await? {
               Some(msg) => msg,
               None => return Err(ZmqError::Internal("REP: Request queue closed".into())),
             }
@@ -325,7 +324,6 @@ impl ISocket for RepSocket {
     Ok(false)
   }
 
-  // <<< REVERTED: handle_pipe_event pushes individual ZMTP frames to its own FairQueue >>>
   async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { mut msg, .. } => {
@@ -339,7 +337,7 @@ impl ISocket for RepSocket {
           more_flag = msg.is_more(),
           "REP handle_pipe_event: Received frame, pushing to FairQueue."
         );
-        if let Err(e) = self.incoming_request_queue.push_message(msg).await {
+        if let Err(e) = self.incoming_request_queue.push_item(msg).await {
           tracing::error!(
             handle = self.core.handle,
             pipe_id = pipe_read_id,
