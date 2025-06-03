@@ -86,7 +86,7 @@ impl SessionBase {
     }
   }
 
-  async fn try_publish_peer_identity_established_if_ready(&mut self, session_handle: usize, endpoint_uri_clone: &str, pending_peer_identity: &mut Option<Blob>,) {
+  async fn try_publish_peer_identity_established_if_ready(&mut self, session_handle: usize, logical_endpoint_uri_for_log_only: &str, pending_peer_identity: &mut Option<Blob>,) {
 
     // Check general readiness flags and if specific data is available (and not yet consumed for publication)
     if self.engine_ready &&
@@ -107,7 +107,7 @@ impl SessionBase {
       if self.context.event_bus().publish(event).is_err() {
         tracing::warn!(
           handle = session_handle,
-          uri = %endpoint_uri_clone,
+          uri = %logical_endpoint_uri_for_log_only,
           "Failed to publish PeerIdentityEstablished event after conditions met. Identity was consumed."
         );
         // Note: If publish fails, pending_peer_identity is now None.
@@ -115,12 +115,12 @@ impl SessionBase {
       } else {
         tracing::trace!(
           handle = session_handle,
-          uri = %endpoint_uri_clone,
+          uri = %logical_endpoint_uri_for_log_only,
           "Published PeerIdentityEstablished event successfully. Identity consumed."
         );
       }
 
-      self.send_monitor_event(SocketEvent::HandshakeSucceeded { endpoint: endpoint_uri_clone.to_string() }).await;
+      self.send_monitor_event(SocketEvent::HandshakeSucceeded { endpoint: self.connected_endpoint_uri.to_string() }).await;
     }
   }
 
