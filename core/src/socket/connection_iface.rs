@@ -125,7 +125,6 @@ impl ISocketConnection for SessionConnection {
           "SessionConnection: Sending message (blocking on HWM)"
         );
         
-        // yield_now().await;
         self
           .pipe_to_session_tx
           .send(msg)

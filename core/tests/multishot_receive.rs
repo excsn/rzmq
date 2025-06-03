@@ -7,8 +7,6 @@
 use rzmq::{
   socket::options::{
     IO_URING_RCVMULTISHOT,      // Boolean toggle for the feature
-    IO_URING_RECV_BUFFER_COUNT, // To configure the pool
-    IO_URING_RECV_BUFFER_SIZE,  // To configure the pool
     RCVHWM,
     SNDHWM, // For general socket behavior
   },
@@ -45,12 +43,12 @@ async fn setup_push_pull_for_multishot_recv(
   pull_socket
     .set_option(IO_URING_RCVMULTISHOT, &(1i32).to_ne_bytes()) // Enable multishot
     .await?;
-  pull_socket
-    .set_option(IO_URING_RECV_BUFFER_COUNT, &(buffer_count as i32).to_ne_bytes())
-    .await?;
-  pull_socket
-    .set_option(IO_URING_RECV_BUFFER_SIZE, &(buffer_size as i32).to_ne_bytes())
-    .await?;
+  // pull_socket
+  //   .set_option(IO_URING_RECV_BUFFER_COUNT, &(buffer_count as i32).to_ne_bytes())
+  //   .await?;
+  // pull_socket
+  //   .set_option(IO_URING_RECV_BUFFER_SIZE, &(buffer_size as i32).to_ne_bytes())
+  //   .await?;
   // Set a reasonable RCVHWM for the PULL socket's API-level queue,
   // though multishot buffer pool size is the primary receive buffer.
   pull_socket

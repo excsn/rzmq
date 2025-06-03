@@ -7,7 +7,7 @@ use criterion::{
 };
 use rzmq::{
   socket::options::{
-    IO_URING_RCVMULTISHOT, IO_URING_RECV_BUFFER_COUNT, IO_URING_RECV_BUFFER_SIZE, RCVHWM, SNDHWM, SNDTIMEO,
+    IO_URING_RCVMULTISHOT, RCVHWM, SNDHWM, SNDTIMEO,
   },
   Context, Msg, SocketType, ZmqError,
 };
@@ -45,12 +45,12 @@ async fn setup_push_pull_for_recv_bench(
   if enable_multishot_on_pull {
     println!("[Setup {}] Configuring PULL for Multishot Receive", endpoint);
     pull.set_option(IO_URING_RCVMULTISHOT, &(1i32).to_ne_bytes()).await?;
-    pull
-      .set_option(IO_URING_RECV_BUFFER_COUNT, &(MS_BUF_COUNT as i32).to_ne_bytes())
-      .await?;
-    pull
-      .set_option(IO_URING_RECV_BUFFER_SIZE, &(MS_BUF_SIZE as i32).to_ne_bytes())
-      .await?;
+    // pull
+    //   .set_option(IO_URING_RECV_BUFFER_COUNT, &(MS_BUF_COUNT as i32).to_ne_bytes())
+    //   .await?;
+    // pull
+    //   .set_option(IO_URING_RECV_BUFFER_SIZE, &(MS_BUF_SIZE as i32).to_ne_bytes())
+    //   .await?;
   } else {
     println!("[Setup {}] Configuring PULL for Standard Receive", endpoint);
   }
