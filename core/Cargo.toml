@@ -64,6 +64,7 @@ x25519-dalek = { workspace = true, optional = true }
 # For benchmarks
 anyhow = "^1"
 criterion = { version = "0.5", features = ["async_tokio"] }
+bench_matrix = { version = "^0" }
 serial_test = "^3"
 # For integration tests
 tokio-test = "^0.4"
