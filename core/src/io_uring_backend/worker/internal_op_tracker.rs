@@ -26,11 +26,13 @@ pub(crate) enum InternalOpType {
 pub(crate) enum InternalOpPayload {
   None,
   SendBuffer {
-    buffer: Bytes, // Data being sent (if not ZC)
+    buffer: Bytes,               // Data being sent (if not ZC)
     app_op_ud: Option<UserData>, // UserData of the originating UringOpRequest (e.g., SendDataViaHandler)
     app_op_name: Option<String>, // Name of the app-level operation
   },
-  CancelTarget { target_user_data: UserData },
+  CancelTarget {
+    target_user_data: UserData,
+  },
   SendZeroCopy {
     send_buf_id: RegisteredSendBufferId, // ID from SendBufferPool
     app_op_ud: UserData,                 // UserData of the originating UringOpRequest
@@ -39,9 +41,9 @@ pub(crate) enum InternalOpPayload {
 }
 
 impl Default for InternalOpPayload {
-    fn default() -> Self {
-        InternalOpPayload::None
-    }
+  fn default() -> Self {
+    InternalOpPayload::None
+  }
 }
 
 /// Details stored for an in-flight internal operation.
@@ -77,27 +79,31 @@ impl InternalOpTracker {
     let id = self.next_id;
     self.next_id = self.next_id.wrapping_add(1);
     if self.next_id == 0 {
-        self.next_id = 1_000_000_000;
+      self.next_id = 1_000_000_000;
     }
-    self.op_to_details.insert(id, InternalOpDetails { fd, op_type, payload });
+    self
+      .op_to_details
+      .insert(id, InternalOpDetails { fd, op_type, payload });
     id
   }
 
   pub fn take_op_details(&mut self, user_data: UserData) -> Option<InternalOpDetails> {
     self.op_to_details.remove(&user_data)
   }
-  
+
   #[allow(dead_code)]
   pub fn get_op_details(&self, user_data: UserData) -> Option<&InternalOpDetails> {
     self.op_to_details.get(&user_data)
   }
 
   pub fn is_empty(&self) -> bool {
-      self.op_to_details.is_empty()
+    self.op_to_details.is_empty()
   }
 
   pub fn remove_ops_for_fd(&mut self, fd_to_remove: RawFd) {
     // Payloads (like Bytes for Send) associated with removed ops will be dropped here.
-    self.op_to_details.retain(|_user_data, details| details.fd != fd_to_remove);
+    self
+      .op_to_details
+      .retain(|_user_data, details| details.fd != fd_to_remove);
   }
 }

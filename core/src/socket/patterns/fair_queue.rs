@@ -13,7 +13,7 @@ pub(crate) enum PushError<T: Send + 'static> {
 pub(crate) struct FairQueue<T: Send + 'static> {
   receiver: Receiver<T>,
   sender: Sender<T>,
-  hwm: usize, 
+  hwm: usize,
 }
 
 impl<T: Send + 'static> FairQueue<T> {

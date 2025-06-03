@@ -7,7 +7,7 @@ use crate::{error::ZmqError, Blob}; // Blob for EngineReady, ZmqError for replie
 use super::mailbox::MailboxSender as SessionBaseCommandSender;
 
 #[cfg(feature = "io-uring")]
-use std::os::unix::io::RawFd; 
+use std::os::unix::io::RawFd;
 
 // Using tokio's oneshot for replies within commands.
 // async_channel is used for the mailboxes themselves and for inter-actor pipes.
@@ -92,7 +92,7 @@ pub enum Command {
   /// Sent from Listener/Connecter (via SocketCore) -> Session to provide Engine details.
   Attach {
     connection: EngineConnectionType,
-    engine_handle: Option<usize>,  // Optional unique handle ID of the Engine actor.
+    engine_handle: Option<usize>, // Optional unique handle ID of the Engine actor.
     engine_task_handle: Option<tokio::task::JoinHandle<()>>, // Optional JoinHandle for the Engine's task.
   },
   /// Sent from Session/Pipe -> Engine to send a message over the transport.
@@ -152,17 +152,12 @@ pub enum Command {
     pipe_write_id: usize,
   },
   #[cfg(feature = "io-uring")]
-  UringFdMessage {
-    fd: RawFd,
-    msg: Msg,
-  },
+  UringFdMessage { fd: RawFd, msg: Msg },
   #[cfg(feature = "io-uring")]
-  UringFdError {
-    fd: RawFd,
-    error: ZmqError,
-  },
+  UringFdError { fd: RawFd, error: ZmqError },
   #[cfg(feature = "io-uring")]
-  UringFdHandshakeComplete { // Used by uring::global_state processor to inform SocketCore
+  UringFdHandshakeComplete {
+    // Used by uring::global_state processor to inform SocketCore
     fd: RawFd,
     peer_identity: Option<Blob>,
   },

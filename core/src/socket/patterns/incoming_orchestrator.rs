@@ -220,14 +220,21 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
   pub async fn reset_recv_message_buffer(&self) {
     let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
     if !buffer_guard.is_empty() {
-      tracing::trace!(handle = self.socket_core_handle, "Orchestrator: Resetting current_recv_frames_buffer.");
+      tracing::trace!(
+        handle = self.socket_core_handle,
+        "Orchestrator: Resetting current_recv_frames_buffer."
+      );
       *buffer_guard = VecDeque::new();
     }
   }
 
   pub async fn clear_pipe_state(&self, pipe_read_id: usize) {
     if self.partial_pipe_messages.remove(&pipe_read_id).is_some() {
-      tracing::debug!(handle = self.socket_core_handle, pipe_id = pipe_read_id, "Orchestrator: Cleared partial ZMTP message buffer for detached pipe");
+      tracing::debug!(
+        handle = self.socket_core_handle,
+        pipe_id = pipe_read_id,
+        "Orchestrator: Cleared partial ZMTP message buffer for detached pipe"
+      );
     }
     // Also clear the main recv buffer if a pipe detaches.
     // This is a simplification; a more advanced system might only clear if the buffered message

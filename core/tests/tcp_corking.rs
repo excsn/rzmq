@@ -232,63 +232,63 @@ async fn test_tcp_cork_ping_pong_interaction() -> Result<(), ZmqError> {
 
 #[tokio::test]
 async fn test_tcp_cork_state_management_with_more_flag() -> Result<(), ZmqError> {
-    println!("\n--- Starting test_tcp_cork_state_management_with_more_flag ---");
-    let ctx = common::test_context();
-    let endpoint = "tcp://127.0.0.1:5805"; // Unique port
-    // Enable cork on sender. SNDTIMEO is not set to 0 here initially.
-    let (push, pull) = setup_pair_with_cork(&ctx, endpoint, true).await?;
+  println!("\n--- Starting test_tcp_cork_state_management_with_more_flag ---");
+  let ctx = common::test_context();
+  let endpoint = "tcp://127.0.0.1:5805"; // Unique port
+                                         // Enable cork on sender. SNDTIMEO is not set to 0 here initially.
+  let (push, pull) = setup_pair_with_cork(&ctx, endpoint, true).await?;
 
-    // Message 1 (single part, should set and unset cork)
-    println!("SENDER: Sending Message 1 ('SinglePart')");
-    push.send(Msg::from_static(b"SinglePart")).await?;
-    // ZmtpEngineCore: expect=T, cork=F -> set cork=T -> send -> expect=T, unset cork=F
-    println!("SENDER: Sent Message 1.");
+  // Message 1 (single part, should set and unset cork)
+  println!("SENDER: Sending Message 1 ('SinglePart')");
+  push.send(Msg::from_static(b"SinglePart")).await?;
+  // ZmtpEngineCore: expect=T, cork=F -> set cork=T -> send -> expect=T, unset cork=F
+  println!("SENDER: Sent Message 1.");
 
-    let rec1 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
-    assert_eq!(rec1.data().unwrap(), b"SinglePart");
-    println!("RECEIVER: Received Message 1.");
+  let rec1 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+  assert_eq!(rec1.data().unwrap(), b"SinglePart");
+  println!("RECEIVER: Received Message 1.");
 
-    // Message 2 (multi-part)
-    let mut msg2_part1 = Msg::from_static(b"MultiPart1");
-    msg2_part1.set_flags(MsgFlags::MORE);
-    let msg2_part2 = Msg::from_static(b"MultiPart2");
+  // Message 2 (multi-part)
+  let mut msg2_part1 = Msg::from_static(b"MultiPart1");
+  msg2_part1.set_flags(MsgFlags::MORE);
+  let msg2_part2 = Msg::from_static(b"MultiPart2");
 
-    println!("SENDER: Sending Message 2, Part 1 ('MultiPart1' with MORE)");
-    push.send(msg2_part1).await?;
-    // ZmtpEngineCore: expect=T, cork=F -> set cork=T -> send -> expect=F (because MORE)
-    println!("SENDER: Sent Message 2, Part 1.");
-    // Cork should be ON in the engine now.
+  println!("SENDER: Sending Message 2, Part 1 ('MultiPart1' with MORE)");
+  push.send(msg2_part1).await?;
+  // ZmtpEngineCore: expect=T, cork=F -> set cork=T -> send -> expect=F (because MORE)
+  println!("SENDER: Sent Message 2, Part 1.");
+  // Cork should be ON in the engine now.
 
-    // Introduce a small delay. If corking is working, Part1 might be held.
-    tokio::time::sleep(Duration::from_millis(10)).await;
+  // Introduce a small delay. If corking is working, Part1 might be held.
+  tokio::time::sleep(Duration::from_millis(10)).await;
 
-    println!("SENDER: Sending Message 2, Part 2 ('MultiPart2' no MORE)");
-    push.send(msg2_part2).await?;
-    // ZmtpEngineCore: expect=F, cork=T -> send -> expect=T (because no MORE), unset cork=F
-    println!("SENDER: Sent Message 2, Part 2.");
+  println!("SENDER: Sending Message 2, Part 2 ('MultiPart2' no MORE)");
+  push.send(msg2_part2).await?;
+  // ZmtpEngineCore: expect=F, cork=T -> send -> expect=T (because no MORE), unset cork=F
+  println!("SENDER: Sent Message 2, Part 2.");
 
-    // Receiver gets Message 2
-    let rec2_part1 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
-    assert_eq!(rec2_part1.data().unwrap(), b"MultiPart1");
-    assert!(rec2_part1.is_more());
-    println!("RECEIVER: Received Message 2, Part 1.");
+  // Receiver gets Message 2
+  let rec2_part1 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+  assert_eq!(rec2_part1.data().unwrap(), b"MultiPart1");
+  assert!(rec2_part1.is_more());
+  println!("RECEIVER: Received Message 2, Part 1.");
 
-    let rec2_part2 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
-    assert_eq!(rec2_part2.data().unwrap(), b"MultiPart2");
-    assert!(!rec2_part2.is_more());
-    println!("RECEIVER: Received Message 2, Part 2.");
-    
-    // Message 3 (single part again, to check cork state reset)
-    println!("SENDER: Sending Message 3 ('AnotherSingle')");
-    push.send(Msg::from_static(b"AnotherSingle")).await?;
-    // ZmtpEngineCore: expect=T, cork=F -> set cork=T -> send -> expect=T, unset cork=F
-    println!("SENDER: Sent Message 3.");
+  let rec2_part2 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+  assert_eq!(rec2_part2.data().unwrap(), b"MultiPart2");
+  assert!(!rec2_part2.is_more());
+  println!("RECEIVER: Received Message 2, Part 2.");
 
-    let rec3 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
-    assert_eq!(rec3.data().unwrap(), b"AnotherSingle");
-    println!("RECEIVER: Received Message 3.");
+  // Message 3 (single part again, to check cork state reset)
+  println!("SENDER: Sending Message 3 ('AnotherSingle')");
+  push.send(Msg::from_static(b"AnotherSingle")).await?;
+  // ZmtpEngineCore: expect=T, cork=F -> set cork=T -> send -> expect=T, unset cork=F
+  println!("SENDER: Sent Message 3.");
 
-    ctx.term().await?;
-    println!("--- Test finished ---");
-    Ok(())
+  let rec3 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+  assert_eq!(rec3.data().unwrap(), b"AnotherSingle");
+  println!("RECEIVER: Received Message 3.");
+
+  ctx.term().await?;
+  println!("--- Test finished ---");
+  Ok(())
 }

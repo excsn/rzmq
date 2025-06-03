@@ -1,16 +1,14 @@
-// core/src/socket/core/event_processor.rs
-
 use crate::error::ZmqError;
+use crate::runtime::system_events::ConnectionInteractionModel;
 use crate::runtime::{Command, SystemEvent};
 #[cfg(feature = "io-uring")]
-use crate::uring;
-use crate::runtime::system_events::ConnectionInteractionModel;
-use crate::socket::connection_iface::{ISocketConnection, SessionConnection};
-#[cfg(feature = "io-uring")]
 use crate::socket::connection_iface::UringFdConnection;
+use crate::socket::connection_iface::{ISocketConnection, SessionConnection};
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
 use crate::socket::core::{command_processor, pipe_manager, shutdown, SocketCore};
 use crate::socket::ISocket;
+#[cfg(feature = "io-uring")]
+use crate::uring;
 
 use std::sync::Arc;
 use tokio::task::Id as TaskId;
@@ -40,7 +38,11 @@ pub(crate) async fn process_system_event(
         shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
       } else {
         // This event is for another socket, SocketCore ignores it.
-        tracing::trace!(handle = core_handle, other_socket_id = socket_id, "SocketCore observed SocketClosing event for another socket.");
+        tracing::trace!(
+          handle = core_handle,
+          other_socket_id = socket_id,
+          "SocketCore observed SocketClosing event for another socket."
+        );
       }
     }
     SystemEvent::ActorStopping {
@@ -86,7 +88,7 @@ pub(crate) async fn process_system_event(
             new_conn_uri = %endpoint_uri,
             "SocketCore ignoring NewConnectionEstablished during its shutdown. Attempting to close new connection."
           );
-          
+
           if let Some(iface) = connection_iface_from_event_opt {
             if let Err(e) = iface.close_connection().await {
               tracing::error!(handle = core_handle, new_conn_uri = %endpoint_uri, "Error closing orphaned new connection: {}", e);
@@ -196,7 +198,7 @@ pub(crate) async fn process_system_event(
         .await;
       }
     }
-    
+
     SystemEvent::ActorStarted {
       handle_id: _started_actor_id,
       actor_type: _actor_type,
@@ -224,7 +226,7 @@ async fn handle_new_connection_established(
   _managing_actor_task_id_from_event: Option<TaskId>,
 ) -> Result<(), ZmqError> {
   let core_handle = core_arc.handle;
-  
+
   let connection_instance_id = match &interaction_model_from_event {
     ConnectionInteractionModel::ViaSessionActor {
       session_actor_handle_id,
@@ -237,7 +239,7 @@ async fn handle_new_connection_established(
       unreachable!("ViaUringFd model when io-uring feature is disabled")
     }
   };
-  
+
   let is_outbound_this_core_initiated = {
     let core_s_guard = core_arc.core_state.read();
     !core_s_guard.endpoints.values().any(|ep_info| {
@@ -263,7 +265,7 @@ async fn handle_new_connection_established(
       // SocketCore now constructs the SessionConnection iface here.
       // connection_iface_from_event_opt should be None.
       if connection_iface_from_event_opt.is_some() {
-          tracing::warn!(handle = core_handle, conn_uri = %endpoint_uri_from_event, "NewConnectionEstablished for ViaSessionActor unexpectedly received a pre-existing ISocketConnection. This is unusual.");
+        tracing::warn!(handle = core_handle, conn_uri = %endpoint_uri_from_event, "NewConnectionEstablished for ViaSessionActor unexpectedly received a pre-existing ISocketConnection. This is unusual.");
       }
 
       let (actual_core_write_id, actual_core_read_id) = pipe_manager::setup_pipe_with_session_actor(
@@ -275,7 +277,7 @@ async fn handle_new_connection_established(
       )
       .await?;
 
-      let arc_socket_options = core_arc.core_state.read().options.clone(); 
+      let arc_socket_options = core_arc.core_state.read().options.clone();
       let core_context_clone = core_arc.context.clone();
 
       // Construct the SessionConnection *after* pipes are set up by pipe_manager
@@ -287,14 +289,13 @@ async fn handle_new_connection_established(
         .cloned()
         .ok_or_else(|| ZmqError::Internal("Failed to retrieve pipe sender for SessionConnection".into()))?;
 
-      
       // Construct final_connection_iface for ViaSessionActor path
       final_connection_iface = Arc::new(SessionConnection::new(
         session_actor_mailbox.clone(),
         session_actor_handle_id,
         tx_core_to_session_for_iface,
         arc_socket_options,
-        core_context_clone, 
+        core_context_clone,
       ));
 
       let endpoint_info = EndpointInfo {
@@ -346,15 +347,15 @@ async fn handle_new_connection_established(
       // SocketCore now always constructs the UringFdConnection.
       // connection_iface_from_event_opt should be None from the event.
       if connection_iface_from_event_opt.is_some() {
-          tracing::warn!(handle = core_handle, fd = fd, "NewConnectionEstablished for ViaUringFd unexpectedly received a pre-existing ISocketConnection. This is unusual and will be ignored.");
+        tracing::warn!(handle = core_handle, fd = fd, "NewConnectionEstablished for ViaUringFd unexpectedly received a pre-existing ISocketConnection. This is unusual and will be ignored.");
       }
 
       let arc_socket_options_uring = core_arc.core_state.read().options.clone();
       let core_context_clone_uring = core_arc.context.clone();
       final_connection_iface = Arc::new(UringFdConnection::new(
-        fd, 
+        fd,
         arc_socket_options_uring,
-        core_context_clone_uring, 
+        core_context_clone_uring,
       ));
 
       let uring_fd_as_endpoint_handle_id = fd as usize;

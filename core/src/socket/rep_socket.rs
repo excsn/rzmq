@@ -96,7 +96,7 @@ impl ISocket for RepSocket {
     if msg.is_more() {
       msg.set_flags(msg.flags() & !MsgFlags::MORE);
     }
-    
+
     // Delegate to send_multipart with a single payload frame
     self.send_multipart(vec![msg]).await
   }
@@ -125,7 +125,8 @@ impl ISocket for RepSocket {
     }
 
     let mut user_payload_frames = payload_frames;
-    if user_payload_frames.is_empty() { // ZMQ REP must send at least one frame (can be empty)
+    if user_payload_frames.is_empty() {
+      // ZMQ REP must send at least one frame (can be empty)
       user_payload_frames.push(Msg::new());
     }
 
@@ -135,7 +136,7 @@ impl ISocket for RepSocket {
         RepState::ReceivedRequest(info) => info,
         RepState::ReadyToReceive => {
           // Restore state as we didn't consume it
-          *current_state_guard = RepState::ReadyToReceive; 
+          *current_state_guard = RepState::ReadyToReceive;
           return Err(ZmqError::InvalidState(
             "REP socket must recv() a request before sending a reply",
           ));
@@ -157,15 +158,15 @@ impl ISocket for RepSocket {
     }; // core_s_read is dropped
 
     // Assemble all ZMTP frames for the wire: routing_prefix + user_payload_frames
-    let mut zmtp_wire_frames: Vec<Msg> = Vec::with_capacity(
-      peer_to_reply_to.routing_prefix.len() + user_payload_frames.len()
-    );
+    let mut zmtp_wire_frames: Vec<Msg> =
+      Vec::with_capacity(peer_to_reply_to.routing_prefix.len() + user_payload_frames.len());
     zmtp_wire_frames.extend(peer_to_reply_to.routing_prefix); // routing_prefix frames should already have MORE flags set correctly from when they were received.
     zmtp_wire_frames.extend(user_payload_frames);
 
     // Ensure MORE flags are set correctly for the entire sequence
     let num_total_frames = zmtp_wire_frames.len();
-    if num_total_frames == 0 { // Should not happen if user_payload_frames is guaranteed non-empty
+    if num_total_frames == 0 {
+      // Should not happen if user_payload_frames is guaranteed non-empty
       return Ok(());
     }
 
@@ -176,7 +177,7 @@ impl ISocket for RepSocket {
         frame.set_flags(frame.flags() & !MsgFlags::MORE); // Last frame of the logical message
       }
     }
-    
+
     // Call ISocketConnection::send_multipart once with all prepared ZMTP wire frames
     match conn_iface.send_multipart(zmtp_wire_frames).await {
       Ok(()) => {

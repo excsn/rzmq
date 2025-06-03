@@ -158,7 +158,7 @@ pub enum ZmqError {
 impl From<io::Error> for ZmqError {
   fn from(e: io::Error) -> Self {
     ZmqError::IoError {
-      kind: e.kind(),        // Store theErrorKind.
+      kind: e.kind(),         // Store theErrorKind.
       message: e.to_string(), // Store the String representation of the error.
     }
   }

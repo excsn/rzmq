@@ -16,7 +16,7 @@ use tokio::time::{interval, Interval};
 pub(crate) async fn run_command_loop(
   core_arc: Arc<SocketCore>,
   socket_logic_strong: Arc<dyn ISocket>, // Strong Arc to the ISocket pattern logic
-  mut command_receiver: MailboxReceiver, // Mailbox for user commands, now mutable
+  command_receiver: MailboxReceiver,     // Mailbox for user commands, now mutable
   mut system_event_rx: broadcast::Receiver<SystemEvent>, // Event bus receiver
 ) {
   let core_handle = core_arc.handle;

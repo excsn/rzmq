@@ -6,7 +6,7 @@
 
 use rzmq::{
   socket::options::{
-    IO_URING_RCVMULTISHOT,      // Boolean toggle for the feature
+    IO_URING_RCVMULTISHOT, // Boolean toggle for the feature
     RCVHWM,
     SNDHWM, // For general socket behavior
   },

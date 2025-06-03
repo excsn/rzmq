@@ -6,7 +6,7 @@ use io_uring::IoUring;
 use libc;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use tracing::{error, info, warn, trace};
+use tracing::{error, info, trace, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RegisteredSendBufferId(u16);
@@ -14,8 +14,8 @@ pub(crate) struct RegisteredSendBufferId(u16);
 #[derive(Debug)]
 struct SendBufferSlot {
   id: RegisteredSendBufferId,
-  buffer: Vec<u8>,        // Owns the memory for the buffer
-  in_kernel_use: bool,  // True if SEND_ZC submitted, awaiting F_NOTIFY
+  buffer: Vec<u8>,     // Owns the memory for the buffer
+  in_kernel_use: bool, // True if SEND_ZC submitted, awaiting F_NOTIFY
 }
 
 impl SendBufferSlot {
@@ -48,11 +48,7 @@ pub(crate) struct SendBufferPool {
 }
 
 impl SendBufferPool {
-  pub fn new(
-    ring: &IoUring,
-    count: usize,
-    capacity_per_buffer: usize,
-  ) -> Result<Self, ZmqError> {
+  pub fn new(ring: &IoUring, count: usize, capacity_per_buffer: usize) -> Result<Self, ZmqError> {
     if count == 0 || capacity_per_buffer == 0 {
       warn!("SendBufferPool initialized with zero count or capacity. Zero-copy send will be effectively disabled.");
       return Ok(Self {
@@ -79,20 +75,13 @@ impl SendBufferPool {
       free_ids.push_back(RegisteredSendBufferId(i as u16));
     }
 
-    let iovecs_to_register: Vec<libc::iovec> =
-      slots.iter().map(|slot| slot.iovec()).collect();
+    let iovecs_to_register: Vec<libc::iovec> = slots.iter().map(|slot| slot.iovec()).collect();
 
     unsafe {
-      ring
-        .submitter()
-        .register_buffers(&iovecs_to_register)
-        .map_err(|e| {
-          error!("SendBufferPool: Failed to register_buffers: {}", e);
-          ZmqError::Internal(format!(
-            "SendBufferPool: Failed to register_buffers: {}",
-            e
-          ))
-        })?;
+      ring.submitter().register_buffers(&iovecs_to_register).map_err(|e| {
+        error!("SendBufferPool: Failed to register_buffers: {}", e);
+        ZmqError::Internal(format!("SendBufferPool: Failed to register_buffers: {}", e))
+      })?;
     }
 
     info!(
@@ -100,20 +89,14 @@ impl SendBufferPool {
       count, capacity_per_buffer
     );
     Ok(Self {
-      inner: Mutex::new(SendBufferPoolInner {
-        pool: slots,
-        free_ids,
-      }),
+      inner: Mutex::new(SendBufferPoolInner { pool: slots, free_ids }),
     })
   }
 
   /// Attempts to acquire a free buffer, copies `data_to_copy` into it,
   /// and marks it as in kernel use.
   /// Returns the buffer's ID, a pointer to its data, and the length of data copied.
-  pub fn acquire_and_prep_buffer(
-    &self,
-    data_to_copy: &Bytes,
-  ) -> Option<(RegisteredSendBufferId, *const u8, u32)> {
+  pub fn acquire_and_prep_buffer(&self, data_to_copy: &Bytes) -> Option<(RegisteredSendBufferId, *const u8, u32)> {
     if data_to_copy.is_empty() {
       trace!("SendBufferPool: acquire_and_prep_buffer called with empty data, skipping.");
       return None; // Cannot SEND_ZC empty data
@@ -143,7 +126,11 @@ impl SendBufferPool {
       slot.as_mut_slice()[..data_to_copy.len()].copy_from_slice(data_to_copy);
       slot.in_kernel_use = true; // Mark as given to kernel
 
-      trace!("SendBufferPool: Acquired buffer {:?} for {} bytes.", buffer_id, data_to_copy.len());
+      trace!(
+        "SendBufferPool: Acquired buffer {:?} for {} bytes.",
+        buffer_id,
+        data_to_copy.len()
+      );
       Some((buffer_id, slot.ptr(), data_to_copy.len() as u32))
     } else {
       trace!("SendBufferPool: No free send buffers available.");
@@ -155,19 +142,15 @@ impl SendBufferPool {
   /// Called after the kernel signals it's done (e.g., via SEND_ZC F_NOTIFY CQE).
   pub fn release_buffer(&self, id: RegisteredSendBufferId) {
     let mut inner_guard = self.inner.lock();
-    if let Some(slot_index) = inner_guard
-      .pool
-      .iter()
-      .position(|s| s.id == id)
-    {
+    if let Some(slot_index) = inner_guard.pool.iter().position(|s| s.id == id) {
       let slot = &mut inner_guard.pool[slot_index];
       if slot.in_kernel_use {
         slot.in_kernel_use = false;
         // Check if it's already in free_ids to prevent duplicates, though ideally it shouldn't be.
         if !inner_guard.free_ids.contains(&id) {
-            inner_guard.free_ids.push_back(id);
+          inner_guard.free_ids.push_back(id);
         } else {
-            warn!("SendBufferPool: Buffer ID {:?} was already in free_ids when trying to release (in_kernel_use was true). State may be inconsistent.", id);
+          warn!("SendBufferPool: Buffer ID {:?} was already in free_ids when trying to release (in_kernel_use was true). State may be inconsistent.", id);
         }
         trace!("SendBufferPool: Released buffer {:?}.", id);
       } else {
@@ -178,14 +161,11 @@ impl SendBufferPool {
         // If it wasn't marked in_kernel_use, it should ideally already be in free_ids or never taken.
         // Adding it defensively if not present.
         if !inner_guard.free_ids.contains(&id) {
-            inner_guard.free_ids.push_back(id);
+          inner_guard.free_ids.push_back(id);
         }
       }
     } else {
-      error!(
-        "SendBufferPool: Attempted to release an unknown buffer ID: {:?}",
-        id
-      );
+      error!("SendBufferPool: Attempted to release an unknown buffer ID: {:?}", id);
     }
   }
 
@@ -200,15 +180,9 @@ impl SendBufferPool {
     drop(inner_guard); // Release lock
 
     info!("SendBufferPool: Unregistering all send buffers.");
-    ring
-      .submitter()
-      .unregister_buffers()
-      .map_err(|e| {
-        error!("SendBufferPool: Failed to unregister_buffers: {}", e);
-        ZmqError::Internal(format!(
-          "SendBufferPool: Failed to unregister_buffers: {}",
-          e
-        ))
-      })
+    ring.submitter().unregister_buffers().map_err(|e| {
+      error!("SendBufferPool: Failed to unregister_buffers: {}", e);
+      ZmqError::Internal(format!("SendBufferPool: Failed to unregister_buffers: {}", e))
+    })
   }
 }

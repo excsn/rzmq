@@ -1,9 +1,6 @@
 use rzmq::{
   socket::options::{LAST_ENDPOINT, LINGER, RCVHWM, SNDHWM},
-  Context,
-  Msg,
-  SocketType,
-  ZmqError,
+  Context, Msg, SocketType, ZmqError,
 };
 use std::time::Duration;
 mod common;

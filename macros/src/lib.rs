@@ -68,14 +68,13 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
   // is active in the crate where this macro attribute (`#[rzmq::main]`) is being used.
   // This is typically the end-user's application crate, which would enable
   // the "io-uring" feature for its `rzmq` dependency.
-  let underlying_main_macro_path =
-        if cfg!(all(target_os = "linux", feature = "io-uring")) {
-            eprintln!("RZMQ_MACRO_DIAGNOSTIC (Expansion Context): Trying tokio_uring::main. (is_linux: {}, io-uring_feature_in_this_compilation_unit: {})", cfg!(target_os = "linux"), cfg!(feature = "io-uring"));
-            quote! { tokio_uring::main }
-        } else {
-            eprintln!("RZMQ_MACRO_DIAGNOSTIC (Expansion Context): Using tokio::main. (is_linux: {}, io-uring_feature_in_this_compilation_unit: {})", cfg!(target_os = "linux"), cfg!(feature = "io-uring"));
-            quote! { tokio::main }
-        };
+  let underlying_main_macro_path = if cfg!(all(target_os = "linux", feature = "io-uring")) {
+    eprintln!("RZMQ_MACRO_DIAGNOSTIC (Expansion Context): Trying tokio_uring::main. (is_linux: {}, io-uring_feature_in_this_compilation_unit: {})", cfg!(target_os = "linux"), cfg!(feature = "io-uring"));
+    quote! { tokio_uring::main }
+  } else {
+    eprintln!("RZMQ_MACRO_DIAGNOSTIC (Expansion Context): Using tokio::main. (is_linux: {}, io-uring_feature_in_this_compilation_unit: {})", cfg!(target_os = "linux"), cfg!(feature = "io-uring"));
+    quote! { tokio::main }
+  };
 
   // Reconstruct the function with the chosen Tokio main macro attribute,
   // preserving all other original parts of the function.
@@ -98,41 +97,48 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// rzmq's behavior with or without the io_uring backend.
 #[proc_macro_attribute]
 pub fn test(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input_fn = parse_macro_input!(item as ItemFn);
-    let fn_vis = &input_fn.vis;     // Usually `pub(crate)` or none for tests
-    let fn_sig = &input_fn.sig;     // Includes name, async, inputs, output
-    let fn_block = &input_fn.block;
-    let fn_attrs = &input_fn.attrs; // Keep other attributes like `#[should_panic]`
+  let input_fn = parse_macro_input!(item as ItemFn);
+  let fn_vis = &input_fn.vis; // Usually `pub(crate)` or none for tests
+  let fn_sig = &input_fn.sig; // Includes name, async, inputs, output
+  let fn_block = &input_fn.block;
+  let fn_attrs = &input_fn.attrs; // Keep other attributes like `#[should_panic]`
 
-    if fn_sig.asyncness.is_none() {
-        let error_msg = "`#[rzmq::test]` attribute can only be used on `async` functions";
-        return syn::Error::new_spanned(&fn_sig.fn_token, error_msg)
-            .to_compile_error()
-            .into();
-    }
+  if fn_sig.asyncness.is_none() {
+    let error_msg = "`#[rzmq::test]` attribute can only be used on `async` functions";
+    return syn::Error::new_spanned(&fn_sig.fn_token, error_msg)
+      .to_compile_error()
+      .into();
+  }
 
-    // Conditionally choose the underlying Tokio test macro attribute
-    let underlying_test_macro_path =
-        if cfg!(all(target_os = "linux", feature = "io-uring")) {
-            eprintln!("RZMQ_MACRO_DIAGNOSTIC (test): Using tokio_uring::test. (is_linux: {}, io-uring_feature: {})", cfg!(target_os = "linux"), cfg!(feature = "io-uring"));
-            // Ensure tokio-uring provides a #[test] attribute.
-            // As of tokio-uring 0.5, it *does* provide `tokio_uring::test`.
-            quote! { tokio_uring::test }
-        } else {
-            eprintln!("RZMQ_MACRO_DIAGNOSTIC (test): Using tokio::test. (is_linux: {}, io-uring_feature: {})", cfg!(target_os = "linux"), cfg!(feature = "io-uring"));
-            quote! { tokio::test }
-        };
+  // Conditionally choose the underlying Tokio test macro attribute
+  let underlying_test_macro_path = if cfg!(all(target_os = "linux", feature = "io-uring")) {
+    eprintln!(
+      "RZMQ_MACRO_DIAGNOSTIC (test): Using tokio_uring::test. (is_linux: {}, io-uring_feature: {})",
+      cfg!(target_os = "linux"),
+      cfg!(feature = "io-uring")
+    );
+    // Ensure tokio-uring provides a #[test] attribute.
+    // As of tokio-uring 0.5, it *does* provide `tokio_uring::test`.
+    quote! { tokio_uring::test }
+  } else {
+    eprintln!(
+      "RZMQ_MACRO_DIAGNOSTIC (test): Using tokio::test. (is_linux: {}, io-uring_feature: {})",
+      cfg!(target_os = "linux"),
+      cfg!(feature = "io-uring")
+    );
+    quote! { tokio::test }
+  };
 
-    // Reconstruct the function with the chosen Tokio test macro attribute,
-    // and importantly, ensure the standard #[test] attribute is also present
-    // if the chosen macro doesn't imply it (tokio::test and tokio_uring::test do).
-    let expanded_code = quote! {
-        #(#fn_attrs)* // Apply existing attributes first (e.g. #[should_panic])
-        // The Tokio test macros typically handle the #[test] part.
-        #[#underlying_test_macro_path]
-        #fn_vis #fn_sig // Includes async fn original_name(...) -> ReturnType
-        #fn_block
-    };
+  // Reconstruct the function with the chosen Tokio test macro attribute,
+  // and importantly, ensure the standard #[test] attribute is also present
+  // if the chosen macro doesn't imply it (tokio::test and tokio_uring::test do).
+  let expanded_code = quote! {
+      #(#fn_attrs)* // Apply existing attributes first (e.g. #[should_panic])
+      // The Tokio test macros typically handle the #[test] part.
+      #[#underlying_test_macro_path]
+      #fn_vis #fn_sig // Includes async fn original_name(...) -> ReturnType
+      #fn_block
+  };
 
-    TokenStream::from(expanded_code)
+  TokenStream::from(expanded_code)
 }

@@ -55,7 +55,7 @@ async fn setup_pub_sub(ctx: &Context) -> Result<(rzmq::Socket, rzmq::Socket), Zm
 
   pub_socket.bind(BIND_ADDR_PUB_SUB).await?;
   sub_socket.connect(BIND_ADDR_PUB_SUB).await?;
-  
+
   wait_for_event_pub_sub(&pub_monitor, |e| {
     // Wait for PUB to see SUB
     matches!(e, SocketEvent::HandshakeSucceeded { .. })

@@ -41,7 +41,8 @@ async fn setup_dealer_router_send_comparison(
       println!("[Setup {}] IO_URING_SNDZEROCOPY enabled for DEALER", endpoint);
     }
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    if enable_zerocopy_opt { // Ensure this check is also inside the cfg_not block
+    if enable_zerocopy_opt {
+      // Ensure this check is also inside the cfg_not block
       println!(
         "[Setup {}] IO_URING_SNDZEROCOPY requested but not applicable (not Linux or io-uring feature off)",
         endpoint
@@ -52,14 +53,17 @@ async fn setup_dealer_router_send_comparison(
   if enable_cork_opt {
     #[cfg(target_os = "linux")]
     {
-        dealer.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await?;
-        println!("[Setup {}] TCP_CORK_OPT enabled for DEALER", endpoint);
+      dealer.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await?;
+      println!("[Setup {}] TCP_CORK_OPT enabled for DEALER", endpoint);
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Silently ignore or log if TCP_CORK is attempted on non-Linux
-        let _ = dealer.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await;
-        println!("[Setup {}] TCP_CORK_OPT requested but not applicable (not Linux)", endpoint);
+      // Silently ignore or log if TCP_CORK is attempted on non-Linux
+      let _ = dealer.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await;
+      println!(
+        "[Setup {}] TCP_CORK_OPT requested but not applicable (not Linux)",
+        endpoint
+      );
     }
   }
 
@@ -75,7 +79,8 @@ async fn setup_dealer_router_send_comparison(
   dealer.send(Msg::from_static(b"INIT_DEALER_ZC_CMP")).await?;
   // Router receives two frames: [identity, actual_message_from_dealer]
   let identity_msg = router.recv().await?;
-  let identity = identity_msg.data_bytes()
+  let identity = identity_msg
+    .data_bytes()
     .ok_or_else(|| ZmqError::Other("Identity message frame had no data during setup"))?
     .to_vec();
   let _payload = router.recv().await?; // Consume the "INIT_DEALER_ZC_CMP" payload
@@ -96,12 +101,14 @@ async fn setup_pub_sub_send_comparison(
   if enable_zerocopy_on_pub_opt {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     {
-      publisher.set_option(IO_URING_SNDZEROCOPY, &(1i32).to_ne_bytes()).await?;
+      publisher
+        .set_option(IO_URING_SNDZEROCOPY, &(1i32).to_ne_bytes())
+        .await?;
       println!("[Setup {}] IO_URING_SNDZEROCOPY enabled for PUB", endpoint);
     }
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
     if enable_zerocopy_on_pub_opt {
-         println!(
+      println!(
         "[Setup {}] IO_URING_SNDZEROCOPY (PUB) requested but not applicable (not Linux or io-uring feature off)",
         endpoint
       );
@@ -111,20 +118,22 @@ async fn setup_pub_sub_send_comparison(
   if enable_cork_on_pub_opt {
     #[cfg(target_os = "linux")]
     {
-        publisher.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await?;
-        println!("[Setup {}] TCP_CORK_OPT enabled for PUB", endpoint);
+      publisher.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await?;
+      println!("[Setup {}] TCP_CORK_OPT enabled for PUB", endpoint);
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = publisher.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await;
-         println!("[Setup {}] TCP_CORK_OPT (PUB) requested but not applicable (not Linux)", endpoint);
+      let _ = publisher.set_option(TCP_CORK, &(1i32).to_ne_bytes()).await;
+      println!(
+        "[Setup {}] TCP_CORK_OPT (PUB) requested but not applicable (not Linux)",
+        endpoint
+      );
     }
   }
 
   publisher.set_option(SNDHWM, &(1000i32).to_ne_bytes()).await?;
   subscriber.set_option(RCVHWM, &(1000i32).to_ne_bytes()).await?;
   subscriber.set_option(SUBSCRIBE, b"").await?;
-
 
   publisher.bind(endpoint).await?;
   tokio::time::sleep(Duration::from_millis(50)).await;
@@ -146,8 +155,8 @@ fn zerocopy_vs_standard_benchmarks(c: &mut Criterion<WallTime>) {
     let combinations = [
       // (try_zerocopy, try_cork, description_suffix)
       (false, false, "Standard"),
-      (false, true, "CorkOnly"),       // Cork implies Linux for effect
-      (true, false, "ZCOnly_Uring"),   // ZC implies Linux + io-uring feature
+      (false, true, "CorkOnly"),     // Cork implies Linux for effect
+      (true, false, "ZCOnly_Uring"), // ZC implies Linux + io-uring feature
       (true, true, "ZC_Cork_Uring"), // ZC implies Linux + io-uring feature, Cork implies Linux
     ];
 
@@ -183,36 +192,36 @@ fn zerocopy_vs_standard_benchmarks(c: &mut Criterion<WallTime>) {
         // Setup sockets, ZMQ context, and message template ONCE for this BenchmarkId.
         // This block uses the `rt` chosen above.
         let (ctx, dealer, router, _identity, msg_template) = rt.block_on(async {
-            let zmq_ctx = bench_context();
-            let (d, r, id) =
-                setup_dealer_router_send_comparison(&zmq_ctx, &endpoint, try_zc, try_cork)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "Setup failed for DR {}:{} on {}: {:?}",
-                        bench_id_str, desc_suffix, endpoint, e
-                    )
-                });
-            let payload_vec = vec![0u8; payload_size];
-            let mt = Msg::from_vec(payload_vec);
-            (zmq_ctx, d, r, id, mt)
+          let zmq_ctx = bench_context();
+          let (d, r, id) = setup_dealer_router_send_comparison(&zmq_ctx, &endpoint, try_zc, try_cork)
+            .await
+            .unwrap_or_else(|e| {
+              panic!(
+                "Setup failed for DR {}:{} on {}: {:?}",
+                bench_id_str, desc_suffix, endpoint, e
+              )
+            });
+          let payload_vec = vec![0u8; payload_size];
+          let mt = Msg::from_vec(payload_vec);
+          (zmq_ctx, d, r, id, mt)
         });
 
         b.to_async(&rt).iter_batched(
-            || msg_template.clone(), // Setup for each sample (clone the message)
-            |msg| async {            // Routine for each iteration within a sample
-                dealer.send(msg).await.unwrap();
-                // Router receives [identity, payload]
-                let _id_frame = router.recv().await.unwrap();
-                let _payload_frame = router.recv().await.unwrap();
-            },
-            criterion::BatchSize::NumBatches(NUM_MESSAGES_BENCH as u64),
+          || msg_template.clone(), // Setup for each sample (clone the message)
+          |msg| async {
+            // Routine for each iteration within a sample
+            dealer.send(msg).await.unwrap();
+            // Router receives [identity, payload]
+            let _id_frame = router.recv().await.unwrap();
+            let _payload_frame = router.recv().await.unwrap();
+          },
+          criterion::BatchSize::NumBatches(NUM_MESSAGES_BENCH as u64),
         );
 
         // Teardown: Terminate the ZMQ context used for this specific BenchmarkId.
         // Sockets (`dealer`, `router`) are dropped automatically when they go out of scope here.
         rt.block_on(async {
-            ctx.term().await.unwrap();
+          ctx.term().await.unwrap();
         });
       });
     }
@@ -255,43 +264,50 @@ fn zerocopy_vs_standard_benchmarks(c: &mut Criterion<WallTime>) {
 
       ps_group.bench_function(BenchmarkId::new(&bench_id_str, desc_suffix), |b| {
         let rt = if try_zc && cfg!(all(target_os = "linux", feature = "io-uring")) {
-          println!("[Bench PS {}:{}] Using tokio-uring runtime for endpoint {}", bench_id_str, desc_suffix, endpoint);
+          println!(
+            "[Bench PS {}:{}] Using tokio-uring runtime for endpoint {}",
+            bench_id_str, desc_suffix, endpoint
+          );
           #[cfg(all(target_os = "linux", feature = "io-uring"))]
-          { tokio_uring::builder().build().unwrap() }
+          {
+            tokio_uring::builder().build().unwrap()
+          }
           #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
           unreachable!("Runtime selection logic error: Should have skipped ZC bench if not Linux/io-uring");
         } else {
-          println!("[Bench PS {}:{}] Using standard Tokio runtime for endpoint {}", bench_id_str, desc_suffix, endpoint);
+          println!(
+            "[Bench PS {}:{}] Using standard Tokio runtime for endpoint {}",
+            bench_id_str, desc_suffix, endpoint
+          );
           TokioBuilder::new_current_thread().enable_all().build().unwrap()
         };
 
         let (ctx, publisher, subscriber, msg_template) = rt.block_on(async {
-            let zmq_ctx = bench_context();
-            let (p, s) =
-                setup_pub_sub_send_comparison(&zmq_ctx, &endpoint, try_zc, try_cork)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "Setup failed for PS {}:{} on {}: {:?}",
-                        bench_id_str, desc_suffix, endpoint, e
-                    )
-                });
-            let payload_vec = vec![0u8; payload_size];
-            let mt = Msg::from_vec(payload_vec);
-            (zmq_ctx, p, s, mt)
+          let zmq_ctx = bench_context();
+          let (p, s) = setup_pub_sub_send_comparison(&zmq_ctx, &endpoint, try_zc, try_cork)
+            .await
+            .unwrap_or_else(|e| {
+              panic!(
+                "Setup failed for PS {}:{} on {}: {:?}",
+                bench_id_str, desc_suffix, endpoint, e
+              )
+            });
+          let payload_vec = vec![0u8; payload_size];
+          let mt = Msg::from_vec(payload_vec);
+          (zmq_ctx, p, s, mt)
         });
 
         b.to_async(&rt).iter_batched(
-            || msg_template.clone(),
-            |msg| async {
-                publisher.send(msg).await.unwrap();
-                let _received_msg = subscriber.recv().await.unwrap();
-            },
-            criterion::BatchSize::NumBatches(NUM_MESSAGES_BENCH as u64),
+          || msg_template.clone(),
+          |msg| async {
+            publisher.send(msg).await.unwrap();
+            let _received_msg = subscriber.recv().await.unwrap();
+          },
+          criterion::BatchSize::NumBatches(NUM_MESSAGES_BENCH as u64),
         );
 
         rt.block_on(async {
-            ctx.term().await.unwrap();
+          ctx.term().await.unwrap();
         });
       });
     }

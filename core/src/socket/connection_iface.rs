@@ -1,18 +1,18 @@
 use crate::error::ZmqError;
 #[cfg(feature = "io-uring")]
-use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
-use crate::message::Msg;
-use crate::runtime::SystemEvent;
-use crate::runtime::{command::Command, mailbox::MailboxSender as SessionMailboxSender};
-#[cfg(feature = "io-uring")]
 use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSender;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::UringOpRequest;
 #[cfg(feature = "io-uring")]
-use crate::uring;
+use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
+use crate::message::Msg;
+use crate::runtime::SystemEvent;
+use crate::runtime::{command::Command, mailbox::MailboxSender as SessionMailboxSender};
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
 use crate::socket::SocketEvent;
+#[cfg(feature = "io-uring")]
+use crate::uring;
 use crate::Context;
 
 use std::any::Any;
@@ -49,7 +49,9 @@ impl ISocketConnection for DummyConnection {
   }
 
   async fn send_multipart(&self, _msgs: Vec<Msg>) -> Result<(), ZmqError> {
-    Err(ZmqError::UnsupportedFeature("DummyConnection cannot send multipart".into()))
+    Err(ZmqError::UnsupportedFeature(
+      "DummyConnection cannot send multipart".into(),
+    ))
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
@@ -76,7 +78,7 @@ pub(crate) struct SessionConnection {
   // or if SessionConnection itself might later interact with systems needing unique IDs.
   // For now, primarily for UringFdConnection pattern.
   #[allow(dead_code)] // May not be used if SessionConnection doesn't directly create ops for ExternalOpTracker
-  context: Context, 
+  context: Context,
 }
 
 // Added Debug impl for SessionConnection manually as Context was added which makes auto-derive complex
@@ -88,7 +90,7 @@ impl fmt::Debug for SessionConnection {
       .field("pipe_to_session_tx_closed", &self.pipe_to_session_tx.is_closed())
       .field("socket_options", &self.socket_options)
       // Context doesn't have a simple Debug, so just indicate its presence
-      .field("context_present", &true) 
+      .field("context_present", &true)
       .finish()
   }
 }
@@ -124,7 +126,7 @@ impl ISocketConnection for SessionConnection {
           // pipe_id = self.pipe_to_session_tx.id_somehow(), // async_channel Sender doesn't expose an ID easily
           "SessionConnection: Sending message (blocking on HWM)"
         );
-        
+
         self
           .pipe_to_session_tx
           .send(msg)
@@ -190,7 +192,7 @@ impl ISocketConnection for SessionConnection {
       }
     }
   }
-  
+
   // For SessionConnection, send_multipart sends each part individually.
   // ZMTP framing for the logical message happens at a higher level (e.g., in specific ISocket impls).
   async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
@@ -239,8 +241,7 @@ impl fmt::Debug for UringFdConnection {
 
 #[cfg(feature = "io-uring")]
 impl UringFdConnection {
-  pub(crate) fn new(fd: RawFd, socket_options: Arc<SocketOptions>,
-    context: Context,) -> Self {
+  pub(crate) fn new(fd: RawFd, socket_options: Arc<SocketOptions>, context: Context) -> Self {
     Self {
       fd,
       worker_op_tx: uring::global_state::get_global_uring_worker_op_tx().unwrap(),
@@ -316,7 +317,7 @@ impl ISocketConnection for UringFdConnection {
   async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
     let (reply_tx, reply_rx) = tokio_oneshot::channel();
     let unique_user_data = self.context.inner().next_handle() as u64;
-    
+
     // Create the new request variant
     let req = UringOpRequest::SendDataMultipartViaHandler {
       user_data: unique_user_data,
@@ -337,7 +338,7 @@ impl ISocketConnection for UringFdConnection {
     // Timeout logic remains similar to send_message
     let ack_timeout = self.socket_options.sndtimeo.unwrap_or(Duration::from_secs(5));
     let effective_ack_timeout = if ack_timeout.is_zero() {
-      Duration::from_millis(1) 
+      Duration::from_millis(1)
     } else {
       ack_timeout
     };
@@ -345,7 +346,11 @@ impl ISocketConnection for UringFdConnection {
     match tokio_timeout(effective_ack_timeout, reply_rx).await {
       Ok(Ok(Ok(_completion))) => Ok(()), // Assumes SendDataViaHandlerAck is used for multipart too
       Ok(Ok(Err(e))) => {
-        tracing::warn!(fd = self.fd, "UringWorker reported error for SendDataMultipartViaHandler: {}", e);
+        tracing::warn!(
+          fd = self.fd,
+          "UringWorker reported error for SendDataMultipartViaHandler: {}",
+          e
+        );
         Err(e)
       }
       Ok(Err(oneshot_err)) => {
@@ -354,7 +359,9 @@ impl ISocketConnection for UringFdConnection {
           "OneShot channel error waiting for SendDataMultipartViaHandler ack: {}",
           oneshot_err
         );
-        Err(ZmqError::Internal("UringWorker reply channel error for multipart send".into()))
+        Err(ZmqError::Internal(
+          "UringWorker reply channel error for multipart send".into(),
+        ))
       }
       Err(_timeout_elapsed) => {
         tracing::error!(
@@ -370,7 +377,7 @@ impl ISocketConnection for UringFdConnection {
       }
     }
   }
-  
+
   async fn close_connection(&self) -> Result<(), ZmqError> {
     let (reply_tx, reply_rx) = tokio_oneshot::channel();
 
@@ -436,18 +443,18 @@ pub(crate) struct InprocConnection {
 }
 
 impl fmt::Debug for InprocConnection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InprocConnection")
-            .field("connection_id", &self.connection_id)
-            .field("local_pipe_write_id_to_peer", &self.local_pipe_write_id_to_peer)
-            .field("local_pipe_read_id_from_peer", &self.local_pipe_read_id_from_peer)
-            .field("peer_inproc_name_or_uri", &self.peer_inproc_name_or_uri)
-            .field("context_present", &true) // Context doesn't have a simple Debug
-            .field("data_tx_to_peer_closed", &self.data_tx_to_peer.is_closed())
-            .field("monitor_tx_is_some", &self.monitor_tx.is_some())
-            .field("socket_options", &self.socket_options)
-            .finish()
-    }
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("InprocConnection")
+      .field("connection_id", &self.connection_id)
+      .field("local_pipe_write_id_to_peer", &self.local_pipe_write_id_to_peer)
+      .field("local_pipe_read_id_from_peer", &self.local_pipe_read_id_from_peer)
+      .field("peer_inproc_name_or_uri", &self.peer_inproc_name_or_uri)
+      .field("context_present", &true) // Context doesn't have a simple Debug
+      .field("data_tx_to_peer_closed", &self.data_tx_to_peer.is_closed())
+      .field("monitor_tx_is_some", &self.monitor_tx.is_some())
+      .field("socket_options", &self.socket_options)
+      .finish()
+  }
 }
 
 impl InprocConnection {

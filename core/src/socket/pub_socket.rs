@@ -64,7 +64,7 @@ impl ISocket for PubSocket {
 
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
     if !self.core.is_running().await {
-        return Err(ZmqError::InvalidState("Socket is closing".into()));
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let payload_preview_str = msg
       .data()
@@ -77,9 +77,13 @@ impl ISocket for PubSocket {
         msg_payload_preview = %payload_preview_str,
         "PubSocket::send preparing to distribute message"
     );
-    
-    match self.distributor.send_to_all(&msg, self.core.handle, &self.core.core_state).await {
-      Ok(()) => Ok(()), 
+
+    match self
+      .distributor
+      .send_to_all(&msg, self.core.handle, &self.core.core_state)
+      .await
+    {
+      Ok(()) => Ok(()),
       Err(failed_uris_with_errors) => {
         for (uri, error_detail) in failed_uris_with_errors {
           tracing::debug!(
@@ -105,7 +109,10 @@ impl ISocket for PubSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     if frames.is_empty() {
-      tracing::warn!(handle = self.core.handle, "PUB send_multipart called with empty frames vector. Doing nothing.");
+      tracing::warn!(
+        handle = self.core.handle,
+        "PUB send_multipart called with empty frames vector. Doing nothing."
+      );
       return Ok(());
     }
 
@@ -120,7 +127,11 @@ impl ISocket for PubSocket {
     }
     // `frames` now correctly represents the ZMTP frames of one logical ZMQ message.
 
-    match self.distributor.send_to_all_multipart(frames, self.core.handle, &self.core.core_state).await {
+    match self
+      .distributor
+      .send_to_all_multipart(frames, self.core.handle, &self.core.core_state)
+      .await
+    {
       Ok(()) => Ok(()),
       Err(failed_uris_with_errors) => {
         for (uri, error_detail) in failed_uris_with_errors {
@@ -132,7 +143,7 @@ impl ISocket for PubSocket {
           );
           self.distributor.remove_peer_uri(&uri);
         }
-        Ok(()) 
+        Ok(())
       }
     }
   }
@@ -162,18 +173,25 @@ impl ISocket for PubSocket {
     _pipe_write_id: usize, // No longer directly used by PubSocket for Distributor
     _peer_identity: Option<&[u8]>,
   ) {
-    let endpoint_uri_option = self.core.core_state.read() // Guard dropped
-        .pipe_read_id_to_endpoint_uri
-        .get(&pipe_read_id)
-        .cloned();
+    let endpoint_uri_option = self
+      .core
+      .core_state
+      .read() // Guard dropped
+      .pipe_read_id_to_endpoint_uri
+      .get(&pipe_read_id)
+      .cloned();
 
     if let Some(endpoint_uri) = endpoint_uri_option {
       tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "PUB attaching connection");
-      self.pipe_read_to_endpoint_uri.write().insert(pipe_read_id, endpoint_uri.clone()); // Guard dropped
+      self
+        .pipe_read_to_endpoint_uri
+        .write()
+        .insert(pipe_read_id, endpoint_uri.clone()); // Guard dropped
       self.distributor.add_peer_uri(endpoint_uri); // This uses its own internal lock
     } else {
       tracing::warn!(
-        handle = self.core.handle, pipe_read_id,
+        handle = self.core.handle,
+        pipe_read_id,
         "PUB pipe_attached: Could not find endpoint_uri for pipe_read_id. Distributor not updated."
       );
     }
@@ -191,7 +209,7 @@ impl ISocket for PubSocket {
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
     tracing::debug!(handle = self.core.handle, pipe_read_id, "PUB detaching connection");
-    
+
     let maybe_endpoint_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id); // Guard dropped
 
     if let Some(endpoint_uri) = maybe_endpoint_uri {
@@ -199,7 +217,8 @@ impl ISocket for PubSocket {
       tracing::trace!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "PUB removed detached connection from distributor");
     } else {
       tracing::warn!(
-        handle = self.core.handle, pipe_read_id,
+        handle = self.core.handle,
+        pipe_read_id,
         "PUB detach: Endpoint URI not found for read ID in local map. Distributor may not be updated."
       );
     }

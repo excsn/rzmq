@@ -1,4 +1,7 @@
-use rzmq::{Context, Msg, SocketType, ZmqError, socket::{LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME}};
+use rzmq::{
+  socket::{LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME},
+  Context, Msg, SocketType, ZmqError,
+};
 use std::time::Duration;
 
 // Helper to print message parts for diagnostics

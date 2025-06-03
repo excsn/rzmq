@@ -9,7 +9,7 @@ use std::os::fd::AsRawFd;
 #[derive(Clone)] // EventFD is Cloneable
 pub struct SignalingOpSender {
   op_tx: KanalAsyncSender<UringOpRequest>, // Store the async sender directly
-  event_fd: eventfd::EventFD,            // Clone of the UringWorker's EventFD
+  event_fd: eventfd::EventFD,              // Clone of the UringWorker's EventFD
 }
 
 impl SignalingOpSender {
@@ -80,7 +80,7 @@ impl SignalingOpSender {
   pub fn is_full(&self) -> bool {
     self.op_tx.is_full()
   }
-  
+
   pub fn capacity(&self) -> usize {
     self.op_tx.capacity()
   }
@@ -98,7 +98,15 @@ impl SignalingOpSender {
 impl std::fmt::Debug for SignalingOpSender {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("SignalingOpSender")
-      .field("op_tx_details", &format_args!("KanalAsyncSender(len:{}, cap:{:?}, closed:{})", self.op_tx.len(), self.op_tx.capacity(), self.op_tx.is_closed()))
+      .field(
+        "op_tx_details",
+        &format_args!(
+          "KanalAsyncSender(len:{}, cap:{:?}, closed:{})",
+          self.op_tx.len(),
+          self.op_tx.capacity(),
+          self.op_tx.is_closed()
+        ),
+      )
       .field("event_fd_raw", &self.event_fd.as_raw_fd())
       .finish()
   }

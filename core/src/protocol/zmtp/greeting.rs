@@ -43,7 +43,7 @@ impl ZmtpGreeting {
     // Total Length (64) - Signature (10) - MajorV (1) - MinorV (1) - Mech (20) - AsServer (1) = Padding (31)
     let current_len = GREETING_PREFIX.len() + 2 + MECHANISM_LENGTH + 1;
     let padding_len = GREETING_LENGTH - current_len;
-    
+
     if padding_len > 0 {
       // Should always be > 0
       buffer.put_bytes(0, padding_len);

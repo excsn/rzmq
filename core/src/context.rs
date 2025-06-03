@@ -55,7 +55,6 @@ impl ContextInner {
   /// Creates new shared context state
   /// and spawning the event listener task.
   fn new(actor_mailbox_capacity: usize) -> ZmqResult<Self> {
-
     let event_bus = Arc::new(EventBus::new());
     let actor_wait_group = WaitGroup::new();
 
@@ -65,7 +64,7 @@ impl ContextInner {
       global_state::ensure_global_uring_systems_started()?;
       global_state::get_global_uring_worker_op_tx()?;
     }
-    
+
     Ok(Self {
       next_handle: Arc::new(std::sync::atomic::AtomicUsize::new(1)), // Start handle IDs from 1.
       sockets: parking_lot::RwLock::new(HashMap::new()),

@@ -737,7 +737,7 @@ pub(crate) async fn send_msg_with_timeout(
         pipe_id = pipe_target_id,
         "Attempting non-blocking send via pipe"
       );
-      
+
       match pipe_tx.try_send(msg) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(_failed_msg_back)) => {

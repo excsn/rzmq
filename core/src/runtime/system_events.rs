@@ -250,7 +250,10 @@ pub enum ConnectionInteractionModel {
 impl fmt::Debug for ConnectionInteractionModel {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      ConnectionInteractionModel::ViaSessionActor { session_actor_mailbox, session_actor_handle_id } => f
+      ConnectionInteractionModel::ViaSessionActor {
+        session_actor_mailbox,
+        session_actor_handle_id,
+      } => f
         .debug_struct("ViaSessionActor")
         .field("session_actor_mailbox_closed", &session_actor_mailbox.is_closed())
         .field("session_actor_handle_id", session_actor_handle_id)

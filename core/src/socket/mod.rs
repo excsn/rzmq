@@ -136,7 +136,7 @@ pub trait ISocket: Send + Sync + 'static {
   /// Handles reading subsequent frames if the first frame has the MORE flag.
   /// Respects RCVTIMEO for the overall operation of receiving the full message.
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError>;
-  
+
   /// Applies a socket option. Some options might be handled by `SocketCore` directly,
   /// while others might require pattern-specific logic via `set_pattern_option`.
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError>;

@@ -24,7 +24,7 @@ pub use system_events::{ActorType, SystemEvent};
 pub use command::EngineConnectionType;
 
 // Sync Primitives
-pub(crate) use latch::CountDownLatch;
-pub(crate) use waitgroup::WaitGroup;
-pub(crate) use one_shot_sender::OneShotSender;
 pub(crate) use actor_drop_guard::ActorDropGuard;
+pub(crate) use latch::CountDownLatch;
+pub(crate) use one_shot_sender::OneShotSender;
+pub(crate) use waitgroup::WaitGroup;

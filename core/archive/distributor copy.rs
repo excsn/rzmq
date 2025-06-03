@@ -49,7 +49,11 @@ impl Distributor {
     core_state_mutex: &parking_lot::RwLock<CoreState>,
   ) -> Result<(), Vec<(usize, ZmqError)>> {
     let peer_ids = self.get_peer_ids().await;
-    tracing::debug!(handle = core_handle, ?peer_ids, "Distributor::send_to_all: Distributing to peer_ids");
+    tracing::debug!(
+      handle = core_handle,
+      ?peer_ids,
+      "Distributor::send_to_all: Distributing to peer_ids"
+    );
     if peer_ids.is_empty() {
       return Ok(());
     }
@@ -61,9 +65,10 @@ impl Distributor {
     for pipe_write_id in peer_ids {
       if let Some(sender) = core_state_mutex.read().get_pipe_sender(pipe_write_id) {
         let msg_clone = msg.clone();
-        let payload_preview_str = msg_clone.data()
-            .map(|d| String::from_utf8_lossy(&d.iter().take(20).copied().collect::<Vec<_>>()).into_owned()) // Convert Cow to owned String
-            .unwrap_or_else(|| "<empty_payload>".to_string());
+        let payload_preview_str = msg_clone
+          .data()
+          .map(|d| String::from_utf8_lossy(&d.iter().take(20).copied().collect::<Vec<_>>()).into_owned()) // Convert Cow to owned String
+          .unwrap_or_else(|| "<empty_payload>".to_string());
 
         tracing::trace!(
             handle = core_handle,

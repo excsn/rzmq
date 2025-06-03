@@ -2,7 +2,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rzmq::socket::{
-  options::{RCVHWM, SNDHWM, SUBSCRIBE}, SocketType
+  options::{RCVHWM, SNDHWM, SUBSCRIBE},
+  SocketType,
 };
 use rzmq::{Context, Msg, ZmqError};
 use std::env;
@@ -13,7 +14,7 @@ use tokio::time::{sleep, timeout};
 
 // Setup details
 // export RZRUST_BENCH_SOCKET_TYPE="PUSH"
-// export RZRUST_BENCH_TARGET_ADDR="tcp://your-pull-server:port" 
+// export RZRUST_BENCH_TARGET_ADDR="tcp://your-pull-server:port"
 // # export RZRUST_BENCH_NUM_OPS="10000" # Optional
 // cargo bench --bench generic_client_benchmark
 

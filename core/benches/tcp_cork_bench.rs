@@ -4,10 +4,16 @@ use criterion::{
   criterion_group, criterion_main, measurement::WallTime, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
 use rzmq::{
-  socket::{options::{RCVHWM, SNDHWM, SUBSCRIBE, TCP_CORK}, LINGER},
+  socket::{
+    options::{RCVHWM, SNDHWM, SUBSCRIBE, TCP_CORK},
+    LINGER,
+  },
   Context, Msg, SocketType, ZmqError,
 };
-use std::{sync::atomic::{AtomicU16, Ordering as AtomicOrdering}, time::Duration};
+use std::{
+  sync::atomic::{AtomicU16, Ordering as AtomicOrdering},
+  time::Duration,
+};
 use tokio::runtime::Builder as TokioBuilder;
 
 // Helper to create a context for benchmarks
@@ -23,7 +29,7 @@ const BENCH_ENDPOINT_BASE_PORT_CORK: u16 = 43582;
 static NEXT_BENCH_PORT: AtomicU16 = AtomicU16::new(BENCH_ENDPOINT_BASE_PORT_CORK);
 
 fn get_next_bench_port() -> u16 {
-    NEXT_BENCH_PORT.fetch_add(1, AtomicOrdering::Relaxed)
+  NEXT_BENCH_PORT.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
 // --- DEALER-ROUTER Setup for Cork Bench ---
@@ -121,7 +127,6 @@ fn tcp_cork_benchmarks(c: &mut Criterion<WallTime>) {
         // The closure passed to bench_function is run once for each BenchmarkId.
         // Sockets are created AND destroyed within this closure's scope.
         |b| {
-
           // Create ONE ZMQ context for ALL benchmarks in this file.
           let local_ctx = bench_context();
           // Sockets and message template are set up here.
@@ -164,7 +169,7 @@ fn tcp_cork_benchmarks(c: &mut Criterion<WallTime>) {
             drop(dealer); // Ensure these are dropped before local_ctx.term()
             drop(router);
             local_ctx.term().await.unwrap_or_else(|e| {
-                eprintln!("Error terminating local ZMQ context for {}: {}", endpoint, e);
+              eprintln!("Error terminating local ZMQ context for {}: {}", endpoint, e);
             });
           });
         },
@@ -191,7 +196,6 @@ fn tcp_cork_benchmarks(c: &mut Criterion<WallTime>) {
       ps_group.bench_function(
         BenchmarkId::new(format!("PubToSub_payload_{}B", payload_size), desc),
         |b| {
-
           // Create ONE ZMQ context for ALL benchmarks in this file.
           let local_ctx = bench_context();
           let (publisher, subscriber, msg_template) = rt.block_on(async {
@@ -213,14 +217,13 @@ fn tcp_cork_benchmarks(c: &mut Criterion<WallTime>) {
             },
             criterion::BatchSize::NumBatches(NUM_MESSAGES_BENCH as u64),
           );
-          
 
           // Teardown for this BenchmarkId
           rt.block_on(async {
             drop(publisher);
             drop(subscriber);
             local_ctx.term().await.unwrap_or_else(|e| {
-                eprintln!("Error terminating local ZMQ context for {}: {}", endpoint, e);
+              eprintln!("Error terminating local ZMQ context for {}: {}", endpoint, e);
             });
           });
         },

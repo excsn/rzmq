@@ -1,7 +1,7 @@
+use async_recursion::async_recursion;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use async_recursion::async_recursion;
 use tokio::sync::RwLock;
 
 /// A node in the subscription trie.

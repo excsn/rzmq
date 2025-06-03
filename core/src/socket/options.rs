@@ -173,8 +173,8 @@ pub(crate) struct TcpTransportConfig {
 #[derive(Debug, Clone, Default)]
 pub struct PlainMechanismSocketOptions {
   pub enabled: bool,
-  pub server_role: Option<bool>,     // Role override
-  pub username: Option<String>, // Security options stored here?
+  pub server_role: Option<bool>, // Role override
+  pub username: Option<String>,  // Security options stored here?
   pub password: Option<String>,
 }
 
@@ -371,7 +371,6 @@ pub(crate) fn parse_string_option(value: &[u8], option_id: i32) -> Result<String
   String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option_id))
 }
 
-
 // --- New Helper Functions for Applying/Retrieving Core Options ---
 
 /// Applies a core-level socket option value to the `SocketOptions` struct.
@@ -379,12 +378,12 @@ pub(crate) fn parse_string_option(value: &[u8], option_id: i32) -> Result<String
 /// are managed by `SocketCore` or affect its underlying configuration.
 /// Pattern-specific options (like SUBSCRIBE for SUB) are handled by `ISocket::set_pattern_option`.
 pub(crate) fn apply_core_option_value(
-    options: &mut SocketOptions, // Mutable reference to update
-    option_id: i32,
-    value: &[u8],
+  options: &mut SocketOptions, // Mutable reference to update
+  option_id: i32,
+  value: &[u8],
 ) -> Result<(), ZmqError> {
-    tracing::debug!(option_id, value_len=value.len(), "Applying core socket option");
-    match option_id {
+  tracing::debug!(option_id, value_len = value.len(), "Applying core socket option");
+  match option_id {
         SNDHWM => options.sndhwm = parse_i32_option(value)?.max(0) as usize,
         RCVHWM => options.rcvhwm = parse_i32_option(value)?.max(0) as usize,
         LINGER => options.linger = parse_linger_option(value)?,
@@ -438,16 +437,16 @@ pub(crate) fn apply_core_option_value(
 
         _ => return Err(ZmqError::InvalidOption(option_id)), // Unknown option ID
     }
-    Ok(())
+  Ok(())
 }
 
 /// Retrieves a core-level socket option value from the `SocketOptions` and `CoreState` structs.
 pub(crate) fn retrieve_core_option_value(
-    options: &SocketOptions,       // Read reference
-    core_s_reader: &CoreState, // Read reference to CoreState for things like LAST_ENDPOINT
-    option_id: i32,
+  options: &SocketOptions,   // Read reference
+  core_s_reader: &CoreState, // Read reference to CoreState for things like LAST_ENDPOINT
+  option_id: i32,
 ) -> Result<Vec<u8>, ZmqError> {
-    match option_id {
+  match option_id {
         SNDHWM => Ok((options.sndhwm as i32).to_ne_bytes().to_vec()),
         RCVHWM => Ok((options.rcvhwm as i32).to_ne_bytes().to_vec()),
         LINGER => Ok(options.linger.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),
@@ -481,7 +480,7 @@ pub(crate) fn retrieve_core_option_value(
 
         #[cfg(feature = "io-uring")]
         IO_URING_SESSION_ENABLED => Ok((options.io_uring.session_enabled as i32).to_ne_bytes().to_vec()),
-        
+
         #[cfg(feature = "io-uring")]
         IO_URING_SNDZEROCOPY => Ok((options.io_uring.send_zerocopy as i32).to_ne_bytes().to_vec()),
 

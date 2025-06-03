@@ -62,11 +62,9 @@ async fn setup_req_rep(ctx: &Context) -> Result<(rzmq::Socket, rzmq::Socket), Zm
   .map_err(|e| ZmqError::Internal(format!("REP Listening event error: {}", e)))?;
 
   req.connect(BIND_ADDR_REQ_REP).await?;
-  wait_for_event_req_rep(&rep_monitor, |e| {
-    matches!(e, SocketEvent::HandshakeSucceeded { .. })
-  })
-  .await
-  .map_err(|e| ZmqError::Internal(format!("REP Connection event error: {}", e)))?;
+  wait_for_event_req_rep(&rep_monitor, |e| matches!(e, SocketEvent::HandshakeSucceeded { .. }))
+    .await
+    .map_err(|e| ZmqError::Internal(format!("REP Connection event error: {}", e)))?;
 
   sleep(Duration::from_millis(20)).await;
   Ok((req, rep))
@@ -76,7 +74,7 @@ async fn setup_req_rep(ctx: &Context) -> Result<(rzmq::Socket, rzmq::Socket), Zm
 fn req_rep_tcp_throughput(c: &mut Criterion) {
   let rt = Runtime::new().expect("Failed to create Tokio runtime");
   let mut group = c.benchmark_group("REQ_REP_TCP_RoundTrip");
-  
+
   group
     .warm_up_time(Duration::from_secs(5)) // Increase warm-up time
     .measurement_time(Duration::from_secs(10)) // Increase measurement time

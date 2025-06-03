@@ -86,14 +86,17 @@ impl SessionBase {
     }
   }
 
-  async fn try_publish_peer_identity_established_if_ready(&mut self, session_handle: usize, logical_endpoint_uri_for_log_only: &str, pending_peer_identity: &mut Option<Blob>,) {
-
+  async fn try_publish_peer_identity_established_if_ready(
+    &mut self,
+    session_handle: usize,
+    logical_endpoint_uri_for_log_only: &str,
+    pending_peer_identity: &mut Option<Blob>,
+  ) {
     // Check general readiness flags and if specific data is available (and not yet consumed for publication)
     if self.engine_ready &&
        self.pipe_attached && // Identity is present and not yet taken for publishing
        self.pipe_write_id.is_some()
     {
-
       // Take the identity, consuming it. This ensures we only publish once for this identity setup.
       let identity_to_publish = pending_peer_identity.take(); // Safe due to .is_some()
       let core_pipe_read_id_for_event = self.pipe_write_id.unwrap(); // Safe due to .is_some()
@@ -101,7 +104,7 @@ impl SessionBase {
       let event = SystemEvent::PeerIdentityEstablished {
         parent_core_id: self.parent_socket_id,
         connection_identifier: core_pipe_read_id_for_event, // This is Session's pipe_write_id
-        peer_identity: identity_to_publish,             // This is the Blob itself
+        peer_identity: identity_to_publish,                 // This is the Blob itself
       };
 
       if self.context.event_bus().publish(event).is_err() {
@@ -120,7 +123,11 @@ impl SessionBase {
         );
       }
 
-      self.send_monitor_event(SocketEvent::HandshakeSucceeded { endpoint: self.connected_endpoint_uri.to_string() }).await;
+      self
+        .send_monitor_event(SocketEvent::HandshakeSucceeded {
+          endpoint: self.connected_endpoint_uri.to_string(),
+        })
+        .await;
     }
   }
 
@@ -310,7 +317,7 @@ impl SessionBase {
               Command::EngineReady { peer_identity: received_identity } => {
                 tracing::debug!(handle = session_handle, uri = %endpoint_uri_for_monitor_event, peer_id = ?received_identity, "Session received EngineReady");
                 self.engine_ready = true;
-                
+
                 peer_identity_from_engine = received_identity.clone();
 
                 self.try_publish_peer_identity_established_if_ready(session_handle, &endpoint_uri_for_monitor_event, &mut peer_identity_from_engine).await;

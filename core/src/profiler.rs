@@ -6,9 +6,9 @@
 #[cfg(debug_assertions)]
 use std::time::{Duration, Instant};
 #[cfg(debug_assertions)]
-use tracing; // Assuming tracing is used for logging (already a dependency)
+use std::vec::Vec;
 #[cfg(debug_assertions)]
-use std::vec::Vec; // Explicit import for clarity if needed
+use tracing; // Assuming tracing is used for logging (already a dependency) // Explicit import for clarity if needed
 
 // --- LoopProfiler definition: Active version for debug builds ---
 #[cfg(debug_assertions)]
@@ -24,7 +24,7 @@ pub(crate) struct LoopProfiler {
   loop_start_time: Instant,
   current_segment_start_time: Instant,
   current_segment_label: &'static str,
-  segment_timings: Vec<SegmentTiming>, 
+  segment_timings: Vec<SegmentTiming>,
   threshold: Duration, // Only log if total loop time exceeds this
   log_counter: usize,
   log_interval: usize, // Log every N iterations if below threshold (if > 0)
@@ -80,15 +80,15 @@ impl LoopProfiler {
       let mut log_output = format!("[UringWorker Latency] Total: {:?}", total_loop_duration);
       for timing in &self.segment_timings {
         if timing.duration > Duration::from_micros(1) || timing.duration.as_nanos() > 0 {
-            log_output.push_str(&format!(", {}: {:?}", timing.label, timing.duration));
+          log_output.push_str(&format!(", {}: {:?}", timing.label, timing.duration));
         } else if total_loop_duration > Duration::ZERO {
-            log_output.push_str(&format!(", {}: ~0us", timing.label));
+          log_output.push_str(&format!(", {}: ~0us", timing.label));
         }
       }
       // Use a specific tracing target for these latency logs
       tracing::warn!(target: "rzmq::worker_latency", "{}", log_output);
     }
-    
+
     self.loop_start(); // Reset for the next loop iteration
   }
 }
@@ -102,15 +102,17 @@ pub(crate) struct LoopProfiler; // Zero-sized type
 impl LoopProfiler {
   // Constructor takes same args but does nothing with them, returns ZST
   #[inline(always)] // Hint to compiler to optimize away
-  pub fn new(_threshold: std::time::Duration, _log_interval: usize) -> Self { LoopProfiler }
-  
+  pub fn new(_threshold: std::time::Duration, _log_interval: usize) -> Self {
+    LoopProfiler
+  }
+
   // Methods are no-ops, should be optimized out by the compiler
   #[inline(always)]
   pub fn loop_start(&mut self) {}
-  
+
   #[inline(always)]
   pub fn mark_segment_end_and_start_new(&mut self, _next_segment_label: &'static str) {}
-  
+
   #[inline(always)]
   pub fn log_and_reset_for_next_loop(&mut self) {}
 }

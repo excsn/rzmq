@@ -11,9 +11,9 @@ use crate::protocol::zmtp::{
   greeting::{ZmtpGreeting, GREETING_LENGTH},
 };
 use crate::runtime::{ActorType, Command, MailboxReceiver, MailboxSender};
-use crate::security::{negotiate_security_mechanism, IDataCipher};
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
+use crate::security::{negotiate_security_mechanism, IDataCipher};
 use crate::security::{null::NullMechanism, plain::PlainMechanism, Mechanism, MechanismStatus};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::{Blob, Context, MsgFlags};
@@ -287,17 +287,13 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       return Err(ZmqError::ProtocolViolation(version_error_msg));
     }
 
-    let mut negotiated_mechanism = negotiate_security_mechanism(
-      self.is_server,
-      &self.config, 
-      &peer_greeting,
-      self.handle, 
-    )?;
+    let mut negotiated_mechanism =
+      negotiate_security_mechanism(self.is_server, &self.config, &peer_greeting, self.handle)?;
 
     // --- Security Handshake (Token Exchange using Framed stream) ---
     tracing::debug!(
       engine_handle = self.handle,
-      mechanism = negotiated_mechanism.name(), 
+      mechanism = negotiated_mechanism.name(),
       "Starting security token exchange."
     );
     let handshake_timeout = self.config.handshake_timeout.unwrap_or(Duration::from_secs(30));

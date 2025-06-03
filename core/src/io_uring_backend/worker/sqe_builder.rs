@@ -2,12 +2,12 @@
 
 #![cfg(feature = "io-uring")]
 
-use crate::io_uring_backend::ops::{UringOpRequest, UringOpCompletion, UserData};
+use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest, UserData};
 use crate::ZmqError;
 use io_uring::{opcode, squeue, types};
+use std::mem;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
-use std::mem;
 
 use super::socket_addr_to_sockaddr_storage;
 
@@ -29,18 +29,18 @@ use super::socket_addr_to_sockaddr_storage;
 ///   during socket creation for Connect) or if the request type is unhandled here but
 ///   was expected to produce an SQE.
 pub(crate) fn build_sqe_for_external_request(
-    request: &UringOpRequest,
-    out_connect_fd: &mut Option<RawFd>,
-    _ring_features_has_ext_arg: bool, // Parameter kept for future use if needed
+  request: &UringOpRequest,
+  out_connect_fd: &mut Option<RawFd>,
+  _ring_features_has_ext_arg: bool, // Parameter kept for future use if needed
 ) -> Result<Option<squeue::Entry>, UringOpCompletion> {
-    // Ensure out_connect_fd is reset for each call if it's reused.
-    // However, it's better if the caller manages its state.
-    // This function will only set it if it creates an FD for Connect.
-    // *out_connect_fd = None; // Caller should initialize this to None before calling.
+  // Ensure out_connect_fd is reset for each call if it's reused.
+  // However, it's better if the caller manages its state.
+  // This function will only set it if it creates an FD for Connect.
+  // *out_connect_fd = None; // Caller should initialize this to None before calling.
 
-    let user_data = request.get_user_data_ref(); // Use the helper
+  let user_data = request.get_user_data_ref(); // Use the helper
 
-    match request {
+  match request {
         UringOpRequest::Nop { .. } => {
             Ok(Some(opcode::Nop::new().build().user_data(user_data)))
         }

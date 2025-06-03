@@ -197,7 +197,9 @@ impl ISocket for PushSocket {
         }
       } else {
         if !self.core.is_running().await {
-          return Err(ZmqError::InvalidState("Socket terminated while waiting for peer".into()));
+          return Err(ZmqError::InvalidState(
+            "Socket terminated while waiting for peer".into(),
+          ));
         }
         match sndtimeo_opt {
           Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
@@ -229,7 +231,9 @@ impl ISocket for PushSocket {
       Ok(()) => Ok(()),
       Err(ZmqError::ConnectionClosed) => {
         self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-        Err(ZmqError::HostUnreachable("PUSH: Peer connection closed during multipart send".into()))
+        Err(ZmqError::HostUnreachable(
+          "PUSH: Peer connection closed during multipart send".into(),
+        ))
       }
       Err(e) => Err(e),
     }

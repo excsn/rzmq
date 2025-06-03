@@ -184,7 +184,7 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_false() -> Result<
     "ROUTER sending to unknown ID {:?} (mandatory=false, identity frame)...",
     unknown_id_data
   );
-  
+
   let send_id_res = router.send(id_msg).await;
   assert!(
     send_id_res.is_ok(),
@@ -205,11 +205,9 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_false() -> Result<
   // The first send attempt for the identity has already returned Ok(()).
   // If the user then tries to send the payload part:
   let payload_to_send = Msg::from_static(payload_msg_data);
-  println!(
-    "ROUTER sending payload to (still) unknown ID (mandatory=false, payload frame)..."
-  );
+  println!("ROUTER sending payload to (still) unknown ID (mandatory=false, payload frame)...");
   let send_payload_res = router.send(payload_to_send).await;
-   
+
   assert!(
     matches!(send_payload_res, Err(ZmqError::InvalidMessage(_))),
     "Expected InvalidMessage sending payload without MORE after identity was dropped (mandatory=false), got {:?}",
@@ -304,7 +302,7 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
 
   println!("Binding ROUTER to {}...", endpoint);
   router.bind(endpoint).await?;
-  
+
   println!("ROUTER waiting for Listening event...");
   wait_for_monitor_event(
     &monitor_rx,

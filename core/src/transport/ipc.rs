@@ -9,8 +9,8 @@ use crate::runtime::{
   mailbox, system_events::ConnectionInteractionModel, ActorDropGuard, ActorType, Command,
   MailboxReceiver as GenericMailboxReceiver, MailboxSender as GenericMailboxSender, SystemEvent,
 };
-use crate::transport::ipc::create_and_spawn_ipc_engine_wrapper as create_and_spawn_ipc_engine;
 use crate::socket::connection_iface::ISocketConnection;
+use crate::transport::ipc::create_and_spawn_ipc_engine_wrapper as create_and_spawn_ipc_engine;
 // EngineConnectionType for Command::Attach for standard path
 use crate::runtime::command::EngineConnectionType as CommandEngineConnectionType;
 use crate::session::SessionBase;
@@ -252,13 +252,12 @@ impl IpcListener {
             let handle_source_clone = handle_source.clone();
             let actual_connected_uri_ipc = connection_specific_uri.clone();
             let logical_uri = endpoint_uri.clone();
-            
+
             async move {
               let _permit_scoped_for_task = _permit_guard;
 
               let session_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
               let engine_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
 
               let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
                 session_hdl_id,
@@ -461,7 +460,7 @@ impl IpcConnecter {
               let session_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
               let engine_hdl_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
               let actual_connected_uri_ipc = format!("ipc://{}", peer_addr_str);
-              let logical_uri = endpoint_uri_clone.clone(); 
+              let logical_uri = endpoint_uri_clone.clone();
 
               let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
                 session_hdl_id, actual_connected_uri_ipc.clone(), logical_uri.clone(), monitor_tx.clone(),

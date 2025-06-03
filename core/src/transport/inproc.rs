@@ -8,8 +8,8 @@ use crate::message::Msg;
 use crate::runtime::{OneShotSender, SystemEvent};
 use crate::socket::core::pipe_manager::run_pipe_reader_task;
 use crate::socket::core::{EndpointInfo, EndpointType, SocketCore};
-use crate::socket::SocketEvent;
 use crate::socket::events::MonitorSender;
+use crate::socket::SocketEvent;
 
 use async_channel::bounded;
 use std::sync::Arc;
@@ -120,7 +120,7 @@ pub(crate) async fn connect_inproc(
 
   let inproc_endpoint_entry_handle_id = core_arc.context.inner().next_handle();
 
-  let connector_socket_options = core_arc.core_state.read().options.clone(); 
+  let connector_socket_options = core_arc.core_state.read().options.clone();
   let connector_monitor_tx = core_arc.core_state.read().get_monitor_sender_clone();
   let inproc_conn_iface = Arc::new(crate::socket::connection_iface::InprocConnection::new(
     inproc_endpoint_entry_handle_id,
@@ -145,16 +145,15 @@ pub(crate) async fn connect_inproc(
     is_outbound_connection: true,
     connection_iface: inproc_conn_iface,
   };
-  { // Scope for write lock
+  {
+    // Scope for write lock
     let mut core_s_write = core_arc.core_state.write();
-    core_s_write
-        .endpoints
-        .insert(connector_uri_str.clone(), endpoint_info);
-      
+    core_s_write.endpoints.insert(connector_uri_str.clone(), endpoint_info);
+
     // Populate the reverse map for the connector's CoreState
     core_s_write
-        .pipe_read_id_to_endpoint_uri
-        .insert(pipe_id_connector_reads_from_binder, connector_uri_str.clone());
+      .pipe_read_id_to_endpoint_uri
+      .insert(pipe_id_connector_reads_from_binder, connector_uri_str.clone());
   }
 
   // <<< MODIFIED [Use the already cloned connector_monitor_tx for this event] >>>

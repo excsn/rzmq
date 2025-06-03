@@ -10,11 +10,11 @@ use crate::socket::ISocket;
 use crate::{delegate_to_core, Blob};
 
 use async_trait::async_trait;
-use parking_lot::{RwLock, RwLockReadGuard}; 
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::HashMap;
 // <<< REMOVED [VecDeque for current_recv_buffer no longer needed in SubSocket itself] >>>
 use std::sync::Arc;
-use std::time::Duration; 
+use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct SubSocket {
@@ -84,12 +84,13 @@ impl SubSocket {
 
   async fn send_subscription_command_to_all(&self, is_subscribe: bool, topic: &[u8]) {
     let msg = Self::construct_subscription_message(is_subscribe, topic);
-    let peer_uris: Vec<String> = {
-      self.pipe_read_to_endpoint_uri.read().values().cloned().collect()
-    };
+    let peer_uris: Vec<String> = { self.pipe_read_to_endpoint_uri.read().values().cloned().collect() };
 
     if peer_uris.is_empty() {
-      tracing::trace!(handle = self.core.handle, "Subscription command (all): No peer URIs to send to.");
+      tracing::trace!(
+        handle = self.core.handle,
+        "Subscription command (all): No peer URIs to send to."
+      );
       return;
     }
 
@@ -99,7 +100,7 @@ impl SubSocket {
     }
 
     let num_peers = send_futures.len();
-    futures::future::join_all(send_futures).await; 
+    futures::future::join_all(send_futures).await;
 
     tracing::debug!(
         handle = self.core.handle,
@@ -145,7 +146,10 @@ impl ISocket for SubSocket {
     // For SUB, QItem is Vec<Msg> (the filtered message).
     // The transform closure is identity because app_frames *is* the QItem.
     let transform_fn = |q_item: Vec<Msg>| q_item;
-    self.incoming_orchestrator.recv_message(rcvtimeo_opt, transform_fn).await
+    self
+      .incoming_orchestrator
+      .recv_message(rcvtimeo_opt, transform_fn)
+      .await
   }
   // <<< MODIFIED END >>>
 
@@ -165,11 +169,14 @@ impl ISocket for SubSocket {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo; 
+    let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
     // For SUB, QItem is Vec<Msg> (the filtered logical message).
     // The transform closure is identity.
     let transform_fn = |q_item: Vec<Msg>| q_item;
-    self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt, transform_fn).await 
+    self
+      .incoming_orchestrator
+      .recv_logical_message(rcvtimeo_opt, transform_fn)
+      .await
   }
   // <<< MODIFIED END >>>
 
@@ -193,7 +200,7 @@ impl ISocket for SubSocket {
       }
       UNSUBSCRIBE => {
         tracing::debug!(handle=self.core.handle, topic=?String::from_utf8_lossy(value), "Unsubscribing from topic");
-        if self.subscriptions.unsubscribe(value).await { 
+        if self.subscriptions.unsubscribe(value).await {
           self.send_subscription_command_to_all(false, value).await;
         }
         Ok(())
@@ -216,11 +223,17 @@ impl ISocket for SubSocket {
       Command::PipeMessageReceived { msg, .. } => {
         if let Some(raw_zmtp_message_vec) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
           // raw_zmtp_message_vec is, e.g., [topic_frame_M, data_frame_NM] from a PUB.
-          let topic_data = raw_zmtp_message_vec.get(0).and_then(|frame| frame.data()).unwrap_or_default(); 
+          let topic_data = raw_zmtp_message_vec
+            .get(0)
+            .and_then(|frame| frame.data())
+            .unwrap_or_default();
 
           if self.subscriptions.matches(topic_data).await {
             // If it matches, raw_zmtp_message_vec *is* the QItem (the logical message for SUB app).
-            self.incoming_orchestrator.queue_item(pipe_read_id, raw_zmtp_message_vec).await?;
+            self
+              .incoming_orchestrator
+              .queue_item(pipe_read_id, raw_zmtp_message_vec)
+              .await?;
           } else {
             tracing::trace!(handle = self.core.handle, pipe_id = pipe_read_id, topic = ?String::from_utf8_lossy(topic_data), "SUB: Message dropped (no subscription match).");
           }
@@ -232,43 +245,57 @@ impl ISocket for SubSocket {
   }
   // <<< MODIFIED END >>>
 
-  async fn pipe_attached(
-    &self,
-    pipe_read_id: usize,
-    _pipe_write_id: usize, 
-    _peer_identity: Option<&[u8]>,
-  ) {
-    let endpoint_uri_option = self.core_state_read().pipe_read_id_to_endpoint_uri.get(&pipe_read_id).cloned();
+  async fn pipe_attached(&self, pipe_read_id: usize, _pipe_write_id: usize, _peer_identity: Option<&[u8]>) {
+    let endpoint_uri_option = self
+      .core_state_read()
+      .pipe_read_id_to_endpoint_uri
+      .get(&pipe_read_id)
+      .cloned();
 
     if let Some(endpoint_uri) = endpoint_uri_option {
       tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "SUB attaching connection");
-      self.pipe_read_to_endpoint_uri.write().insert(pipe_read_id, endpoint_uri.clone()); 
+      self
+        .pipe_read_to_endpoint_uri
+        .write()
+        .insert(pipe_read_id, endpoint_uri.clone());
 
       let current_topics = self.subscriptions.get_all_topics().await;
       if !current_topics.is_empty() {
         tracing::debug!(handle = self.core.handle, uri = %endpoint_uri, num_topics = current_topics.len(), "Sending existing subscriptions to newly attached peer.");
         for topic in current_topics {
           let sub_msg = Self::construct_subscription_message(true, &topic);
-          self.send_subscription_command_to_uri(endpoint_uri.clone(), &sub_msg).await;
+          self
+            .send_subscription_command_to_uri(endpoint_uri.clone(), &sub_msg)
+            .await;
         }
       }
     } else {
-      tracing::warn!(handle = self.core.handle, pipe_read_id, "SUB pipe_attached: Could not find endpoint_uri. Cannot update map or send initial subscriptions.");
+      tracing::warn!(
+        handle = self.core.handle,
+        pipe_read_id,
+        "SUB pipe_attached: Could not find endpoint_uri. Cannot update map or send initial subscriptions."
+      );
     }
   }
 
   async fn update_peer_identity(&self, pipe_read_id: usize, identity: Option<Blob>) {
-    tracing::trace!(handle = self.core.handle, socket_type = "SUB", pipe_read_id, ?identity, "update_peer_identity called, but SUB socket does not use peer identities. Ignoring.");
+    tracing::trace!(
+      handle = self.core.handle,
+      socket_type = "SUB",
+      pipe_read_id,
+      ?identity,
+      "update_peer_identity called, but SUB socket does not use peer identities. Ignoring."
+    );
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
     tracing::debug!(handle = self.core.handle, pipe_read_id, "SUB detaching pipe");
-    
-    let removed_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id); 
+
+    let removed_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id);
     if removed_uri.is_some() {
       tracing::trace!(handle = self.core.handle, pipe_read_id, uri = %removed_uri.unwrap(), "SUB removed endpoint_uri mapping for detached pipe");
     }
-    
-    self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await; 
+
+    self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await;
   }
 }

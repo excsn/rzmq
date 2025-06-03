@@ -359,9 +359,9 @@ async fn close_active_connections(
       );
       let linger_opt_val = core_arc.core_state.read().options.linger;
       coordinator.start_linger_if_needed(linger_opt_val, core_handle); // Call the method on coordinator
-      // The check for linger expiry and advancing to cleaning will happen in the main command_loop's linger_check_interval.
-      // Or, we can replicate that check here if we want to be more proactive.
-      // For now, let linger_check_interval handle the next step.
+                                                                       // The check for linger expiry and advancing to cleaning will happen in the main command_loop's linger_check_interval.
+                                                                       // Or, we can replicate that check here if we want to be more proactive.
+                                                                       // For now, let linger_check_interval handle the next step.
     }
   }
 }

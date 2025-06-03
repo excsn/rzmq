@@ -1,6 +1,6 @@
-use std::{collections::HashMap, time::Duration};
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
+use std::{collections::HashMap, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::ZmqError;

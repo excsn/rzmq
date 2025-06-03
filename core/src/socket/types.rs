@@ -138,7 +138,7 @@ impl Socket {
   pub async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     self.inner.recv_multipart().await
   }
-  
+
   /// Sets a socket option asynchronously.
   /// Options control various aspects of the socket's behavior (e.g., high-water marks, timeouts).
   /// Refer to ZMQ documentation for standard option IDs and their meanings.

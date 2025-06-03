@@ -126,8 +126,9 @@ impl Distributor {
     &self,
     zmtp_frames: Vec<Msg>, // These are the ZMTP frames for one logical ZMQ message
     core_handle: usize,
-    core_state_accessor: &parking_lot::RwLock<CoreState>, 
-  ) -> Result<(), Vec<(String, ZmqError)>> { // Error returns URI and ZmqError
+    core_state_accessor: &parking_lot::RwLock<CoreState>,
+  ) -> Result<(), Vec<(String, ZmqError)>> {
+    // Error returns URI and ZmqError
     let uris_to_send_to = self.get_peer_uris();
     tracing::debug!(
       handle = core_handle,
@@ -139,7 +140,7 @@ impl Distributor {
       return Ok(());
     }
 
-    let mut failed_uris = Vec::new(); 
+    let mut failed_uris = Vec::new();
 
     for uri_to_send in uris_to_send_to {
       let conn_iface_opt: Option<Arc<dyn ISocketConnection>> = {
@@ -152,7 +153,7 @@ impl Distributor {
 
       if let Some(conn_iface) = conn_iface_opt {
         // Clone the Vec<Msg> for each peer, as send_multipart might be consumed or held by handler
-        let frames_for_this_peer = zmtp_frames.clone(); 
+        let frames_for_this_peer = zmtp_frames.clone();
         match conn_iface.send_multipart(frames_for_this_peer).await {
           Ok(()) => {
             tracing::trace!(handle = core_handle, uri = %uri_to_send, "Distributor: send_multipart successful for URI.");
@@ -162,11 +163,11 @@ impl Distributor {
           }
           Err(e @ ZmqError::ConnectionClosed) => {
             tracing::debug!(handle = core_handle, uri = %uri_to_send, "PUB (Distributor) send_multipart: peer disconnected during send to URI");
-            failed_uris.push((uri_to_send.clone(), e)); 
+            failed_uris.push((uri_to_send.clone(), e));
           }
           Err(e) => {
             tracing::error!(handle = core_handle, uri = %uri_to_send, error = %e, "PUB (Distributor) send_multipart to URI encountered unexpected error");
-            failed_uris.push((uri_to_send.clone(), e)); 
+            failed_uris.push((uri_to_send.clone(), e));
           }
         }
       } else {

@@ -6,13 +6,14 @@ use criterion::{
   criterion_group, criterion_main, measurement::WallTime, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
 use rzmq::{
-  socket::options::{
-    IO_URING_RCVMULTISHOT, RCVHWM, SNDHWM, SNDTIMEO,
-  },
+  socket::options::{IO_URING_RCVMULTISHOT, RCVHWM, SNDHWM, SNDTIMEO},
   Context, Msg, SocketType, ZmqError,
 };
-use std::{sync::atomic::{AtomicU16, Ordering as AtomicOrdering}, time::Instant}; // For unique ports
 use std::time::Duration;
+use std::{
+  sync::atomic::{AtomicU16, Ordering as AtomicOrdering},
+  time::Instant,
+}; // For unique ports
 
 // --- Port Management for Benchmarks ---
 const BENCH_ENDPOINT_BASE_PORT_MS_RECV: u16 = 6300;

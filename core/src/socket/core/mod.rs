@@ -33,7 +33,7 @@ pub struct SocketCore {
   pub(crate) handle: usize,
   pub(crate) context: Context,
   pub(crate) command_sender: MailboxSender,
-  pub(crate) core_state: parking_lot::RwLock<CoreState>, 
+  pub(crate) core_state: parking_lot::RwLock<CoreState>,
   // Weak reference to the ISocket pattern logic to avoid Arc cycles.
   // Needs Tokio's RwLock because `get_socket_logic` is async.
   pub(crate) socket_logic: TokioRwLock<Option<std::sync::Weak<dyn ISocket>>>,

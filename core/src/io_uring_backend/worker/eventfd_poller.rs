@@ -1,7 +1,7 @@
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::ops::UserData;
-use crate::io_uring_backend::worker::internal_op_tracker::{InternalOpTracker, InternalOpType, InternalOpPayload};
+use crate::io_uring_backend::worker::internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType};
 
 use io_uring::{opcode, squeue, types};
 use std::os::fd::AsRawFd;
@@ -14,13 +14,13 @@ pub(crate) struct EventFdPoller {
 }
 
 impl std::fmt::Debug for EventFdPoller {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EventFdPoller")
-            .field("event_fd_raw", &self.event_fd.as_raw_fd()) // Use AsRawFd
-            .field("current_poll_user_data", &self.current_poll_user_data)
-            .field("is_poll_submitted", &self.is_poll_submitted)
-            .finish()
-    }
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("EventFdPoller")
+      .field("event_fd_raw", &self.event_fd.as_raw_fd()) // Use AsRawFd
+      .field("current_poll_user_data", &self.current_poll_user_data)
+      .field("is_poll_submitted", &self.is_poll_submitted)
+      .finish()
+  }
 }
 
 impl EventFdPoller {
@@ -89,12 +89,9 @@ impl EventFdPoller {
     // Build the POLL_ADD SQE.
     // The `current_poll_user_data` field holds the UserData generated in `new()`
     // or by `handle_cqe_if_matches()` after a previous poll completed.
-    let poll_entry = opcode::PollAdd::new(
-      types::Fd(self.event_fd_raw()),
-      libc::POLLIN as u32,
-    )
-    .build()
-    .user_data(self.current_poll_user_data);
+    let poll_entry = opcode::PollAdd::new(types::Fd(self.event_fd_raw()), libc::POLLIN as u32)
+      .build()
+      .user_data(self.current_poll_user_data);
 
     match unsafe { sq.push(&poll_entry) } {
       Ok(_) => {
@@ -128,10 +125,10 @@ impl EventFdPoller {
         cqe_user_data,
         cqe_result
       );
-      
+
       // Current poll is now considered complete, regardless of outcome.
-      self.is_poll_submitted = false; 
-      
+      self.is_poll_submitted = false;
+
       // Important: The InternalOpTracker entry for `self.current_poll_user_data`
       // should be consumed by the caller (`cqe_processor`) by calling
       // `internal_op_tracker.take_op_details(cqe_user_data)`.
@@ -143,31 +140,53 @@ impl EventFdPoller {
         // For a simple POLLIN, a non-negative result usually means POLLIN is ready.
         // (Note: IORING_CQE_F_MORE is for multi-shot polls, not directly relevant here yet)
         if (cqe_result as u32 & libc::POLLERR as u32) != 0 {
-            tracing::error!("[EventFdPoller] Eventfd poll (ud: {}) completed with POLLERR. FD: {}", cqe_user_data, self.event_fd_raw());
-            // Consider this a critical error for the eventfd itself. The poller might not be recoverable.
-            // For now, we will still attempt to re-poll, but this needs monitoring.
+          tracing::error!(
+            "[EventFdPoller] Eventfd poll (ud: {}) completed with POLLERR. FD: {}",
+            cqe_user_data,
+            self.event_fd_raw()
+          );
+          // Consider this a critical error for the eventfd itself. The poller might not be recoverable.
+          // For now, we will still attempt to re-poll, but this needs monitoring.
         } else if (cqe_result as u32 & libc::POLLHUP as u32) != 0 {
-            tracing::error!("[EventFdPoller] Eventfd poll (ud: {}) completed with POLLHUP. FD: {}", cqe_user_data, self.event_fd_raw());
+          tracing::error!(
+            "[EventFdPoller] Eventfd poll (ud: {}) completed with POLLHUP. FD: {}",
+            cqe_user_data,
+            self.event_fd_raw()
+          );
         } else {
-            // Assume POLLIN if no error flags and non-negative result.
-            match self.event_fd.read() {
-              Ok(val) => {
-                tracing::trace!("[EventFdPoller] Read value {} from eventfd {}.", val, self.event_fd_raw());
-              }
-              Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tracing::trace!("[EventFdPoller] Read from eventfd {} would block (non-blocking read after poll signal).", self.event_fd_raw());
-              }
-              Err(e) => {
-                tracing::error!("[EventFdPoller] Error reading from eventfd {}: {}. Worker might not wake for new ops.", self.event_fd_raw(), e);
-                // This is problematic. The eventfd might be in a bad state.
-              }
+          // Assume POLLIN if no error flags and non-negative result.
+          match self.event_fd.read() {
+            Ok(val) => {
+              tracing::trace!(
+                "[EventFdPoller] Read value {} from eventfd {}.",
+                val,
+                self.event_fd_raw()
+              );
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+              tracing::trace!(
+                "[EventFdPoller] Read from eventfd {} would block (non-blocking read after poll signal).",
+                self.event_fd_raw()
+              );
+            }
+            Err(e) => {
+              tracing::error!(
+                "[EventFdPoller] Error reading from eventfd {}: {}. Worker might not wake for new ops.",
+                self.event_fd_raw(),
+                e
+              );
+              // This is problematic. The eventfd might be in a bad state.
+            }
+          }
         }
-      } else { // cqe_result < 0
+      } else {
+        // cqe_result < 0
         let errno = -cqe_result;
         tracing::error!(
           "[EventFdPoller] Eventfd poll SQE (ud: {}) failed with errno: {}. FD: {}",
-          cqe_user_data, errno, self.event_fd_raw()
+          cqe_user_data,
+          errno,
+          self.event_fd_raw()
         );
         // If the poll operation itself fails (e.g., EBADF), re-polling might not be useful.
         // For now, we will still set up for a re-poll.
@@ -185,7 +204,7 @@ impl EventFdPoller {
         "[EventFdPoller] Prepared for next poll submission with new UserData: {}",
         self.current_poll_user_data
       );
-      
+
       return true; // CQE was handled by this poller
     }
     false // CQE did not match this poller's UserData

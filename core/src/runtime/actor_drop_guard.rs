@@ -15,12 +15,7 @@ pub(crate) struct ActorDropGuard {
 }
 
 impl ActorDropGuard {
-  pub fn new(
-    context: Context,
-    handle_id: usize,
-    actor_type: ActorType,
-    endpoint_uri: Option<String>,
-  ) -> Self {
+  pub fn new(context: Context, handle_id: usize, actor_type: ActorType, endpoint_uri: Option<String>) -> Self {
     let stopped_normally = Arc::new(AtomicBool::new(false));
     Self {
       context,
