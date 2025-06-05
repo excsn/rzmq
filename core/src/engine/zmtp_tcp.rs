@@ -18,7 +18,7 @@ pub(crate) fn create_and_spawn_tcp_engine(
   options: Arc<SocketOptions>,
   is_server: bool,
   context: &Context, // Accept Context reference
-  _parent_id: usize, // ID of the parent Session actor
+  parent_id: usize, // ID of the parent Session actor
 ) -> (MailboxSender, JoinHandle<()>) {
   let capacity = context.inner().get_actor_mailbox_capacity();
   let (tx, rx) = mailbox(capacity);
@@ -56,7 +56,7 @@ pub(crate) fn create_and_spawn_tcp_engine(
     context.clone(), // Pass context clone to the engine core
   );
 
-  let task_handle = tokio::spawn(core.run_loop());
+  let task_handle = tokio::spawn(core.run_loop(parent_id));
 
   // Note: ActorStarted event is published by the caller (e.g., Listener/Connecter)
   // immediately after this function returns successfully and the task is known to be spawned.

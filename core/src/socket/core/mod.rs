@@ -48,7 +48,6 @@ impl SocketCore {
     socket_type: SocketType,
     mut initial_options: SocketOptions,
   ) -> Result<(Arc<dyn ISocket>, MailboxSender), ZmqError> {
-    let actor_type_socketcore = ActorType::SocketCore;
     let capacity = context.inner().get_actor_mailbox_capacity();
     let (cmd_tx, cmd_rx) = mailbox(capacity); // Creates async-channel pair
 
@@ -101,9 +100,6 @@ impl SocketCore {
       cmd_rx,
       system_event_receiver,
     ));
-
-    // Publish ActorStarted event after spawning
-    context.publish_actor_started(handle, actor_type_socketcore, None);
 
     Ok((socket_logic_arc_impl, cmd_tx))
   }

@@ -779,7 +779,6 @@ pub(crate) fn process_all_cqes(
             ..
           } = op_details.payload
           {
-            // println!("ZEROCOPY");
             if let Some(pool_arc) = send_buffer_pool {
               pool_arc.release_buffer(send_buf_id);
               trace!(
@@ -917,7 +916,6 @@ pub(crate) fn process_all_cqes(
           }
         }
         InternalOpType::Send => {
-          // println!("NOZEROCOPY");
           trace!(
             "[CQE Proc] Normal Send completion (ud:{}, fd:{}, res:{})",
             cqe_user_data,

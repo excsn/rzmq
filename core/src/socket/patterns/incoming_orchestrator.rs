@@ -242,4 +242,8 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     // For now, this ensures no stale data from a disconnected pipe is accidentally delivered.
     self.reset_recv_message_buffer().await;
   }
+  
+  pub fn close(&self) {
+    self.main_incoming_queue.close();
+  }
 }

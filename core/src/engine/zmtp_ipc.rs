@@ -18,7 +18,7 @@ pub(crate) fn create_and_spawn_ipc_engine(
   options: Arc<SocketOptions>,
   is_server: bool,
   context: &Context,
-  _parent_id: usize, // ID of the parent Session actor
+  parent_id: usize, // ID of the parent Session actor
 ) -> (MailboxSender, JoinHandle<()>) {
   let capacity = context.inner().get_actor_mailbox_capacity();
   let (tx, rx) = mailbox(capacity);
@@ -54,7 +54,7 @@ pub(crate) fn create_and_spawn_ipc_engine(
   );
 
   // Spawn the generic core loop task
-  let task_handle = tokio::spawn(core.run_loop()); // run_loop consumes core
+  let task_handle = tokio::spawn(core.run_loop(parent_id)); // run_loop consumes core
 
   // Note: ActorStarted event is published by the caller (e.g., Listener/Connecter)
   // immediately after this function returns successfully and the task is known to be spawned.

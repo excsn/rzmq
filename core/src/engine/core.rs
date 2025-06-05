@@ -10,7 +10,7 @@ use crate::protocol::zmtp::{
   command::ZmtpCommand,
   greeting::{ZmtpGreeting, GREETING_LENGTH},
 };
-use crate::runtime::{ActorType, Command, MailboxReceiver, MailboxSender};
+use crate::runtime::{ActorDropGuard, ActorType, Command, MailboxReceiver, MailboxSender};
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
 use crate::security::{negotiate_security_mechanism, IDataCipher};
@@ -23,6 +23,7 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use std::{fmt, marker::PhantomData};
 
+use async_channel::{SendError, TrySendError};
 use bytes::{BufMut, BytesMut};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
@@ -589,13 +590,21 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
     }
   }
 
-  pub async fn run_loop(mut self) {
+  pub async fn run_loop(mut self, session_handle_id: usize) {
     tokio::task::yield_now().await;
 
     let engine_actor_handle = self.handle;
     let engine_actor_type = ActorType::Engine;
     let engine_context_clone = self.context.clone();
     let role_str = if self.is_server { "Server" } else { "Client" };
+
+    let mut actor_drop_guard = ActorDropGuard::new(
+      engine_context_clone.clone(),
+      engine_actor_handle,
+      ActorType::Engine,
+      None,
+      Some(session_handle_id),
+    );
 
     tracing::info!(
       engine_handle = engine_actor_handle,
@@ -951,9 +960,12 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
                         }
                       }
                     } else { // Data message
-                      if self.session_mailbox.send(Command::EnginePushCmd { msg: decoded_msg }).await.is_err() {
-                        final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed on incoming data".into()));
-                        should_break_loop = true; break 'zmtp_parse_loop;
+                      match self.session_mailbox.send(Command::EnginePushCmd { msg: decoded_msg }).await {
+                        Ok(_) => {},
+                        Err(_) => {
+                          final_error_for_actor_stop = Some(ZmqError::Internal("Session mailbox closed on incoming data".into()));
+                          should_break_loop = true; break 'zmtp_parse_loop;
+                        }
                       }
                     }
                   }
@@ -1056,7 +1068,7 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       role = role_str,
       "ZmtpEngineCoreStd loop finished. Cleaning up."
     );
-
+    
     #[cfg(target_os = "linux")]
     if self.is_corked {
       if let Some(fd) = self.stream_fd_for_cork {
@@ -1070,10 +1082,27 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
 
     // Attempt to shutdown the stream gracefully.
     // `current_underlying_stream` is the raw `S`.
-    if let Err(e) = current_underlying_stream.shutdown().await {
-      tracing::warn!(engine_handle = engine_actor_handle, error = %e, "Error during stream shutdown.");
+    let stream_shutdown_timeout = Duration::from_secs(2); // Configurable, short timeout
+    match tokio::time::timeout(stream_shutdown_timeout, current_underlying_stream.shutdown()).await {
+      Ok(Ok(())) => {
+        tracing::debug!(engine_handle = engine_actor_handle, "Stream shutdown successful.");
+      }
+      Ok(Err(e)) => {
+        tracing::warn!(engine_handle = engine_actor_handle, error = %e, "Error during stream shutdown().");
+        if final_error_for_actor_stop.is_none() {
+          // Keep original error if already set
+          final_error_for_actor_stop = Some(ZmqError::from(e));
+        }
+      }
+      Err(_timeout_elapsed) => {
+        tracing::warn!(engine_handle = engine_actor_handle, timeout = ?stream_shutdown_timeout, "Timeout during stream shutdown(). Stream might be abruptly closed.");
+        if final_error_for_actor_stop.is_none() {
+          final_error_for_actor_stop = Some(ZmqError::Timeout);
+        }
+        // Don't await stream drop, just let it happen.
+      }
     }
-    drop(current_underlying_stream); // Ensure it's dropped.
+    drop(current_underlying_stream);
 
     // Notify Session that engine has stopped.
     if !self.session_mailbox.is_closed() {
@@ -1082,13 +1111,12 @@ impl<S: ZmtpStdStream + AsRawFd> ZmtpEngineCoreStd<S> {
       }
     }
 
-    // Publish ActorStopping event.
-    engine_context_clone.publish_actor_stopping(
-      engine_actor_handle,
-      engine_actor_type,
-      None, // TODO: Could add peer URI from config if it's a client engine.
-      final_error_for_actor_stop,
-    );
+    if let Some(err) = final_error_for_actor_stop.take() {
+      actor_drop_guard.set_error(err);
+    } else {
+      actor_drop_guard.waive();
+    }
+
     tracing::info!(
       engine_handle = engine_actor_handle,
       role = role_str,

@@ -82,7 +82,9 @@ impl ISocket for RepSocket {
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     delegate_to_core!(self, UserGetOpt, option: option)
   }
+
   async fn close(&self) -> Result<(), ZmqError> {
+    self.incoming_request_queue.close();
     delegate_to_core!(self, UserClose,)
   }
 

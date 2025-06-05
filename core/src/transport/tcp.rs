@@ -128,7 +128,6 @@ impl TcpListener {
 
     let accept_loop_parent_hdl = handle;
     let accept_loop_hdl_id = context.inner().next_handle();
-    let accept_loop_act_type = ActorType::AcceptLoop;
 
     let accept_loop_task_jh = tokio::spawn(TcpListener::run_accept_loop(
       accept_loop_hdl_id,
@@ -143,7 +142,6 @@ impl TcpListener {
       parent_socket_id,
       conn_limiter.clone(),
     ));
-    context.publish_actor_started(accept_loop_hdl_id, accept_loop_act_type, Some(accept_loop_parent_hdl));
 
     let listener_actor = TcpListener {
       handle,
@@ -154,21 +152,26 @@ impl TcpListener {
       parent_socket_id,
     };
 
-    let cmd_loop_jh = tokio::spawn(listener_actor.run_command_loop());
-    context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
+    let cmd_loop_jh = tokio::spawn(listener_actor.run_command_loop(parent_socket_id));
 
     Ok((tx, cmd_loop_jh, resolved_uri))
   }
 
-  // ... (run_command_loop remains the same)
-  async fn run_command_loop(self) {
+  async fn run_command_loop(self, parent_socket_id: usize) {
     let listener_cmd_loop_handle = self.handle;
-    let listener_cmd_loop_actor_type = ActorType::Listener;
     let endpoint_uri_clone_log = self.endpoint.clone();
     let event_bus = self.context.event_bus();
     let mut system_event_rx = event_bus.subscribe();
     tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener command loop started");
     let mut final_error_for_actor_stopping: Option<ZmqError> = None;
+
+    let mut actor_drop_guard = ActorDropGuard::new(
+      self.context,
+      listener_cmd_loop_handle,
+      ActorType::Listener,
+      Some(endpoint_uri_clone_log.clone()),
+      Some(parent_socket_id),
+    );
 
     let _loop_result: Result<(), ()> = async {
       loop {
@@ -231,12 +234,12 @@ impl TcpListener {
       tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener accept loop task joined cleanly.");
     }
 
-    self.context.publish_actor_stopping(
-      listener_cmd_loop_handle,
-      listener_cmd_loop_actor_type,
-      Some(self.endpoint),
-      final_error_for_actor_stopping,
-    );
+    if let Some(err) = final_error_for_actor_stopping.take() {
+      actor_drop_guard.set_error(err);
+    } else {
+      actor_drop_guard.waive();
+    }
+
     tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener command loop actor fully stopped.");
   }
 
@@ -258,12 +261,12 @@ impl TcpListener {
       uring::global_state::get_global_uring_worker_op_tx().expect("URING HAS NOT BEEN INITIALIZED!");
     }
 
-    let accept_loop_actor_type = ActorType::AcceptLoop;
-    let actor_drop_guard = ActorDropGuard::new(
+    let mut actor_drop_guard = ActorDropGuard::new(
       context.clone(),
       accept_loop_handle,
-      accept_loop_actor_type,
+      ActorType::AcceptLoop,
       Some(endpoint_uri.clone()),
+      Some(parent_socket_core_id),
     );
     tracing::debug!(handle = accept_loop_handle, uri = %endpoint_uri, "TCP Accept loop (unified) started.");
     let mut loop_error_to_report: Option<ZmqError> = None;
@@ -528,13 +531,11 @@ impl TcpListener {
         }
       }
     }
-    actor_drop_guard.waive();
-    context.publish_actor_stopping(
-      accept_loop_handle,
-      accept_loop_actor_type,
-      Some(endpoint_uri),
-      loop_error_to_report,
-    );
+    if let Some(err) = loop_error_to_report.take() {
+      actor_drop_guard.set_error(err);
+    } else {
+      actor_drop_guard.waive();
+    }
     tracing::info!("TCP Accept loop {} fully stopped.", accept_loop_handle);
   }
 }
@@ -585,15 +586,22 @@ impl TcpConnecter {
       context: context.clone(),
       parent_socket_id,
     };
-    let task_join_handle = tokio::spawn(connecter_actor.run_connect_loop(monitor_tx));
-    context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
+    let task_join_handle = tokio::spawn(connecter_actor.run_connect_loop(monitor_tx, parent_socket_id));
+
     task_join_handle
   }
 
-  async fn run_connect_loop(self, monitor_tx: Option<MonitorSender>) {
+  async fn run_connect_loop(self, monitor_tx: Option<MonitorSender>, parent_socket_id: usize) {
     let connecter_handle = self.handle;
     let actor_type = ActorType::Connecter;
     let endpoint_uri_clone = self.endpoint.clone();
+    let mut actor_drop_guard = ActorDropGuard::new(
+      self.context.clone(),
+      connecter_handle,
+      actor_type,
+      Some(endpoint_uri_clone.clone()),
+      Some(parent_socket_id),
+    );
 
     tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Long-Lived TCP Connecter actor started.");
 
@@ -607,9 +615,7 @@ impl TcpConnecter {
             target_endpoint_uri: self.endpoint.clone(),
             error_msg: err.to_string(),
           });
-          self
-            .context
-            .publish_actor_stopping(connecter_handle, actor_type, Some(endpoint_uri_clone), Some(err));
+          actor_drop_guard.set_error(err);
           return;
         }
       },
@@ -620,9 +626,7 @@ impl TcpConnecter {
           target_endpoint_uri: self.endpoint.clone(),
           error_msg: err.to_string(),
         });
-        self
-          .context
-          .publish_actor_stopping(connecter_handle, actor_type, Some(endpoint_uri_clone), Some(err));
+        actor_drop_guard.set_error(err);
         return;
       }
     };
@@ -784,12 +788,11 @@ impl TcpConnecter {
       }
     }
 
-    self.context.publish_actor_stopping(
-      connecter_handle,
-      actor_type,
-      Some(endpoint_uri_clone),
-      last_connect_attempt_error,
-    );
+    if let Some(err) = last_connect_attempt_error.take() {
+      actor_drop_guard.set_error(err);
+    } else {
+      actor_drop_guard.waive();
+    }
     tracing::info!(handle = connecter_handle, uri = %self.endpoint, "TCP Connecter actor task fully stopped.");
   }
 

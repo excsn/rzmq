@@ -105,7 +105,6 @@ pub(crate) async fn setup_pipe_with_session_actor(
   Ok((core_write_id, core_read_id))
 }
 
-// ... (run_pipe_reader_task remains the same)
 pub(crate) async fn run_pipe_reader_task(
   context: RzmqContext,
   core_handle: usize,
@@ -117,13 +116,12 @@ pub(crate) async fn run_pipe_reader_task(
   let pipe_reader_task_handle_id = context.inner().next_handle();
   let pipe_reader_actor_type = ActorType::PipeReader;
 
-  context.publish_actor_started(pipe_reader_task_handle_id, pipe_reader_actor_type, Some(core_handle));
-
-  let drop_guard = ActorDropGuard::new(
+  let mut actor_drop_guard = ActorDropGuard::new(
     context.clone(),
     pipe_reader_task_handle_id,
     pipe_reader_actor_type,
     None,
+    Some(core_handle),
   );
 
   tracing::debug!(
@@ -209,16 +207,13 @@ pub(crate) async fn run_pipe_reader_task(
     "PipeReaderTask finished."
   );
 
-  drop_guard.waive();
-  context.publish_actor_stopping(
-    pipe_reader_task_handle_id,
-    pipe_reader_actor_type,
-    None,
-    final_error_for_stopping,
-  );
+  if let Some(err) = final_error_for_stopping.take() {
+    actor_drop_guard.set_error(err);
+  } else {
+    actor_drop_guard.waive();
+  }
 }
 
-// ... (cleanup_stopped_child_resources, cleanup_session_state_by_uri, cleanup_session_state_by_pipe remain the same)
 pub(crate) async fn cleanup_stopped_child_resources(
   core_arc: Arc<SocketCore>,
   socket_logic_strong: &Arc<dyn ISocket>,

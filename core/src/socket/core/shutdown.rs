@@ -140,7 +140,6 @@ impl ShutdownCoordinator {
       return false;
     }
     let core_pipes_empty = core_s_reader.pipes_tx.values().all(|sender| sender.is_empty());
-    // TODO: Add ISocket::pattern_queues_empty() check later.
 
     if core_pipes_empty {
       tracing::debug!(
@@ -194,7 +193,7 @@ pub(crate) async fn initiate_core_shutdown(
     was_due_to_error,
     "Initiating SocketCore shutdown steps."
   );
-
+  
   // Event publishing is now done by the caller (command_loop or event_processor)
   // publish_socket_closing_event(&core_arc.context, core_handle).await;
 

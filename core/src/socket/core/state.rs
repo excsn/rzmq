@@ -1,6 +1,6 @@
 // core/src/socket/core/state.rs
 
-use crate::runtime::{Command, MailboxSender, SystemEvent}; // Command, SystemEvent not directly used in structs but for context
+use crate::runtime::MailboxSender; // Command, SystemEvent not directly used in structs but for context
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::task::JoinHandle;
 
 /// Stores information about an active endpoint (Listener or Session) managed by `SocketCore`.

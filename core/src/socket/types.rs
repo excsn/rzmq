@@ -4,7 +4,7 @@ use crate::error::ZmqError; // For Result types in API methods.
 use crate::message::Msg; // For send/recv methods.
 use crate::runtime::Command; // For UserMonitor command payload.
 use crate::runtime::MailboxSender; // For storing the SocketCore's command sender.
-use crate::socket::events::{MonitorReceiver, SocketEvent, DEFAULT_MONITOR_CAPACITY}; // For socket monitoring.
+use crate::socket::events::{MonitorReceiver, DEFAULT_MONITOR_CAPACITY}; // For socket monitoring.
 use crate::socket::ISocket; // The internal trait implemented by specific socket patterns.
 use std::fmt;
 use std::sync::Arc;

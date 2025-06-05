@@ -100,6 +100,7 @@ impl ISocket for ReqSocket {
   }
   async fn close(&self) -> Result<(), ZmqError> {
     self.reply_available_notifier.notify_waiters();
+    self.incoming_orchestrator.close();
     delegate_to_core!(self, UserClose,)
   }
 
@@ -118,7 +119,7 @@ impl ISocket for ReqSocket {
 
     let target_endpoint_uri_for_state_update: String;
     {
-      let mut current_state_guard = self.state.lock().await;
+      let current_state_guard = self.state.lock().await;
       if !matches!(*current_state_guard, ReqState::ReadyToSend) {
         return Err(ZmqError::InvalidState(
           "REQ socket must call recv() before sending again",
@@ -179,11 +180,10 @@ impl ISocket for ReqSocket {
         *current_state_guard = ReqState::ExpectingReply {
           target_endpoint_uri: target_endpoint_uri_for_state_update.clone(),
         };
-        // <<< MODIFIED [Call orchestrator's method to reset its internal buffer] >>>
         self.incoming_orchestrator.reset_recv_message_buffer().await;
         Ok(())
       }
-      Err(e @ ZmqError::ConnectionClosed) => {
+      Err(ZmqError::ConnectionClosed) => { // Renamed variable 'e' to avoid conflict if used later
         self
           .load_balancer
           .remove_connection(&target_endpoint_uri_for_state_update);
@@ -198,50 +198,87 @@ impl ISocket for ReqSocket {
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
     if !self.core.is_running().await {
-      return Err(ZmqError::InvalidState("Socket is closing".into()));
+        // Initial check, more checks inside select if notifier fires
+        return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
     let rcvtimeo_opt: Option<Duration> = { self.core.core_state.read().options.rcvtimeo };
 
-    // Check current state before calling orchestrator
-    {
-      let op_state_guard = self.state.lock().await;
-      if !matches!(*op_state_guard, ReqState::ExpectingReply { .. }) {
-        return Err(ZmqError::InvalidState("REQ socket must call send() before receiving"));
-      }
+    { // Scope for state_guard
+        let op_state_guard = self.state.lock().await;
+        if !matches!(*op_state_guard, ReqState::ExpectingReply { .. }) {
+            return Err(ZmqError::InvalidState("REQ socket must call send() before receiving"));
+        }
     } // Lock released
 
-    // For REQ, QItem is Vec<Msg> (the reply payload).
-    // The transform_fn tells orchestrator.recv_message how to convert this QItem (Vec<Msg>)
-    // into the sequence of app_frames it should buffer and serve one-by-one.
-    // For REQ, the QItem (reply payload Vec<Msg>) IS the app_frames for the orchestrator's buffer.
-    let transform_fn = |q_item: Vec<Msg>| q_item;
+    let notifier = self.reply_available_notifier.clone();
+    
+    // Define transform_fn for the main orchestrator call
+    let transform_fn_main = |q_item: Vec<Msg>| q_item;
+    let orchestrator_fut = self.incoming_orchestrator
+        .recv_message(rcvtimeo_opt, transform_fn_main);
 
-    let result = self
-      .incoming_orchestrator
-      .recv_message(rcvtimeo_opt, transform_fn)
-      .await;
+    let received_msg_result: Result<Msg, ZmqError>;
 
-    // If recv_message successfully returned a frame and that frame was the last part
-    // of the logical message (MORE=false), then transition REQ state to ReadyToSend.
-    // The orchestrator's recv_message sets the MORE flag on the returned Msg correctly
-    // based on its internal buffer.
-    if result.is_ok() && result.as_ref().map_or(true, |m| !m.is_more()) {
-      let mut state_guard = self.state.lock().await;
-      // Only transition if still ExpectingReply; could have been changed by pipe_detached or error.
-      if matches!(*state_guard, ReqState::ExpectingReply { .. }) {
-        *state_guard = ReqState::ReadyToSend;
-        // Notify any other tasks that might be waiting on state change, though less common for REQ.
-        self.reply_available_notifier.notify_waiters();
-      }
-    } else if result.is_err() {
-      // On any error from recv_message (Timeout, ResourceLimitReached, QueueClosed),
-      // reset state to allow a new request.
-      let mut state_guard = self.state.lock().await;
-      *state_guard = ReqState::ReadyToSend;
-      self.reply_available_notifier.notify_waiters();
+    tokio::select! {
+        biased; // Prioritize notifier branch
+
+        _ = notifier.notified() => {
+            if !self.core.is_running().await {
+                tracing::debug!("REQ recv: Notifier signaled, core not running. Exiting due to close.");
+                received_msg_result = Err(ZmqError::ConnectionClosed);
+            } else {
+                // Core is running. Notification might be for message arrival or state change.
+                // Poll orchestrator with zero timeout to check for an immediate message.
+                let transform_fn_poll = |q_item: Vec<Msg>| q_item;
+                match self.incoming_orchestrator.recv_message(Some(Duration::ZERO), transform_fn_poll).await {
+                    Ok(msg) => {
+                        received_msg_result = Ok(msg);
+                    }
+                    Err(ZmqError::Timeout) => {
+                        // No immediate message. Check if state was reset (e.g., by pipe_detached).
+                        let state_guard = self.state.lock().await;
+                        if matches!(*state_guard, ReqState::ReadyToSend) {
+                            tracing::warn!("REQ recv: Notifier signaled, no immediate message. State is ReadyToSend (likely peer disconnect or request aborted).");
+                            received_msg_result = Err(ZmqError::ConnectionClosed); // Or a more specific error
+                        } else {
+                            tracing::error!("REQ recv: Notifier signaled, no immediate message, but still ExpectingReply. Treating as interruption.");
+                            received_msg_result = Err(ZmqError::Internal("Receive operation interrupted by notification without immediate data.".into()));
+                        }
+                    }
+                    Err(e) => { // Other error from orchestrator (e.g., QueueClosed)
+                        received_msg_result = Err(e);
+                    }
+                }
+            }
+        }
+
+        res = orchestrator_fut => {
+            received_msg_result = res;
+        }
     }
-    result
+
+    // State update logic
+    if let Ok(ref msg) = received_msg_result {
+        if !msg.is_more() { // Last part of the logical message
+            let mut state_guard = self.state.lock().await;
+            // Only transition if still ExpectingReply; could have been changed by another path.
+            if matches!(*state_guard, ReqState::ExpectingReply { .. }) {
+                *state_guard = ReqState::ReadyToSend;
+                self.reply_available_notifier.notify_waiters();
+            }
+        }
+    } else if received_msg_result.is_err() {
+        // On any error (Timeout, ContextTerminated, ConnectionClosed from notifier branch, QueueClosed from orchestrator, etc.)
+        // reset state to allow a new request.
+        let mut state_guard = self.state.lock().await;
+        if matches!(*state_guard, ReqState::ExpectingReply { .. }) {
+            *state_guard = ReqState::ReadyToSend;
+            self.reply_available_notifier.notify_waiters();
+        }
+    }
+    
+    received_msg_result
   }
 
   async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
@@ -256,32 +293,74 @@ impl ISocket for ReqSocket {
 
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     if !self.core.is_running().await {
-      return Err(ZmqError::InvalidState("Socket is closing".into()));
-    }
-    // Check REQ state
-    {
-      let op_state_guard = self.state.lock().await;
-      if !matches!(*op_state_guard, ReqState::ExpectingReply { .. }) {
-        return Err(ZmqError::InvalidState(
-          "REQ socket must call send() before receiving reply",
-        ));
-      }
+        return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
     let rcvtimeo_opt: Option<Duration> = { self.core.core_state.read().options.rcvtimeo };
-    // For REQ, QItem is Vec<Msg> (the reply payload parts). The transform closure is identity.
-    let transform_fn = |q_item: Vec<Msg>| q_item;
-    let result = self
-      .incoming_orchestrator
-      .recv_logical_message(rcvtimeo_opt, transform_fn)
-      .await;
+
+    { // Scope for state_guard
+        let op_state_guard = self.state.lock().await;
+        if !matches!(*op_state_guard, ReqState::ExpectingReply { .. }) {
+            return Err(ZmqError::InvalidState(
+                "REQ socket must call send() before receiving reply",
+            ));
+        }
+    } // Lock released
+
+    let notifier = self.reply_available_notifier.clone();
+
+    // Define transform_fn for the main orchestrator call
+    let transform_fn_main = |q_item: Vec<Msg>| q_item;
+    let orchestrator_fut = self.incoming_orchestrator
+        .recv_logical_message(rcvtimeo_opt, transform_fn_main);
+    
+    let received_msgs_result: Result<Vec<Msg>, ZmqError>;
+
+    tokio::select! {
+        biased; // Prioritize notifier branch
+
+        _ = notifier.notified() => {
+            if !self.core.is_running().await {
+                tracing::debug!("REQ recv_multipart: Notifier signaled, core not running. Exiting due to close.");
+                received_msgs_result = Err(ZmqError::ConnectionClosed);
+            } else {
+                // Core is running. Poll orchestrator.
+                let transform_fn_poll = |q_item: Vec<Msg>| q_item;
+                match self.incoming_orchestrator.recv_logical_message(Some(Duration::ZERO), transform_fn_poll).await {
+                    Ok(msgs) => {
+                        received_msgs_result = Ok(msgs);
+                    }
+                    Err(ZmqError::Timeout) => {
+                        let state_guard = self.state.lock().await;
+                        if matches!(*state_guard, ReqState::ReadyToSend) {
+                            tracing::warn!("REQ recv_multipart: Notifier signaled, no immediate message. State is ReadyToSend (likely peer disconnect or request aborted).");
+                            received_msgs_result = Err(ZmqError::ConnectionClosed);
+                        } else {
+                            tracing::error!("REQ recv_multipart: Notifier signaled, no immediate message, but still ExpectingReply. Treating as interruption.");
+                            received_msgs_result = Err(ZmqError::Internal("Receive multipart operation interrupted by notification without immediate data.".into()));
+                        }
+                    }
+                    Err(e) => {
+                        received_msgs_result = Err(e);
+                    }
+                }
+            }
+        }
+
+        res = orchestrator_fut => {
+            received_msgs_result = res;
+        }
+    }
 
     // After receiving the full logical message (or erroring), transition state.
-    let mut state_guard = self.state.lock().await;
-    *state_guard = ReqState::ReadyToSend;
-    self.reply_available_notifier.notify_waiters();
+    { // Scope for state_guard before returning result
+        let mut state_guard = self.state.lock().await;
+        *state_guard = ReqState::ReadyToSend;
+        // Notify waiters, as the state has changed, potentially unblocking other operations or just signaling completion.
+        self.reply_available_notifier.notify_waiters(); 
+    }
 
-    result
+    received_msgs_result
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
@@ -312,14 +391,11 @@ impl ISocket for ReqSocket {
           }
         };
 
-        let (is_expected_reply, notifier_clone_opt) = {
+        let is_expected_reply = { // Removed notifier_clone_opt as it's not strictly needed here
           let op_state_guard = self.state.lock().await;
           match &*op_state_guard {
-            ReqState::ExpectingReply { target_endpoint_uri } => (
-              *target_endpoint_uri == source_uri,
-              Some(self.reply_available_notifier.clone()),
-            ),
-            ReqState::ReadyToSend => (false, None),
+            ReqState::ExpectingReply { target_endpoint_uri } => *target_endpoint_uri == source_uri,
+            ReqState::ReadyToSend => false,
           }
         };
 
@@ -331,9 +407,6 @@ impl ISocket for ReqSocket {
         if let Some(raw_zmtp_reply_vec) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
           match self.process_incoming_zmtp_message_for_req(pipe_read_id, raw_zmtp_reply_vec) {
             Ok(reply_payload_parts) => {
-              // Release lock before await on queue_item
-              // The notifier_clone_opt needs to be handled carefully if op_state_guard is re-acquired
-              // For simplicity, just use self.reply_available_notifier after queue_item completes or errors.
               if self
                 .incoming_orchestrator
                 .queue_item(pipe_read_id, reply_payload_parts)
@@ -345,10 +418,12 @@ impl ISocket for ReqSocket {
                   pipe_id = pipe_read_id,
                   "REQ: Failed to push reply to orchestrator queue."
                 );
+                // If queueing fails (e.g., orchestrator closed), transition state.
                 let mut state_guard_err = self.state.lock().await;
                 *state_guard_err = ReqState::ReadyToSend;
                 self.reply_available_notifier.notify_waiters();
               } else {
+                // Successfully queued item, notify any waiting recv/recv_multipart.
                 self.reply_available_notifier.notify_one();
               }
             }
@@ -359,6 +434,11 @@ impl ISocket for ReqSocket {
                 "REQ: Error processing ZMTP reply: {}. Dropping.",
                 e
               );
+              // Consider if state should be reset here too. If processing fails, the reply is lost.
+              // It might be safer to reset to ReadyToSend to allow a new request.
+              let mut state_guard_err = self.state.lock().await;
+              *state_guard_err = ReqState::ReadyToSend;
+              self.reply_available_notifier.notify_waiters();
             }
           }
         }
@@ -418,7 +498,8 @@ impl ISocket for ReqSocket {
         if *target_endpoint_uri == detached_uri {
           tracing::warn!(handle = self.core.handle, pipe_id = pipe_read_id, uri = %detached_uri, "Target REP peer detached while REQ was expecting reply. Resetting state and notifying recv.");
           *op_state_guard = ReqState::ReadyToSend;
-          self.reply_available_notifier.notify_one();
+          // Notify any waiting recv/recv_multipart that the state has changed abortively.
+          self.reply_available_notifier.notify_one(); 
         }
       }
     }

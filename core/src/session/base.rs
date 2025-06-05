@@ -2,7 +2,7 @@
 
 use crate::context::Context;
 use crate::error::ZmqError;
-use crate::runtime::{mailbox, ActorType, Command, EngineConnectionType, MailboxReceiver, MailboxSender, SystemEvent};
+use crate::runtime::{mailbox, ActorDropGuard, ActorType, Command, EngineConnectionType, MailboxReceiver, MailboxSender, SystemEvent};
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::{Blob, Msg};
 
@@ -39,7 +39,7 @@ impl SessionBase {
     context: Context,
     parent_socket_id: usize,
   ) -> (MailboxSender, JoinHandle<()>) {
-    let actor_type = ActorType::Session;
+
     let capacity = context.inner().get_actor_mailbox_capacity();
     let (tx, rx) = mailbox(capacity);
     let session = SessionBase {
@@ -64,12 +64,10 @@ impl SessionBase {
 
     tracing::debug!(session_handle = handle, uri = %endpoint_uri_for_log, "Spawning SessionBase task");
     // `session` is moved into `run_loop` here.
-    let task_handle = tokio::spawn(session.run_loop());
+    let task_handle = tokio::spawn(session.run_loop(parent_socket_id));
 
     // Log after spawning, using the cloned/argument value.
     tracing::debug!(session_handle = handle, uri = %endpoint_uri_for_log, "SessionBase task spawned. Publishing ActorStarted event.");
-
-    context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
 
     (tx, task_handle)
   }
@@ -131,14 +129,16 @@ impl SessionBase {
     }
   }
 
-  async fn run_loop(mut self) {
+  async fn run_loop(mut self, parent_socket_id: usize) {
     let session_handle = self.handle;
-    let actor_type = ActorType::Session;
     let endpoint_uri_for_monitor_event = self.logical_target_endpoint_uri.clone(); // Clone for logging and event publishing.
     let event_bus = self.context.event_bus();
     let mut system_event_rx = event_bus.subscribe();
 
     tracing::info!(handle = session_handle, uri = %endpoint_uri_for_monitor_event, "SessionBase actor started main loop. Initial engine_ready={}, pipe_attached={}", self.engine_ready, self.pipe_attached);
+
+
+    let mut actor_drop_guard = ActorDropGuard::new(self.context.clone(), session_handle, ActorType::Session, Some(endpoint_uri_for_monitor_event.clone()), Some(parent_socket_id));
 
     let mut _engine_stopped_cleanly = false; // Renamed to avoid warning if not used extensively
     let mut error_to_report_on_stop: Option<ZmqError> = None;
@@ -149,7 +149,8 @@ impl SessionBase {
       loop {
         let should_read_core_pipe = self.pipe_attached && self.engine_ready && self.rx_from_core.is_some();
         let core_pipe_receiver_ref = self.rx_from_core.as_ref();
-          tracing::debug!(handle = session_handle, uri = %endpoint_uri_for_monitor_event, "Session loop iteration. engine_ready={}, pipe_attached={}, shutdown_signal={}", self.engine_ready, self.pipe_attached, received_shutdown_signal);
+        tracing::debug!(handle = session_handle, uri = %endpoint_uri_for_monitor_event, "Session loop iteration. engine_ready={}, pipe_attached={}, shutdown_signal={}", self.engine_ready, self.pipe_attached, received_shutdown_signal);
+
         tokio::select! {
 
           biased;
@@ -284,6 +285,8 @@ impl SessionBase {
                   self.engine_task_handle = None;
                   received_shutdown_signal = true;
                 }
+                println!("THOUSAND YEARS OF WAR");
+                break;
               }
               Command::EnginePushCmd { msg } => {
                 if self.engine_ready {
@@ -390,12 +393,11 @@ impl SessionBase {
       }
     }
 
-    self.context.publish_actor_stopping(
-      session_handle,
-      actor_type,
-      Some(endpoint_uri_for_monitor_event),
-      error_to_report_on_stop,
-    );
+    if let Some(err) = error_to_report_on_stop {
+      actor_drop_guard.set_error(err);
+    } else {
+      actor_drop_guard.waive();
+    }
     tracing::info!(handle = session_handle, uri = %self.connected_endpoint_uri, "SessionBase actor fully stopped.");
   }
 

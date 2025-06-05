@@ -42,7 +42,6 @@ pub(crate) struct IpcListener {
 }
 
 impl IpcListener {
-  // ... (create_and_spawn method signature and initial setup remain similar)
   pub(crate) fn create_and_spawn(
     handle: usize,
     endpoint_uri: String, // User-provided URI
@@ -74,7 +73,6 @@ impl IpcListener {
 
     let accept_loop_parent_hdl = handle;
     let accept_loop_hdl_id = context.inner().next_handle();
-    let accept_loop_act_type = ActorType::AcceptLoop;
 
     let accept_loop_task_jh = tokio::spawn(IpcListener::run_accept_loop(
       accept_loop_hdl_id,
@@ -88,7 +86,6 @@ impl IpcListener {
       parent_socket_id,
       conn_limiter.clone(),
     ));
-    context.publish_actor_started(accept_loop_hdl_id, accept_loop_act_type, Some(accept_loop_parent_hdl));
 
     let listener_actor = IpcListener {
       handle,
@@ -100,20 +97,26 @@ impl IpcListener {
       parent_socket_id,
     };
 
-    let cmd_loop_jh = tokio::spawn(listener_actor.run_command_loop());
-    context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
+    let cmd_loop_jh = tokio::spawn(listener_actor.run_command_loop(parent_socket_id));
 
     Ok((tx, cmd_loop_jh, resolved_uri))
   }
 
   // ... (run_command_loop remains the same)
-  async fn run_command_loop(mut self) {
+  async fn run_command_loop(mut self, parent_handle_id: usize) {
     let listener_cmd_loop_handle = self.handle;
-    let listener_cmd_loop_actor_type = ActorType::Listener;
     let endpoint_uri_clone_log = self.endpoint.clone();
     let event_bus = self.context.event_bus();
     let mut system_event_rx = event_bus.subscribe();
     let listener_abort_handle = self.listener_handle.take();
+
+    let mut actor_drop_guard = ActorDropGuard::new(
+      self.context.clone(),
+      listener_cmd_loop_handle,
+      ActorType::Listener,
+      Some(endpoint_uri_clone_log.clone()),
+      Some(parent_handle_id),
+    );
 
     tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener command loop started");
     let mut final_error_for_actor_stopping: Option<ZmqError> = None;
@@ -184,12 +187,12 @@ impl IpcListener {
       }
     }
 
-    self.context.publish_actor_stopping(
-      listener_cmd_loop_handle,
-      listener_cmd_loop_actor_type,
-      Some(self.endpoint.clone()),
-      final_error_for_actor_stopping,
-    );
+    if let Some(err) = final_error_for_actor_stopping {
+      actor_drop_guard.set_error(err);
+    } else {
+      actor_drop_guard.waive();
+    }
+
     tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener command loop actor fully stopped.");
   }
 
@@ -205,12 +208,12 @@ impl IpcListener {
     parent_socket_core_id: usize,
     connection_limiter: Arc<Semaphore>,
   ) {
-    let accept_loop_actor_type = ActorType::AcceptLoop;
-    let actor_drop_guard = ActorDropGuard::new(
+    let mut actor_drop_guard = ActorDropGuard::new(
       context.clone(),
       accept_loop_handle,
-      accept_loop_actor_type,
+      ActorType::AcceptLoop,
       Some(endpoint_uri.clone()),
+      Some(parent_socket_core_id),
     );
     tracing::debug!(handle = accept_loop_handle, uri = %endpoint_uri, "IPC Accept loop started.");
     let mut loop_error_to_report: Option<ZmqError> = None;
@@ -341,13 +344,13 @@ impl IpcListener {
         }
       }
     }
-    actor_drop_guard.waive();
-    context.publish_actor_stopping(
-      accept_loop_handle,
-      accept_loop_actor_type,
-      Some(endpoint_uri),
-      loop_error_to_report,
-    );
+
+    if let Some(err) = loop_error_to_report {
+      actor_drop_guard.set_error(err);
+    } else {
+      actor_drop_guard.waive();
+    }
+
     tracing::info!("IPC Accept loop {} fully stopped.", accept_loop_handle);
   }
 }
@@ -399,7 +402,6 @@ impl IpcConnecter {
     context: Context,
     parent_socket_id: usize,
   ) -> JoinHandle<()> {
-    let actor_type = ActorType::Connecter;
     let connecter_actor = IpcConnecter {
       handle,
       endpoint_uri: endpoint_uri.clone(),
@@ -409,16 +411,22 @@ impl IpcConnecter {
       context: context.clone(),
       parent_socket_id,
     };
-    let task_join_handle = tokio::spawn(connecter_actor.run_connect_attempt(monitor_tx));
-    context.publish_actor_started(handle, actor_type, Some(parent_socket_id));
+    let task_join_handle = tokio::spawn(connecter_actor.run_connect_attempt(monitor_tx, parent_socket_id));
     task_join_handle
   }
 
-  async fn run_connect_attempt(mut self, monitor_tx: Option<MonitorSender>) {
+  async fn run_connect_attempt(self, monitor_tx: Option<MonitorSender>, parent_handle_id: usize) {
     let connecter_handle = self.handle;
-    let actor_type = ActorType::Connecter;
     let endpoint_uri_clone = self.endpoint_uri.clone();
     let mut final_error_for_actor_stop: Option<ZmqError> = None;
+
+    let mut actor_drop_guard = ActorDropGuard::new(
+      self.context.clone(),
+      connecter_handle,
+      ActorType::Connecter,
+      Some(endpoint_uri_clone.clone()),
+      Some(parent_handle_id),
+    );
 
     tracing::info!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, path = ?self.path, "IPC Connecter actor started.");
 
@@ -520,12 +528,11 @@ impl IpcConnecter {
     }
 
     tracing::info!(connecter_handle = connecter_handle, uri = %endpoint_uri_clone, "IPC Connecter actor finished.");
-    self.context.publish_actor_stopping(
-      connecter_handle,
-      actor_type,
-      Some(endpoint_uri_clone),
-      final_error_for_actor_stop,
-    );
+    if let Some(err) = final_error_for_actor_stop {
+      actor_drop_guard.set_error(err);
+    } else {
+      actor_drop_guard.waive();
+    }
     tracing::info!(connecter_handle = connecter_handle, uri = %self.endpoint_uri, "IPC Connecter actor fully stopped.");
   }
 }
@@ -544,7 +551,6 @@ pub(crate) fn create_and_spawn_ipc_engine_wrapper(
   context: &Context,
   session_handle_id: usize,
 ) -> (GenericMailboxSender, JoinHandle<()>) {
-  let engine_actor_type = ActorType::Engine;
   let (engine_command_mailbox, engine_task_join_handle) = crate::engine::zmtp_ipc::create_and_spawn_ipc_engine(
     engine_handle_id,
     session_cmd_mailbox,
@@ -554,6 +560,5 @@ pub(crate) fn create_and_spawn_ipc_engine_wrapper(
     context,
     session_handle_id,
   );
-  context.publish_actor_started(engine_handle_id, engine_actor_type, Some(session_handle_id));
   (engine_command_mailbox, engine_task_join_handle)
 }

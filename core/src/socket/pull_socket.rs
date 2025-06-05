@@ -12,12 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout as tokio_timeout;
 
-use crate::{delegate_to_core, Blob, MsgFlags}; // Added MsgFlags
+use crate::{delegate_to_core, Blob};
 
 #[derive(Debug)]
 pub(crate) struct PullSocket {
   core: Arc<SocketCore>,
-  // <<< MODIFIED [PullSocket uses FairQueue<Msg> to store individual incoming Msg frames] >>>
   incoming_message_queue: FairQueue<Msg>,
 }
 
@@ -26,7 +25,6 @@ impl PullSocket {
     let queue_capacity = { core.core_state.read().options.rcvhwm.max(1) }; // Scoped read
     Self {
       core,
-      // <<< MODIFIED [Initialize FairQueue<Msg>] >>>
       incoming_message_queue: FairQueue::new(queue_capacity),
     }
   }
@@ -57,6 +55,9 @@ impl ISocket for PullSocket {
   }
   async fn unbind(&self, endpoint: &str) -> Result<(), ZmqError> {
     delegate_to_core!(self, UserUnbind, endpoint: endpoint.to_string())
+  }
+  async fn close(&self) -> Result<(), ZmqError> {
+    delegate_to_core!(self, UserClose,)
   }
 
   async fn send(&self, _msg: Msg) -> Result<(), ZmqError> {
@@ -101,7 +102,6 @@ impl ISocket for PullSocket {
     Err(ZmqError::InvalidState("PULL sockets cannot send messages".into()))
   }
 
-  // <<< MODIFIED START [PullSocket::recv_multipart() implementation] >>>
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
@@ -180,16 +180,13 @@ impl ISocket for PullSocket {
       }
     }
   }
-  // <<< MODIFIED END >>>
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec())
   }
+
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     delegate_to_core!(self, UserGetOpt, option: option)
-  }
-  async fn close(&self) -> Result<(), ZmqError> {
-    delegate_to_core!(self, UserClose,)
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {

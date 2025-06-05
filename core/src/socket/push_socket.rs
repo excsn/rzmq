@@ -57,6 +57,9 @@ impl ISocket for PushSocket {
   async fn unbind(&self, endpoint: &str) -> Result<(), ZmqError> {
     delegate_to_core!(self, UserUnbind, endpoint: endpoint.to_string())
   }
+  async fn close(&self) -> Result<(), ZmqError> {
+    delegate_to_core!(self, UserClose,)
+  }
 
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
     if !self.core.is_running().await {
@@ -248,9 +251,6 @@ impl ISocket for PushSocket {
   }
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     delegate_to_core!(self, UserGetOpt, option: option)
-  }
-  async fn close(&self) -> Result<(), ZmqError> {
-    delegate_to_core!(self, UserClose,)
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {

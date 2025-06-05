@@ -91,4 +91,9 @@ impl<T: Send + 'static> FairQueue<T> {
   pub fn is_empty(&self) -> bool {
     self.receiver.is_empty()
   }
+
+  pub fn close(&self) {
+    self.sender.close();
+    self.receiver.close();
+  }
 }
