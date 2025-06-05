@@ -24,6 +24,7 @@ pub mod runtime;
 pub mod security;
 /// Manages individual connection sessions, bridging sockets and engines.
 pub mod session;
+pub mod sessionx;
 /// Defines socket types, options, and the core socket actor logic.
 pub mod socket;
 /// Deals with network transport layers (TCP, IPC, Inproc).

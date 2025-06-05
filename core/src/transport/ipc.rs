@@ -9,7 +9,6 @@ use crate::runtime::{
   mailbox, system_events::ConnectionInteractionModel, ActorDropGuard, ActorType, Command,
   MailboxReceiver as GenericMailboxReceiver, MailboxSender as GenericMailboxSender, SystemEvent,
 };
-use crate::socket::connection_iface::ISocketConnection;
 use crate::transport::ipc::create_and_spawn_ipc_engine_wrapper as create_and_spawn_ipc_engine;
 // EngineConnectionType for Command::Attach for standard path
 use crate::runtime::command::EngineConnectionType as CommandEngineConnectionType;
@@ -541,7 +540,6 @@ fn is_fatal_ipc_accept_error(e: &io::Error) -> bool {
   matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe)
 }
 
-// ... (create_and_spawn_ipc_engine_wrapper remains the same)
 pub(crate) fn create_and_spawn_ipc_engine_wrapper(
   engine_handle_id: usize,
   session_cmd_mailbox: GenericMailboxSender,

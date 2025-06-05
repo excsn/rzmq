@@ -8,7 +8,6 @@ use crate::message::Msg;
 use crate::runtime::{OneShotSender, SystemEvent};
 use crate::socket::core::pipe_manager::run_pipe_reader_task;
 use crate::socket::core::{EndpointInfo, EndpointType, SocketCore};
-use crate::socket::events::MonitorSender;
 use crate::socket::SocketEvent;
 
 use async_channel::bounded;

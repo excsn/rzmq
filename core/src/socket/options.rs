@@ -188,9 +188,8 @@ pub(crate) struct ZmtpEngineConfig {
   pub heartbeat_ivl: Option<Duration>,
   pub heartbeat_timeout: Option<Duration>,
   pub handshake_timeout: Option<Duration>,
-  // Add security mechanism choice later if needed
-  // pub security_mechanism: PlannedMechanismEnum,
-
+  pub rcvtimeo: Option<Duration>,
+  pub sndtimeo: Option<Duration>,
   // io-uring specific options
   pub use_send_zerocopy: bool,
   pub use_recv_multishot: bool,
@@ -205,6 +204,32 @@ pub(crate) struct ZmtpEngineConfig {
   pub use_plain: bool,
   pub plain_username_for_engine: Option<String>,
   pub plain_password_for_engine: Option<String>,
+}
+
+impl From<&SocketOptions> for ZmtpEngineConfig {
+  fn from(options: &SocketOptions) -> Self {
+    ZmtpEngineConfig {
+      routing_id: options.routing_id.clone(),
+      socket_type_name: options.socket_type_name.clone(),
+      heartbeat_ivl: options.heartbeat_ivl,
+      heartbeat_timeout: options.heartbeat_timeout,
+      handshake_timeout: options.handshake_ivl,
+      rcvtimeo: options.rcvtimeo,
+      sndtimeo: options.sndtimeo,
+      use_send_zerocopy: options.io_uring.send_zerocopy,
+      use_recv_multishot: options.io_uring.recv_multishot,
+      use_cork: options.tcp_cork,
+      #[cfg(feature = "noise_xx")]
+      use_noise_xx: options.noise_xx_options.enabled,
+      #[cfg(feature = "noise_xx")]
+      noise_xx_local_sk_bytes_for_engine: options.noise_xx_options.static_secret_key_bytes,
+      #[cfg(feature = "noise_xx")]
+      noise_xx_remote_pk_bytes_for_engine: options.noise_xx_options.remote_static_public_key_bytes,
+      use_plain: options.plain_options.enabled,
+      plain_username_for_engine: options.plain_options.username.clone(),
+      plain_password_for_engine: options.plain_options.password.clone(),
+    }
+  }
 }
 
 // --- Helper functions for parsing option values ---
