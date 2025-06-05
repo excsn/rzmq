@@ -9,10 +9,12 @@ use crate::runtime::{
   MailboxReceiver as GenericMailboxReceiver, MailboxSender as GenericMailboxSender, SystemEvent,
 };
 use crate::session::SessionBase;
+use crate::sessionx::actor::SessionConnectionActorX;
+use crate::sessionx::states::ActorConfigX;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::socket::options::{SocketOptions, TcpTransportConfig, ZmtpEngineConfig};
-use crate::socket::DEFAULT_RECONNECT_IVL_MS;
+use crate::socket::{ISocket, DEFAULT_RECONNECT_IVL_MS};
 
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSender;
@@ -28,6 +30,7 @@ use std::os::unix::io::{AsRawFd, IntoRawFd};
 #[cfg(feature = "io-uring")]
 use tokio::sync::oneshot as tokio_oneshot;
 
+use core::fmt;
 use std::io;
 use std::net::SocketAddr as StdSocketAddr;
 use std::sync::Arc;
@@ -45,8 +48,6 @@ mod underlying_std_net {
 }
 
 // --- TcpListener Actor ---
-// ... (TcpListener struct definition remains the same)
-#[derive(Debug)]
 pub(crate) struct TcpListener {
   handle: usize,
   endpoint: String,
@@ -54,6 +55,21 @@ pub(crate) struct TcpListener {
   listener_handle: JoinHandle<()>,
   context: Context,
   parent_socket_id: usize,
+  socket_logic: Arc<dyn ISocket>,
+}
+
+impl fmt::Debug for TcpListener {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TcpListener")
+      .field("handle", &self.handle)
+      .field("endpoint", &self.endpoint)
+      .field("mailbox_receiver_is_closed", &self.mailbox_receiver.is_closed())
+      .field("listener_handle_is_finished", &self.listener_handle.is_finished())
+      .field("context_present", &true)
+      .field("parent_socket_id", &self.parent_socket_id)
+      .field("socket_logic_present", &true)
+      .finish()
+  }
 }
 
 impl TcpListener {
@@ -61,6 +77,7 @@ impl TcpListener {
     handle: usize,
     endpoint: String,
     options: Arc<SocketOptions>,
+    socket_logic: Arc<dyn ISocket>,
     context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
     monitor_tx: Option<MonitorSender>,
     context: Context,
@@ -134,6 +151,7 @@ impl TcpListener {
       Arc::new(tokio_listener),
       transport_cfg.clone(),
       options.clone(),
+      socket_logic.clone(),
       context_handle_source.clone(),
       monitor_tx.clone(),
       context.clone(),
@@ -148,6 +166,7 @@ impl TcpListener {
       listener_handle: accept_loop_task_jh,
       context: context.clone(),
       parent_socket_id,
+      socket_logic,
     };
 
     let cmd_loop_jh = tokio::spawn(listener_actor.run_command_loop(parent_socket_id));
@@ -248,6 +267,7 @@ impl TcpListener {
     listener: Arc<underlying_std_net::TcpListener>,
     transport_config: TcpTransportConfig,
     socket_options: Arc<SocketOptions>,
+    socket_logic: Arc<dyn ISocket>,
     handle_source: Arc<std::sync::atomic::AtomicUsize>,
     monitor_tx: Option<MonitorSender>,
     context: Context,
@@ -307,6 +327,7 @@ impl TcpListener {
             let handle_source_clone = handle_source.clone();
             let actual_connected_uri = connection_specific_uri.clone();
             let logical_uri = endpoint_uri_listener.to_string(); // e.g., "tcp://127.0.0.1:5558"
+            let socket_logic = socket_logic.clone();
 
             async move {
               let _permit_scoped_for_task = _permit_guard;
@@ -315,6 +336,7 @@ impl TcpListener {
               let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
               let mut managing_actor_task_id_for_event: Option<TaskId> = None;
               let mut setup_successful = true;
+              let mut sca_or_session_join_handle_opt: Option<JoinHandle<()>> = None;
 
               if use_io_uring_for_session {
                 #[cfg(feature = "io-uring")]
@@ -429,48 +451,36 @@ impl TcpListener {
                   );
                   setup_successful = false;
                 } else {
-                  let session_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                  let engine_hdl_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                  let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
-                    session_hdl_id,
-                    actual_connected_uri.clone(),
-                    logical_uri.clone(),
-                    monitor_tx_clone.clone(),
-                    context_clone.clone(),
-                    parent_socket_core_id,
-                  );
-
-                  managing_actor_task_id_for_event = Some(session_task_hdl.id());
-                  connection_iface_for_event = None;
-                  interaction_model_for_event = Some(ConnectionInteractionModel::ViaSessionActor {
-                    session_actor_mailbox: session_cmd_mailbox.clone(),
-                    session_actor_handle_id: session_hdl_id, // Pass the session's handle ID
-                  });
-
-                  // Attach Engine to Session
-                  let (engine_mb, engine_task_hdl) = create_and_spawn_tcp_engine(
-                    engine_hdl_id,
-                    session_cmd_mailbox.clone(),
-                    tokio_tcp_stream,
-                    socket_options_clone.clone(),
-                    true,
-                    &context_clone,
-                    session_hdl_id,
-                  );
-                  let attach_engine_cmd = Command::Attach {
-                    connection: CommandEngineConnectionType::Standard {
-                      engine_mailbox: engine_mb,
-                    },
-                    engine_handle: Some(engine_hdl_id),
-                    engine_task_handle: Some(engine_task_hdl),
+                  let sca_handle_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                  let actor_conf = ActorConfigX {
+                    context: context_clone.clone(),
+                    monitor_tx: monitor_tx_clone,
+                    logical_target_endpoint_uri: logical_uri.clone(), // Was `logical_uri` in your original
+                    connected_endpoint_uri: actual_connected_uri.clone(),
+                    is_server_role: true,
                   };
-                  if session_cmd_mailbox.send(attach_engine_cmd).await.is_err() {
-                    tracing::error!("AttachEngine to Session {} failed.", session_hdl_id);
-                    session_task_hdl.abort();
-                    setup_successful = false;
-                  }
-                  // No SessionConnection constructed here by Listener
+                  let engine_conf = Arc::new(ZmtpEngineConfig::from(&*socket_options_clone));
+
+                  let (command_sender_for_sca, command_receiver_for_sca) =
+                    mailbox(context_clone.inner().get_actor_mailbox_capacity());
+
+                  // tokio_tcp_stream is moved into SessionConnectionActorX
+                  let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+                    sca_handle_id,
+                    parent_socket_core_id,
+                    tokio_tcp_stream,
+                    actor_conf,
+                    engine_conf,
+                    command_receiver_for_sca,
+                    socket_logic,
+                  );
+
+                  interaction_model_for_event = Some(ConnectionInteractionModel::ViaSca {
+                    sca_mailbox: command_sender_for_sca,
+                    sca_handle_id,
+                  });
+                  managing_actor_task_id_for_event = Some(sca_task_handle.id());
+                  connection_iface_for_event = None; // SocketCore creates ScaConnectionIface
                 }
               }
 
@@ -546,29 +556,42 @@ type UnifiedConnectOutcome = (
   String,         // actual_peer_uri
 );
 
-#[derive(Debug)]
 pub(crate) struct TcpConnecter {
   handle: usize,
   endpoint: String,
   config: TcpTransportConfig,
   context_options: Arc<SocketOptions>,
+  socket_logic: Arc<dyn ISocket>,
   context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
   context: Context,
   parent_socket_id: usize,
 }
 
+impl fmt::Debug for TcpConnecter {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TcpConnecter")
+      .field("handle", &self.handle)
+      .field("endpoint", &self.endpoint)
+      .field("config", &self.config)
+      .field("context_options", &self.context_options)
+      .field("socket_logic_present", &true)
+      .field("context_present", &true)
+      .field("parent_socket_id", &self.parent_socket_id)
+      .finish()
+  }
+}
+
 impl TcpConnecter {
-  // ... (create_and_spawn method remains the same)
   pub(crate) fn create_and_spawn(
     handle: usize,
     endpoint: String,
     options: Arc<SocketOptions>,
+    socket_logic: Arc<dyn ISocket>,
     context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
     monitor_tx: Option<MonitorSender>,
     context: Context,
     parent_socket_id: usize,
   ) -> JoinHandle<()> {
-    let actor_type = ActorType::Connecter;
     let transport_config = TcpTransportConfig {
       tcp_nodelay: options.tcp_nodelay,
       keepalive_time: options.tcp_keepalive_idle,
@@ -580,6 +603,7 @@ impl TcpConnecter {
       endpoint: endpoint.clone(),
       config: transport_config,
       context_options: options,
+      socket_logic,
       context_handle_source,
       context: context.clone(),
       parent_socket_id,
@@ -948,56 +972,45 @@ impl TcpConnecter {
         apply_tcp_socket_options_to_tokio(&std_tokio_stream, &self.config)?;
 
         let actual_connected_uri = format!("tcp://{}", peer_addr_actual);
-        let logical_uri_for_monitor = endpoint_uri_original.to_string();
 
-        let session_hdl_id = self
+        let sca_handle_id = self
           .context_handle_source
           .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let engine_hdl_id = self
-          .context_handle_source
-          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let actor_conf = ActorConfigX {
+          context: self.context.clone(),
+          monitor_tx: monitor_tx.clone(), // Pass the Connecter's monitor_tx
+          logical_target_endpoint_uri: endpoint_uri_original.to_string(),
+          connected_endpoint_uri: actual_connected_uri.clone(),
+          is_server_role: false, // Outgoing connection is client role
+        };
+        let engine_conf = Arc::new(ZmtpEngineConfig::from(&*self.context_options));
 
-        let (session_cmd_mailbox, session_task_hdl) = SessionBase::create_and_spawn(
-          session_hdl_id,
-          actual_connected_uri,
-          logical_uri_for_monitor,
-          monitor_tx.clone(),
-          self.context.clone(),
+        // Create a standard Command mailbox for the SCA
+        let (command_sender_for_sca, command_receiver_for_sca) =
+          mailbox(self.context.inner().get_actor_mailbox_capacity());
+
+        // tokio_tcp_stream is moved into SessionConnectionActorX here
+        let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+          sca_handle_id,
           self.parent_socket_id,
-        );
-
-        // Attach Engine
-        let (engine_mb, engine_task_hdl) = create_and_spawn_tcp_engine(
-          engine_hdl_id,
-          session_cmd_mailbox.clone(),
           std_tokio_stream,
-          self.context_options.clone(),
-          false,
-          &self.context,
-          session_hdl_id,
+          actor_conf,
+          engine_conf,
+          command_receiver_for_sca,
+          self.socket_logic.clone(),
         );
-        let attach_engine_cmd = Command::Attach {
-          connection: CommandEngineConnectionType::Standard {
-            engine_mailbox: engine_mb,
-          },
-          engine_handle: Some(engine_hdl_id),
-          engine_task_handle: Some(engine_task_hdl),
-        };
-        if session_cmd_mailbox.send(attach_engine_cmd).await.is_err() {
-          session_task_hdl.abort();
-          return Err(ZmqError::Internal("Failed AttachEngine to Session".into()));
-        }
 
-        let connection_iface = None;
-        let interaction_model = ConnectionInteractionModel::ViaSessionActor {
-          session_actor_mailbox: session_cmd_mailbox,
-          session_actor_handle_id: session_hdl_id,
+        // Populate variables for the common return structure
+        let interaction_model = ConnectionInteractionModel::ViaSca {
+          sca_mailbox: command_sender_for_sca, // SocketCore uses this to send Command::ScaInitializePipes
+          sca_handle_id,
         };
+        let connection_iface = None;
 
         Ok((
           connection_iface,
           interaction_model,
-          Some(session_task_hdl.id()),
+          Some(sca_task_handle.id()),
           format!("tcp://{}", peer_addr_actual),
         ))
       }

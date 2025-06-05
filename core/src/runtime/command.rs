@@ -151,6 +151,16 @@ pub enum Command {
     /// The ID the Session uses to write to its pipe (SocketCore reads from this ID).
     pipe_write_id: usize,
   },
+
+  /// Sent from SocketCore -> SessionConnectionActorX to provide its pipes and routing info.
+  ScaInitializePipes {
+    /// The unique handle of the target SessionConnectionActorX.
+    sca_handle_id: usize,
+    /// Channel for SCA to receive Msgs (outgoing data) from SocketCore.
+    rx_from_core: AsyncReceiver<Msg>,
+    /// The ID the SCA should use in the `pipe_id` field when calling `ISocket::handle_pipe_event`.
+    core_pipe_read_id_for_incoming_routing: usize,
+  },
   #[cfg(feature = "io-uring")]
   UringFdMessage { fd: RawFd, msg: Msg },
   #[cfg(feature = "io-uring")]
@@ -189,6 +199,7 @@ impl Command {
       Command::PipeMessageReceived { .. } => "PipeMessageReceived",
       Command::PipeClosedByPeer { .. } => "PipeClosedByPeer",
       Command::AttachPipe { .. } => "AttachPipe",
+      Command::ScaInitializePipes { .. } => "ScaInitializePipes",
       #[cfg(feature = "io-uring")]
       Command::UringFdMessage { .. } => "UringFdMessage",
       #[cfg(feature = "io-uring")]

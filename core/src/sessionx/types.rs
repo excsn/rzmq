@@ -44,22 +44,3 @@ pub(crate) enum HandshakeSubPhaseX {
   ReadyExchange,
   Done,
 }
-
-// <<< ADDED [Module for SessionConnectionActorX related command variants] >>>
-/// Commands specific to the SessionConnectionActorX, typically sent by SocketCore.
-#[derive(Debug)]
-pub(crate) enum ScaCommand {
-  /// Provides the SessionConnectionActorX with the necessary channels and IDs
-  /// to communicate back and forth with the SocketCore.
-  AttachPipesAndRoutingInfo {
-    /// Channel to receive outgoing application messages from SocketCore.
-    rx_from_core: async_channel::Receiver<crate::Msg>,
-    /// Mailbox of the parent SocketCore to send incoming messages (as Commands) to.
-    parent_socket_core_mailbox: crate::runtime::MailboxSender,
-    /// The ID that SocketCore uses to identify this connection for messages
-    /// flowing from this actor *to* SocketCore.
-    core_pipe_read_id_for_incoming_routing: usize,
-  },
-  /// Command to initiate a graceful shutdown of the connection.
-  Stop,
-}

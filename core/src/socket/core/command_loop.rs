@@ -20,7 +20,6 @@ pub(crate) async fn run_command_loop(
   mut system_event_rx: broadcast::Receiver<SystemEvent>, // Event bus receiver
 ) {
   let core_handle = core_arc.handle;
-  let core_actor_type = ActorType::SocketCore;
   let context_clone_for_stop = core_arc.context.clone(); // For publishing ActorStopping
   let socket_type_for_log = core_arc.core_state.read().socket_type; // Get once for logging
 
@@ -207,12 +206,6 @@ pub(crate) async fn run_command_loop(
   // This needs to be done carefully if context itself is shutting down.
   // ContextInner::unregister_socket should be robust.
   core_arc.context.inner().unregister_socket(core_handle);
-
-  if let Some(socket) = core_arc.socket_logic.read().await.as_ref() {
-    if let Some(socket) = socket.upgrade(){
-      socket.close().await;
-    }
-  }
 
   // Unregister any bound inproc names.
   #[cfg(feature = "inproc")]

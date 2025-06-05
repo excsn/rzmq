@@ -80,13 +80,13 @@ pub(crate) async fn process_socket_command(
   // --- SocketCore is Running ---
   match command {
     Command::UserBind { endpoint, reply_tx } => {
-      handle_user_bind(core_arc, endpoint, reply_tx).await;
+      handle_user_bind(core_arc, socket_logic_strong.clone(), endpoint, reply_tx).await;
     }
     Command::UserConnect { endpoint, reply_tx } => {
-      handle_user_connect(core_arc, endpoint, reply_tx).await;
+      handle_user_connect(core_arc, socket_logic_strong.clone(), endpoint, reply_tx).await;
     }
     Command::UserDisconnect { endpoint, reply_tx } => {
-      handle_user_disconnect(core_arc, socket_logic_strong, endpoint, reply_tx).await;
+      handle_user_disconnect(core_arc, endpoint, reply_tx).await;
     }
     Command::UserUnbind { endpoint, reply_tx } => {
       handle_user_unbind(core_arc, socket_logic_strong, endpoint, reply_tx).await;
@@ -268,6 +268,7 @@ pub(crate) async fn process_socket_command(
 
 async fn handle_user_bind(
   core_arc: Arc<SocketCore>,
+  socket_logic: Arc<dyn ISocket>,
   endpoint: String,
   reply_tx: oneshot::Sender<Result<(), ZmqError>>,
 ) {
@@ -298,6 +299,7 @@ async fn handle_user_bind(
           child_actor_handle,
           endpoint.clone(), // User provided endpoint for listener creation
           options_clone,
+          socket_logic,
           context_clone.inner().next_handle.clone(), // For unique ID generation within listener
           monitor_tx_clone,
           context_clone.clone(),
@@ -350,6 +352,7 @@ async fn handle_user_bind(
           endpoint.clone(), // User provided
           path_buf.clone(),
           options_clone,
+          socket_logic,
           context_clone.inner().next_handle.clone(),
           monitor_tx_clone,
           context_clone.clone(),
@@ -431,6 +434,7 @@ async fn handle_user_bind(
 
 async fn handle_user_connect(
   core_arc: Arc<SocketCore>,
+  socket_logic: Arc<dyn ISocket>,
   endpoint_uri: String, // User-provided URI
   reply_tx: oneshot::Sender<Result<(), ZmqError>>,
 ) {
@@ -442,7 +446,7 @@ async fn handle_user_connect(
     Ok(Endpoint::Tcp(_, ref parsed_uri_for_connecter)) | Ok(Endpoint::Ipc(_, ref parsed_uri_for_connecter)) => {
       // For TCP/IPC, spawn a Connecter actor.
       // The URI passed to respawn_connecter_actor should be the one used for connection attempts.
-      respawn_connecter_actor(core_arc.clone(), parsed_uri_for_connecter.clone()).await;
+      respawn_connecter_actor(core_arc.clone(), socket_logic, parsed_uri_for_connecter.clone()).await;
       let _ = reply_tx.send(Ok(())); // UserConnect is async, Ok(()) means attempt initiated.
     }
     #[cfg(feature = "inproc")]
@@ -467,7 +471,8 @@ async fn handle_user_connect(
 
 /// Spawns a new connecter actor for the given target URI.
 /// This is called by `handle_user_connect` and potentially by `cleanup_stopped_child_resources` for reconnects.
-pub(crate) async fn respawn_connecter_actor(core_arc: Arc<SocketCore>, target_uri: String) {
+pub(crate) async fn respawn_connecter_actor(core_arc: Arc<SocketCore>,
+    socket_logic: Arc<dyn ISocket>, target_uri: String) {
   let core_handle = core_arc.handle;
   let parent_socket_id = core_handle; // SocketCore is the parent
   let context_clone = core_arc.context.clone();
@@ -489,6 +494,7 @@ pub(crate) async fn respawn_connecter_actor(core_arc: Arc<SocketCore>, target_ur
         connecter_actor_handle,
         target_uri.clone(), // Pass the target_uri
         options_clone,
+          socket_logic,
         handle_source_clone,
         monitor_tx_clone,
         context_clone,
@@ -510,6 +516,7 @@ pub(crate) async fn respawn_connecter_actor(core_arc: Arc<SocketCore>, target_ur
         target_uri.clone(),
         path_buf,
         options_clone,
+          socket_logic,
         handle_source_clone,
         monitor_tx_clone,
         context_clone,
@@ -538,7 +545,7 @@ pub(crate) async fn respawn_connecter_actor(core_arc: Arc<SocketCore>, target_ur
 }
 
 /// Handles the ConnectionAttemptFailed system event.
-pub(crate) async fn handle_connect_failed_event(core_arc: Arc<SocketCore>, target_uri: String, error: ZmqError) {
+pub(crate) async fn handle_connect_failed_event(core_arc: Arc<SocketCore>, socket_logic: Arc<dyn ISocket + 'static>, target_uri: String, error: ZmqError) {
   let core_handle = core_arc.handle;
   tracing::warn!(handle = core_handle, uri = %target_uri, error = %error, "ConnectionAttemptFailed event received.");
 
@@ -563,7 +570,7 @@ pub(crate) async fn handle_connect_failed_event(core_arc: Arc<SocketCore>, targe
     // The Connecter's own loop implements the retry delays.
     // If ConnectionAttemptFailed means the Connecter actor *itself* has stopped, then we respawn.
     // This implies ConnectionAttemptFailed is usually published by a Connecter just before it stops.
-    respawn_connecter_actor(core_arc, target_uri).await;
+    respawn_connecter_actor(core_arc, socket_logic, target_uri).await;
   } else {
     tracing::info!(handle = core_handle, uri = %target_uri, "Connection failed, reconnect not enabled or error is fatal.");
   }
@@ -571,7 +578,6 @@ pub(crate) async fn handle_connect_failed_event(core_arc: Arc<SocketCore>, targe
 
 async fn handle_user_disconnect(
   core_arc: Arc<SocketCore>,
-  socket_logic_strong: &Arc<dyn ISocket>,
   endpoint: String,
   reply_tx: oneshot::Sender<Result<(), ZmqError>>,
 ) {

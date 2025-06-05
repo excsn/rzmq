@@ -2,7 +2,12 @@
 
 //! Type aliases for actor communication channels based on `async-channel`.
 
-use crate::{runtime::command::Command, sessionx::ScaCommand}; // Import the Command enum that these mailboxes will carry.
+use crate::runtime::command::Command;
+
+/// Default capacity for bounded mailboxes created by the `mailbox()` helper function.
+/// This capacity applies to the single mailbox used by `SocketCore` and other simpler actors.
+/// It can be tuned based on expected load and performance characteristics.
+pub const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
 
 /// The sending end of an actor's mailbox.
 /// It is cloneable, allowing multiple actors or tasks to send commands to the same mailbox.
@@ -11,21 +16,6 @@ pub type MailboxSender = async_channel::Sender<Command>;
 /// The receiving end of an actor's mailbox.
 /// Only one task should typically own and receive from a `MailboxReceiver` to process commands sequentially.
 pub type MailboxReceiver = async_channel::Receiver<Command>;
-
-/// The sending end of a SessionConnectionActorX's mailbox.
-pub type ScaMailboxSender = async_channel::Sender<ScaCommand>;
-
-/// The receiving end of a SessionConnectionActorX's mailbox.
-pub type ScaMailboxReceiver = async_channel::Receiver<ScaCommand>;
-
-/// Creates a new bounded mailbox channel pair specifically for ScaCommand.
-pub fn sca_mailbox(capacity: usize) -> (ScaMailboxSender, ScaMailboxReceiver) {
-  async_channel::bounded(capacity.max(1))
-}
-/// Default capacity for bounded mailboxes created by the `mailbox()` helper function.
-/// This capacity applies to the single mailbox used by `SocketCore` and other simpler actors.
-/// It can be tuned based on expected load and performance characteristics.
-pub const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
 
 // Note: The `SocketMailbox` struct and its associated constants
 // (DEFAULT_SYSTEM_MAILBOX_CAPACITY, DEFAULT_USER_MAILBOX_CAPACITY)

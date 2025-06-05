@@ -5,30 +5,26 @@
 use crate::engine::ZmtpStdStream;
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::runtime::{
-  ActorDropGuard, ActorType, Command as GlobalCommand, SystemEvent,
-};
-use crate::runtime::mailbox::{ScaMailboxReceiver, ScaMailboxSender}; // Using specific types
+use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};
 use crate::socket::options::ZmtpEngineConfig;
-use crate::Blob;
+use crate::socket::ISocket;
+use crate::{Blob, MailboxReceiver};
 
 use bytes::BytesMut;
 use futures::FutureExt; // Not directly used here, but kept for consistency if needed later
+use std::fmt::Debug; // For Debug bound on S
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd; // For AsRawFd bound if S needs it for cork_info init
-use std::fmt::Debug;     // For Debug bound on S
 use std::sync::Arc;
 use std::time::Instant as StdInstant; // Explicitly use StdInstant for clarity
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
-
 use super::pipe_manager::CorePipeManagerX;
 use super::protocol_handler::ZmtpProtocolHandlerX;
 use super::states::ActorConfigX;
-use super::types::{ConnectionPhaseX, ScaCommand, ZmtpHandshakeProgressX};
-
+use super::types::{ConnectionPhaseX, ZmtpHandshakeProgressX};
 
 // SessionConnectionActorX might not need to be Debug itself if not printed directly.
 // If it is, S would need to be Debug. Let's assume for now it doesn't need direct Debug.
@@ -37,12 +33,12 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   current_phase: ConnectionPhaseX,
   parent_socket_id: usize,
   actor_config: ActorConfigX, // Contains context, monitor_tx, uris, is_server
-  
+
   // ZmtpProtocolHandlerX constructor now takes Arc<ZmtpEngineConfig>
   zmtp_handler: ZmtpProtocolHandlerX<S>,
   core_pipe_manager: CorePipeManagerX,
 
-  command_mailbox_receiver: ScaMailboxReceiver,
+  command_mailbox_receiver: MailboxReceiver,
   system_event_receiver: broadcast::Receiver<SystemEvent>,
 
   pending_peer_identity_from_handshake: Option<Blob>,
@@ -52,15 +48,12 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   // pong_timeout_sleep is a one-shot future, created when needed
   // No field for pong_timeout_timer needed if we use Sleep::new_timeout approach.
 
-  // <<< ADDED [State for managing TCP_CORK hint] >>>
   // This flag indicates if the *next* ZMTP frame to be sent out via zmtp_handler.write_data_msg
   // is the first frame of a new logical ZMQ message.
   is_next_outgoing_frame_first_of_zmq_msg: bool,
-  // <<< ADDED END >>>
 
-  // <<< ADDED [Overall handshake timeout tracking] >>>
   handshake_deadline: Option<TokioInstant>,
-  // <<< ADDED END >>>
+  socket_logic: Arc<dyn ISocket>,
 }
 
 // Add AsRawFd bound here if ZmtpProtocolHandlerX::new needs it for cork setup.
@@ -78,28 +71,28 @@ where
     stream: S, // Consumes the stream
     actor_config: ActorConfigX,
     engine_config: Arc<ZmtpEngineConfig>,
-    command_mailbox_receiver: ScaMailboxReceiver,
-    // System event receiver is subscribed by the actor itself in run_loop.
-    // The creator (Listener/Connecter) should provide the Context.
-  ) -> JoinHandle<()> { // Returns JoinHandle for the SCA task
-    
+    command_mailbox_receiver: MailboxReceiver,
+    socket_logic: Arc<dyn ISocket>,
+  ) -> JoinHandle<()> {
+    // Returns JoinHandle for the SCA task
+
     let zmtp_handler = ZmtpProtocolHandlerX::new(
-        stream, 
-        engine_config.clone(), // ZmtpProtocolHandlerX clones Arc
-        actor_config.is_server_role,
-        handle, // Pass actor handle for logging within ZmtpProtocolHandlerX
+      stream,
+      engine_config.clone(), // ZmtpProtocolHandlerX clones Arc
+      actor_config.is_server_role,
+      handle, // Pass actor handle for logging within ZmtpProtocolHandlerX
     );
 
     let mut ping_check_timer = None;
     if let Some(ivl) = engine_config.heartbeat_ivl {
-        if !ivl.is_zero() {
-            // Start timer such that the first tick is after `ivl` from now.
-            let mut timer = tokio::time::interval_at(TokioInstant::now() + ivl, ivl);
-            timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            ping_check_timer = Some(timer);
-        }
+      if !ivl.is_zero() {
+        // Start timer such that the first tick is after `ivl` from now.
+        let mut timer = tokio::time::interval_at(TokioInstant::now() + ivl, ivl);
+        timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ping_check_timer = Some(timer);
+      }
     }
-    
+
     // Overall handshake timeout
     let handshake_deadline = engine_config.handshake_timeout.map(|d| TokioInstant::now() + d);
 
@@ -119,6 +112,7 @@ where
       ping_check_timer,
       is_next_outgoing_frame_first_of_zmq_msg: true, // Initially, any outgoing is first
       handshake_deadline,
+      socket_logic,
     };
 
     let task_handle = tokio::spawn(actor.run_loop());
@@ -145,20 +139,19 @@ where
     while self.current_phase != ConnectionPhaseX::Terminating {
       let mut pong_timeout_future = futures::future::pending().left_future();
       if self.current_phase == ConnectionPhaseX::Operational && self.zmtp_handler.heartbeat_state.waiting_for_pong {
-          if let Some(deadline_std) = self.zmtp_handler.heartbeat_state.get_pong_deadline() {
-              // Convert std::time::Instant to tokio::time::Instant
-              let deadline_tokio = TokioInstant::from_std(deadline_std);
-              pong_timeout_future = tokio::time::sleep_until(deadline_tokio).right_future();
-          }
+        if let Some(deadline_std) = self.zmtp_handler.heartbeat_state.get_pong_deadline() {
+          // Convert std::time::Instant to tokio::time::Instant
+          let deadline_tokio = TokioInstant::from_std(deadline_std);
+          pong_timeout_future = tokio::time::sleep_until(deadline_tokio).right_future();
+        }
       }
 
       let mut overall_handshake_timeout_future = futures::future::pending().left_future();
       if self.current_phase == ConnectionPhaseX::HandshakeInProgress {
-          if let Some(deadline) = self.handshake_deadline {
-              overall_handshake_timeout_future = tokio::time::sleep_until(deadline).right_future();
-          }
+        if let Some(deadline) = self.handshake_deadline {
+          overall_handshake_timeout_future = tokio::time::sleep_until(deadline).right_future();
+        }
       }
-
 
       tokio::select! {
         biased;
@@ -166,7 +159,7 @@ where
         // --- ARM 1: Control Commands (AttachPipes, Stop) ---
         maybe_cmd = self.command_mailbox_receiver.recv(), if !matches!(self.current_phase, ConnectionPhaseX::Terminating) => {
           match maybe_cmd {
-            Ok(command) => self.process_sca_command(command).await,
+            Ok(command) => self.process_command(command).await,
             Err(_) => {
               tracing::info!(sca_handle = self.handle, "SCA Command mailbox closed.");
               self.transition_to_shutdown_stream(None).await;
@@ -186,7 +179,7 @@ where
             }
           }
         }
-        
+
         // --- ARM 3: Overall Handshake Timeout ---
         _ = overall_handshake_timeout_future, if self.current_phase == ConnectionPhaseX::HandshakeInProgress && self.handshake_deadline.is_some() => {
             tracing::warn!(sca_handle = self.handle, uri = %self.actor_config.connected_endpoint_uri, "Overall ZMTP handshake timed out.");
@@ -203,7 +196,7 @@ where
           if self.current_phase == ConnectionPhaseX::Operational && self.core_pipe_manager.is_attached() => {
           match maybe_msg_from_core {
             Ok(msg) => self.handle_outgoing_from_core(msg).await,
-            Err(_) => { 
+            Err(_) => {
               tracing::info!(sca_handle = self.handle, "Pipe from SocketCore closed.");
               self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await; // Or Internal error
             }
@@ -247,10 +240,15 @@ where
       }
     }
 
-    tracing::info!(sca_handle = self.handle, "SCA loop finished. Final phase: {:?}.", self.current_phase);
+    tracing::info!(
+      sca_handle = self.handle,
+      "SCA loop finished. Final phase: {:?}.",
+      self.current_phase
+    );
     // Post-loop cleanup (already initiated if error/stop occurred, this is a final catch-all)
-    if self.current_phase != ConnectionPhaseX::Terminating { // If loop exited for other reasons
-        self.perform_final_cleanup_actions().await;
+    if self.current_phase != ConnectionPhaseX::Terminating {
+      // If loop exited for other reasons
+      self.perform_final_cleanup_actions().await;
     }
 
     if let Some(err) = self.error_for_drop_guard.take() {
@@ -258,35 +256,70 @@ where
     } else {
       actor_drop_guard.waive();
     }
-    tracing::info!(sca_handle = self.handle, "SCA {} fully stopped.", self.actor_config.connected_endpoint_uri);
+    tracing::info!(
+      sca_handle = self.handle,
+      "SCA {} fully stopped.",
+      self.actor_config.connected_endpoint_uri
+    );
   }
 
   // --- Helper Methods for select! Arms & State Transitions ---
 
-  async fn process_sca_command(&mut self, command: ScaCommand) {
+  async fn process_command(&mut self, command: Command) {
     tracing::debug!(sca_handle = self.handle, "Processing ScaCommand: {:?}", command);
     match command {
-      ScaCommand::AttachPipesAndRoutingInfo {
-        rx_from_core, parent_socket_core_mailbox, core_pipe_read_id_for_incoming_routing,
+      Command::ScaInitializePipes {
+        sca_handle_id, // Used to verify command is for this actor instance
+        rx_from_core,
+        core_pipe_read_id_for_incoming_routing,
       } => {
-        if self.core_pipe_manager.is_attached() {
-          tracing::warn!(sca_handle = self.handle, "Already attached. Ignoring AttachPipes.");
+        if self.handle != sca_handle_id {
+          tracing::warn!(
+            sca_handle = self.handle,
+            expected_id = sca_handle_id,
+            "Received ScaInitializePipes for wrong actor. Ignoring."
+          );
+          // Important: Drop rx_from_core to prevent resource leak if it's not used
+          drop(rx_from_core);
           return;
         }
-        self.core_pipe_manager.attach(rx_from_core, parent_socket_core_mailbox, core_pipe_read_id_for_incoming_routing);
-        tracing::info!(sca_handle = self.handle, "Core pipes attached. Read ID: {}", core_pipe_read_id_for_incoming_routing);
-        
+        if self.core_pipe_manager.is_attached() {
+          tracing::warn!(
+            sca_handle = self.handle,
+            "Already attached. Ignoring ScaInitializePipes."
+          );
+          drop(rx_from_core); // Still drop the provided channels
+          return;
+        }
+        self.core_pipe_manager.attach(
+          rx_from_core,
+          core_pipe_read_id_for_incoming_routing,
+        );
+        tracing::info!(
+          sca_handle = self.handle,
+          core_read_id = core_pipe_read_id_for_incoming_routing,
+          "Core pipes attached via ScaInitializePipes."
+        );
+
         if self.current_phase == ConnectionPhaseX::WaitingForPipes {
           self.check_and_transition_to_operational().await;
-        } else if self.current_phase == ConnectionPhaseX::HandshakeInProgress && self.zmtp_handler.is_handshake_complete() {
-          // Handshake finished just before pipes, common scenario
-          self.current_phase = ConnectionPhaseX::WaitingForPipes; // Formally enter waiting
+        } else if self.current_phase == ConnectionPhaseX::HandshakeInProgress
+          && self.zmtp_handler.is_handshake_complete()
+        {
+          self.current_phase = ConnectionPhaseX::WaitingForPipes;
           self.check_and_transition_to_operational().await;
         }
       }
-      ScaCommand::Stop => {
+      Command::Stop => {
         tracing::info!(sca_handle = self.handle, "Received Stop command.");
         self.transition_to_shutdown_stream(None).await;
+      }
+      unexpected_cmd => {
+        tracing::warn!(
+          sca_handle = self.handle,
+          "Received unexpected Command variant: {:?}",
+          unexpected_cmd.variant_name()
+        );
       }
     }
   }
@@ -295,54 +328,62 @@ where
     match event {
       SystemEvent::ContextTerminating => {
         tracing::info!(sca_handle = self.handle, "Received ContextTerminating.");
-        self.transition_to_shutdown_stream(Some(ZmqError::Internal("Context terminating".into()))).await;
+        self
+          .transition_to_shutdown_stream(Some(ZmqError::Internal("Context terminating".into())))
+          .await;
       }
       SystemEvent::SocketClosing { socket_id } if socket_id == self.parent_socket_id => {
         tracing::info!(sca_handle = self.handle, "Parent SocketCore ({}) closing.", socket_id);
-        self.transition_to_shutdown_stream(Some(ZmqError::Internal("Parent socket closing".into()))).await;
+        self
+          .transition_to_shutdown_stream(Some(ZmqError::Internal("Parent socket closing".into())))
+          .await;
       }
       _ => {}
     }
   }
 
   async fn handle_handshake_progression(&mut self) {
-    if self.current_phase != ConnectionPhaseX::HandshakeInProgress { return; }
+    if self.current_phase != ConnectionPhaseX::HandshakeInProgress {
+      return;
+    }
 
     match self.zmtp_handler.advance_handshake().await {
       Ok(ZmtpHandshakeProgressX::InProgress) => {}
       Ok(ZmtpHandshakeProgressX::IdentityReady(blob)) => {
         self.pending_peer_identity_from_handshake = Some(blob);
         // Continue handshake if not yet complete overall
-        if !self.zmtp_handler.is_handshake_complete() { return; }
+        if !self.zmtp_handler.is_handshake_complete() {
+          return;
+        }
         // If complete, fall through to HandshakeComplete logic
       }
       Ok(ZmtpHandshakeProgressX::HandshakeComplete) => {
         // If IdentityReady was also emitted in the same step, pending_peer_identity_from_handshake is set.
       }
       Ok(ZmtpHandshakeProgressX::ProtocolError(s)) => {
-          self.set_fatal_error(ZmqError::ProtocolViolation(s)).await;
-          return; // Error handled, no further progression this tick
+        self.set_fatal_error(ZmqError::ProtocolViolation(s)).await;
+        return; // Error handled, no further progression this tick
       }
       Ok(ZmtpHandshakeProgressX::FatalError(e)) | Err(e) => {
         self.set_fatal_error(e).await;
         return;
       }
     }
-    
+
     // Check if overall handshake is now complete
     if self.zmtp_handler.is_handshake_complete() {
-        tracing::info!(sca_handle = self.handle, "Handshake complete via ZmtpProtocolHandlerX.");
-        self.current_phase = ConnectionPhaseX::WaitingForPipes;
-        self.handshake_deadline = None; // Handshake done, clear deadline
-        self.check_and_transition_to_operational().await;
+      tracing::info!(sca_handle = self.handle, "Handshake complete via ZmtpProtocolHandlerX.");
+      self.current_phase = ConnectionPhaseX::WaitingForPipes;
+      self.handshake_deadline = None; // Handshake done, clear deadline
+      self.check_and_transition_to_operational().await;
     }
   }
 
   async fn check_and_transition_to_operational(&mut self) {
     if self.current_phase == ConnectionPhaseX::WaitingForPipes &&
        self.zmtp_handler.is_handshake_complete() && // Should always be true if in WaitingForPipes
-       self.core_pipe_manager.is_attached() {
-      
+       self.core_pipe_manager.is_attached()
+    {
       tracing::info!(sca_handle = self.handle, "Transitioning to Operational phase.");
       self.current_phase = ConnectionPhaseX::Operational;
 
@@ -353,23 +394,31 @@ where
         let event = SystemEvent::PeerIdentityEstablished {
           parent_core_id: self.parent_socket_id,
           connection_identifier: routing_id,
-          peer_identity: final_peer_identity, 
+          peer_identity: final_peer_identity,
         };
         if self.actor_config.context.event_bus().publish(event).is_err() {
-          tracing::warn!(sca_handle = self.handle, "Failed to publish PeerIdentityEstablished event.");
+          tracing::warn!(
+            sca_handle = self.handle,
+            "Failed to publish PeerIdentityEstablished event."
+          );
         } else {
           tracing::debug!(sca_handle = self.handle, "Published PeerIdentityEstablished event.");
         }
       } else {
-          tracing::error!(sca_handle = self.handle, "CRITICAL: Cannot publish PeerIdentityEstablished: core_pipe_read_id not set after pipes attached.");
-          // This is a logic error if pipes are attached but no routing ID.
-          self.set_fatal_error(ZmqError::Internal("Pipe routing ID missing post-attach".into())).await;
-          return;
+        tracing::error!(
+          sca_handle = self.handle,
+          "CRITICAL: Cannot publish PeerIdentityEstablished: core_pipe_read_id not set after pipes attached."
+        );
+        // This is a logic error if pipes are attached but no routing ID.
+        self
+          .set_fatal_error(ZmqError::Internal("Pipe routing ID missing post-attach".into()))
+          .await;
+        return;
       }
 
       if let Some(monitor) = &self.actor_config.monitor_tx {
         let _ = monitor.try_send(crate::socket::SocketEvent::HandshakeSucceeded {
-            endpoint: self.actor_config.connected_endpoint_uri.clone(),
+          endpoint: self.actor_config.connected_endpoint_uri.clone(),
         });
       }
     }
@@ -377,41 +426,54 @@ where
 
   async fn handle_outgoing_from_core(&mut self, msg: Msg) {
     // Pass self.is_next_outgoing_frame_first_of_zmq_msg as the hint
-    match self.zmtp_handler.write_data_msg(msg, self.is_next_outgoing_frame_first_of_zmq_msg).await {
-        Ok(was_last_part_of_logical_msg) => {
-            // Update state for the *next* frame based on whether the *current* one was the last
-            self.is_next_outgoing_frame_first_of_zmq_msg = was_last_part_of_logical_msg;
-        }
-        Err(e) => self.set_fatal_error(e).await,
+    match self
+      .zmtp_handler
+      .write_data_msg(msg, self.is_next_outgoing_frame_first_of_zmq_msg)
+      .await
+    {
+      Ok(was_last_part_of_logical_msg) => {
+        // Update state for the *next* frame based on whether the *current* one was the last
+        self.is_next_outgoing_frame_first_of_zmq_msg = was_last_part_of_logical_msg;
+      }
+      Err(e) => self.set_fatal_error(e).await,
     }
   }
 
   async fn handle_incoming_from_network(&mut self, msg: Msg) {
+    // Get the pipe_id needed for ISocket::handle_pipe_event
+    let pipe_read_id = self
+      .core_pipe_manager
+      .state
+      .core_pipe_read_id_for_incoming_routing
+      .expect("Cannot handle incoming message without core_pipe_read_id");
+
     if msg.is_command() {
+      // Process PING/PONG
       match self.zmtp_handler.process_incoming_data_command_frame(&msg) {
         Ok(Some(pong_reply)) => {
-          // PONG is a self-contained logical message.
           if let Err(e) = self.zmtp_handler.write_data_msg(pong_reply, true).await {
             self.set_fatal_error(e).await;
           }
-          // After sending PONG, the next outgoing user message is still "first".
-          // self.is_next_outgoing_frame_first_of_zmq_msg remains true (or is set to true).
-          // Let's assume PONG doesn't affect the user data message corking state.
         }
-        Ok(None) => { /* Command handled (e.g., PONG received), no reply needed */ }
+        Ok(None) => { /* PONG received and handled */ }
         Err(e) => self.set_fatal_error(e).await,
       }
-    } else { // Data message
-      if let Err(e) = self.core_pipe_manager.send_msg_to_core(msg, self.handle).await {
-        if matches!(e, ZmqError::ResourceLimitReached) {
-            tracing::info!(sca_handle = self.handle, "Incoming message dropped (SocketCore backpressure).");
-        } else {
-            self.set_fatal_error(e).await;
-        }
+    } else {
+      // Data message. Send DIRECTLY to ISocket pattern logic.
+      let command_for_isocket = Command::PipeMessageReceived {
+        pipe_id: pipe_read_id,
+        msg,
+      };
+      if let Err(e) = self
+        .socket_logic
+        .handle_pipe_event(pipe_read_id, command_for_isocket)
+        .await
+      {
+        tracing::error!(sca_handle = self.handle, pipe_id = pipe_read_id, error = %e, "Fatal error from ISocket::handle_pipe_event. Shutting down connection.");
+        self.set_fatal_error(e).await;
       }
     }
-    // Any incoming activity resets the "next outgoing is first" flag for TCP_CORK logic,
-    // as it breaks the contiguity of our sends.
+    // Any incoming activity breaks the contiguity of our own sends for corking.
     self.is_next_outgoing_frame_first_of_zmq_msg = true;
   }
 
@@ -424,34 +486,37 @@ where
   }
 
   async fn transition_to_shutdown_stream(&mut self, accompanying_error: Option<ZmqError>) {
-      if self.current_phase != ConnectionPhaseX::ShuttingDownStream && self.current_phase != ConnectionPhaseX::Terminating {
-          tracing::info!(sca_handle = self.handle, "Transitioning to ShuttingDownStream phase.");
-          if let Some(err) = accompanying_error {
-              if self.error_for_drop_guard.is_none() {
-                  self.error_for_drop_guard = Some(err);
-              }
-          }
-          self.current_phase = ConnectionPhaseX::ShuttingDownStream;
+    if self.current_phase != ConnectionPhaseX::ShuttingDownStream && self.current_phase != ConnectionPhaseX::Terminating
+    {
+      tracing::info!(sca_handle = self.handle, "Transitioning to ShuttingDownStream phase.");
+      if let Some(err) = accompanying_error {
+        if self.error_for_drop_guard.is_none() {
+          self.error_for_drop_guard = Some(err);
+        }
       }
+      self.current_phase = ConnectionPhaseX::ShuttingDownStream;
+    }
   }
-  
+
   async fn perform_graceful_shutdown(&mut self) {
     // This method is called when self.current_phase is ShuttingDownStream
     tracing::info!(sca_handle = self.handle, "SCA performing graceful shutdown of stream.");
     if let Err(e) = self.zmtp_handler.initiate_stream_shutdown().await {
       tracing::warn!(sca_handle = self.handle, "Error during stream shutdown: {}.", e);
-      if self.error_for_drop_guard.is_none() { self.error_for_drop_guard = Some(e); }
+      if self.error_for_drop_guard.is_none() {
+        self.error_for_drop_guard = Some(e);
+      }
     }
     self.perform_final_cleanup_actions().await; // Includes setting phase to Terminating
   }
 
   async fn perform_final_cleanup_actions(&mut self) {
-      // Ensure stream is none if not already handled by initiate_stream_shutdown
-      if self.zmtp_handler.stream.is_some() {
-          let _ = self.zmtp_handler.initiate_stream_shutdown().await; // Best effort
-      }
-      self.core_pipe_manager.detach_and_clear_pipes();
-      self.current_phase = ConnectionPhaseX::Terminating;
-      tracing::debug!(sca_handle = self.handle, "SCA final cleanup actions complete.");
+    // Ensure stream is none if not already handled by initiate_stream_shutdown
+    if self.zmtp_handler.stream.is_some() {
+      let _ = self.zmtp_handler.initiate_stream_shutdown().await; // Best effort
+    }
+    self.core_pipe_manager.detach_and_clear_pipes();
+    self.current_phase = ConnectionPhaseX::Terminating;
+    tracing::debug!(sca_handle = self.handle, "SCA final cleanup actions complete.");
   }
 }

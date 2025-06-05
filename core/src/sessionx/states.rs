@@ -3,13 +3,10 @@
 #![allow(dead_code)] // Allow dead code for now
 
 use crate::context::Context; // For ActorConfig
-use crate::runtime::MailboxSender as GenericMailboxSender; // For CorePipeManagerX
 use crate::socket::events::MonitorSender;
-use crate::{Blob, Msg}; // For CorePipeManagerX
+use crate::Msg; // For CorePipeManagerX
 
 use async_channel::Receiver as AsyncReceiver;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// General configuration and context for the SessionConnectionActorX.
 #[derive(Debug, Clone)] // Clone if it needs to be passed around easily
@@ -26,23 +23,16 @@ pub(crate) struct ActorConfigX {
 #[derive(Debug)]
 pub(crate) struct CorePipeManagerXState {
   pub rx_from_core: Option<AsyncReceiver<Msg>>,
-  pub parent_socket_core_mailbox: Option<GenericMailboxSender>,
   pub core_pipe_read_id_for_incoming_routing: Option<usize>,
   pub is_attached: bool,
-  // Potential future additions for advanced backpressure:
-  // pub incoming_to_core_buffer: std::collections::VecDeque<Msg>,
-  // pub max_core_buffer_size: usize,
 }
 
 impl CorePipeManagerXState {
   pub(crate) fn new() -> Self {
     Self {
       rx_from_core: None,
-      parent_socket_core_mailbox: None,
       core_pipe_read_id_for_incoming_routing: None,
       is_attached: false,
-      // incoming_to_core_buffer: Default::default(),
-      // max_core_buffer_size: 0, // or some default
     }
   }
 }

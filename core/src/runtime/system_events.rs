@@ -2,7 +2,7 @@
 
 use super::OneShotSender;
 use crate::message::Msg;
-use crate::runtime::mailbox::MailboxSender as SessionCommandMailboxSender;
+use crate::runtime::mailbox::{MailboxSender as SessionCommandMailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::{error::ZmqError, Blob};
 
@@ -25,6 +25,7 @@ pub enum ActorType {
   AcceptLoop,
   /// The actor managing a ZMTP session over an established connection.
   Session,
+  SessionConnectionActor,
   /// The actor handling the ZMTP protocol details and I/O for a specific session.
   Engine,
   /// The task dedicated to establishing an outgoing connection (e.g., TCP or IPC connector).
@@ -237,6 +238,10 @@ pub enum ConnectionInteractionModel {
     /// The unique handle ID of the SessionBase actor.
     session_actor_handle_id: usize,
   },
+  ViaSca { // SCA = SessionConnectionActor
+    sca_mailbox: SessionCommandMailboxSender,
+    sca_handle_id: usize,
+  },
   /// Connection is managed directly by the UringWorker using a RawFd.
   #[cfg(feature = "io-uring")]
   ViaUringFd {
@@ -258,6 +263,11 @@ impl fmt::Debug for ConnectionInteractionModel {
         .field("session_actor_mailbox_closed", &session_actor_mailbox.is_closed())
         .field("session_actor_handle_id", session_actor_handle_id)
         .finish(),
+      ConnectionInteractionModel::ViaSca { sca_mailbox, sca_handle_id } => 
+        f.debug_struct("ViaSca")
+         .field("sca_mailbox_closed", &sca_mailbox.is_closed())
+         .field("sca_handle_id", sca_handle_id)
+         .finish(),
       #[cfg(feature = "io-uring")]
       ConnectionInteractionModel::ViaUringFd { fd } => f.debug_struct("ViaUringFd").field("fd", fd).finish(),
       #[cfg(not(feature = "io-uring"))]

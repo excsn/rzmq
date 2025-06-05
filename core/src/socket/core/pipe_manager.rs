@@ -343,7 +343,7 @@ pub(crate) async fn cleanup_stopped_child_resources(
                 target_uri = %target_uri_to_reconnect,
                 "Unexpected session/engine stop for outbound connection. Initiating reconnect..."
               );
-              command_processor::respawn_connecter_actor(core_arc.clone(), target_uri_to_reconnect).await;
+              command_processor::respawn_connecter_actor(core_arc.clone(),  socket_logic_strong.clone(), target_uri_to_reconnect).await;
             } else {
               tracing::warn!(
                 handle = core_handle,
