@@ -590,6 +590,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "fibre"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e0544b77dbfcf50f6bfea941756d31a4744547e0e92b4fd705b561c48e700fd"
+dependencies = [
+ "futures-core",
+ "futures-util",
+ "lazy_static",
+ "parking_lot",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1297,6 +1309,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "eventfd",
+ "fibre",
  "futures",
  "io-uring",
  "io_uring_buf_ring",

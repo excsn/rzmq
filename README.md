@@ -1,7 +1,7 @@
 # rzmq: An Asynchronous Pure Rust ZeroMQ Implementation
 
-[![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 [![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 
 **rzmq** is an ongoing effort to build a high-performance, asynchronous pure Rust implementation of the ZeroMQ (ØMQ) messaging library. It leverages the [Tokio](https://tokio.rs/) runtime for its asynchronous capabilities and aims to provide a familiar ZeroMQ API within the modern Rust ecosystem.
 
