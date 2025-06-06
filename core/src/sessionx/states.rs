@@ -6,7 +6,7 @@ use crate::context::Context; // For ActorConfig
 use crate::socket::events::MonitorSender;
 use crate::Msg; // For CorePipeManagerX
 
-use async_channel::Receiver as AsyncReceiver;
+use fibre::mpmc::AsyncReceiver;
 
 /// General configuration and context for the SessionConnectionActorX.
 #[derive(Debug, Clone)] // Clone if it needs to be passed around easily

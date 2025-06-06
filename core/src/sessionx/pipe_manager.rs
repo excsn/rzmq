@@ -1,9 +1,7 @@
-// core/src/sessionx/pipe_manager.rs
-
 #![allow(dead_code)]
 
 use crate::Msg;
-use async_channel::{Receiver as AsyncReceiver, RecvError};
+use fibre::mpmc::{AsyncReceiver, RecvError};
 
 // Import the state struct we defined earlier
 use super::states::CorePipeManagerXState;
@@ -44,7 +42,7 @@ impl CorePipeManagerX {
     } else {
       // This indicates a programming error: called before pipes are attached
       // or after they've been detached.
-      Err(RecvError) // Or a more specific custom error
+      Err(RecvError::Disconnected) // Or a more specific custom error
     }
   }
 
@@ -52,9 +50,7 @@ impl CorePipeManagerX {
   /// The receiving end (`rx_from_core`) is typically managed by its sender (`SocketCore`).
   /// This method ensures `CorePipeManagerX` stops trying to use the pipes.
   pub(crate) fn detach_and_clear_pipes(&mut self) {
-    if let Some(rx) = self.state.rx_from_core.take() {
-      rx.close();
-    }
+    let _ = self.state.rx_from_core.take();
     self.state.core_pipe_read_id_for_incoming_routing = None;
     self.state.is_attached = false;
   }

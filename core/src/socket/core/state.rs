@@ -8,7 +8,7 @@ use crate::socket::types::SocketType;
 use crate::socket::SocketEvent;
 use crate::Msg; // For AsyncSender<Msg>
 
-use async_channel::Sender as AsyncSender; // Sticking with async-channel for pipes_tx for now
+use fibre::mpmc::AsyncSender;
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;
@@ -30,7 +30,7 @@ pub(crate) struct EndpointInfo {
   pub endpoint_type: EndpointType,
   /// The resolved URI of this endpoint (e.g., actual bound TCP address or peer's address).
   pub endpoint_uri: String,
-  /// - For Session (ViaSessionActor): `Some((actual_core_write_id, actual_core_read_id))` for async_channel pipes.
+  /// - For Session (ViaSessionActor): `Some((actual_core_write_id, actual_core_read_id))` for pipes.
   /// - For Session (ViaUringFd): `Some((synthetic_write_id, synthetic_read_id))` for ISocket interaction.
   /// - For Listener: `None`.
   pub pipe_ids: Option<(usize, usize)>, // (core_writes_here, core_reads_from_here)
@@ -61,7 +61,7 @@ pub(crate) struct CoreState {
   pub(crate) handle: usize,
   pub options: Arc<SocketOptions>,
   pub socket_type: SocketType,
-  // For Session-based path: Map Core's pipe_write_id -> async_channel Sender to Session's data pipe
+  // For Session-based path: Map Core's pipe_write_id -> Sender to Session's data pipe
   pub pipes_tx: HashMap<usize, AsyncSender<Msg>>,
   // For Session-based path: Map Core's pipe_read_id -> JoinHandle of PipeReaderTask
   pub pipe_reader_task_handles: HashMap<usize, JoinHandle<()>>,
@@ -157,7 +157,7 @@ impl CoreState {
 
   pub(crate) fn send_monitor_event(&self, event: SocketEvent) {
     if let Some(ref tx) = self.monitor_tx {
-      if tx.try_send(event).is_err() {
+      if tx.clone().to_sync().send(event).is_err() {
         // Non-blocking send
         tracing::warn!(
           socket_handle = self.handle,

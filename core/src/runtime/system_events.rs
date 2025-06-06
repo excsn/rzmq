@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use super::OneShotSender;
 use crate::message::Msg;
 use crate::runtime::mailbox::{MailboxSender as SessionCommandMailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
@@ -11,6 +10,7 @@ use std::fmt;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
+use fibre::mpmc::{AsyncReceiver, AsyncSender};
 use fibre::oneshot;
 use tokio::task::Id as TaskId;
 
@@ -136,9 +136,9 @@ pub enum SystemEvent {
     /// The URI of the connector socket, for logging or identification purposes.
     connector_uri: String,
     /// The channel sender the Binder uses to send messages TO the Connector.
-    binder_pipe_tx_to_connector: async_channel::Sender<Msg>,
+    binder_pipe_tx_to_connector: AsyncSender<Msg>,
     /// The channel receiver the Binder uses to get messages FROM the Connector.
-    binder_pipe_rx_from_connector: async_channel::Receiver<Msg>,
+    binder_pipe_rx_from_connector: AsyncReceiver<Msg>,
     /// The ID the connector uses to write messages to the binder.
     connector_pipe_write_id: usize,
     /// The ID the connector uses to read messages from the binder.

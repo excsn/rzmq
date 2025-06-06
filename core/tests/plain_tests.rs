@@ -34,7 +34,7 @@ async fn setup_client(
   username: Option<&str>,
   password: Option<&str>,
   // Add other mechanism configs
-) -> Result<(Socket, async_channel::Receiver<SocketEvent>), ZmqError> {
+) -> Result<(Socket, fibre::mpmc::AsyncReceiver<SocketEvent>), ZmqError> {
   let client = ctx.socket(SocketType::Req)?;
   if enable_plain {
     let user_to_set = username.unwrap_or("");

@@ -3,6 +3,7 @@
 //! Type aliases for actor communication channels based on `async-channel`.
 
 use crate::runtime::command::Command;
+use fibre::mpmc;
 
 /// Default capacity for bounded mailboxes created by the `mailbox()` helper function.
 /// This capacity applies to the single mailbox used by `SocketCore` and other simpler actors.
@@ -11,11 +12,11 @@ pub const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
 
 /// The sending end of an actor's mailbox.
 /// It is cloneable, allowing multiple actors or tasks to send commands to the same mailbox.
-pub type MailboxSender = async_channel::Sender<Command>;
+pub type MailboxSender = mpmc::AsyncSender<Command>;
 
 /// The receiving end of an actor's mailbox.
 /// Only one task should typically own and receive from a `MailboxReceiver` to process commands sequentially.
-pub type MailboxReceiver = async_channel::Receiver<Command>;
+pub type MailboxReceiver = mpmc::AsyncReceiver<Command>;
 
 // Note: The `SocketMailbox` struct and its associated constants
 // (DEFAULT_SYSTEM_MAILBOX_CAPACITY, DEFAULT_USER_MAILBOX_CAPACITY)
@@ -28,5 +29,5 @@ pub type MailboxReceiver = async_channel::Receiver<Command>;
 /// # Returns
 /// A tuple containing the `MailboxSender` and `MailboxReceiver`.
 pub fn mailbox(capacity: usize) -> (MailboxSender, MailboxReceiver) {
-  async_channel::bounded(capacity.max(1))
+  mpmc::bounded_async(capacity.max(1))
 }

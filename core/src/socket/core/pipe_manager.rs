@@ -11,9 +11,10 @@ use crate::socket::core::state::{EndpointInfo, EndpointType};
 use crate::socket::core::{command_processor, SocketCore}; // command_processor needed for respawn_connecter_actor
 use crate::socket::{ISocket, SocketEvent};
 
-use async_channel::{bounded, Receiver as AsyncReceiver, SendError, Sender as AsyncSender, TrySendError};
+use fibre::mpmc::{bounded_async, AsyncReceiver, AsyncSender};
 #[cfg(feature = "inproc")]
 use fibre::oneshot;
+use fibre::{SendError, TrySendError};
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,9 +53,9 @@ pub(crate) async fn setup_pipe_with_session_actor(
   let core_read_id = core_arc.context.inner().next_handle();
 
   // Pipe 1: SocketCore -> SessionBase (Core writes, Session reads)
-  let (tx_core_to_session, rx_session_from_core) = bounded::<Msg>(pipe_core_to_session_hwm);
+  let (tx_core_to_session, rx_session_from_core) = bounded_async::<Msg>(pipe_core_to_session_hwm);
   // Pipe 2: SessionBase -> SocketCore (Session writes, Core reads)
-  let (tx_session_to_core, rx_core_from_session) = bounded::<Msg>(pipe_session_to_core_hwm);
+  let (tx_session_to_core, rx_core_from_session) = bounded_async::<Msg>(pipe_session_to_core_hwm);
 
   {
     let mut core_s_guard = core_arc.core_state.write();
@@ -706,7 +707,6 @@ pub(crate) async fn handle_inproc_pipe_peer_closed_event(
   }
 }
 
-// ... (send_msg_with_timeout remains the same)
 pub(crate) async fn send_msg_with_timeout(
   pipe_tx: &AsyncSender<Msg>,
   msg: Msg,
@@ -721,7 +721,7 @@ pub(crate) async fn send_msg_with_timeout(
         pipe_id = pipe_target_id,
         "Sending message via pipe (blocking on HWM)"
       );
-      pipe_tx.send(msg).await.map_err(|SendError(_failed_msg_back)| {
+      pipe_tx.send(msg).await.map_err(|_| {
         tracing::debug!(
           core_handle = socket_core_handle,
           pipe_id = pipe_target_id,
@@ -755,6 +755,7 @@ pub(crate) async fn send_msg_with_timeout(
           );
           Err(ZmqError::ConnectionClosed)
         }
+        _ => unreachable!(),
       }
     }
     Some(timeout_duration) => {
@@ -766,7 +767,7 @@ pub(crate) async fn send_msg_with_timeout(
       );
       match timeout(timeout_duration, pipe_tx.send(msg)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(SendError(_failed_msg_back))) => {
+        Ok(Err(SendError::Closed)) => {
           tracing::debug!(
             core_handle = socket_core_handle,
             pipe_id = pipe_target_id,
@@ -782,6 +783,7 @@ pub(crate) async fn send_msg_with_timeout(
           );
           Err(ZmqError::Timeout)
         }
+        _ => unreachable!(),
       }
     }
   }

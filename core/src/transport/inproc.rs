@@ -5,16 +5,15 @@
 use crate::context::Context;
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::runtime::{OneShotSender, SystemEvent};
+use crate::runtime::{SystemEvent};
 use crate::socket::core::pipe_manager::run_pipe_reader_task;
 use crate::socket::core::{EndpointInfo, EndpointType, SocketCore};
 use crate::socket::SocketEvent;
 
-use async_channel::bounded;
+use fibre::mpmc::{bounded_async};
 use std::sync::Arc;
 use fibre::oneshot;
 
-// ... (bind_inproc remains the same)
 pub(crate) async fn bind_inproc(name: String, core_arc: Arc<SocketCore>) -> Result<(), ZmqError> {
   tracing::debug!(binder_core_handle = core_arc.handle, inproc_name = %name, "Attempting to bind inproc endpoint");
   core_arc
@@ -91,8 +90,8 @@ pub(crate) async fn connect_inproc(
   let pipe_id_connector_writes_to_binder = core_arc.context.inner().next_handle();
   let pipe_id_connector_reads_from_binder = pipe_id_connector_writes_to_binder + 1;
 
-  let (tx_connector_to_binder, rx_binder_from_connector) = bounded::<Msg>(pipe_hwm);
-  let (tx_binder_to_connector, rx_connector_from_binder) = bounded::<Msg>(pipe_hwm);
+  let (tx_connector_to_binder, rx_binder_from_connector) = bounded_async::<Msg>(pipe_hwm);
+  let (tx_binder_to_connector, rx_connector_from_binder) = bounded_async::<Msg>(pipe_hwm);
 
   core_arc
     .core_state
@@ -155,11 +154,9 @@ pub(crate) async fn connect_inproc(
       .insert(pipe_id_connector_reads_from_binder, connector_uri_str.clone());
   }
 
-  // <<< MODIFIED [Use the already cloned connector_monitor_tx for this event] >>>
   let monitor_tx_for_event = connector_monitor_tx;
-  // <<< MODIFIED END >>>
 
-  let (reply_tx, mut reply_rx_internal_binder) = oneshot::channel();
+  let (reply_tx, mut reply_rx_internal_binder) = oneshot::oneshot();
   let request_event = SystemEvent::InprocBindingRequest {
     target_inproc_name: name.clone(),
     connector_uri: connector_uri_str.clone(),

@@ -6,7 +6,7 @@ use crate::runtime::{mailbox, ActorDropGuard, ActorType, Command, EngineConnecti
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::{Blob, Msg};
 
-use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
+use fibre::mpmc::{AsyncReceiver, AsyncSender};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;

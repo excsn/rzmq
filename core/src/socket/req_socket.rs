@@ -100,7 +100,6 @@ impl ISocket for ReqSocket {
   }
   async fn close(&self) -> Result<(), ZmqError> {
     self.reply_available_notifier.notify_waiters();
-    self.incoming_orchestrator.close();
     delegate_to_core!(self, UserClose,)
   }
 

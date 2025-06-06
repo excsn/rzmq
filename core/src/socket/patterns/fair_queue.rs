@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use async_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use fibre::{mpmc::{bounded_async, AsyncReceiver, AsyncSender, TryRecvError, TrySendError}, RecvError};
 
 #[derive(Debug)]
 pub(crate) enum PushError<T: Send + 'static> {
@@ -11,15 +11,15 @@ pub(crate) enum PushError<T: Send + 'static> {
 /// for fair consumption.
 #[derive(Debug)]
 pub(crate) struct FairQueue<T: Send + 'static> {
-  receiver: Receiver<T>,
-  sender: Sender<T>,
+  receiver: AsyncReceiver<T>,
+  sender: AsyncSender<T>,
   hwm: usize,
 }
 
 impl<T: Send + 'static> FairQueue<T> {
   /// Creates a new fair queue with a specific capacity (HWM).
   pub fn new(capacity: usize) -> Self {
-    let (sender, receiver) = async_channel::bounded(capacity.max(1));
+    let (sender, receiver) = bounded_async(capacity.max(1));
     Self {
       receiver,
       sender,
@@ -49,7 +49,7 @@ impl<T: Send + 'static> FairQueue<T> {
   pub async fn pop_item(&self) -> Result<Option<T>, ZmqError> {
     match self.receiver.recv().await {
       Ok(item) => Ok(Some(item)),
-      Err(async_channel::RecvError) => Ok(None), // Channel closed
+      Err(RecvError::Disconnected) => Ok(None), // Channel closed
     }
   }
 
@@ -62,6 +62,7 @@ impl<T: Send + 'static> FairQueue<T> {
         tracing::error!("FairQueue try_send failed: Channel was closed.");
         Err(PushError::Closed(returned_item))
       }
+      _ => unreachable!(),
     }
   }
 
@@ -70,7 +71,7 @@ impl<T: Send + 'static> FairQueue<T> {
     match self.receiver.try_recv() {
       Ok(item) => Ok(Some(item)),
       Err(TryRecvError::Empty) => Ok(None),
-      Err(TryRecvError::Closed) => {
+      Err(TryRecvError::Disconnected) => {
         tracing::error!("FairQueue try_recv error: Channel closed");
         Err(ZmqError::Internal("FairQueue channel closed unexpectedly".into()))
       }
@@ -90,10 +91,5 @@ impl<T: Send + 'static> FairQueue<T> {
   /// Returns true if the queue is empty.
   pub fn is_empty(&self) -> bool {
     self.receiver.is_empty()
-  }
-
-  pub fn close(&self) {
-    self.sender.close();
-    self.receiver.close();
   }
 }

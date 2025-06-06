@@ -84,7 +84,6 @@ impl ISocket for RepSocket {
   }
 
   async fn close(&self) -> Result<(), ZmqError> {
-    self.incoming_request_queue.close();
     delegate_to_core!(self, UserClose,)
   }
 

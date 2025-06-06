@@ -5,7 +5,7 @@ use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::SocketCore;
-use async_channel::TrySendError;
+use fibre::TrySendError;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +37,6 @@ impl ScaConnectionIface {
 
 #[async_trait]
 impl ISocketConnection for ScaConnectionIface {
-  // <<< MODIFIED START [send_message now uses the data pipe] >>>
   async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
     tracing::trace!(
       sca_handle = self.sca_handle_id,
@@ -60,6 +59,7 @@ impl ISocketConnection for ScaConnectionIface {
           Ok(()) => Ok(()),
           Err(TrySendError::Full(_)) => Err(ZmqError::ResourceLimitReached),
           Err(TrySendError::Closed(_)) => Err(ZmqError::ConnectionClosed),
+          Err(TrySendError::Sent(_)) => unreachable!(),
         }
       } else {
         // Blocking/timed send

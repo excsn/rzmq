@@ -22,7 +22,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_channel::{SendError, TrySendError};
+use fibre::mpmc::{AsyncSender, SendError, TrySendError};
 use async_trait::async_trait;
 use tokio::task::yield_now;
 use tokio::time::timeout as tokio_timeout;
@@ -71,7 +71,7 @@ impl ISocketConnection for DummyConnection {
 pub(crate) struct SessionConnection {
   session_mailbox: SessionMailboxSender,
   connection_id: usize,
-  pipe_to_session_tx: async_channel::Sender<Msg>,
+  pipe_to_session_tx: AsyncSender<Msg>,
   socket_options: Arc<SocketOptions>,
   // Added context field to generate unique UserData for operations.
   // This is necessary if UringFdConnection needs a similar capability and we want to keep new() signatures consistent
@@ -99,7 +99,7 @@ impl SessionConnection {
   pub(crate) fn new(
     session_mailbox: SessionMailboxSender,
     connection_id: usize,
-    pipe_to_session_tx: async_channel::Sender<Msg>,
+    pipe_to_session_tx: AsyncSender<Msg>,
     socket_options: Arc<SocketOptions>,
     context: Context,
   ) -> Self {
@@ -123,7 +123,7 @@ impl ISocketConnection for SessionConnection {
         // Infinite timeout (block until HWM allows or pipe closes)
         tracing::trace!(
           conn_id = self.connection_id,
-          // pipe_id = self.pipe_to_session_tx.id_somehow(), // async_channel Sender doesn't expose an ID easily
+          // pipe_id = self.pipe_to_session_tx.id_somehow(),
           "SessionConnection: Sending message (blocking on HWM)"
         );
 
@@ -131,7 +131,7 @@ impl ISocketConnection for SessionConnection {
           .pipe_to_session_tx
           .send(msg)
           .await
-          .map_err(|SendError(_failed_msg_back)| {
+          .map_err(|_| {
             tracing::warn!(
               conn_id = self.connection_id,
               "SessionConnection: Pipe send failed (ConnectionClosed)"
@@ -161,6 +161,7 @@ impl ISocketConnection for SessionConnection {
             );
             Err(ZmqError::ConnectionClosed)
           }
+          _ => unreachable!(),
         }
       }
       Some(timeout_duration) => {
@@ -172,7 +173,7 @@ impl ISocketConnection for SessionConnection {
         );
         match tokio_timeout(timeout_duration, self.pipe_to_session_tx.send(msg)).await {
           Ok(Ok(())) => Ok(()), // Sent within timeout
-          Ok(Err(SendError(_failed_msg_back))) => {
+          Ok(Err(SendError::Closed)) => {
             // Pipe closed during timed send
             tracing::warn!(
               conn_id = self.connection_id,
@@ -188,6 +189,7 @@ impl ISocketConnection for SessionConnection {
             );
             Err(ZmqError::Timeout)
           }
+          _ => unreachable!(),
         }
       }
     }
@@ -437,7 +439,7 @@ pub(crate) struct InprocConnection {
   local_pipe_read_id_from_peer: usize,
   peer_inproc_name_or_uri: String,
   context: Context,
-  data_tx_to_peer: async_channel::Sender<Msg>,
+  data_tx_to_peer: AsyncSender<Msg>,
   monitor_tx: Option<MonitorSender>,
   socket_options: Arc<SocketOptions>,
 }
@@ -464,7 +466,7 @@ impl InprocConnection {
     local_pipe_read_id_from_peer: usize,
     peer_inproc_name_or_uri: String,
     context: Context,
-    data_tx_to_peer: async_channel::Sender<Msg>,
+    data_tx_to_peer: AsyncSender<Msg>,
     monitor_tx: Option<MonitorSender>,
     socket_options: Arc<SocketOptions>,
   ) -> Self {
@@ -488,7 +490,7 @@ impl ISocketConnection for InprocConnection {
 
     match timeout_opt {
       None => {
-        self.data_tx_to_peer.send(msg).await.map_err(|SendError(_)| {
+        self.data_tx_to_peer.send(msg).await.map_err(|_| {
           tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection send failed (ConnectionClosed)");
           ZmqError::ConnectionClosed
         })
@@ -501,16 +503,18 @@ impl ISocketConnection for InprocConnection {
             tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection non-blocking send failed (ConnectionClosed)");
             Err(ZmqError::ConnectionClosed)
           }
+          _ => unreachable!(),
         }
       }
       Some(duration) => {
         match tokio_timeout(duration, self.data_tx_to_peer.send(msg)).await {
           Ok(Ok(())) => Ok(()),
-          Ok(Err(SendError(_))) => {
+          Ok(Err(SendError::Closed)) => {
             tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection timed send failed (ConnectionClosed)");
             Err(ZmqError::ConnectionClosed)
           }
           Err(_) => Err(ZmqError::Timeout),
+          _ => unreachable!(),
         }
       }
     }
@@ -549,8 +553,6 @@ impl ISocketConnection for InprocConnection {
         );
       }
     }
-
-    self.data_tx_to_peer.close();
 
     let target_name_for_event = self
       .peer_inproc_name_or_uri

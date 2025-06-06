@@ -9,7 +9,7 @@ use super::mailbox::MailboxSender as SessionBaseCommandSender;
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;
 
-use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
+use fibre::mpmc::{AsyncReceiver, AsyncSender};
 use fibre::oneshot;
 
 /// Describes how SessionBase connects to its engine.

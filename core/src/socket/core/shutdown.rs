@@ -510,10 +510,8 @@ pub(crate) async fn perform_final_pipe_cleanup(
     )
   };
 
-  for (id, sender) in pipes_tx_map.drain() {
-    sender.close();
-    tracing::trace!(handle = core_handle, pipe_id = id, "Closed pipe sender.");
-  }
+  let _ = pipes_tx_map.drain();
+  
   for (id, handle) in reader_tasks_map.drain() {
     handle.abort();
     tracing::trace!(handle = core_handle, pipe_id = id, "Aborted pipe reader.");
