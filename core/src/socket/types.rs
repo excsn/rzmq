@@ -8,7 +8,7 @@ use crate::socket::events::{MonitorReceiver, DEFAULT_MONITOR_CAPACITY}; // For s
 use crate::socket::ISocket; // The internal trait implemented by specific socket patterns.
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::oneshot; // For reply channels in commands.
+use fibre::oneshot;
 
 /// Represents the type of a ZeroMQ socket, defining its messaging pattern and behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -180,7 +180,7 @@ impl Socket {
   /// (e.g., if the socket's internal actor communication fails).
   pub async fn monitor(&self, capacity: usize) -> Result<MonitorReceiver, ZmqError> {
     let (monitor_tx, monitor_rx) = async_channel::bounded(capacity.max(1)); // Ensure capacity is at least 1.
-    let (reply_tx, reply_rx) = oneshot::channel(); // For acknowledging monitor setup.
+    let (reply_tx, mut reply_rx) = oneshot::channel();
 
     // Create a UserMonitor command to send to the SocketCore.
     let cmd = Command::UserMonitor { monitor_tx, reply_tx };
@@ -194,7 +194,7 @@ impl Socket {
 
     // Wait for the SocketCore to acknowledge that the monitor has been set up.
     // The `??` propagates the `RecvError` from `reply_rx.await` and then the `Result<(), ZmqError>` inside.
-    reply_rx
+    reply_rx.recv()
       .await
       .map_err(|_recv_error| ZmqError::Internal("Reply channel error during monitor setup".into()))??;
 

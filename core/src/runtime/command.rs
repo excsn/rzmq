@@ -9,10 +9,8 @@ use super::mailbox::MailboxSender as SessionBaseCommandSender;
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;
 
-// Using tokio's oneshot for replies within commands.
-// async_channel is used for the mailboxes themselves and for inter-actor pipes.
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
-use tokio::sync::oneshot;
+use fibre::oneshot;
 
 /// Describes how SessionBase connects to its engine.
 #[derive(Debug)]

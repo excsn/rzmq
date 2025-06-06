@@ -11,6 +11,7 @@ use std::fmt;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
+use fibre::oneshot;
 use tokio::task::Id as TaskId;
 
 /// Type identifier for different actors in the system.
@@ -145,7 +146,7 @@ pub enum SystemEvent {
     /// A oneshot sender for the binder to reply with `Ok(())` if the connection
     /// is accepted, or `Err(ZmqError)` if rejected.
     /// Note: `ZmqError` is used here as `oneshot::Sender` itself doesn't require the payload to be `Clone`.
-    reply_tx: OneShotSender,
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
   },
 
   /// Published by an `inproc` connector's `SocketCore` when it closes its side

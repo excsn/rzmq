@@ -181,8 +181,7 @@ pub(crate) async fn process_system_event(
         } else {
           tracing::debug!(handle = core_handle, target_inproc_name = %target_inproc_name, "SocketCore (binder) ignoring InprocBindingRequest during shutdown.");
           let _ = reply_tx
-            .take_and_send_forget(Err(ZmqError::InvalidState("Binder socket is shutting down".into())))
-            .await;
+            .send(Err(ZmqError::InvalidState("Binder socket is shutting down".into())));
         }
       }
     }

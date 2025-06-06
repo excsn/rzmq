@@ -18,7 +18,7 @@ use crate::transport::tcp::{TcpConnecter, TcpListener}; // For TCP bind/connect
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use fibre::oneshot;
 
 /// Processes a command received on SocketCore's command mailbox.
 /// Returns Ok(()) if processed, or Err(ZmqError) for fatal errors that should stop SocketCore.

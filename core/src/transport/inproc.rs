@@ -12,7 +12,7 @@ use crate::socket::SocketEvent;
 
 use async_channel::bounded;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use fibre::oneshot;
 
 // ... (bind_inproc remains the same)
 pub(crate) async fn bind_inproc(name: String, core_arc: Arc<SocketCore>) -> Result<(), ZmqError> {
@@ -159,7 +159,7 @@ pub(crate) async fn connect_inproc(
   let monitor_tx_for_event = connector_monitor_tx;
   // <<< MODIFIED END >>>
 
-  let (reply_tx_internal_binder, reply_rx_internal_binder) = oneshot::channel();
+  let (reply_tx, mut reply_rx_internal_binder) = oneshot::channel();
   let request_event = SystemEvent::InprocBindingRequest {
     target_inproc_name: name.clone(),
     connector_uri: connector_uri_str.clone(),
@@ -167,7 +167,7 @@ pub(crate) async fn connect_inproc(
     binder_pipe_tx_to_connector: tx_binder_to_connector,
     connector_pipe_write_id: pipe_id_connector_writes_to_binder,
     connector_pipe_read_id: pipe_id_connector_reads_from_binder,
-    reply_tx: OneShotSender::new(reply_tx_internal_binder),
+    reply_tx: reply_tx,
   };
 
   tracing::debug!(connector_core_handle = connector_core_handle, inproc_name = %name, "Publishing InprocBindingRequest event");
@@ -183,7 +183,7 @@ pub(crate) async fn connect_inproc(
     return;
   }
 
-  match reply_rx_internal_binder.await {
+  match reply_rx_internal_binder.recv().await {
     Ok(Ok(())) => {
       tracing::info!(connector_core_handle = connector_core_handle, inproc_name = %name, "Inproc connection established successfully via event bus");
 

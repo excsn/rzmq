@@ -2,6 +2,8 @@
 
 use crate::context::Context as RzmqContext; // Alias to avoid clash if needed
 use crate::error::ZmqError;
+#[cfg(feature = "inproc")]
+use crate::error::ZmqResult;
 use crate::message::Msg;
 use crate::runtime::OneShotSender as RuntimeOneShotSender;
 use crate::runtime::{ActorDropGuard, ActorType, Command, MailboxSender};
@@ -10,6 +12,8 @@ use crate::socket::core::{command_processor, SocketCore}; // command_processor n
 use crate::socket::{ISocket, SocketEvent};
 
 use async_channel::{bounded, Receiver as AsyncReceiver, SendError, Sender as AsyncSender, TrySendError};
+#[cfg(feature = "inproc")]
+use fibre::oneshot;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
@@ -553,7 +557,7 @@ pub(crate) async fn process_inproc_binding_request_event(
   pipe_tx_for_binder_to_send_to_connector: AsyncSender<Msg>,
   binder_write_id_for_this_connection: usize,
   binder_read_id_for_this_connection: usize,
-  reply_tx_to_connector: RuntimeOneShotSender,
+  reply_tx_to_connector: oneshot::Sender<ZmqResult<()>>,
 ) -> Result<(), ZmqError> {
   use crate::socket::{
     core::state::{EndpointInfo, EndpointType},
@@ -643,7 +647,7 @@ pub(crate) async fn process_inproc_binding_request_event(
     tracing::info!(binder_handle = binder_core_handle, connector_uri = %connector_uri, "Inproc connection accepted by binder.");
   }
 
-  if reply_tx_to_connector.take_and_send_forget(accept_result.clone()).await == false {
+  if reply_tx_to_connector.send(accept_result.clone()).is_err() {
     tracing::warn!(binder_handle = binder_core_handle, connector_uri = %connector_uri, "Failed to send InprocBindingRequest reply to connector (already taken/dropped).");
   }
   accept_result

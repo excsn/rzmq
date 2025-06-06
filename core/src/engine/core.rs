@@ -23,7 +23,6 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use std::{fmt, marker::PhantomData};
 
-use async_channel::{SendError, TrySendError};
 use bytes::{BufMut, BytesMut};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
