@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use fibre::{mpmc::{bounded_async, AsyncReceiver, AsyncSender, TryRecvError, TrySendError}, RecvError};
+use fibre::{mpmc::{bounded_async, AsyncReceiver, AsyncSender}, TryRecvError, TrySendError, RecvError};
 
 #[derive(Debug)]
 pub(crate) enum PushError<T: Send + 'static> {

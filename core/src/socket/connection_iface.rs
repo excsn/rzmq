@@ -22,7 +22,8 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fibre::mpmc::{AsyncSender, SendError, TrySendError};
+use fibre::{SendError, TrySendError};
+use fibre::mpmc::AsyncSender;
 use async_trait::async_trait;
 use tokio::task::yield_now;
 use tokio::time::timeout as tokio_timeout;

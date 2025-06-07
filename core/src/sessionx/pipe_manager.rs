@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
 use crate::Msg;
-use fibre::mpmc::{AsyncReceiver, RecvError};
+use fibre::RecvError;
+use fibre::mpmc::AsyncReceiver;
 
 // Import the state struct we defined earlier
 use super::states::CorePipeManagerXState;
