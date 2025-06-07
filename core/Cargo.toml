@@ -29,14 +29,12 @@ bench_external_clients = []
 
 # --- Core Async Runtime & Concurrency ---
 fibre = { version = "^0" }
-async-channel = "^2"
 async-trait = "^0.1.88"
 async-recursion = "^1.0"
 tokio = { version = "^1", features = ["fs", "rt", "rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
 tokio-util = { version = "^0.7", features = ["codec"] }
 futures = "^0.3"
 parking_lot = "^0"
-kanal = "^0.1"
 
 # --- I/O & Buffers ---
 bytes = "^1.4"
@@ -137,11 +135,3 @@ required-features = ["inproc"]
 [[test]]
 name = "noise_xx"
 required-features = ["noise_xx"]
-
-[[test]]
-name = "multishot_receive"
-required-features = ["io-uring"]
-
-[[test]]
-name = "zerocopy_send"
-required-features = ["io-uring"]

@@ -269,9 +269,9 @@ Represents significant events occurring within a socket or its connections, used
 
 ### In `rzmq::socket::events`:
 
-*   `pub type MonitorSender = async_channel::Sender<SocketEvent>`
+*   `pub type MonitorSender = fibre::mpsc::Sender<SocketEvent>`
     *   The sending end of the channel used for socket monitor events.
-*   `pub type MonitorReceiver = async_channel::Receiver<SocketEvent>`
+*   `pub type MonitorReceiver = fibre::mpsc::Receiver<SocketEvent>`
     *   The receiving end of the channel used for socket monitor events.
 
 ## 8. Public Constants

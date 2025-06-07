@@ -12,7 +12,8 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::thread::JoinHandle as StdThreadJoinHandle;
 
-use kanal::{ReceiveError as KanalReceiveError, Receiver as KanalReceiver, Sender as KanalSyncSender};
+#[cfg(feature = "io-uring")]
+use fibre::mpmc::{AsyncReceiver, Receiver as SyncReceiver, Sender as SyncSender};
 use once_cell::sync::OnceCell;
 #[cfg(feature = "io-uring")]
 use parking_lot::Mutex;
@@ -24,9 +25,9 @@ use tracing::{debug, error, info, trace, warn};
 static URING_WORKER_OP_TX: OnceCell<Mutex<Option<SignalingOpSender>>> = OnceCell::new();
 static URING_WORKER_JOIN_HANDLE: OnceCell<Mutex<Option<StdThreadJoinHandle<Result<(), ZmqError>>>>> = OnceCell::new();
 
-static PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR: OnceCell<Mutex<Option<KanalSyncSender<(RawFd, HandlerUpstreamEvent)>>>> =
+static PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR: OnceCell<Mutex<Option<SyncSender<(RawFd, HandlerUpstreamEvent)>>>> =
   OnceCell::new();
-static PARSED_MSG_RX_FOR_PROCESSOR: OnceCell<Mutex<Option<KanalReceiver<(RawFd, HandlerUpstreamEvent)>>>> =
+static PARSED_MSG_RX_FOR_PROCESSOR: OnceCell<Mutex<Option<AsyncReceiver<(RawFd, HandlerUpstreamEvent)>>>> =
   OnceCell::new();
 static URING_UPSTREAM_PROCESSOR_JOIN_HANDLE: OnceCell<Mutex<Option<TokioTaskJoinHandle<()>>>> = OnceCell::new();
 
@@ -54,13 +55,13 @@ pub(crate) fn get_uring_worker_join_handle_mutex() -> &'static Mutex<Option<StdT
 }
 #[doc(hidden)]
 #[cfg(feature = "io-uring")]
-pub(crate) fn get_global_parsed_msg_tx_mutex() -> &'static Mutex<Option<KanalSyncSender<(RawFd, HandlerUpstreamEvent)>>>
+pub(crate) fn get_global_parsed_msg_tx_mutex() -> &'static Mutex<Option<SyncSender<(RawFd, HandlerUpstreamEvent)>>>
 {
   PARSED_MSG_TX_FOR_WORKER_TO_PROCESSOR.get_or_init(Default::default)
 }
 #[doc(hidden)]
 #[cfg(feature = "io-uring")]
-pub(crate) fn get_global_parsed_msg_rx_mutex() -> &'static Mutex<Option<KanalReceiver<(RawFd, HandlerUpstreamEvent)>>> {
+pub(crate) fn get_global_parsed_msg_rx_mutex() -> &'static Mutex<Option<AsyncReceiver<(RawFd, HandlerUpstreamEvent)>>> {
   PARSED_MSG_RX_FOR_PROCESSOR.get_or_init(Default::default)
 }
 #[doc(hidden)]
@@ -131,13 +132,14 @@ pub(crate) fn unregister_uring_fd_socket_core_mailbox(fd: RawFd) {
 // --- run_global_uring_upstream_processor (remains pub(crate)) ---
 #[cfg(feature = "io-uring")]
 pub(crate) async fn run_global_uring_upstream_processor(
-  msg_rx: KanalReceiver<(RawFd, HandlerUpstreamEvent)>, // This receiver is taken from the Mutex<Option<...>>
-  fd_to_mailbox_map: Arc<RwLock<HashMap<RawFd, SocketCoreMailboxSender>>>, // This Arc is taken from its OnceCell
+  msg_rx: AsyncReceiver<(RawFd, HandlerUpstreamEvent)>,
+  fd_to_mailbox_map: Arc<RwLock<HashMap<RawFd, SocketCoreMailboxSender>>>,
 ) {
-  // ... (logic remains the same) ...
   info!("Global io_uring upstream message processor task started.");
   loop {
-    match msg_rx.as_async().recv().await {
+    use fibre::RecvError;
+
+    match msg_rx.recv().await {
       Ok((fd, upstream_event)) => {
         trace!(raw_fd = fd, event_type = ?upstream_event_variant_name(&upstream_event), "UringUpstreamProcessor: Received event for FD.");
         let socket_core_mailbox_clone: Option<SocketCoreMailboxSender> = { fd_to_mailbox_map.read().get(&fd).cloned() };
@@ -166,7 +168,7 @@ pub(crate) async fn run_global_uring_upstream_processor(
           );
         }
       }
-      Err(KanalReceiveError::Closed) | Err(KanalReceiveError::SendClosed) => {
+      Err(RecvError::Disconnected) => {
         info!("UringUpstreamProcessor: Upstream message channel closed. Terminating task.");
         break;
       }

@@ -49,8 +49,7 @@ impl SocketCore {
     mut initial_options: SocketOptions,
   ) -> Result<(Arc<dyn ISocket>, MailboxSender), ZmqError> {
     let capacity = context.inner().get_actor_mailbox_capacity();
-    let (cmd_tx, cmd_rx) = mailbox(capacity); // Creates async-channel pair
-
+    let (cmd_tx, cmd_rx) = mailbox(capacity);
     initial_options.socket_type_name = format!("{:?}", socket_type).to_uppercase();
 
     let core_state_instance_new = CoreState::new(handle, socket_type, initial_options);

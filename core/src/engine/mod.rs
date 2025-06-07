@@ -3,6 +3,8 @@ pub(crate) mod core;
 pub mod zmtp_ipc;
 pub mod zmtp_tcp;
 
+use std::os::fd::AsRawFd;
+
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::security::MechanismStatus; // Needs security module defined
@@ -34,7 +36,7 @@ pub trait IEngine: Send + Sync + 'static {
 }
 
 /// Trait alias for streams usable by ZMTP engines.
-pub(crate) trait ZmtpStdStream: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug + 'static {}
+pub(crate) trait ZmtpStdStream: AsyncRead + AsyncWrite + Unpin + Send + AsRawFd + std::fmt::Debug + 'static {}
 // Implement the marker trait for Tokio's streams
 impl ZmtpStdStream for tokio::net::TcpStream {}
 #[cfg(feature = "ipc")]

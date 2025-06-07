@@ -10,7 +10,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use kanal::Sender as KanalSender;
+use fibre::mpmc::Sender as UpstreamEventSender;
 
 // UserData re-export from ops.rs
 pub use crate::io_uring_backend::ops::UserData;
@@ -250,5 +250,5 @@ pub enum HandlerUpstreamEvent {
 
 #[derive(Clone)]
 pub struct WorkerIoConfig {
-  pub upstream_event_tx: KanalSender<(RawFd, HandlerUpstreamEvent)>,
+  pub upstream_event_tx: UpstreamEventSender<(RawFd, HandlerUpstreamEvent)>,
 }

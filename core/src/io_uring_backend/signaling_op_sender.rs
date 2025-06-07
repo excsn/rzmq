@@ -3,24 +3,23 @@
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::ops::UringOpRequest;
-use kanal::{AsyncSender as KanalAsyncSender, SendError as KanalSendError};
-use std::os::fd::AsRawFd;
+use fibre::{mpmc::{AsyncSender, SendError}, TrySendError};
+use std::{os::fd::AsRawFd, usize};
 
 #[derive(Clone)] // EventFD is Cloneable
 pub struct SignalingOpSender {
-  op_tx: KanalAsyncSender<UringOpRequest>, // Store the async sender directly
+  op_tx: AsyncSender<UringOpRequest>, // Store the async sender directly
   event_fd: eventfd::EventFD,              // Clone of the UringWorker's EventFD
 }
 
 impl SignalingOpSender {
-  pub fn new(op_tx: KanalAsyncSender<UringOpRequest>, event_fd: eventfd::EventFD) -> Self {
+  pub fn new(op_tx: AsyncSender<UringOpRequest>, event_fd: eventfd::EventFD) -> Self {
     Self { op_tx, event_fd }
   }
 
   /// Asynchronously sends an operation request and signals the eventfd on success.
-  pub async fn send(&self, req: UringOpRequest) -> Result<(), KanalSendError> {
-    // Send to the underlying Kanal channel first.
-    // Kanal's async sender's send method is itself async.
+  pub async fn send(&self, req: UringOpRequest) -> Result<(), SendError> {
+    // Send to the underlying channel first.
     let send_result = self.op_tx.send(req).await;
 
     if send_result.is_ok() {
@@ -44,12 +43,12 @@ impl SignalingOpSender {
         );
       }
     }
-    // Return the original result of the Kanal send operation.
+    // Return the original result of the send operation.
     send_result
   }
 
   /// Attempts to send an operation request without blocking and signals eventfd on success.
-  pub fn try_send(&self, req: UringOpRequest) -> Result<bool, KanalSendError> {
+  pub fn try_send(&self, req: UringOpRequest) -> Result<(), TrySendError<UringOpRequest>> {
     let send_result = self.op_tx.try_send(req);
 
     if send_result.is_ok() {
@@ -71,7 +70,7 @@ impl SignalingOpSender {
     send_result
   }
 
-  // --- Delegated methods to KanalAsyncSender ---
+  // --- Delegated methods to AsyncSender ---
 
   pub fn is_closed(&self) -> bool {
     self.op_tx.is_closed()
@@ -82,14 +81,14 @@ impl SignalingOpSender {
   }
 
   pub fn capacity(&self) -> usize {
-    self.op_tx.capacity()
+    self.op_tx.capacity().unwrap_or(usize::MAX)
   }
 
   pub fn len(&self) -> usize {
     self.op_tx.len()
   }
 
-  // Note: Other methods like `send_blocking` or `send_timeout` from Kanal's Sender
+  // Note: Other methods like `send_blocking` or `send_timeout` from Sender
   // would need to be implemented here if they are intended to be used through SignalingOpSender,
   // each also signaling the event_fd on success. For now, focusing on `send` (async) and `try_send`.
 }
@@ -101,7 +100,7 @@ impl std::fmt::Debug for SignalingOpSender {
       .field(
         "op_tx_details",
         &format_args!(
-          "KanalAsyncSender(len:{}, cap:{:?}, closed:{})",
+          "AsyncSender(len:{}, cap:{:?}, closed:{})",
           self.op_tx.len(),
           self.op_tx.capacity(),
           self.op_tx.is_closed()

@@ -10,14 +10,16 @@ use crate::io_uring_backend::worker::external_op_tracker::MultipartSendState;
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType};
 use crate::profiler::LoopProfiler;
 use crate::ZmqError;
-use io_uring::{opcode, types};
-use kanal::ReceiveError as KanalReceiveError;
+
 use std::any::Any;
 use std::collections::VecDeque;
 use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
+
+use fibre::{RecvError, TryRecvError};
+use io_uring::{opcode, types};
 use tracing::{debug, error, info, trace, warn};
 
 impl UringWorker {
@@ -972,7 +974,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         break;
       }
       match worker.op_rx.try_recv() {
-        Ok(Some(request_from_channel)) => {
+        Ok(request_from_channel) => {
           user_space_activity_this_cycle = true;
           match worker.handle_external_op_request_submission(request_from_channel.clone()) {
             Ok(_sqe_produced) => {}
@@ -981,8 +983,10 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             }
           }
         }
-        Ok(None) => break,
-        Err(KanalReceiveError::Closed) | Err(KanalReceiveError::SendClosed) => {
+        Err(TryRecvError::Empty) => {
+          break;
+        }
+        Err(TryRecvError::Disconnected) => {
           info!("UringWorker: op_rx channel closed. Setting shutdown_requested = true.");
           worker.shutdown_requested = true;
           break;
@@ -1169,7 +1173,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           // This gives op_rx higher priority than a blocking kernel wait.
 
           match worker.op_rx.try_recv() {
-            Ok(Some(request_from_channel)) => {
+            Ok(request_from_channel) => {
               trace!("UringWorker: Polled op_rx while kernel ops pending; got new request. Will process next iter.");
               match worker.handle_external_op_request_submission(request_from_channel) {
                 Ok(_sqe_produced) => {}
@@ -1179,7 +1183,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               }
               kernel_poll_timeout_duration = KERNEL_POLL_INITIAL; // Activity, reset kernel poll
             }
-            Ok(None) => {
+            Err(TryRecvError::Empty) => {
               // op_rx is empty
               trace!(
                                 "UringWorker: op_rx empty. Kernel ops pending (int:{}, ext:{}, ev_poll:{}) or eventfd poll active. Waiting for CQEs with timeout: {:?}.",
@@ -1236,7 +1240,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
               profiler.mark_segment_end_and_start_new("kernel_wait_submit_with_args");
             }
-            Err(KanalReceiveError::Closed) | Err(KanalReceiveError::SendClosed) => {
+            Err(TryRecvError::Disconnected) => {
               info!("UringWorker: op_rx channel closed while checking (kernel ops pending branch).");
               worker.shutdown_requested = true;
             }

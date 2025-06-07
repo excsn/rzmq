@@ -27,10 +27,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
+use fibre::mpmc::{unbounded, AsyncSender, Sender as SyncSender, Receiver as SyncReceiver};
 use io_uring::opcode;
 use io_uring::types;
 use io_uring::IoUring;
-use kanal::{AsyncSender as KanalAsyncSender, Receiver as KanalReceiver, Sender as KanalSyncSender};
 use tracing::{error, info, trace, warn};
 
 // Publicly re-export for use within io_uring_backend module
@@ -42,7 +42,7 @@ pub(crate) use multishot_reader::MultishotReader;
 
 pub struct UringWorker {
   ring: IoUring,
-  op_rx: KanalReceiver<UringOpRequest>,
+  op_rx: SyncReceiver<UringOpRequest>,
 
   buffer_manager: Option<BufferRingManager>, // Option because it's initialized via UringOpRequest
   handler_manager: HandlerManager,
@@ -90,10 +90,10 @@ impl UringWorker {
   pub fn spawn_with_config(
     config: UringConfig,
     factories: Vec<Arc<dyn ProtocolHandlerFactory>>,
-    upstream_event_tx: KanalSyncSender<(RawFd, HandlerUpstreamEvent)>,
+    upstream_event_tx: SyncSender<(RawFd, HandlerUpstreamEvent)>,
   ) -> Result<(SignalingOpSender, std::thread::JoinHandle<Result<(), ZmqError>>), ZmqError> {
-    let (op_tx_sync, op_rx) = kanal::unbounded::<UringOpRequest>();
-    let op_tx_async_for_signaler: KanalAsyncSender<UringOpRequest> = op_tx_sync.to_async();
+    let (op_tx_sync, op_rx) = unbounded::<UringOpRequest>();
+    let op_tx_async_for_signaler: AsyncSender<UringOpRequest> = op_tx_sync.to_async();
 
     let worker_io_config = Arc::new(WorkerIoConfig { upstream_event_tx });
 

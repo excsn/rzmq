@@ -61,7 +61,13 @@ impl ContextInner {
     // Auto initialize io uring if cfg enabled
     #[cfg(feature = "io-uring")]
     {
-      global_state::ensure_global_uring_systems_started()?;
+      match global_state::ensure_global_uring_systems_started()
+      {
+        Ok(_) | Err(ZmqError::InvalidState(_)) => {},
+        Err(err) => {
+          return Err(err);
+        }
+      }
       global_state::get_global_uring_worker_op_tx()?;
     }
 

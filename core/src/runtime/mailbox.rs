@@ -1,6 +1,6 @@
 // src/runtime/mailbox.rs
 
-//! Type aliases for actor communication channels based on `async-channel`.
+//! Type aliases for actor communication channels.
 
 use crate::runtime::command::Command;
 use fibre::mpmc;

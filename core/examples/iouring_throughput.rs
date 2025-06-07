@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use rzmq::socket::options as zmq_opts; // For socket option constants
-use rzmq::uring::{initialize_uring_backend, UringConfig};
+use rzmq::uring::{initialize_uring_backend, shutdown_uring_backend, UringConfig};
 use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
 use std::time::{Duration, Instant}; // For efficient Bytes cloning
 

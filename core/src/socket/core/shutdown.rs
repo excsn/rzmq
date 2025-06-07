@@ -662,7 +662,7 @@ pub(crate) async fn handle_failed_uring_fd_connection(
           failed_fd = fd,
           "Uring FD connection failed. Attempting to respawn connecter."
       );
-      command_processor::respawn_connecter_actor(core_arc, target_uri_to_reconnect).await;
+      command_processor::respawn_connecter_actor(core_arc, socket_logic_strong.clone(), target_uri_to_reconnect).await;
     }
   }
 }
