@@ -21,8 +21,6 @@ pub use mailbox::DEFAULT_MAILBOX_CAPACITY;
 pub use event_bus::EventBus;
 pub use system_events::{ActorType, SystemEvent};
 
-pub use command::EngineConnectionType;
-
 // Sync Primitives
 pub(crate) use actor_drop_guard::ActorDropGuard;
 pub(crate) use latch::CountDownLatch;

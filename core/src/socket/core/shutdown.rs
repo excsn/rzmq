@@ -405,7 +405,7 @@ pub(crate) async fn handle_actor_stopping_event(
                 was_last_pending = true;
             }
         }
-        ActorType::Session | ActorType::Engine => {
+        ActorType::Session => {
             // stopped_actor_id for Session/Engine should be the connection_instance_id (session handle or RawFd)
             if coordinator.record_connection_closed(stopped_actor_id, core_handle) {
                 was_last_pending = true;

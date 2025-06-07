@@ -20,23 +20,20 @@ use tokio::task::JoinHandle;
 #[derive(Debug)]
 pub(crate) struct EndpointInfo {
   /// - For Listeners/Connecters: Command mailbox to the Listener/Connecter actor.
-  /// - For Session (ViaSessionActor): Command mailbox to the SessionBase actor.
   /// - For Session (ViaUringFd): Could be SocketCore's own sender or a dummy; not used for direct commands.
   pub mailbox: MailboxSender,
   /// - For Listeners/Connecters: `JoinHandle` for their main actor task.
-  /// - For Session (ViaSessionActor or ViaUringFd): `None`, as SocketCore doesn't directly manage their task handles.
+  /// - For Session (ViaUringFd): `None`, as SocketCore doesn't directly manage their task handles.
   pub task_handle: Option<JoinHandle<()>>,
   /// Type of the endpoint (Listener or active Session).
   pub endpoint_type: EndpointType,
   /// The resolved URI of this endpoint (e.g., actual bound TCP address or peer's address).
   pub endpoint_uri: String,
-  /// - For Session (ViaSessionActor): `Some((actual_core_write_id, actual_core_read_id))` for pipes.
   /// - For Session (ViaUringFd): `Some((synthetic_write_id, synthetic_read_id))` for ISocket interaction.
   /// - For Listener: `None`.
   pub pipe_ids: Option<(usize, usize)>, // (core_writes_here, core_reads_from_here)
   /// A unique identifier for this endpoint entry.
   /// - For Listener/Connecter: The handle_id of their primary actor.
-  /// - For Session (ViaSessionActor): The handle_id of the SessionBase actor.
   /// - For Session (ViaUringFd): The RawFd cast to usize.
   pub handle_id: usize,
   /// For connected endpoints (Sessions), this stores the original target URI if it was an outgoing connect.

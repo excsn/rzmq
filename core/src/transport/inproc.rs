@@ -100,11 +100,9 @@ pub(crate) async fn connect_inproc(
     .insert(pipe_id_connector_writes_to_binder, tx_connector_to_binder.clone());
 
   let connector_context_clone = core_arc.context.clone();
-  let connector_command_sender_clone = core_arc.command_sender();
   let pipe_reader_task_join_handle = tokio::spawn(run_pipe_reader_task(
     connector_context_clone,
     connector_core_handle,
-    connector_command_sender_clone,
     socket_logic,
     pipe_id_connector_reads_from_binder,
     rx_connector_from_binder.clone(),

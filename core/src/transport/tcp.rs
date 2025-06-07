@@ -1,14 +1,9 @@
-// core/src/transport/tcp.rs
-
 use crate::context::Context;
-use crate::engine::zmtp_tcp::create_and_spawn_tcp_engine;
 use crate::error::ZmqError;
-use crate::runtime::command::EngineConnectionType as CommandEngineConnectionType;
 use crate::runtime::{
   mailbox, system_events::ConnectionInteractionModel, ActorDropGuard, ActorType, Command,
   MailboxReceiver as GenericMailboxReceiver, MailboxSender as GenericMailboxSender, SystemEvent,
 };
-use crate::session::SessionBase;
 use crate::sessionx::actor::SessionConnectionActorX;
 use crate::sessionx::states::ActorConfigX;
 use crate::socket::connection_iface::ISocketConnection;
@@ -490,7 +485,7 @@ impl TcpListener {
                     parent_core_id: parent_socket_core_id,
                     endpoint_uri: actual_connected_uri.clone(),
                     target_endpoint_uri: logical_uri.clone(),
-                    connection_iface: connection_iface_for_event, // Will be None for ViaSessionActor here
+                    connection_iface: connection_iface_for_event,
                     interaction_model: inter_model,
                     managing_actor_task_id: managing_actor_task_id_for_event,
                   };

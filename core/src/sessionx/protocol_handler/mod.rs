@@ -2,7 +2,7 @@
 
 #![allow(dead_code, unused_variables, unused_mut)]
 
-use crate::engine::ZmtpStdStream;
+use crate::transport::ZmtpStdStream;
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::protocol::zmtp::greeting::ZmtpGreeting; // Needed for pending_peer_greeting

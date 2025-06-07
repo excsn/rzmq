@@ -3,7 +3,7 @@
 #![allow(dead_code, unused_variables)]
 
 use super::ZmtpProtocolHandlerX;
-use crate::engine::ZmtpStdStream;
+use crate::transport::ZmtpStdStream;
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::protocol::zmtp::command::{ZmtpCommand, ZmtpReady};

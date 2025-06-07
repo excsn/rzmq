@@ -4,7 +4,7 @@ use crate::runtime::{Command, SystemEvent};
 use crate::sessionx::ScaConnectionIface;
 #[cfg(feature = "io-uring")]
 use crate::socket::connection_iface::UringFdConnection;
-use crate::socket::connection_iface::{ISocketConnection, SessionConnection};
+use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
 use crate::socket::core::{command_processor, pipe_manager, shutdown, SocketCore};
 use crate::socket::ISocket;
@@ -96,12 +96,8 @@ pub(crate) async fn process_system_event(
               tracing::error!(handle = core_handle, new_conn_uri = %endpoint_uri, "Error closing orphaned new connection: {}", e);
             }
           }
-          if let ConnectionInteractionModel::ViaSessionActor {
-            session_actor_mailbox, ..
-          } = interaction_model
-          {
-            let _ = session_actor_mailbox.try_send(Command::Stop);
-          } else if let ConnectionInteractionModel::ViaSca { sca_mailbox, .. } = interaction_model {
+          
+          if let ConnectionInteractionModel::ViaSca { sca_mailbox, .. } = interaction_model {
             let _ = sca_mailbox.try_send(Command::Stop);
           }
         }
@@ -236,10 +232,6 @@ async fn handle_new_connection_established(
   let core_handle = core_arc.handle;
 
   let connection_instance_id = match &interaction_model_from_event {
-    ConnectionInteractionModel::ViaSessionActor {
-      session_actor_handle_id,
-      ..
-    } => *session_actor_handle_id,
     ConnectionInteractionModel::ViaSca { sca_handle_id, .. } => *sca_handle_id,
     #[cfg(feature = "io-uring")]
     ConnectionInteractionModel::ViaUringFd { fd } => *fd as usize,
@@ -260,90 +252,6 @@ async fn handle_new_connection_established(
   let final_connection_iface: Arc<dyn ISocketConnection>;
 
   match interaction_model_from_event {
-    ConnectionInteractionModel::ViaSessionActor {
-      session_actor_mailbox,
-      session_actor_handle_id,
-    } => {
-      tracing::debug!(
-        handle = core_handle,
-        conn_uri = %endpoint_uri_from_event,
-        session_actor_id = session_actor_handle_id,
-        "NewConnectionEstablished: Standard SessionActor path. SocketCore will construct SessionConnection."
-      );
-
-      // SocketCore now constructs the SessionConnection iface here.
-      // connection_iface_from_event_opt should be None.
-      if connection_iface_from_event_opt.is_some() {
-        tracing::warn!(handle = core_handle, conn_uri = %endpoint_uri_from_event, "NewConnectionEstablished for ViaSessionActor unexpectedly received a pre-existing ISocketConnection. This is unusual.");
-      }
-
-      let (actual_core_write_id, actual_core_read_id) = pipe_manager::setup_pipe_with_session_actor(
-        core_arc.clone(),
-        socket_logic_strong.clone(),
-        &session_actor_mailbox,  // Pass reference
-        session_actor_handle_id, // Use ID from event
-        &endpoint_uri_from_event,
-      )
-      .await?;
-
-      let arc_socket_options = core_arc.core_state.read().options.clone();
-      let core_context_clone = core_arc.context.clone();
-
-      // Construct the SessionConnection *after* pipes are set up by pipe_manager
-      let tx_core_to_session_for_iface = core_arc
-        .core_state
-        .read()
-        .pipes_tx
-        .get(&actual_core_write_id)
-        .cloned()
-        .ok_or_else(|| ZmqError::Internal("Failed to retrieve pipe sender for SessionConnection".into()))?;
-
-      // Construct final_connection_iface for ViaSessionActor path
-      final_connection_iface = Arc::new(SessionConnection::new(
-        session_actor_mailbox.clone(),
-        session_actor_handle_id,
-        tx_core_to_session_for_iface,
-        arc_socket_options,
-        core_context_clone,
-      ));
-
-      let endpoint_info = EndpointInfo {
-        mailbox: session_actor_mailbox.clone(),
-        task_handle: None,
-        endpoint_type: EndpointType::Session,
-        endpoint_uri: endpoint_uri_from_event.clone(),
-        pipe_ids: Some((actual_core_write_id, actual_core_read_id)),
-        handle_id: session_actor_handle_id, // Use session_actor_handle_id from event
-        target_endpoint_uri: Some(target_endpoint_uri_from_event),
-        is_outbound_connection: is_outbound_this_core_initiated,
-        connection_iface: final_connection_iface,
-      };
-
-      {
-        let mut core_s = core_arc.core_state.write();
-        if let Some(old_info) = core_s.endpoints.insert(endpoint_uri_from_event.clone(), endpoint_info) {
-          tracing::warn!(handle=core_handle, uri=%endpoint_uri_from_event, "Overwrote existing EndpointInfo for NewConnectionEstablished.");
-          if let Some(old_task_handle) = old_info.task_handle {
-            old_task_handle.abort();
-          }
-          if let Some((old_w, old_r)) = old_info.pipe_ids {
-            core_s.remove_pipe_state(old_w, old_r);
-            let socket_logic_clone = socket_logic_strong.clone();
-            tokio::spawn(async move {
-              socket_logic_clone.pipe_detached(old_r).await;
-            });
-          }
-        }
-        core_s
-          .pipe_read_id_to_endpoint_uri
-          .insert(actual_core_read_id, endpoint_uri_from_event.clone());
-      }
-      socket_logic_strong
-        .pipe_attached(actual_core_read_id, actual_core_write_id, None)
-        .await;
-      tracing::info!(handle=core_handle, session_id=connection_instance_id, conn_uri=%endpoint_uri_from_event, "Session-based connection fully attached.");
-    }
-
     ConnectionInteractionModel::ViaSca {
       sca_mailbox,
       sca_handle_id,

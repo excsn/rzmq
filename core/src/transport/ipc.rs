@@ -608,24 +608,3 @@ impl IpcConnecter {
 fn is_fatal_ipc_accept_error(e: &io::Error) -> bool {
   matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe)
 }
-
-pub(crate) fn create_and_spawn_ipc_engine_wrapper(
-  engine_handle_id: usize,
-  session_cmd_mailbox: GenericMailboxSender,
-  unix_stream: UnixStream,
-  socket_options: Arc<SocketOptions>,
-  is_server_role: bool,
-  context: &Context,
-  session_handle_id: usize,
-) -> (GenericMailboxSender, JoinHandle<()>) {
-  let (engine_command_mailbox, engine_task_join_handle) = crate::engine::zmtp_ipc::create_and_spawn_ipc_engine(
-    engine_handle_id,
-    session_cmd_mailbox,
-    unix_stream,
-    socket_options,
-    is_server_role,
-    context,
-    session_handle_id,
-  );
-  (engine_command_mailbox, engine_task_join_handle)
-}

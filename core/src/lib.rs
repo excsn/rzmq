@@ -10,8 +10,6 @@
 
 /// Defines the `Context`, which is the entry point for creating sockets.
 pub mod context;
-/// Manages the ZMTP protocol engine and transport-specific I/O.
-pub mod engine;
 /// Defines custom error types used throughout the library.
 pub mod error;
 /// Contains types related to message representation (Msg, Blob, etc.).
@@ -23,7 +21,6 @@ pub mod runtime;
 /// Handles security mechanisms (NULL, PLAIN, NOISE_XX) and ZAP.
 pub mod security;
 /// Manages individual connection sessions, bridging sockets and engines.
-pub mod session;
 pub mod sessionx;
 /// Defines socket types, options, and the core socket actor logic.
 pub mod socket;

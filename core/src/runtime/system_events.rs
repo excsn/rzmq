@@ -26,13 +26,11 @@ pub enum ActorType {
   AcceptLoop,
   /// The actor managing a ZMTP session over an established connection.
   Session,
-  SessionConnectionActor,
-  /// The actor handling the ZMTP protocol details and I/O for a specific session.
-  Engine,
+  /// The task dedicated to reading messages from an inter-actor pipe,
+  /// specifically used for inproc connections.
+  PipeReader,
   /// The task dedicated to establishing an outgoing connection (e.g., TCP or IPC connector).
   Connecter,
-  /// The task dedicated to reading messages from an inter-actor pipe (e.g., SocketCore reading from Session).
-  PipeReader,
   /// The dedicated task within ContextInner managing the WaitGroup via events from the EventBus.
   ContextListener,
 }
@@ -229,16 +227,6 @@ impl fmt::Debug for SystemEvent {
 // This enum describes how SocketCore interacts with an established connection.
 #[derive(Clone)] // ISocketConnection is Arc'd, RawFd is Copy, MailboxSender is Clone
 pub enum ConnectionInteractionModel {
-  // Renamed from ConnectionDetailsForSocketCore for clarity
-  /// Connection is managed via a standard SessionBase actor (and its ZmtpEngineCoreStd).
-  ViaSessionActor {
-    // SocketCore sends commands (like Stop) to SessionBase via this mailbox.
-    // Data messages from SocketCore to SessionBase go via a dedicated pipe,
-    // set up by SocketCore with Command::AttachPipe.
-    session_actor_mailbox: SessionCommandMailboxSender,
-    /// The unique handle ID of the SessionBase actor.
-    session_actor_handle_id: usize,
-  },
   ViaSca { // SCA = SessionConnectionActor
     sca_mailbox: SessionCommandMailboxSender,
     sca_handle_id: usize,
@@ -256,14 +244,6 @@ pub enum ConnectionInteractionModel {
 impl fmt::Debug for ConnectionInteractionModel {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      ConnectionInteractionModel::ViaSessionActor {
-        session_actor_mailbox,
-        session_actor_handle_id,
-      } => f
-        .debug_struct("ViaSessionActor")
-        .field("session_actor_mailbox_closed", &session_actor_mailbox.is_closed())
-        .field("session_actor_handle_id", session_actor_handle_id)
-        .finish(),
       ConnectionInteractionModel::ViaSca { sca_mailbox, sca_handle_id } => 
         f.debug_struct("ViaSca")
          .field("sca_mailbox_closed", &sca_mailbox.is_closed())

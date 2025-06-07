@@ -3,7 +3,7 @@
 #![allow(dead_code, unused_variables)] // Keep for now
 
 use super::ZmtpProtocolHandlerX; // To access fields of the main struct
-use crate::engine::ZmtpStdStream;
+use crate::transport::ZmtpStdStream;
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::protocol::zmtp::ZmtpCodec; // For encoding messages

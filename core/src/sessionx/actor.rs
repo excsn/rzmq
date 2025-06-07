@@ -2,7 +2,7 @@
 
 #![allow(dead_code, unused_variables, unused_mut)]
 
-use crate::engine::ZmtpStdStream;
+use crate::transport::ZmtpStdStream;
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};

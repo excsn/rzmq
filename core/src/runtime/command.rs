@@ -1,25 +1,12 @@
-// src/runtime/command.rs
-
 use crate::message::Msg;
-use crate::socket::MonitorSender; // For UserMonitor command
-use crate::{error::ZmqError, Blob}; // Blob for EngineReady, ZmqError for replies
-
-use super::mailbox::MailboxSender as SessionBaseCommandSender;
+use crate::socket::MonitorSender;
+use crate::{error::ZmqError};
 
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
 use fibre::oneshot;
-
-/// Describes how SessionBase connects to its engine.
-#[derive(Debug)]
-pub enum EngineConnectionType {
-  /// Connection to a standard engine running in the main Tokio runtime.
-  Standard {
-    engine_mailbox: SessionBaseCommandSender, // Mailbox to send SessionBaseCommand to std engine
-  },
-}
 
 /// Defines messages exchanged between actors (Sockets, Sessions, Engines, etc.).
 /// These are primarily for direct, targeted communication, often expecting a reply,
@@ -86,44 +73,6 @@ pub enum Command {
   /// for very targeted shutdown scenarios (though event bus is preferred for general lifecycle).
   Stop,
 
-  // --- Session <-> Engine Interaction (Direct commands, not via event bus) ---
-  /// Sent from Listener/Connecter (via SocketCore) -> Session to provide Engine details.
-  Attach {
-    connection: EngineConnectionType,
-    engine_handle: Option<usize>, // Optional unique handle ID of the Engine actor.
-    engine_task_handle: Option<tokio::task::JoinHandle<()>>, // Optional JoinHandle for the Engine's task.
-  },
-  /// Sent from Session/Pipe -> Engine to send a message over the transport.
-  SessionPushCmd {
-    msg: Msg, // The message to be pushed to the Engine for sending.
-  },
-  /// Sent from Engine -> Session carrying a received message from the transport.
-  EnginePushCmd {
-    msg: Msg, // The message received by the Engine.
-  },
-  /// Sent from Engine -> Session when ZMTP handshake is complete and ready for data.
-  EngineReady {
-    peer_identity: Option<Blob>, // Optional identity of the peer, established during handshake.
-  },
-  /// Sent from Engine -> Session upon a fatal error within the Engine.
-  EngineError {
-    error: ZmqError, // The error that occurred in the Engine.
-  },
-  /// Sent from Engine -> Session upon clean shutdown of the Engine.
-  EngineStopped,
-
-  // --- ZAP Related (Examples, for direct Session <-> Engine interaction if ZAP is handled there) ---
-  /// Sent from Engine -> Session to initiate ZAP authentication check.
-  RequestZapAuth {
-    // Payload would include ZAP request frames (Mechanism, Credentials, etc.)
-    // Details TBD based on ZAP implementation.
-  },
-  /// Sent from Session -> Engine with ZAP reply from an authenticator.
-  ProcessZapReply {
-    // Payload would include ZAP reply frames (Status Code, UserID, Metadata, etc.)
-    // Details TBD.
-  },
-
   // --- Pipe Management (PipeReaderTask -> SocketCore, direct commands for performance) ---
   /// Sent from PipeReaderTask -> SocketCore when a message arrives from a session's data pipe.
   PipeMessageReceived {
@@ -186,14 +135,6 @@ impl Command {
       Command::UserMonitor { .. } => "UserMonitor",
       Command::UserClose { .. } => "UserClose",
       Command::Stop => "Stop",
-      Command::Attach { .. } => "Attach",
-      Command::SessionPushCmd { .. } => "SessionPushCmd",
-      Command::EnginePushCmd { .. } => "EnginePushCmd",
-      Command::EngineReady { .. } => "EngineReady",
-      Command::EngineError { .. } => "EngineError",
-      Command::EngineStopped => "EngineStopped",
-      Command::RequestZapAuth { .. } => "RequestZapAuth",
-      Command::ProcessZapReply { .. } => "ProcessZapReply",
       Command::PipeMessageReceived { .. } => "PipeMessageReceived",
       Command::PipeClosedByPeer { .. } => "PipeClosedByPeer",
       Command::AttachPipe { .. } => "AttachPipe",
