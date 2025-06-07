@@ -1,5 +1,3 @@
-// examples/dealer_router_iouring_throughput.rs
-
 use bytes::Bytes;
 use futures::future::join_all;
 use rzmq::socket::{events::SocketEvent, options as zmq_opts};

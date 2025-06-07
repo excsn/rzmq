@@ -1,3 +1,5 @@
+pub mod capacity_gate;
+
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;

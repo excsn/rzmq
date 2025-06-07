@@ -31,6 +31,7 @@ bench_external_clients = []
 fibre = { version = "^0" }
 async-trait = "^0.1.88"
 async-recursion = "^1.0"
+futures-intrusive = "^0"
 tokio = { version = "^1", features = ["fs", "rt", "rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
 tokio-util = { version = "^0.7", features = ["codec"] }
 futures = "^0.3"
@@ -94,15 +95,6 @@ harness = false
 name = "generic_client_benchmark"
 harness = false
 required-features = ["bench_external_clients"]
-
-[[bench]]
-name = "tcp_cork_bench"
-harness = false
-
-[[bench]]
-name = "zerocopy_bench"
-harness = false
-required-features = ["io-uring"]
 
 [[example]]
 name = "plain_req_rep"
