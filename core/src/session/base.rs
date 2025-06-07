@@ -148,7 +148,7 @@ impl SessionBase {
     let _loop_result: Result<(), ()> = async {
       loop {
         let should_read_core_pipe = self.pipe_attached && self.engine_ready && self.rx_from_core.is_some();
-        let core_pipe_receiver_ref = self.rx_from_core.as_ref();
+        let mut core_pipe_receiver_ref = self.rx_from_core.as_mut();
         tracing::debug!(handle = session_handle, uri = %endpoint_uri_for_monitor_event, "Session loop iteration. engine_ready={}, pipe_attached={}, shutdown_signal={}", self.engine_ready, self.pipe_attached, received_shutdown_signal);
 
         tokio::select! {
@@ -198,7 +198,7 @@ impl SessionBase {
           }
 
           // IMPORTANT: We are prioritizing THIS outgoing arm to keep a moving and robust server. THIS SHOULD NEVER BE BELOW THE INCOMING ARM!!!!
-          msg_result = async { core_pipe_receiver_ref.unwrap().recv().await }, if should_read_core_pipe && !received_shutdown_signal => {
+          msg_result = async { core_pipe_receiver_ref.as_mut().unwrap().recv().await }, if should_read_core_pipe && !received_shutdown_signal => {
             tracing::debug!(handle = session_handle, uri = %endpoint_uri_for_monitor_event, "Session polled rx_from_core branch.");
             match msg_result {
               Ok(msg) => {

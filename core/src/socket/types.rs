@@ -181,7 +181,7 @@ impl Socket {
   /// (e.g., if the socket's internal actor communication fails).
   pub async fn monitor(&self, capacity: usize) -> Result<MonitorReceiver, ZmqError> {
     let (monitor_tx, monitor_rx) = bounded_async(capacity.max(1)); // Ensure capacity is at least 1.
-    let (reply_tx, mut reply_rx) = oneshot::oneshot();
+    let (reply_tx, reply_rx) = oneshot::oneshot();
 
     // Create a UserMonitor command to send to the SocketCore.
     let cmd = Command::UserMonitor { monitor_tx, reply_tx };

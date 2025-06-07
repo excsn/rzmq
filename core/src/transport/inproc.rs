@@ -156,7 +156,7 @@ pub(crate) async fn connect_inproc(
 
   let monitor_tx_for_event = connector_monitor_tx;
 
-  let (reply_tx, mut reply_rx_internal_binder) = oneshot::oneshot();
+  let (reply_tx, reply_rx_internal_binder) = oneshot::oneshot();
   let request_event = SystemEvent::InprocBindingRequest {
     target_inproc_name: name.clone(),
     connector_uri: connector_uri_str.clone(),

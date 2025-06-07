@@ -174,7 +174,7 @@ impl TcpListener {
     Ok((tx, cmd_loop_jh, resolved_uri))
   }
 
-  async fn run_command_loop(self, parent_socket_id: usize) {
+  async fn run_command_loop(mut self, parent_socket_id: usize) {
     let listener_cmd_loop_handle = self.handle;
     let endpoint_uri_clone_log = self.endpoint.clone();
     let event_bus = self.context.event_bus();

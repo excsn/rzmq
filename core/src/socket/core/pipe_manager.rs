@@ -116,7 +116,7 @@ pub(crate) async fn run_pipe_reader_task(
   core_command_mailbox: MailboxSender,
   socket_logic_strong: Arc<dyn ISocket>,
   pipe_read_id: usize,
-  pipe_receiver: AsyncReceiver<Msg>,
+  mut pipe_receiver: AsyncReceiver<Msg>,
 ) {
   let pipe_reader_task_handle_id = context.inner().next_handle();
   let pipe_reader_actor_type = ActorType::PipeReader;

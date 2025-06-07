@@ -52,7 +52,7 @@ macro_rules! delegate_to_core {
     {
       use fibre::oneshot;
       // Create a oneshot channel for the reply.
-      let (reply_tx, mut reply_rx) = oneshot::oneshot();
+      let (reply_tx, reply_rx) = oneshot::oneshot();
       // Construct the command variant with its fields and the reply sender.
       // Ensure Command is accessible, e.g., via $crate::runtime::Command
       let cmd = $crate::runtime::Command::$variant { $($field : $value),+, reply_tx };
@@ -70,7 +70,7 @@ macro_rules! delegate_to_core {
   ($self:ident, $variant:ident $(,)?) => {
       {
         use fibre::oneshot;
-          let (reply_tx, mut reply_rx) = oneshot::oneshot();
+          let (reply_tx, reply_rx) = oneshot::oneshot();
           let cmd = $crate::runtime::Command::$variant { reply_tx };
           $self.mailbox()
               .send(cmd)

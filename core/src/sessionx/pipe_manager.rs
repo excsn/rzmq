@@ -36,8 +36,8 @@ impl CorePipeManagerX {
   /// Attempts to receive a message from SocketCore (i.e., an outgoing message
   /// to be sent over the network).
   /// This is an async method that will await if the channel is empty.
-  pub(crate) async fn recv_from_core(&mut self) -> Result<Msg, RecvError> {
-    if let Some(rx) = &self.state.rx_from_core {
+  pub(crate) async fn recv_from_core(&self) -> Result<Msg, RecvError> {
+    if let Some(ref rx) = self.state.rx_from_core {
       rx.recv().await
     } else {
       // This indicates a programming error: called before pipes are attached

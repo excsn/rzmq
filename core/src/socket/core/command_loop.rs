@@ -1,9 +1,7 @@
-// core/src/socket/core/command_loop.rs
-
 use crate::error::ZmqError;
-use crate::runtime::{actor_drop_guard, ActorDropGuard, ActorType, Command, MailboxReceiver, SystemEvent};
-use crate::socket::core::state::ShutdownPhase; // To access ShutdownPhase directly
-use crate::socket::core::{command_processor, event_processor, shutdown, SocketCore}; // For calling helpers
+use crate::runtime::{ActorDropGuard, ActorType, MailboxReceiver, SystemEvent};
+use crate::socket::core::state::ShutdownPhase;
+use crate::socket::core::{command_processor, event_processor, shutdown, SocketCore};
 use crate::socket::ISocket;
 
 use std::sync::Arc;
@@ -15,9 +13,9 @@ use tokio::time::{interval, Interval};
 /// It listens for user commands on its mailbox and system events on the event bus.
 pub(crate) async fn run_command_loop(
   core_arc: Arc<SocketCore>,
-  socket_logic_strong: Arc<dyn ISocket>, // Strong Arc to the ISocket pattern logic
-  command_receiver: MailboxReceiver,     // Mailbox for user commands, now mutable
-  mut system_event_rx: broadcast::Receiver<SystemEvent>, // Event bus receiver
+  socket_logic_strong: Arc<dyn ISocket>,
+  command_receiver: MailboxReceiver,
+  mut system_event_rx: broadcast::Receiver<SystemEvent>,
 ) {
   let core_handle = core_arc.handle;
   let context_clone_for_stop = core_arc.context.clone(); // For publishing ActorStopping
