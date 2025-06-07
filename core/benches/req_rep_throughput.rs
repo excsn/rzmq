@@ -1,6 +1,11 @@
-// benches/req_rep_throughput.rs
-
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use bench_matrix::{
+  criterion_runner::{
+    async_suite::{AsyncBenchmarkSuite, AsyncSetupFn},
+    ExtractorFn,
+  },
+  AbstractCombination, MatrixCellValue,
+};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use rzmq::{
   socket::{
     options::{RCVHWM, SNDHWM},
@@ -8,26 +13,56 @@ use rzmq::{
   },
   Context, Msg, SocketType, ZmqError,
 };
-use std::time::{Duration, Instant};
+use std::{
+  future::Future,
+  pin::Pin,
+  sync::{
+    atomic::{AtomicU16, Ordering as AtomicOrdering},
+    Arc,
+  },
+  time::{Duration, Instant},
+};
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 // --- Benchmarking Constants ---
-const NUM_ROUND_TRIPS: usize = 1000; // Fewer messages due to round-trip nature
-const BIND_ADDR_REQ_REP: &str = "tcp://127.0.0.1:5681"; // Unique port
-const SETUP_TIMEOUT_REQ_REP: Duration = Duration::from_secs(5);
-const EVENT_RECV_TIMEOUT_REQ_REP: Duration = Duration::from_secs(4);
-const BENCH_HWM_REQ_REP: i32 = 100_000;
+const BIND_ADDR_BASE: &str = "tcp://127.0.0.1";
+const EVENT_RECV_TIMEOUT: Duration = Duration::from_secs(5);
+const BENCH_HWM: i32 = 100_000;
+const PRINT_BENCH_INFO: bool = false;
 
-// --- Helper: wait_for_event (can be in common.rs) ---
-async fn wait_for_event_req_rep(
+// Global atomic port counter to prevent collisions.
+static NEXT_BENCH_PORT: AtomicU16 = AtomicU16::new(5600);
+
+// --- Configuration for Benchmarks ---
+#[derive(Debug, Clone)]
+pub struct ConfigReqRep {
+  pub num_requesters: usize,
+  pub msg_size: usize,
+  pub requests_per_requester: usize,
+}
+
+// --- State and Context for Benchmarks ---
+#[derive(Default, Debug)]
+struct BenchContext {}
+
+struct BenchState {
+  ctx_arc: Arc<Context>,
+  req_sockets: Vec<rzmq::Socket>,
+  rep_socket: rzmq::Socket,
+  message_payload: Vec<u8>,
+}
+
+// --- Helper: wait_for_event ---
+async fn wait_for_event(
   monitor_rx: &MonitorReceiver,
   check_event: impl Fn(&SocketEvent) -> bool,
 ) -> Result<SocketEvent, String> {
   let start_time = Instant::now();
   loop {
-    if start_time.elapsed() > EVENT_RECV_TIMEOUT_REQ_REP {
-      return Err(format!("Timeout after {:?}", EVENT_RECV_TIMEOUT_REQ_REP));
+    if start_time.elapsed() > EVENT_RECV_TIMEOUT {
+      return Err(format!("Timeout after {:?}", EVENT_RECV_TIMEOUT));
     }
     match timeout(Duration::from_millis(50), monitor_rx.recv()).await {
       Ok(Ok(event)) => {
@@ -41,145 +76,234 @@ async fn wait_for_event_req_rep(
   }
 }
 
-// --- Setup Function for REQ-REP ---
-async fn setup_req_rep(ctx: &Context) -> Result<(rzmq::Socket, rzmq::Socket), ZmqError> {
-  let req = ctx.socket(SocketType::Req)?;
-  let rep = ctx.socket(SocketType::Rep)?;
+// --- Extractor Function ---
+fn extract_config(combo: &AbstractCombination) -> Result<ConfigReqRep, String> {
+  let num_requesters = combo.get_u64(0)? as usize;
+  let msg_size = combo.get_u64(1)? as usize;
+  let requests_per_requester = combo.get_u64(2)? as usize;
 
-  req.set_option(SNDHWM, &BENCH_HWM_REQ_REP.to_ne_bytes()).await?;
-  req.set_option(RCVHWM, &BENCH_HWM_REQ_REP.to_ne_bytes()).await?;
-  rep.set_option(SNDHWM, &BENCH_HWM_REQ_REP.to_ne_bytes()).await?;
-  rep.set_option(RCVHWM, &BENCH_HWM_REQ_REP.to_ne_bytes()).await?;
-
-  let rep_monitor = rep.monitor_default().await?;
-
-  rep.bind(BIND_ADDR_REQ_REP).await?;
-  wait_for_event_req_rep(
-    &rep_monitor,
-    |e| matches!(e, SocketEvent::Listening { endpoint: ep } if ep == BIND_ADDR_REQ_REP),
-  )
-  .await
-  .map_err(|e| ZmqError::Internal(format!("REP Listening event error: {}", e)))?;
-
-  req.connect(BIND_ADDR_REQ_REP).await?;
-  wait_for_event_req_rep(&rep_monitor, |e| matches!(e, SocketEvent::HandshakeSucceeded { .. }))
-    .await
-    .map_err(|e| ZmqError::Internal(format!("REP Connection event error: {}", e)))?;
-
-  sleep(Duration::from_millis(20)).await;
-  Ok((req, rep))
+  Ok(ConfigReqRep {
+    num_requesters,
+    msg_size,
+    requests_per_requester,
+  })
 }
 
-// --- Benchmark Function ---
-fn req_rep_tcp_throughput(c: &mut Criterion) {
-  let rt = Runtime::new().expect("Failed to create Tokio runtime");
-  let mut group = c.benchmark_group("REQ_REP_TCP_RoundTrip");
+// --- Async Setup Function ---
+fn setup_req_rep_bench(
+  _runtime: &Runtime,
+  cfg: &ConfigReqRep,
+) -> Pin<Box<dyn Future<Output = Result<(BenchContext, BenchState), String>> + Send>> {
+  let cfg_clone = cfg.clone();
+  Box::pin(async move {
+    if PRINT_BENCH_INFO {
+      println!("[Setup] Starting for config: {:?}", cfg_clone);
+    }
+    let ctx = Context::new().map_err(|e| format!("Zmq Context creation failed: {}", e))?;
+    let ctx_arc = Arc::new(ctx);
 
-  group
-    .warm_up_time(Duration::from_secs(5)) // Increase warm-up time
-    .measurement_time(Duration::from_secs(10)) // Increase measurement time
-    .sample_size(20); // Increase sample size (number of loops for measurement)
-                      // Note: sample_size for iter_custom is a bit different; iter_custom runs its
-                      //       async block *once* per sample. Criterion decides how many samples.
-                      //       The main effect here is on how many times the setup/teardown + loop runs.
-  for size in [16, 256, 1024, 4096].iter() {
-    // Smaller messages often for REQ-REP
-    // Throughput is number of round trips * (request size + reply size)
-    // Assuming reply size is same as request size for this benchmark
-    group.throughput(Throughput::Bytes((NUM_ROUND_TRIPS * size * 2) as u64));
-    let bench_id = BenchmarkId::from_parameter(format!("{}B", size));
+    // --- Setup REP Socket ---
+    let rep_socket = ctx_arc.socket(SocketType::Rep).map_err(|e| e.to_string())?;
+    rep_socket
+      .set_option(SNDHWM, &BENCH_HWM.to_ne_bytes())
+      .await
+      .map_err(|e| e.to_string())?;
+    rep_socket
+      .set_option(RCVHWM, &BENCH_HWM.to_ne_bytes())
+      .await
+      .map_err(|e| e.to_string())?;
+    let rep_monitor = rep_socket
+      .monitor_default()
+      .await
+      .map_err(|e| e.to_string())?;
+    let port = NEXT_BENCH_PORT.fetch_add(1, AtomicOrdering::Relaxed);
+    let bind_addr = format!("{}:{}", BIND_ADDR_BASE, port);
+    rep_socket
+      .bind(&bind_addr)
+      .await
+      .map_err(|e| e.to_string())?;
+    wait_for_event(
+      &rep_monitor,
+      |e| matches!(e, SocketEvent::Listening { endpoint: ep } if ep == &bind_addr),
+    )
+    .await?;
 
-    group.bench_with_input(bench_id, size, |b, &msg_size| {
-      b.to_async(&rt).iter_custom(|_iters| async move {
-        let ctx = Context::new().expect("Bench context creation failed");
-        let (req, rep) = match timeout(SETUP_TIMEOUT_REQ_REP, setup_req_rep(&ctx)).await {
-          Ok(Ok(sockets)) => sockets,
-          Ok(Err(e)) => panic!("Bench REQ-REP setup failed: {}", e),
-          Err(_) => panic!("Bench REQ-REP setup timed out"),
-        };
+    // --- Setup REQ Sockets ---
+    let mut req_sockets = Vec::with_capacity(cfg_clone.num_requesters);
+    for _ in 0..cfg_clone.num_requesters {
+      let req_socket = ctx_arc.socket(SocketType::Req).map_err(|e| e.to_string())?;
+      req_socket
+        .set_option(SNDHWM, &BENCH_HWM.to_ne_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+      req_socket
+        .set_option(RCVHWM, &BENCH_HWM.to_ne_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+      req_socket
+        .connect(&bind_addr)
+        .await
+        .map_err(|e| e.to_string())?;
+      req_sockets.push(req_socket);
+    }
 
-        let request_payload = vec![0u8; msg_size];
-        let reply_payload = vec![0u8; msg_size]; // Assuming same size reply
+    // --- Verify All Connections ---
+    for i in 0..cfg_clone.num_requesters {
+      wait_for_event(&rep_monitor, |e| {
+        matches!(e, SocketEvent::HandshakeSucceeded { .. })
+      })
+      .await
+      .map_err(|e| format!("REP HandshakeSucceeded event {} error: {}", i, e))?;
+    }
+    if PRINT_BENCH_INFO {
+      println!(
+        "[Setup] {} requesters on {} connected.",
+        cfg_clone.num_requesters, bind_addr
+      );
+    }
+    sleep(Duration::from_millis(50)).await;
 
-        let start = Instant::now();
+    let message_payload = vec![0u8; cfg_clone.msg_size];
+    Ok((
+      BenchContext {},
+      BenchState {
+        ctx_arc,
+        req_sockets,
+        rep_socket,
+        message_payload,
+      },
+    ))
+  })
+}
 
-        let rep_task = {
-          let rep = rep.clone();
-          let reply_payload = reply_payload.clone();
-          tokio::spawn(async move {
-            for _i in 0..NUM_ROUND_TRIPS {
-              match rep.recv().await {
-                Ok(req_msg) => {
-                  black_box(req_msg.data());
-                  let rep_msg = Msg::from_vec(black_box(reply_payload.clone()));
-                  if let Err(e) = rep.send(rep_msg).await {
-                    eprintln!("[REP Task] Error sending reply: {}", e);
-                    return Err(e);
-                  }
-                }
-                Err(ZmqError::InvalidState(ref s)) if s == &"Socket terminated" => break,
-                Err(e) => {
-                  eprintln!("[REP Task] Error receiving request: {}", e);
-                  return Err(e);
-                }
-              }
-            }
-            Ok(())
-          })
-        };
+// --- Async Benchmark Logic ---
+fn benchmark_logic(
+  ctx: BenchContext,
+  state: BenchState,
+  cfg: &ConfigReqRep,
+) -> Pin<Box<dyn Future<Output = (BenchContext, BenchState, Duration)> + Send>> {
+  let total_requests = cfg.num_requesters * cfg.requests_per_requester;
+  let requests_per_requester = cfg.requests_per_requester;
 
-        let req_task = {
-          let req = req.clone();
-          let request_payload = request_payload.clone();
-          tokio::spawn(async move {
-            for _i in 0..NUM_ROUND_TRIPS {
-              let req_msg = Msg::from_vec(black_box(request_payload.clone()));
-              if let Err(e) = req.send(req_msg).await {
-                eprintln!("[REQ Task] Error sending request: {}", e);
-                return Err(e);
-              }
-              match req.recv().await {
-                Ok(rep_msg) => {
-                  black_box(rep_msg.data());
-                }
-                Err(ZmqError::InvalidState(ref s)) if s == &"Socket terminated" => break,
-                Err(e) => {
-                  eprintln!("[REQ Task] Error receiving reply: {}", e);
-                  return Err(e);
-                }
-              }
-            }
-            Ok(())
-          })
-        };
+  Box::pin(async move {
+    let start_time = Instant::now();
 
-        let req_result = req_task.await.expect("REQ task panicked");
-        let rep_result = rep_task.await.expect("REP task panicked");
-        let elapsed = start.elapsed();
-
-        sleep(Duration::from_millis(100)).await; // Quiesce time
-
-        if let Err(e) = req.close().await {
-          eprintln!("[Iter Warning] Error closing REQ: {}", e);
+    // --- REP Task ---
+    let rep_task: JoinHandle<Result<(), ZmqError>> = {
+      let rep_socket = state.rep_socket.clone();
+      let reply_payload = state.message_payload.clone();
+      tokio::spawn(async move {
+        for _ in 0..total_requests {
+          let req_msg = rep_socket.recv().await?;
+          black_box(req_msg.data());
+          let rep_msg = Msg::from_vec(black_box(reply_payload.clone()));
+          rep_socket.send(rep_msg).await?;
         }
-        if let Err(e) = rep.close().await {
-          eprintln!("[Iter Warning] Error closing REP: {}", e);
-        }
-        ctx.term().await.expect("Context termination failed");
+        Ok(())
+      })
+    };
 
-        if let Err(e) = req_result {
-          panic!("Benchmark REQ task failed: {}", e);
+    // --- REQ Tasks ---
+    let mut req_tasks = Vec::new();
+    for req_socket in state.req_sockets.iter().cloned() {
+      let request_payload = state.message_payload.clone();
+      let req_task: JoinHandle<Result<(), ZmqError>> = tokio::spawn(async move {
+        for _ in 0..requests_per_requester {
+          let req_msg = Msg::from_vec(black_box(request_payload.clone()));
+          req_socket.send(req_msg).await?;
+          let rep_msg = req_socket.recv().await?;
+          black_box(rep_msg.data());
         }
-        if let Err(e) = rep_result {
-          panic!("Benchmark REP task failed: {}", e);
-        }
-
-        elapsed
+        Ok(())
       });
-    });
-  }
-  group.finish();
+      req_tasks.push(req_task);
+    }
+
+    let rep_result = rep_task.await.expect("REP task panicked");
+    let req_results = futures::future::join_all(req_tasks).await;
+    let elapsed = start_time.elapsed();
+
+    rep_result.expect("REP task failed with ZmqError");
+    for (i, result) in req_results.into_iter().enumerate() {
+      result
+        .unwrap_or_else(|e| panic!("REQ task {} panicked: {}", i, e))
+        .expect("REQ task failed with ZmqError");
+    }
+
+    (ctx, state, elapsed)
+  })
 }
 
-criterion_group!(benches_req_rep, req_rep_tcp_throughput);
-criterion_main!(benches_req_rep);
+// --- Async Teardown Function ---
+fn teardown_req_rep_bench(
+  _ctx: BenchContext,
+  state: BenchState,
+  _runtime: &Runtime,
+  _cfg: &ConfigReqRep,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+  Box::pin(async move {
+    if PRINT_BENCH_INFO {
+      println!("[Teardown] Closing sockets...");
+    }
+    if let Err(e) = state.rep_socket.close().await {
+      eprintln!("[Teardown Warning] Error closing REP socket: {}", e);
+    }
+    for req_socket in state.req_sockets {
+      if let Err(e) = req_socket.close().await {
+        eprintln!("[Teardown Warning] Error closing REQ socket: {}", e);
+      }
+    }
+    sleep(Duration::from_millis(100)).await;
+  })
+}
+
+// --- Main Benchmark Definition ---
+fn req_rep_matrix_benchmark(c: &mut Criterion) {
+  let rt = Runtime::new().expect("Failed to create Tokio runtime for benchmarks");
+
+  let parameter_axes = vec![
+    vec![
+      MatrixCellValue::Unsigned(1),
+      MatrixCellValue::Unsigned(4),
+      MatrixCellValue::Unsigned(8),
+    ],
+    vec![
+      MatrixCellValue::Unsigned(64),
+      MatrixCellValue::Unsigned(1024),
+    ],
+    vec![MatrixCellValue::Unsigned(1000)],
+  ];
+  let parameter_names = vec![
+    "NumRequesters".to_string(),
+    "MsgSize".to_string(),
+    "ReqsPerRequester".to_string(),
+  ];
+
+  let suite = AsyncBenchmarkSuite::new(
+    c,
+    &rt,
+    "REQ_REP_Scalability_RoundTrip".to_string(),
+    Some(parameter_names),
+    parameter_axes,
+    Box::new(extract_config),
+    setup_req_rep_bench,
+    benchmark_logic,
+    teardown_req_rep_bench,
+  )
+  .configure_criterion_group(|group| {
+    group
+      .warm_up_time(Duration::from_secs(3))
+      .measurement_time(Duration::from_secs(10))
+      .sample_size(10);
+  })
+  .throughput(|cfg: &ConfigReqRep| {
+    let total_bytes_per_round_trip = (cfg.msg_size * 2) as u64;
+    let total_round_trips = (cfg.num_requesters * cfg.requests_per_requester) as u64;
+    Throughput::Bytes(total_round_trips * total_bytes_per_round_trip)
+  });
+
+  suite.run();
+}
+
+criterion_group!(benches, req_rep_matrix_benchmark);
+criterion_main!(benches);

@@ -1,5 +1,3 @@
-// benches/generic_client_benchmark.rs
-
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rzmq::socket::{
   options::{RCVHWM, SNDHWM, SUBSCRIBE},

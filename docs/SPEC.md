@@ -125,7 +125,7 @@ This section defines the stable interface exposed to users of the `rzmq` library
 *   **`Listener`/`Connecter` (Actors):** Transport-specific (TCP, IPC) connection setup using `tokio::net`. On success, create `SessionBase` and `IEngine` (passing connected stream and config), `Attach` Engine to Session, report `ConnSuccess` to `SocketCore`.
 *   **`SessionBase` (Actor):** Manages one connection. Owns `Pipe` pair to `SocketCore`. Relays messages between Pipe and Engine mailbox. Manages ZAP client interactions. Forwards `Stop` to Engine. Propagates Engine status/errors to `SocketCore`.
 *   **`IEngine` (Trait / Actor):** Implementations (`ZmtpTcpEngine`, `ZmtpIpcEngine`). Owns transport stream (`TcpStream`/`UnixStream` or potentially `tokio_uring::net::TcpStream`). Handles ZMTP/3.1 framing/codec. Drives security `Mechanism`. *Optionally* uses `io_uring` for TCP ops if feature enabled and kernel supports. Handles `Stop`. Reports status/errors to Session.
-*   **`Pipe`/`IPipeEvents`:** Bounded async `Msg` queue between Session and SocketCore. Notifies consumer actor of state changes.
+*   **`Pipe`:** Bounded async `Msg` queue between Session and SocketCore. Notifies consumer actor of state changes.
 
 **3.4. Lifecycle Management Details**
 

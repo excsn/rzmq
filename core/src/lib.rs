@@ -38,11 +38,7 @@ pub mod uring;
 // from the crate root (e.g., `rzmq::ZmqError`, `rzmq::Socket`).
 pub use error::ZmqError;
 pub use message::{Blob, Metadata, Msg, MsgFlags}; // Core message components.
-pub use runtime::{Command, IPipeEvents}; // Command for actor communication, IPipeEvents for pipe interaction.
-                                         // pub(crate) is used for types that are part of the public API surface for internal modules
-                                         // but not necessarily for direct end-user consumption from the crate root.
-                                         // However, MailboxSender/Receiver might be useful if users build custom actors interacting with rzmq.
-                                         // For now, keep them internal. If a use case arises, they can be made pub.
+pub use runtime::{Command,};
 pub use context::Context;
 pub(crate) use runtime::{MailboxReceiver, MailboxSender}; // The main entry point for creating sockets.
                                                           // CoreState is internal to socket implementation.

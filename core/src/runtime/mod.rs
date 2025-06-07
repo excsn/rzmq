@@ -8,13 +8,11 @@ pub mod event_bus;
 pub mod latch;
 pub mod mailbox;
 pub mod one_shot_sender;
-pub mod pipe;
 pub mod system_events;
 pub mod waitgroup;
 
 pub use command::Command;
 pub(crate) use mailbox::{mailbox, MailboxReceiver, MailboxSender};
-pub use pipe::IPipeEvents;
 
 pub use mailbox::DEFAULT_MAILBOX_CAPACITY;
 // System Coordination
