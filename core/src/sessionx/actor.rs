@@ -7,7 +7,7 @@ use crate::message::Msg;
 use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::socket::ISocket;
-use crate::throttle::{AdaptiveThrottle, types::AdaptiveThrottleConfig};
+use crate::throttle::{types::AdaptiveThrottleConfig, AdaptiveThrottle};
 use crate::transport::ZmtpStdStream;
 use crate::{Blob, MailboxReceiver};
 
@@ -129,12 +129,20 @@ where
     );
 
     let adaptive_throttle = {
-      let mut config = AdaptiveThrottleConfig::default();
+      let mut config = AdaptiveThrottleConfig::default();  //TODO Need to make this adjustable per socket
       config.credit_per_message = 5;
       config.healthy_balance_width = 1024000;
-      config.max_imbalance = 65536;
+      config.max_imbalance = 6553600;
       config.yield_after_n_consecutive = 256;
       // config.curve_factor = 2.0;
+      config.priority_boost_factor = 5.0;
+
+      if self.actor_config.is_server_role {
+        config.priority = crate::throttle::types::Priority::Egress;
+      } else {
+        config.priority = crate::throttle::types::Priority::Ingress;
+      }
+
       AdaptiveThrottle::new(config)
     };
 
@@ -221,7 +229,7 @@ where
               let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Ingress);
 
               self.handle_incoming_from_network(msg).await;
-              
+
               if throttle_guard.should_throttle() {
                 yield_now().await;
               }
@@ -270,7 +278,7 @@ where
       "SCA loop finished. Final phase: {:?}.",
       self.current_phase
     );
-    
+
     // Post-loop cleanup (already initiated if error/stop occurred, this is a final catch-all)
     if self.current_phase != ConnectionPhaseX::Terminating {
       // If loop exited for other reasons
@@ -321,7 +329,7 @@ where
           drop(rx_from_core); // Still drop the provided channels
           return;
         }
-        
+
         self
           .core_pipe_manager
           .attach(rx_from_core, core_pipe_read_id_for_incoming_routing);

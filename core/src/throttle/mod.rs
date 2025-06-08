@@ -40,14 +40,16 @@
 pub mod strategies;
 pub mod types;
 
-pub use types::{AdaptiveThrottleConfig, Direction};
 use types::ThrottleStateView;
+pub use types::{AdaptiveThrottleConfig, Direction};
 
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use atomic_float::AtomicF64;
 use rand::random;
+
+use crate::throttle::types::Priority;
 
 /// This struct holds both the mutable atomic state and the immutable config.
 /// It is the single unit that will be shared via an `Arc` for cheap, thread-safe access.
@@ -199,6 +201,38 @@ impl ThrottleGuard {
       config: cfg,
     };
     let mut p = (cfg.strategy)(&state);
+
+    // If the current work direction is NOT the prioritized one, and we are
+    // imbalanced in a way that favors the *prioritized* direction, we
+    // dramatically increase the probability of yielding to give the
+    // priority work a chance to run.
+    let is_priority_work = match cfg.priority {
+      Priority::Egress => self.direction == Direction::Egress,
+      Priority::Ingress => self.direction == Direction::Ingress,
+      Priority::None => true, // With no priority, all work is "priority" work.
+    };
+
+    if !is_priority_work {
+      let is_imbalanced_towards_priority = match cfg.priority {
+        // We are doing Ingress (non-priority), and the balance is high (debt),
+        // which means we need to do more Egress (priority) work.
+        Priority::Egress => state.current_balance > state.learned_balance as i32,
+        // We are doing Egress (non-priority), and the balance is low (credit),
+        // which means we need to do more Ingress (priority) work.
+        Priority::Ingress => state.current_balance < state.learned_balance as i32,
+        Priority::None => false,
+      };
+
+      if is_imbalanced_towards_priority {
+        // We are doing non-priority work while the system is waiting for
+        // priority work to happen. Be much more aggressive about yielding.
+        // We can scale the probability, for example, by squaring it to make
+        // small probabilities even smaller, but for larger p, it increases.
+        // A simpler, more direct approach is to just multiply it.
+        p *= cfg.priority_boost_factor; // Add priority_boost_factor to config
+      }
+    }
+
     // piecewise: beyond 2× max_imbalance, always yield
     let dev = (state.current_balance as f64 - state.learned_balance).abs();
     let hard_cut = (cfg.max_imbalance as f64) * 2.0;
@@ -211,7 +245,7 @@ impl ThrottleGuard {
       self.shared.consecutive_egress.store(0, Ordering::Relaxed);
       return true;
     }
-    
+
     false
   }
 }

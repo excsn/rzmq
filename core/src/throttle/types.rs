@@ -1,5 +1,16 @@
 use crate::throttle::strategies::{power_curve_strategy, ThrottlingStrategy};
 
+/// Defines which direction of I/O should be prioritized by the throttle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+  /// Prioritize outgoing data (Egress). Typical for servers.
+  Egress,
+  /// Prioritize incoming data (Ingress). Typical for clients.
+  Ingress,
+  /// No specific priority; treat both directions equally.
+  None,
+}
+
 /// A read-only snapshot of the throttle's state, passed to strategy functions.
 pub struct ThrottleStateView<'a> {
   /// The current real-time debt/credit balance.
@@ -42,6 +53,13 @@ pub struct AdaptiveThrottleConfig {
   /// A function pointer to the chosen probabilistic strategy. The library provides
   /// several default strategies in the `strategies` module.
   pub strategy: ThrottlingStrategy,
+  /// The prioritized direction of I/O.
+  /// The throttle will be more likely to yield for work in the non-prioritized
+  /// direction when an imbalance occurs.
+  pub priority: Priority,
+  /// A multiplier applied to the yield probability for non-prioritized work.
+  /// Values greater than 1.0 (e.g., 2.0 or 3.0) make it more likely to yield.
+  pub priority_boost_factor: f64,
 }
 
 impl Default for AdaptiveThrottleConfig {
@@ -63,6 +81,8 @@ impl Default for AdaptiveThrottleConfig {
       adaptive_learning_rate: lr,
       curve_factor: 2.0, // Quadratic curve
       strategy: power_curve_strategy,
+      priority: Priority::None,
+      priority_boost_factor: 2.5, // A sensible default.
     }
   }
 }
