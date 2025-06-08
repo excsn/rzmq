@@ -13,6 +13,7 @@ use rzmq::{
   },
   Context, Msg, SocketType, ZmqError,
 };
+use tracing::level_filters::LevelFilter;
 use std::{
   future::Future,
   pin::Pin,
@@ -105,11 +106,11 @@ fn setup_req_rep_bench(
     // --- Setup REP Socket ---
     let rep_socket = ctx_arc.socket(SocketType::Rep).map_err(|e| e.to_string())?;
     rep_socket
-      .set_option(SNDHWM, &BENCH_HWM.to_ne_bytes())
+      .set_option(SNDHWM, BENCH_HWM)
       .await
       .map_err(|e| e.to_string())?;
     rep_socket
-      .set_option(RCVHWM, &BENCH_HWM.to_ne_bytes())
+      .set_option(RCVHWM, BENCH_HWM)
       .await
       .map_err(|e| e.to_string())?;
     let rep_monitor = rep_socket
@@ -133,11 +134,11 @@ fn setup_req_rep_bench(
     for _ in 0..cfg_clone.num_requesters {
       let req_socket = ctx_arc.socket(SocketType::Req).map_err(|e| e.to_string())?;
       req_socket
-        .set_option(SNDHWM, &BENCH_HWM.to_ne_bytes())
+        .set_option(SNDHWM, BENCH_HWM)
         .await
         .map_err(|e| e.to_string())?;
       req_socket
-        .set_option(RCVHWM, &BENCH_HWM.to_ne_bytes())
+        .set_option(RCVHWM, BENCH_HWM)
         .await
         .map_err(|e| e.to_string())?;
       req_socket

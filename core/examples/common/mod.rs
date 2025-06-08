@@ -5,6 +5,28 @@ use std::time::{Duration, Instant};
 use futures::future::join_all;
 use rzmq::socket::{MonitorReceiver, SocketEvent};
 
+pub async fn wait_for_event(
+  monitor_rx: &MonitorReceiver,
+  timeout: Duration,
+  check_event: impl Fn(&SocketEvent) -> bool,
+) -> Result<SocketEvent, String> {
+  let start_time = Instant::now();
+  loop {
+    if start_time.elapsed() > timeout {
+      return Err(format!("Timeout after {:?}", timeout));
+    }
+    match tokio::time::timeout(timeout, monitor_rx.recv()).await {
+      Ok(Ok(event)) => {
+        if check_event(&event) {
+          return Ok(event);
+        }
+      }
+      Ok(Err(e)) => return Err(format!("Monitor channel error: {}", e)),
+      Err(_) => {}
+    }
+  }
+}
+
 // Helper function to wait for HandshakeSucceeded events from multiple monitors
 // This function is a general utility and not directly used by the oneshot-based
 // handshake waiting in the main example, but provided as per your request.

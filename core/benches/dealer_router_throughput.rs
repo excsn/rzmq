@@ -117,11 +117,11 @@ fn setup_dealer_router_bench(
       .socket(SocketType::Router)
       .map_err(|e| format!("Router socket creation failed: {}", e))?;
     router
-      .set_option(SNDHWM, &BENCH_HWM.to_ne_bytes())
+      .set_option(SNDHWM, BENCH_HWM)
       .await
       .map_err(|e| e.to_string())?;
     router
-      .set_option(RCVHWM, &BENCH_HWM.to_ne_bytes())
+      .set_option(RCVHWM, BENCH_HWM)
       .await
       .map_err(|e| e.to_string())?;
     let router_monitor = router.monitor_default().await.map_err(|e| e.to_string())?;
@@ -141,11 +141,11 @@ fn setup_dealer_router_bench(
         .socket(SocketType::Dealer)
         .map_err(|e| format!("Dealer {} socket creation failed: {}", i, e))?;
       dealer
-        .set_option(SNDHWM, &BENCH_HWM.to_ne_bytes())
+        .set_option(SNDHWM, BENCH_HWM)
         .await
         .map_err(|e| e.to_string())?;
       dealer
-        .set_option(RCVHWM, &BENCH_HWM.to_ne_bytes())
+        .set_option(RCVHWM, BENCH_HWM)
         .await
         .map_err(|e| e.to_string())?;
       dealer

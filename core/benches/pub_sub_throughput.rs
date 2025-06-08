@@ -111,7 +111,7 @@ fn setup_pub_sub_bench(
       .socket(SocketType::Pub)
       .map_err(|e| e.to_string())?;
     pub_socket
-      .set_option(SNDHWM, &BENCH_HWM.to_ne_bytes())
+      .set_option(SNDHWM, BENCH_HWM)
       .await
       .map_err(|e| e.to_string())?; // Corrected here
     let pub_monitor = pub_socket.monitor_default().await.map_err(|e| e.to_string())?; // Corrected here
@@ -129,7 +129,7 @@ fn setup_pub_sub_bench(
         .socket(SocketType::Sub)
         .map_err(|e| e.to_string())?;
       sub_socket
-        .set_option(RCVHWM, &BENCH_HWM.to_ne_bytes())
+        .set_option(RCVHWM, BENCH_HWM)
         .await
         .map_err(|e| e.to_string())?; // Corrected here
       sub_socket.set_option(SUBSCRIBE, b"").await.map_err(|e| e.to_string())?; // Corrected here

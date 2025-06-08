@@ -1,11 +1,13 @@
-// examples/req_rep_example.rs
+mod common;
 
-use rzmq::{Context, Msg, SocketType, ZmqError};
+use rzmq::{socket::SocketEvent, Context, Msg, SocketType, ZmqError};
 use std::time::Duration;
 use tokio::time::sleep;
 
+use crate::common::wait_for_event;
+
 const REP_ADDR: &str = "tcp://127.0.0.1:5555";
-const NUM_REQUESTS: usize = 5;
+const NUM_REQUESTS: usize = 500;
 
 async fn run_rep_server(ctx: Context) -> Result<(), ZmqError> {
   let rep_socket = ctx.socket(SocketType::Rep)?;
@@ -33,7 +35,11 @@ async fn run_rep_server(ctx: Context) -> Result<(), ZmqError> {
 async fn run_req_client(ctx: Context) -> Result<(), ZmqError> {
   let req_socket = ctx.socket(SocketType::Req)?;
   println!("[REQ] Connecting to {}...", REP_ADDR);
+  let req_socket_monitor = req_socket.monitor_default().await?;
   req_socket.connect(REP_ADDR).await?;
+
+  wait_for_event(&req_socket_monitor, Duration::from_secs(10), |event| matches!(event, SocketEvent::HandshakeSucceeded { .. })).await.map_err(|msg| ZmqError::Internal(msg.to_string()))?;
+
   println!("[REQ] Connected.");
 
   for i in 0..NUM_REQUESTS {
@@ -72,6 +78,18 @@ async fn main() -> Result<(), ZmqError> {
   // Give server a moment to bind
   sleep(Duration::from_millis(200)).await;
 
+  let client_ctx = ctx.clone();
+  let client_handle = tokio::spawn(async move {
+    if let Err(e) = run_req_client(client_ctx).await {
+      eprintln!("[REQ] Error: {}", e);
+    }
+  });
+  let client_ctx = ctx.clone();
+  let client_handle = tokio::spawn(async move {
+    if let Err(e) = run_req_client(client_ctx).await {
+      eprintln!("[REQ] Error: {}", e);
+    }
+  });
   let client_ctx = ctx.clone();
   let client_handle = tokio::spawn(async move {
     if let Err(e) = run_req_client(client_ctx).await {

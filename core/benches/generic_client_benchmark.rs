@@ -152,11 +152,11 @@ fn external_client_benchmarks(c: &mut Criterion) {
               .expect("Failed to create client socket");
 
             client_socket
-              .set_option(SNDHWM, &CLIENT_BENCH_HWM.to_ne_bytes())
+              .set_option(SNDHWM, CLIENT_BENCH_HWM)
               .await
               .unwrap();
             client_socket
-              .set_option(RCVHWM, &CLIENT_BENCH_HWM.to_ne_bytes())
+              .set_option(RCVHWM, CLIENT_BENCH_HWM)
               .await
               .unwrap();
 
@@ -168,7 +168,7 @@ fn external_client_benchmarks(c: &mut Criterion) {
 
             if client_socket_type_enum == SocketType::Sub {
               client_socket
-                .set_option(SUBSCRIBE, current_iter_subscribe_topic.as_bytes())
+                .set_option(SUBSCRIBE, current_iter_subscribe_topic)
                 .await
                 .unwrap();
               sleep(Duration::from_millis(150)).await; // Allow subscribe to propagate (important!)

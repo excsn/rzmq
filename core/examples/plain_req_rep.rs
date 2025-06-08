@@ -51,11 +51,11 @@ async fn main() -> Result<(), ZmqError> {
   client_socket.set_option(LINGER, 0i32).await?; // <<< MODIFIED [Set LINGER option to 0 for quick close] >>>
   println!("[Client] Setting PLAIN_USERNAME to '{}'...", username);
   client_socket
-    .set_option_raw(PLAIN_USERNAME, username.as_bytes())
+    .set_option(PLAIN_USERNAME, username)
     .await?;
   println!("[Client] Setting PLAIN_PASSWORD to '{}'...", password);
   client_socket
-    .set_option_raw(PLAIN_PASSWORD, password.as_bytes())
+    .set_option(PLAIN_PASSWORD, password)
     .await?;
   println!("[Client] Connecting to {}...", bind_addr);
   client_socket.connect(bind_addr).await?;
