@@ -5,10 +5,12 @@ pub mod inproc;
 pub mod ipc;
 pub mod tcp;
 
+use std::os::fd::AsRawFd;
+
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Trait alias for streams usable by ZMTP connection actors.
-pub(crate) trait ZmtpStdStream: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug + 'static {}
+pub(crate) trait ZmtpStdStream: AsyncRead + AsyncWrite + AsRawFd + Unpin + Send + std::fmt::Debug + 'static {}
 
 // Implement the marker trait for Tokio's streams
 impl ZmtpStdStream for tokio::net::TcpStream {}

@@ -1,6 +1,8 @@
+use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::socket::MonitorSender;
-use crate::{error::ZmqError};
+#[cfg(feature = "io-uring")]
+use crate::Blob;
 
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;

@@ -120,7 +120,6 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
       data_cipher: None,
       zmtp_manual_parser: ZmtpManualParser::new(),
       heartbeat_state: ZmtpHeartbeatStateX::new(
-        // Assuming new is defined in heartbeat.rs
         heartbeat_ivl_from_config,
         effective_timeout_corrected,
       ),

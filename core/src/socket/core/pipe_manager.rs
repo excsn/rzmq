@@ -13,6 +13,8 @@ use fibre::mpmc::{AsyncReceiver, AsyncSender};
 #[cfg(feature = "inproc")]
 use fibre::oneshot;
 use fibre::{SendError, TrySendError};
+#[cfg(feature = "io-uring")]
+use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
