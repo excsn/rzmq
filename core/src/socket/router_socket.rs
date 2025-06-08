@@ -95,7 +95,7 @@ impl RouterSocket {
       );
       raw_zmtp_message.remove(0);
     } else {
-      tracing::warn!(
+      tracing::debug!(
         handle = self.core.handle,
         pipe_id = pipe_read_id,
         "Router: Incoming ZMTP message from pipe did not start with an empty delimiter."

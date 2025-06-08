@@ -215,12 +215,10 @@ where
             Ok(msgs) => {
               let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Egress);
 
-              // println!("LP1 {}", throttle_guard.get_current_balance());
               if let Err(e) = self.zmtp_handler.write_data_msgs(msgs).await {
                 self.set_fatal_error(e).await;
               }
 
-              // println!("LP2 {}", throttle_guard.get_current_balance());
               if throttle_guard.should_throttle() {
                 yield_now().await;
               }
@@ -239,11 +237,8 @@ where
                 Ok(Some(msg)) => {
 
                   let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Ingress);
-                  // println!("EP {}", throttle_guard.get_current_balance());
 
                   self.handle_incoming_from_network(msg).await;
-
-                  // println!("EP2 {}", throttle_guard.get_current_balance());
                   
                   if throttle_guard.should_throttle() {
                     yield_now().await;

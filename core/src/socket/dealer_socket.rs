@@ -2,11 +2,11 @@ use crate::delegate_to_core;
 use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
-use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::core::SocketCore;
 use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
 use crate::socket::patterns::LoadBalancer;
 use crate::socket::ISocket;
+use super::patterns::WritePipeCoordinator;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -14,14 +14,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::RwLock as ParkingLotRwLock;
-use parking_lot::RwLockReadGuard as ParkingLotRwLockReadGuard;
-use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit};
+use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::timeout as tokio_timeout;
 
-use super::patterns::WritePipeCoordinator;
 
-const MAX_DEALER_SEND_BUFFER_PARTS: usize = 128;
+const MAX_DEALER_SEND_BUFFER_PARTS: usize = 10240;
 
 #[derive(Debug)]
 enum DealerSendTransaction {
@@ -226,7 +224,6 @@ pub(crate) struct DealerSocket {
   processor_stop_signal: Arc<Notify>,
   current_send_transaction: TokioMutex<DealerSendTransaction>,
   pipe_send_coordinator: Arc<WritePipeCoordinator>,
-  current_recv_buffer: TokioMutex<VecDeque<Msg>>,
 }
 
 impl DealerSocket {
@@ -265,7 +262,6 @@ impl DealerSocket {
       processor_stop_signal: stop_signal_arc,
       current_send_transaction: TokioMutex::new(DealerSendTransaction::Idle),
       pipe_send_coordinator: pipe_send_coordinator_arc,
-      current_recv_buffer: TokioMutex::new(VecDeque::new()),
     }
   }
 
@@ -479,22 +475,30 @@ impl ISocket for DealerSocket {
   }
 
   async fn send_multipart(&self, user_frames: Vec<Msg>) -> Result<(), ZmqError> {
+    
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
+    
     let sndtimeo_opt = { self.core.core_state.read().options.sndtimeo };
 
     loop {
+      
       let mut transaction_guard = self.current_send_transaction.lock().await;
       match &*transaction_guard {
         DealerSendTransaction::Idle => {
           drop(transaction_guard);
+          
           let zmtp_wire_frames = self.prepare_full_multipart_send_sequence(user_frames);
-          return self.send_logical_message(zmtp_wire_frames).await;
+          let res = self.send_logical_message(zmtp_wire_frames).await;
+
+          
+      return res;
         }
         DealerSendTransaction::Buffering {
           completion_notifier, ..
         } => {
+          
           let notifier_clone = completion_notifier.clone();
           drop(transaction_guard);
 
@@ -506,7 +510,7 @@ impl ISocket for DealerSocket {
               tokio::time::sleep(Duration::from_millis(50)).await;
             }
           };
-
+          
           match sndtimeo_opt {
             Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
             Some(duration) => {
@@ -514,6 +518,7 @@ impl ISocket for DealerSocket {
                 biased;
                 _ = closing_signal_future => return Err(ZmqError::InvalidState("Socket is closing while waiting for prior send tx".into())),
                 res = tokio_timeout(duration, notifier_clone.notified()) => {
+                  
                   if res.is_err() { return Err(ZmqError::Timeout); }
                 }
               }
