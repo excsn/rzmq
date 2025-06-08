@@ -3,15 +3,15 @@
 #![allow(dead_code, unused_variables)] // Keep for now
 
 use super::ZmtpProtocolHandlerX; // To access fields of the main struct
-use crate::transport::ZmtpStdStream;
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::protocol::zmtp::ZmtpCodec; // For encoding messages
+use crate::protocol::zmtp::ZmtpCodec;
+use crate::transport::ZmtpStdStream; // For encoding messages
 
 use bytes::{BufMut, BytesMut};
-use tokio_util::codec::Encoder; // Added BufMut
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt}; // For timeouts
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::codec::Encoder; // Added BufMut // For timeouts
 
 pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
@@ -75,16 +75,19 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
     // Read more data from the network into network_read_buffer.
     // Note: read_buf appends to network_read_buffer. If it's not empty from a previous partial
     // encrypted frame, new data will be added.
-    let bytes_read = tokio::time::timeout(operation_timeout, stream.read_buf(&mut handler.network_read_buffer))
-      .await
-      .map_err(|_| {
-        tracing::warn!(
-          sca_handle = handler.actor_handle,
-          "Timeout reading data frame (single op)."
-        );
-        ZmqError::Timeout
-      })?
-      .map_err(|e| ZmqError::from_io_endpoint(e, "data read"))?;
+    let bytes_read = tokio::time::timeout(
+      operation_timeout,
+      stream.read_buf(&mut handler.network_read_buffer),
+    )
+    .await
+    .map_err(|_| {
+      tracing::warn!(
+        sca_handle = handler.actor_handle,
+        "Timeout reading data frame (single op)."
+      );
+      ZmqError::Timeout
+    })?
+    .map_err(|e| ZmqError::from_io_endpoint(e, "data read"))?;
 
     if bytes_read == 0 {
       tracing::debug!(
@@ -94,7 +97,11 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
       return Err(ZmqError::ConnectionClosed);
     }
     handler.heartbeat_state.record_activity();
-    tracing::trace!(sca_handle = handler.actor_handle, bytes_read, "Read data from network.");
+    tracing::trace!(
+      sca_handle = handler.actor_handle,
+      bytes_read,
+      "Read data from network."
+    );
 
     // Process newly read data: decrypt if necessary.
     if let Some(cipher) = &mut handler.data_cipher {
@@ -125,104 +132,91 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
   }
 }
 
+/// Batches, frames, encrypts, and writes a full logical ZMQ message (one or more `Msg` parts).
+/// This is the optimal path for multipart messages.
+pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  mut msgs: Vec<Msg>, // Takes ownership of the Vec
+) -> Result<(), ZmqError> {
+  // Pass a mutable slice of the Vec to the core implementation.
+  write_message_slice_impl(handler, &mut msgs).await
+}
+
+/// A wrapper for sending a single message part, avoiding heap allocation for the `Vec`.
 pub(crate) async fn write_data_msg_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
-  msg: Msg,
-  is_first_part_of_logical_zmq_msg: bool, // True if this is the first ZMTP frame of a potentially multi-frame ZMQ message
+  mut msg: Msg, // Takes ownership of the Msg
+  _is_first_part_of_logical_zmq_msg: bool,
 ) -> Result<bool /* is_last_part_of_logical_zmq_msg */, ZmqError> {
+  let msg_is_more = msg.is_more();
+
+  // Create a temporary array on the stack and pass a mutable slice to the core implementation.
+  // This avoids allocating a Vec on the heap.
+  write_message_slice_impl(handler, &mut [msg]).await?;
+
+  Ok(!msg_is_more)
+}
+
+/// Private helper that contains the core logic for batching, framing, and writing.
+/// It takes a mutable slice `&mut [Msg]` to avoid allocations for the single-message case.
+async fn write_message_slice_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  msgs: &mut [Msg],
+) -> Result<(), ZmqError> {
+  if msgs.is_empty() {
+    return Ok(());
+  }
+
   let stream = handler.stream.as_mut().ok_or_else(|| {
     tracing::error!(
       sca_handle = handler.actor_handle,
-      "Stream is None during write_data_msg_impl."
+      "Stream is None during write_message_slice_impl."
     );
     ZmqError::Internal("Stream unavailable for writing data message".into())
   })?;
 
-  // Timeout for a data write operation. Can be based on SNDTIMEO or a long default.
   let operation_timeout = handler.config.sndtimeo.unwrap_or(Duration::from_secs(300));
 
-  let mut temp_zmtp_encoder = ZmtpCodec::new(); // Stateless
+  // 1. Synchronously encode all message parts from the slice into a single buffer.
   let mut plaintext_zmtp_frame_buffer = BytesMut::new();
-  // Clone msg because ZmtpCodec::encode might take ownership or if we need msg.is_more() later.
-  // ZmtpCodec::encode takes `item: Msg`, so we pass the original `msg`.
-  // We need `msg.is_more()` *after* encoding for cork logic.
-  let msg_is_more = msg.is_more();
-  temp_zmtp_encoder
-    .encode(msg, &mut plaintext_zmtp_frame_buffer)
-    .map_err(|e| ZmqError::Internal(format!("Failed to ZMTP-encode outgoing message: {}", e)))?;
+  let mut temp_zmtp_encoder = ZmtpCodec::new();
+  for msg in msgs {
+    temp_zmtp_encoder.encode(msg.clone(), &mut plaintext_zmtp_frame_buffer)?;
+  }
 
+  // 2. Encrypt the entire batch of ZMTP frames if a cipher is active.
   let wire_bytes_to_send = if let Some(cipher) = &mut handler.data_cipher {
     cipher.encrypt_zmtp_frame(plaintext_zmtp_frame_buffer.freeze())?
   } else {
     plaintext_zmtp_frame_buffer.freeze()
   };
 
+  // 3. Apply CORK, write the entire buffer, and then uncork.
   #[cfg(target_os = "linux")]
   {
     if let Some(ci) = handler.cork_info.as_mut() {
-      // Enable CORK if:
-      // 1. This is the first frame of a logical ZMQ message (indicated by caller)
-      // 2. AND cork_info expects the first frame (meaning previous ZMQ message ended)
-      // 3. AND not already corked.
-      if is_first_part_of_logical_zmq_msg && ci.is_expecting_first_frame() && !ci.is_corked() {
-        ci.apply_cork_state(true, handler.actor_handle).await;
-      }
+      ci.apply_cork_state(true, handler.actor_handle).await;
     }
   }
 
-  tokio::time::timeout(operation_timeout, stream.write_all(&wire_bytes_to_send))
+  let write_result = tokio::time::timeout(operation_timeout, stream.write_all(&wire_bytes_to_send))
     .await
-    .map_err(|_| {
-      tracing::warn!(
-        sca_handle = handler.actor_handle,
-        "Timeout writing data msg (single op)."
-      );
-      ZmqError::Timeout
-    })?
-    .map_err(|e| {
-      #[cfg(target_os = "linux")]
-      if let Some(ci) = handler.cork_info.as_mut() {
-        if ci.is_corked() {
-          // If a write fails while corked, it's crucial to attempt to uncork
-          // to prevent stalling subsequent operations on this FD if it's reused
-          // or if the error is recoverable.
-          // Spawn a task for best-effort uncorking as apply_cork_state is async.
-          let fd_to_uncork = ci.fd(); // Capture fd if needed by a free function
-          let actor_handle_for_uncork = handler.actor_handle;
-          // This needs ci to be 'static or for apply_cork_state to not need &mut self
-          // For simplicity, if apply_cork_state is on TcpCorkInfoX, this is complex.
-          // A simpler immediate fix if write fails while corked:
-          // ci.is_corked = false; // Assume it's effectively uncorked or will be by OS on error/close
-          // But proper uncorking is better.
-          // Let's assume apply_cork_state can be called.
-          // This requires careful thought if ci.apply_cork_state is async and needs &mut self.
-          // For now, let's assume a synchronous attempt or log the need.
-          tracing::warn!(
-            sca_handle = handler.actor_handle,
-            "Write error occurred while corked. Attempting to uncork is complex here. OS might handle on close."
-          );
-          // Ideally, before propagating error:
-          // ci.apply_cork_state(false, handler.actor_handle).await; // This line makes error handling async
-        }
-      }
-      ZmqError::from_io_endpoint(e, "data write")
-    })?;
+    .map_err(|_| ZmqError::Timeout)?
+    .map_err(|e| ZmqError::from_io_endpoint(e, "data write"));
+
   handler.heartbeat_state.record_activity();
 
-  let is_last_frame_of_logical_zmq_msg = !msg_is_more;
-
+  // CRUCIAL: Uncork after the write operation, regardless of success or failure.
   #[cfg(target_os = "linux")]
   {
     if let Some(ci) = handler.cork_info.as_mut() {
-      if ci.is_corked() && is_last_frame_of_logical_zmq_msg {
+      if ci.is_corked() {
         ci.apply_cork_state(false, handler.actor_handle).await;
       }
-      // This flag means "is the *next* frame we send going to be the first of a new ZMQ message?"
-      ci.set_expecting_first_frame(is_last_frame_of_logical_zmq_msg);
+      ci.set_expecting_first_frame(true);
     }
   }
 
-  // Return true if this was the last part of the ZMQ message, false otherwise.
-  // This helps SessionConnectionActorX manage its `sca_is_sending_first_frame_of_zmq_message` state.
-  Ok(is_last_frame_of_logical_zmq_msg)
+  // Finally, return the result of the write operation.
+  write_result
 }
