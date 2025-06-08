@@ -1,14 +1,12 @@
 use crate::error::ZmqError;
 use crate::message::{Msg, MsgFlags};
-use crate::socket::core::SocketCore; // Not used in constructor anymore, core_handle is passed
 use crate::socket::patterns::fair_queue::{FairQueue, PushError};
-#[allow(unused_imports)] // Blob might not be directly used by generic orchestrator
+#[allow(unused_imports)]
 use crate::Blob;
 use dashmap::DashMap;
-use std::collections::VecDeque; // <<< ADDED [For current_recv_frames_buffer] >>>
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::time::Duration;
-use tokio::sync::Mutex as TokioMutex; // <<< ADDED [For current_recv_frames_buffer] >>>
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout as tokio_timeout;
 
 // <<< MODIFIED START [Generic IncomingMessageOrchestrator<QItem> with internal buffering for recv()] >>>
@@ -26,7 +24,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
   pub fn new(core_handle: usize, rcvhwm: usize) -> Self {
     Self {
       socket_core_handle: core_handle,
-      main_incoming_queue: FairQueue::new(rcvhwm.max(1)),
+      main_incoming_queue: FairQueue::new(9000000),
       queue_push_timeout: Some(Duration::from_millis(1000)),
       partial_pipe_messages: DashMap::new(),
       current_recv_frames_buffer: TokioMutex::new(VecDeque::new()),

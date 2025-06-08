@@ -130,7 +130,9 @@ where
 
     let adaptive_throttle = {
       let mut config = AdaptiveThrottleConfig::default();
-      config.healthy_balance_width = 4096;
+      config.healthy_balance_width = 1024000;
+      // config.max_imbalance = 102400000;
+      config.yield_after_n_consecutive = 512;
       AdaptiveThrottle::new(config)
     };
 
@@ -208,28 +210,6 @@ where
           }
         }
 
-        // --- ARM 5: Outgoing Data (from SocketCore to Network) ---
-        maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
-          if self.current_phase == ConnectionPhaseX::Operational && self.core_pipe_manager.is_attached() => {
-          match maybe_msgs_from_core {
-            Ok(msgs) => {
-              let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Egress);
-
-              if let Err(e) = self.zmtp_handler.write_data_msgs(msgs).await {
-                self.set_fatal_error(e).await;
-              }
-
-              if throttle_guard.should_throttle() {
-                yield_now().await;
-              }
-            },
-            Err(_) => {
-              tracing::info!(sca_handle = self.handle, "Pipe from SocketCore closed.");
-              self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await; // Or Internal error
-            }
-          }
-        }
-
         // --- ARM 6: Incoming Data (from Network to SocketCore) ---
         maybe_parsed_frame = async { self.zmtp_handler.read_and_parse_data_frame().await },
             if self.current_phase == ConnectionPhaseX::Operational && self.zmtp_handler.stream.is_some() => {
@@ -252,6 +232,28 @@ where
                 }
                 Err(e) => self.set_fatal_error(e).await,
             }
+        }
+
+        // --- ARM 5: Outgoing Data (from SocketCore to Network) ---
+        maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
+          if self.current_phase == ConnectionPhaseX::Operational && self.core_pipe_manager.is_attached() => {
+          match maybe_msgs_from_core {
+            Ok(msgs) => {
+              let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Egress);
+
+              if let Err(e) = self.zmtp_handler.write_data_msgs(msgs).await {
+                self.set_fatal_error(e).await;
+              }
+
+              if throttle_guard.should_throttle() {
+                yield_now().await;
+              }
+            },
+            Err(_) => {
+              tracing::info!(sca_handle = self.handle, "Pipe from SocketCore closed.");
+              self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await; // Or Internal error
+            }
+          }
         }
 
         // --- ARM 9: Shutdown Step ---
@@ -316,6 +318,7 @@ where
           drop(rx_from_core); // Still drop the provided channels
           return;
         }
+        
         self
           .core_pipe_manager
           .attach(rx_from_core, core_pipe_read_id_for_incoming_routing);

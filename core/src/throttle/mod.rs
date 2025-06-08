@@ -80,8 +80,8 @@ impl Default for AdaptiveThrottleConfig {
     Self {
       credit_per_message: 10,
       healthy_balance_width: 1024,
-      max_imbalance: 4096,
-      yield_after_n_consecutive: 16,
+      max_imbalance: 65536,
+      yield_after_n_consecutive: 64,
       adaptive_learning_rate: 0.005,
       strategy: strategies::power_curve_strategy,
     }
