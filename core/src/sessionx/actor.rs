@@ -7,7 +7,7 @@ use crate::message::Msg;
 use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::socket::ISocket;
-use crate::throttle::{AdaptiveThrottle, AdaptiveThrottleConfig};
+use crate::throttle::{AdaptiveThrottle, types::AdaptiveThrottleConfig};
 use crate::transport::ZmtpStdStream;
 use crate::{Blob, MailboxReceiver};
 
@@ -130,9 +130,11 @@ where
 
     let adaptive_throttle = {
       let mut config = AdaptiveThrottleConfig::default();
+      config.credit_per_message = 5;
       config.healthy_balance_width = 1024000;
-      // config.max_imbalance = 102400000;
-      config.yield_after_n_consecutive = 512;
+      config.max_imbalance = 65536;
+      config.yield_after_n_consecutive = 256;
+      // config.curve_factor = 2.0;
       AdaptiveThrottle::new(config)
     };
 
@@ -212,26 +214,26 @@ where
 
         // --- ARM 6: Incoming Data (from Network to SocketCore) ---
         maybe_parsed_frame = async { self.zmtp_handler.read_and_parse_data_frame().await },
-            if self.current_phase == ConnectionPhaseX::Operational && self.zmtp_handler.stream.is_some() => {
-            match maybe_parsed_frame {
-                Ok(Some(msg)) => {
+          if self.current_phase == ConnectionPhaseX::Operational && self.zmtp_handler.stream.is_some() => {
+          match maybe_parsed_frame {
+            Ok(Some(msg)) => {
 
-                  let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Ingress);
+              let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Ingress);
 
-                  self.handle_incoming_from_network(msg).await;
-                  
-                  if throttle_guard.should_throttle() {
-                    yield_now().await;
-                  }
+              self.handle_incoming_from_network(msg).await;
+              
+              if throttle_guard.should_throttle() {
+                yield_now().await;
+              }
 
-                },
-                Ok(None) => { /* Not enough data yet */ }
-                Err(ZmqError::ConnectionClosed) => {
-                    tracing::info!(sca_handle = self.handle, "Peer closed connection (data phase).");
-                    self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
-                }
-                Err(e) => self.set_fatal_error(e).await,
+            },
+            Ok(None) => { /* Not enough data yet */ }
+            Err(ZmqError::ConnectionClosed) => {
+              tracing::info!(sca_handle = self.handle, "Peer closed connection (data phase).");
+              self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
             }
+            Err(e) => self.set_fatal_error(e).await,
+          }
         }
 
         // --- ARM 5: Outgoing Data (from SocketCore to Network) ---
@@ -268,6 +270,7 @@ where
       "SCA loop finished. Final phase: {:?}.",
       self.current_phase
     );
+    
     // Post-loop cleanup (already initiated if error/stop occurred, this is a final catch-all)
     if self.current_phase != ConnectionPhaseX::Terminating {
       // If loop exited for other reasons

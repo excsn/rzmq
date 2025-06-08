@@ -38,76 +38,26 @@
 //! ```
 
 pub mod strategies;
+pub mod types;
+
+pub use types::{AdaptiveThrottleConfig, Direction};
+use types::ThrottleStateView;
 
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
-use strategies::ThrottlingStrategy;
 
 use atomic_float::AtomicF64;
-
-// --- Public Configuration ---
-
-/// Configuration for the `AdaptiveThrottle`.
-///
-/// These parameters allow tuning the throttle's behavior to prioritize
-/// either low-latency responsiveness or high-throughput bursting.
-#[derive(Debug, Clone)]
-pub struct AdaptiveThrottleConfig {
-  /// The unit of change for the balance counter per operation. Represents the
-  /// "weight" of a single message.
-  pub credit_per_message: i32,
-  /// Defines a "zone of tolerance" around the learned balance. No probabilistic
-  /// throttling occurs if the current balance is within this distance of the
-  /// learned average. A larger value allows for larger, uninterrupted bursts.
-  pub healthy_balance_width: u32,
-  /// The distance from the healthy zone at which throttling probability becomes 100%.
-  /// This acts as a hard safety limit to prevent starvation.
-  pub max_imbalance: u32,
-  /// A hard rule to guarantee fairness. The throttle will always yield after
-  /// this many consecutive operations, regardless of the balance.
-  pub yield_after_n_consecutive: u32,
-  /// Controls how quickly the `learned_balance` adapts to the `current_balance`.
-  /// A smaller value results in a slower, more stable moving average.
-  /// Value should be between 0.0 and 1.0.
-  pub adaptive_learning_rate: f64,
-  /// A function pointer to the chosen probabilistic strategy. The library provides
-  /// several default strategies in the `strategies` module.
-  pub strategy: ThrottlingStrategy,
-}
-
-impl Default for AdaptiveThrottleConfig {
-  fn default() -> Self {
-    Self {
-      credit_per_message: 10,
-      healthy_balance_width: 1024,
-      max_imbalance: 65536,
-      yield_after_n_consecutive: 64,
-      adaptive_learning_rate: 0.005,
-      strategy: strategies::power_curve_strategy,
-    }
-  }
-}
-
-// --- Internal State & Types ---
-
-/// The direction of work relative to the actor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-  /// Work coming into the actor (e.g., reading from a network socket).
-  Ingress,
-  /// Work going out from the actor (e.g., writing to a network socket).
-  Egress,
-}
+use rand::random;
 
 /// This struct holds both the mutable atomic state and the immutable config.
 /// It is the single unit that will be shared via an `Arc` for cheap, thread-safe access.
 #[derive(Debug)]
 struct InternalSharedState {
-  // Atomics for mutable state
   current_balance: AtomicI32,
   learned_balance: AtomicF64,
-  consecutive_count: AtomicU32,
-  // Configuration
+  consecutive_ingress: AtomicU32,
+  consecutive_egress: AtomicU32,
+  ops_since_nudge: AtomicU32,
   config: AdaptiveThrottleConfig,
 }
 
@@ -120,20 +70,30 @@ struct InternalSharedState {
 /// while maximizing throughput for bursty traffic.
 #[derive(Debug, Clone)]
 pub struct AdaptiveThrottle {
-  shared_state: Arc<InternalSharedState>,
+  shared: Arc<InternalSharedState>,
 }
 
 impl AdaptiveThrottle {
   /// Creates a new `AdaptiveThrottle` with the specified configuration.
   pub fn new(config: AdaptiveThrottleConfig) -> Self {
-    let internal_state = InternalSharedState {
+    let mut cfg = config.clone();
+    // clamp learning rate
+    if cfg.adaptive_learning_rate < 0.01 {
+      cfg.adaptive_learning_rate = 0.01;
+    }
+    if cfg.adaptive_learning_rate > 0.2 {
+      cfg.adaptive_learning_rate = 0.2;
+    }
+    let state = InternalSharedState {
       current_balance: AtomicI32::new(0),
       learned_balance: AtomicF64::new(0.0),
-      consecutive_count: AtomicU32::new(0),
-      config,
+      consecutive_ingress: AtomicU32::new(0),
+      consecutive_egress: AtomicU32::new(0),
+      ops_since_nudge: AtomicU32::new(0),
+      config: cfg,
     };
     Self {
-      shared_state: Arc::new(internal_state),
+      shared: Arc::new(state),
     }
   }
 
@@ -142,49 +102,59 @@ impl AdaptiveThrottle {
   /// This method performs an "anticipatory" update to the throttle's internal
   /// state, reflecting the work that is about to happen. The returned guard
   /// must be used to complete the work cycle.
-  pub fn begin_work(&self, direction: Direction) -> ThrottleGuard {
-    let balance_before_update = self.shared_state.current_balance.load(Ordering::Relaxed);
-
-    let new_balance = match direction {
+  pub fn begin_work(&self, dir: Direction) -> ThrottleGuard {
+    let delta = self.shared.config.credit_per_message;
+    let new_balance = match dir {
       Direction::Ingress => {
-        self.shared_state.current_balance.fetch_add(
-          self.shared_state.config.credit_per_message,
-          Ordering::Relaxed,
-        ) + self.shared_state.config.credit_per_message
+        self
+          .shared
+          .current_balance
+          .fetch_add(delta, Ordering::Relaxed)
+          + delta
       }
       Direction::Egress => {
-        self.shared_state.current_balance.fetch_sub(
-          self.shared_state.config.credit_per_message,
-          Ordering::Relaxed,
-        ) - self.shared_state.config.credit_per_message
+        self
+          .shared
+          .current_balance
+          .fetch_sub(delta, Ordering::Relaxed)
+          - delta
       }
     };
 
-    self
-      .shared_state
-      .consecutive_count
-      .fetch_add(1, Ordering::Relaxed);
-
-    // --- Adaptive Learning Logic ---
-    // If the balance just crossed back into the healthy zone, it's a good
-    // time to update our learned average.
-    let learned_balance = self.shared_state.learned_balance.load(Ordering::Relaxed);
-    let healthy_width = self.shared_state.config.healthy_balance_width as f64;
-    let deviation_before = (balance_before_update as f64 - learned_balance).abs();
-    let deviation_after = (new_balance as f64 - learned_balance).abs();
-
-    if deviation_before > healthy_width && deviation_after <= healthy_width {
-      let new_learned_balance = (1.0 - self.shared_state.config.adaptive_learning_rate)
-        * learned_balance
-        + self.shared_state.config.adaptive_learning_rate * (new_balance as f64);
+    // Periodic EMA nudge
+    let since = self.shared.ops_since_nudge.fetch_add(1, Ordering::Relaxed) + 1;
+    if since >= self.shared.config.nudge_interval_ops {
+      let α = self.shared.config.adaptive_learning_rate;
+      let old_learned = self.shared.learned_balance.load(Ordering::Relaxed);
+      let updated = α * (new_balance as f64) + (1.0 - α) * old_learned;
       self
-        .shared_state
+        .shared
         .learned_balance
-        .store(new_learned_balance, Ordering::Relaxed);
+        .store(updated, Ordering::Relaxed);
+      self.shared.ops_since_nudge.store(0, Ordering::Relaxed);
+    }
+
+    // Track direction-specific streaks
+    match dir {
+      Direction::Ingress => {
+        self
+          .shared
+          .consecutive_ingress
+          .fetch_add(1, Ordering::Relaxed);
+        self.shared.consecutive_egress.store(0, Ordering::Relaxed);
+      }
+      Direction::Egress => {
+        self
+          .shared
+          .consecutive_egress
+          .fetch_add(1, Ordering::Relaxed);
+        self.shared.consecutive_ingress.store(0, Ordering::Relaxed);
+      }
     }
 
     ThrottleGuard {
-      shared_state: self.shared_state.clone(),
+      shared: self.shared.clone(),
+      direction: dir,
     }
   }
 }
@@ -194,50 +164,54 @@ impl AdaptiveThrottle {
 /// A temporary guard representing an in-progress I/O operation.
 /// Its purpose is to call the throttling logic when the operation is complete.
 pub struct ThrottleGuard {
-  shared_state: Arc<InternalSharedState>,
+  shared: Arc<InternalSharedState>,
+  direction: Direction,
 }
 
 impl ThrottleGuard {
   pub fn get_current_balance(&self) -> i32 {
-    return self.shared_state.current_balance.load(Ordering::Relaxed);
+    return self.shared.current_balance.load(Ordering::Relaxed);
   }
-  
+
   /// Finalizes the work cycle by checking the throttle's state and potentially
   /// yielding control to the async runtime.
   ///
   /// This method should be called after every I/O operation that was started
   /// with `begin_work`.
   pub fn should_throttle(&self) -> bool {
-    // Hard Rule: Check for consecutive actions.
-    let consecutive = self.shared_state.consecutive_count.load(Ordering::Relaxed);
-    if consecutive >= self.shared_state.config.yield_after_n_consecutive {
-      // Reset the counter and yield.
-      self
-        .shared_state
-        .consecutive_count
-        .store(0, Ordering::Relaxed);
-      return true;
-    }
+    let cfg = &self.shared.config;
 
-    // Probabilistic Rule: Use the configured strategy.
-    let state_view = strategies::ThrottleStateView {
-      current_balance: self.shared_state.current_balance.load(Ordering::Relaxed),
-      learned_balance: self.shared_state.learned_balance.load(Ordering::Relaxed),
-      config: &self.shared_state.config,
+    // Hard cap per-direction
+    let cons = match self.direction {
+      Direction::Ingress => self.shared.consecutive_ingress.load(Ordering::Relaxed),
+      Direction::Egress => self.shared.consecutive_egress.load(Ordering::Relaxed),
     };
-
-    let probability = (self.shared_state.config.strategy)(&state_view);
-
-    if rand::random::<f64>() < probability {
-      // Reset the counter when yielding to give the other direction a fair chance.
-      self
-        .shared_state
-        .consecutive_count
-        .store(0, Ordering::Relaxed);
-      
+    if cons >= cfg.yield_after_n_consecutive {
+      self.shared.consecutive_ingress.store(0, Ordering::Relaxed);
+      self.shared.consecutive_egress.store(0, Ordering::Relaxed);
       return true;
     }
 
-    return false;
+    // Probabilistic
+    let state = ThrottleStateView {
+      current_balance: self.shared.current_balance.load(Ordering::Relaxed),
+      learned_balance: self.shared.learned_balance.load(Ordering::Relaxed),
+      config: cfg,
+    };
+    let mut p = (cfg.strategy)(&state);
+    // piecewise: beyond 2× max_imbalance, always yield
+    let dev = (state.current_balance as f64 - state.learned_balance).abs();
+    let hard_cut = (cfg.max_imbalance as f64) * 2.0;
+    if dev >= hard_cut {
+      p = 1.0;
+    }
+
+    if random::<f64>() < p {
+      self.shared.consecutive_ingress.store(0, Ordering::Relaxed);
+      self.shared.consecutive_egress.store(0, Ordering::Relaxed);
+      return true;
+    }
+    
+    false
   }
 }

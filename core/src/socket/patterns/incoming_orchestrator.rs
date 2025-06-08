@@ -9,7 +9,6 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout as tokio_timeout;
 
-// <<< MODIFIED START [Generic IncomingMessageOrchestrator<QItem> with internal buffering for recv()] >>>
 #[derive(Debug)]
 pub(crate) struct IncomingMessageOrchestrator<QItem: Send + 'static> {
   socket_core_handle: usize,
