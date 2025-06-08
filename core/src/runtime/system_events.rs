@@ -134,9 +134,9 @@ pub enum SystemEvent {
     /// The URI of the connector socket, for logging or identification purposes.
     connector_uri: String,
     /// The channel sender the Binder uses to send messages TO the Connector.
-    binder_pipe_tx_to_connector: AsyncSender<Msg>,
+    binder_pipe_tx_to_connector: AsyncSender<Vec<Msg>>,
     /// The channel receiver the Binder uses to get messages FROM the Connector.
-    binder_pipe_rx_from_connector: AsyncReceiver<Msg>,
+    binder_pipe_rx_from_connector: AsyncReceiver<Vec<Msg>>,
     /// The ID the connector uses to write messages to the binder.
     connector_pipe_write_id: usize,
     /// The ID the connector uses to read messages from the binder.

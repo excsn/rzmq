@@ -22,9 +22,9 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fibre::{SendError, TrySendError};
-use fibre::mpmc::AsyncSender;
 use async_trait::async_trait;
+use fibre::mpmc::AsyncSender;
+use fibre::{SendError, TrySendError};
 use tokio::task::yield_now;
 use tokio::time::timeout as tokio_timeout;
 
@@ -33,8 +33,16 @@ use tokio::sync::oneshot as tokio_oneshot;
 
 #[async_trait]
 pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
-  async fn send_message(&self, msg: Msg) -> Result<(), ZmqError>;
+  /// Sends a single message as a convenience wrapper around `send_multipart`.
+  async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
+    // Default implementation wraps the single message in a Vec and calls the primary method.
+    self.send_multipart(vec![msg]).await
+  }
+
+  /// Sends a complete logical message, which may consist of one or more parts.
+  /// This is the primary method for sending data over the connection.
   async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError>;
+
   async fn close_connection(&self) -> Result<(), ZmqError>;
   fn get_connection_id(&self) -> usize;
   fn as_any(&self) -> &dyn Any;
@@ -46,7 +54,9 @@ pub(crate) struct DummyConnection;
 #[async_trait]
 impl ISocketConnection for DummyConnection {
   async fn send_message(&self, _msg: Msg) -> Result<(), ZmqError> {
-    Err(ZmqError::UnsupportedFeature("DummyConnection cannot send".into()))
+    Err(ZmqError::UnsupportedFeature(
+      "DummyConnection cannot send".into(),
+    ))
   }
 
   async fn send_multipart(&self, _msgs: Vec<Msg>) -> Result<(), ZmqError> {
@@ -72,13 +82,14 @@ impl ISocketConnection for DummyConnection {
 pub(crate) struct SessionConnection {
   session_mailbox: SessionMailboxSender,
   connection_id: usize,
-  pipe_to_session_tx: AsyncSender<Msg>,
+  pipe_to_session_tx: AsyncSender<Vec<Msg>>,
   socket_options: Arc<SocketOptions>,
   // Added context field to generate unique UserData for operations.
   // This is necessary if UringFdConnection needs a similar capability and we want to keep new() signatures consistent
   // or if SessionConnection itself might later interact with systems needing unique IDs.
   // For now, primarily for UringFdConnection pattern.
-  #[allow(dead_code)] // May not be used if SessionConnection doesn't directly create ops for ExternalOpTracker
+  #[allow(dead_code)]
+  // May not be used if SessionConnection doesn't directly create ops for ExternalOpTracker
   context: Context,
 }
 
@@ -88,7 +99,10 @@ impl fmt::Debug for SessionConnection {
     f.debug_struct("SessionConnection")
       .field("session_mailbox_closed", &self.session_mailbox.is_closed())
       .field("connection_id", &self.connection_id)
-      .field("pipe_to_session_tx_closed", &self.pipe_to_session_tx.is_closed())
+      .field(
+        "pipe_to_session_tx_closed",
+        &self.pipe_to_session_tx.is_closed(),
+      )
       .field("socket_options", &self.socket_options)
       // Context doesn't have a simple Debug, so just indicate its presence
       .field("context_present", &true)
@@ -100,7 +114,7 @@ impl SessionConnection {
   pub(crate) fn new(
     session_mailbox: SessionMailboxSender,
     connection_id: usize,
-    pipe_to_session_tx: AsyncSender<Msg>,
+    pipe_to_session_tx: AsyncSender<Vec<Msg>>,
     socket_options: Arc<SocketOptions>,
     context: Context,
   ) -> Self {
@@ -116,7 +130,9 @@ impl SessionConnection {
 
 #[async_trait]
 impl ISocketConnection for SessionConnection {
-  async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
+  // For SessionConnection, send_multipart sends each part individually.
+  // ZMTP framing for the logical message happens at a higher level (e.g., in specific ISocket impls).
+  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
     let timeout_opt = self.socket_options.sndtimeo; // Get SNDTIMEO from stored options
 
     match timeout_opt {
@@ -124,29 +140,24 @@ impl ISocketConnection for SessionConnection {
         // Infinite timeout (block until HWM allows or pipe closes)
         tracing::trace!(
           conn_id = self.connection_id,
-          // pipe_id = self.pipe_to_session_tx.id_somehow(),
-          "SessionConnection: Sending message (blocking on HWM)"
+          "SessionConnection: Sending multipart (blocking on HWM)"
         );
 
-        self
-          .pipe_to_session_tx
-          .send(msg)
-          .await
-          .map_err(|_| {
-            tracing::warn!(
-              conn_id = self.connection_id,
-              "SessionConnection: Pipe send failed (ConnectionClosed)"
-            );
-            ZmqError::ConnectionClosed
-          })
+        self.pipe_to_session_tx.send(msgs).await.map_err(|_| {
+          tracing::warn!(
+            conn_id = self.connection_id,
+            "SessionConnection: Pipe send failed (ConnectionClosed)"
+          );
+          ZmqError::ConnectionClosed
+        })
       }
       Some(d) if d.is_zero() => {
         // Non-blocking (SNDTIMEO = 0)
         tracing::trace!(
           conn_id = self.connection_id,
-          "SessionConnection: Attempting non-blocking send via pipe"
+          "SessionConnection: Attempting non-blocking multipart send via pipe"
         );
-        match self.pipe_to_session_tx.try_send(msg) {
+        match self.pipe_to_session_tx.try_send(msgs) {
           Ok(()) => Ok(()),
           Err(TrySendError::Full(_failed_msg_back)) => {
             tracing::trace!(
@@ -170,9 +181,9 @@ impl ISocketConnection for SessionConnection {
         tracing::trace!(
             conn_id = self.connection_id,
             send_timeout_duration = ?timeout_duration,
-            "SessionConnection: Attempting timed send via pipe"
+            "SessionConnection: Attempting timed multipart send via pipe"
         );
-        match tokio_timeout(timeout_duration, self.pipe_to_session_tx.send(msg)).await {
+        match tokio_timeout(timeout_duration, self.pipe_to_session_tx.send(msgs)).await {
           Ok(Ok(())) => Ok(()), // Sent within timeout
           Ok(Err(SendError::Closed)) => {
             // Pipe closed during timed send
@@ -194,15 +205,6 @@ impl ISocketConnection for SessionConnection {
         }
       }
     }
-  }
-
-  // For SessionConnection, send_multipart sends each part individually.
-  // ZMTP framing for the logical message happens at a higher level (e.g., in specific ISocket impls).
-  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
-    for msg_part in msgs {
-      self.send_message(msg_part).await?;
-    }
-    Ok(())
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
@@ -280,7 +282,10 @@ impl ISocketConnection for UringFdConnection {
     // If SNDTIMEO is None (infinite), wait indefinitely.
     // If SNDTIMEO is Some(ZERO), it's tricky. SendDataViaHandler is async to worker.
     // A true non-blocking check isn't simple here. For now, use a very small timeout or default if ZERO.
-    let ack_timeout = self.socket_options.sndtimeo.unwrap_or(Duration::from_secs(5)); // Default 5s if infinite SNDTIMEO
+    let ack_timeout = self
+      .socket_options
+      .sndtimeo
+      .unwrap_or(Duration::from_secs(5)); // Default 5s if infinite SNDTIMEO
     let effective_ack_timeout = if ack_timeout.is_zero() {
       Duration::from_millis(1)
     } else {
@@ -290,7 +295,11 @@ impl ISocketConnection for UringFdConnection {
     match tokio_timeout(effective_ack_timeout, reply_rx).await {
       Ok(Ok(Ok(_completion))) => Ok(()),
       Ok(Ok(Err(e))) => {
-        tracing::warn!(fd = self.fd, "UringWorker reported error for SendDataViaHandler: {}", e);
+        tracing::warn!(
+          fd = self.fd,
+          "UringWorker reported error for SendDataViaHandler: {}",
+          e
+        );
         Err(e)
       }
       Ok(Err(oneshot_err)) => {
@@ -299,7 +308,9 @@ impl ISocketConnection for UringFdConnection {
           "OneShot channel error waiting for SendDataViaHandler ack: {}",
           oneshot_err
         );
-        Err(ZmqError::Internal("UringWorker reply channel error for send".into()))
+        Err(ZmqError::Internal(
+          "UringWorker reply channel error for send".into(),
+        ))
       }
       Err(_timeout_elapsed) => {
         tracing::error!(
@@ -335,11 +346,17 @@ impl ISocketConnection for UringFdConnection {
         "Failed to send SendDataMultipartViaHandler request to UringWorker: {}",
         e
       );
-      ZmqError::Internal(format!("UringWorker op channel error for multipart send: {}", e))
+      ZmqError::Internal(format!(
+        "UringWorker op channel error for multipart send: {}",
+        e
+      ))
     })?;
 
     // Timeout logic remains similar to send_message
-    let ack_timeout = self.socket_options.sndtimeo.unwrap_or(Duration::from_secs(5));
+    let ack_timeout = self
+      .socket_options
+      .sndtimeo
+      .unwrap_or(Duration::from_secs(5));
     let effective_ack_timeout = if ack_timeout.is_zero() {
       Duration::from_millis(1)
     } else {
@@ -414,7 +431,9 @@ impl ISocketConnection for UringFdConnection {
           "OneShot channel error waiting for ShutdownConnectionHandler ack: {}",
           oneshot_err
         );
-        Err(ZmqError::Internal("UringWorker reply channel error for close".into()))
+        Err(ZmqError::Internal(
+          "UringWorker reply channel error for close".into(),
+        ))
       }
       Err(_timeout_elapsed) => {
         tracing::error!(
@@ -440,7 +459,7 @@ pub(crate) struct InprocConnection {
   local_pipe_read_id_from_peer: usize,
   peer_inproc_name_or_uri: String,
   context: Context,
-  data_tx_to_peer: AsyncSender<Msg>,
+  data_tx_to_peer: AsyncSender<Vec<Msg>>,
   monitor_tx: Option<MonitorSender>,
   socket_options: Arc<SocketOptions>,
 }
@@ -449,8 +468,14 @@ impl fmt::Debug for InprocConnection {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("InprocConnection")
       .field("connection_id", &self.connection_id)
-      .field("local_pipe_write_id_to_peer", &self.local_pipe_write_id_to_peer)
-      .field("local_pipe_read_id_from_peer", &self.local_pipe_read_id_from_peer)
+      .field(
+        "local_pipe_write_id_to_peer",
+        &self.local_pipe_write_id_to_peer,
+      )
+      .field(
+        "local_pipe_read_id_from_peer",
+        &self.local_pipe_read_id_from_peer,
+      )
       .field("peer_inproc_name_or_uri", &self.peer_inproc_name_or_uri)
       .field("context_present", &true) // Context doesn't have a simple Debug
       .field("data_tx_to_peer_closed", &self.data_tx_to_peer.is_closed())
@@ -467,7 +492,7 @@ impl InprocConnection {
     local_pipe_read_id_from_peer: usize,
     peer_inproc_name_or_uri: String,
     context: Context,
-    data_tx_to_peer: AsyncSender<Msg>,
+    data_tx_to_peer: AsyncSender<Vec<Msg>>,
     monitor_tx: Option<MonitorSender>,
     socket_options: Arc<SocketOptions>,
   ) -> Self {
@@ -486,18 +511,18 @@ impl InprocConnection {
 
 #[async_trait]
 impl ISocketConnection for InprocConnection {
-  async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
-    let timeout_opt = self.socket_options.sndtimeo; // Get SNDTIMEO from stored options
+  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+    let timeout_opt = self.socket_options.sndtimeo;
 
     match timeout_opt {
       None => {
-        self.data_tx_to_peer.send(msg).await.map_err(|_| {
+        self.data_tx_to_peer.send(msgs).await.map_err(|_| {
           tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection send failed (ConnectionClosed)");
           ZmqError::ConnectionClosed
         })
       }
       Some(d) if d.is_zero() => {
-        match self.data_tx_to_peer.try_send(msg) {
+        match self.data_tx_to_peer.try_send(msgs) {
           Ok(()) => Ok(()),
           Err(TrySendError::Full(_)) => Err(ZmqError::ResourceLimitReached),
           Err(TrySendError::Closed(_)) => {
@@ -508,7 +533,7 @@ impl ISocketConnection for InprocConnection {
         }
       }
       Some(duration) => {
-        match tokio_timeout(duration, self.data_tx_to_peer.send(msg)).await {
+        match tokio_timeout(duration, self.data_tx_to_peer.send(msgs)).await {
           Ok(Ok(())) => Ok(()),
           Ok(Err(SendError::Closed)) => {
             tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection timed send failed (ConnectionClosed)");
@@ -519,13 +544,6 @@ impl ISocketConnection for InprocConnection {
         }
       }
     }
-  }
-
-  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
-    for msg_part in msgs {
-      self.send_message(msg_part).await?;
-    }
-    Ok(())
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {

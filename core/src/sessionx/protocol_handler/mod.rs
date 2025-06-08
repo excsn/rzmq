@@ -2,13 +2,13 @@
 
 #![allow(dead_code, unused_variables, unused_mut)]
 
-use crate::transport::ZmtpStdStream;
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::protocol::zmtp::greeting::ZmtpGreeting; // Needed for pending_peer_greeting
 use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
 use crate::security::{IDataCipher, Mechanism, NullMechanism};
 use crate::socket::options::ZmtpEngineConfig;
+use crate::transport::ZmtpStdStream;
 use crate::Blob;
 
 use bytes::BytesMut;
@@ -22,10 +22,10 @@ mod data_io;
 mod handshake;
 mod heartbeat; // This will define ZmtpHeartbeatStateX if we move it
 
-use super::cork::{try_create_cork_info, TcpCorkInfoX};
 use self::heartbeat::ZmtpHeartbeatStateX;
-use heartbeat::ZmtpHandshakeStateX;
+use super::cork::{try_create_cork_info, TcpCorkInfoX};
 use super::types::{HandshakeSubPhaseX, ZmtpHandshakeProgressX};
+use heartbeat::ZmtpHandshakeStateX;
 
 pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
   // --- Shared State accessible by sub-module functions via &self or &mut self ---
@@ -63,7 +63,10 @@ impl<S: ZmtpStdStream + fmt::Debug> fmt::Debug for ZmtpProtocolHandlerX<S> {
       .field("stream_is_some", &self.stream.is_some());
     debug_struct
       .field("network_read_buffer_len", &self.network_read_buffer.len())
-      .field("plaintext_feed_buffer_len", &self.plaintext_feed_buffer.len());
+      .field(
+        "plaintext_feed_buffer_len",
+        &self.plaintext_feed_buffer.len(),
+      );
     debug_struct
       .field("handshake_state", &self.handshake_state)
       .field("security_mechanism_name", &self.security_mechanism.name())
@@ -89,7 +92,9 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
   ) -> Self {
     let heartbeat_ivl_from_config = config.heartbeat_ivl;
     let effective_timeout_corrected = config.heartbeat_timeout.unwrap_or_else(|| {
-      heartbeat_ivl_from_config.map_or(Duration::from_secs(30), |ivl| ivl.max(Duration::from_millis(100)))
+      heartbeat_ivl_from_config.map_or(Duration::from_secs(30), |ivl| {
+        ivl.max(Duration::from_millis(100))
+      })
     });
 
     #[cfg(target_os = "linux")]
@@ -159,11 +164,20 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     data_io::write_data_msg_impl(self, msg, is_first_part_of_logical_zmq_msg).await
   }
 
+  /// Frames, encrypts, and writes a full logical ZMQ message (one or more parts)
+  /// to the stream. This is the new, preferred method for sending data.
+  pub(crate) async fn write_data_msgs(&mut self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+    data_io::write_data_msgs_impl(self, msgs).await
+  }
+  
   /// Processes an incoming ZMTP command frame received during the data phase,
   /// primarily for handling PING/PONG.
   ///
   /// Returns `Ok(Some(Msg))` if a PONG reply needs to be sent.
-  pub(crate) fn process_incoming_data_command_frame(&mut self, cmd_msg: &Msg) -> Result<Option<Msg>, ZmqError> {
+  pub(crate) fn process_incoming_data_command_frame(
+    &mut self,
+    cmd_msg: &Msg,
+  ) -> Result<Option<Msg>, ZmqError> {
     heartbeat::process_heartbeat_command_impl(self, cmd_msg)
   }
 
@@ -189,14 +203,21 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
       {
         if let Some(cork_info_ref) = self.cork_info.as_mut() {
           if cork_info_ref.is_corked() {
-            cork_info_ref.apply_cork_state(false, self.actor_handle).await;
+            cork_info_ref
+              .apply_cork_state(false, self.actor_handle)
+              .await;
           }
         }
       }
       // Attempt graceful shutdown of the write side of the stream.
       match stream_ref.shutdown().await {
-        Ok(()) => tracing::debug!(sca_handle = self.actor_handle, "Stream shutdown() successful."),
-        Err(e) => tracing::warn!(sca_handle = self.actor_handle, error = %e, "Error during stream shutdown()."),
+        Ok(()) => tracing::debug!(
+          sca_handle = self.actor_handle,
+          "Stream shutdown() successful."
+        ),
+        Err(e) => {
+          tracing::warn!(sca_handle = self.actor_handle, error = %e, "Error during stream shutdown().")
+        }
       }
     }
     self.stream = None; // Drop the stream, which should close it.

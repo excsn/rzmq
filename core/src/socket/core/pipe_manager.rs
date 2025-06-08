@@ -18,7 +18,6 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-
 pub(crate) async fn run_pipe_reader_task(
   context: RzmqContext,
   core_handle: usize,
@@ -28,7 +27,7 @@ pub(crate) async fn run_pipe_reader_task(
   pipe_read_id: usize,
   pipe_receiver: AsyncReceiver<Msg>,
 ) {
-// <<< MODIFIED END >>>
+  // <<< MODIFIED END >>>
   let pipe_reader_task_handle_id = context.inner().next_handle();
   let pipe_reader_actor_type = ActorType::PipeReader; // This ActorType might be removed soon
 
@@ -72,12 +71,15 @@ pub(crate) async fn run_pipe_reader_task(
             "PipeReaderTask: Error from ISocket::handle_pipe_event: {}. Stopping reader.",
             e
           );
-          if final_error_for_stopping.is_none() { final_error_for_stopping = Some(e); }
+          if final_error_for_stopping.is_none() {
+            final_error_for_stopping = Some(e);
+          }
           break;
         }
         // <<< MODIFIED END >>>
       }
-      Err(_) => { // RecvError implies channel is closed and empty
+      Err(_) => {
+        // RecvError implies channel is closed and empty
         tracing::debug!(
           core_handle = core_handle,
           pipe_reader_task_id = pipe_reader_task_handle_id,
@@ -85,7 +87,9 @@ pub(crate) async fn run_pipe_reader_task(
           "PipeReaderTask: Data pipe closed by peer. Notifying ISocket."
         );
         // <<< MODIFIED [Call ISocket::handle_pipe_event directly for closed pipe] >>>
-        let cmd_closed_for_isocket = Command::PipeClosedByPeer { pipe_id: pipe_read_id };
+        let cmd_closed_for_isocket = Command::PipeClosedByPeer {
+          pipe_id: pipe_read_id,
+        };
         if let Err(e) = socket_logic_strong
           .handle_pipe_event(pipe_read_id, cmd_closed_for_isocket)
           .await
@@ -95,7 +99,9 @@ pub(crate) async fn run_pipe_reader_task(
             "PipeReaderTask: Error from ISocket::handle_pipe_event for PipeClosedByPeer: {}.",
             e
           );
-          if final_error_for_stopping.is_none() { final_error_for_stopping = Some(e); }
+          if final_error_for_stopping.is_none() {
+            final_error_for_stopping = Some(e);
+          }
         }
         // <<< MODIFIED END >>>
         break;
@@ -183,7 +189,11 @@ pub(crate) async fn cleanup_stopped_child_resources(
         .is::<crate::socket::connection_iface::UringFdConnection>()
       {
         let fd = ep_info.handle_id as std::os::unix::io::RawFd;
-        core_arc.core_state.write().uring_fd_to_endpoint_uri.remove(&fd);
+        core_arc
+          .core_state
+          .write()
+          .uring_fd_to_endpoint_uri
+          .remove(&fd);
         crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd);
         tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, %fd, "Unregistered UringFD state for stopped child.");
       }
@@ -231,7 +241,8 @@ pub(crate) async fn cleanup_stopped_child_resources(
               .options
               .reconnect_ivl
               .map_or(false, |d| !d.is_zero());
-            let is_fatal_for_reconnect = error_opt.map_or(false, crate::transport::tcp::is_fatal_connect_error);
+            let is_fatal_for_reconnect =
+              error_opt.map_or(false, crate::transport::tcp::is_fatal_connect_error);
 
             if reconnect_enabled && !is_fatal_for_reconnect {
               tracing::info!(
@@ -239,7 +250,12 @@ pub(crate) async fn cleanup_stopped_child_resources(
                 target_uri = %target_uri_to_reconnect,
                 "Unexpected session/engine stop for outbound connection. Initiating reconnect..."
               );
-              command_processor::respawn_connecter_actor(core_arc.clone(),  socket_logic_strong.clone(), target_uri_to_reconnect).await;
+              command_processor::respawn_connecter_actor(
+                core_arc.clone(),
+                socket_logic_strong.clone(),
+                target_uri_to_reconnect,
+              )
+              .await;
             } else {
               tracing::warn!(
                 handle = core_handle,
@@ -272,9 +288,10 @@ pub(crate) async fn cleanup_session_state_by_uri(
   let ep_info_to_process: EndpointInfo;
   let mut detached_pipe_read_id: Option<usize> = None;
 
-  { // Scope for the write lock
+  {
+    // Scope for the write lock
     let mut core_s_write = core_arc.core_state.write();
-    
+
     // Attempt to remove the EndpointInfo from the map
     let removed_info = match core_s_write.endpoints.remove(endpoint_uri) {
       Some(info) => info,
@@ -287,20 +304,26 @@ pub(crate) async fn cleanup_session_state_by_uri(
     // Validate and process the removed info while still under lock
     if removed_info.endpoint_type != EndpointType::Session {
       tracing::error!(handle = core_handle, uri = %endpoint_uri, "Cleanup by URI: Expected Session type, found {:?}. Reinserting.", removed_info.endpoint_type);
-      core_s_write.endpoints.insert(endpoint_uri.to_string(), removed_info);
+      core_s_write
+        .endpoints
+        .insert(endpoint_uri.to_string(), removed_info);
       return None;
     }
-    
+
     tracing::info!(handle = core_handle, uri = %endpoint_uri, "Removed EndpointInfo by URI during proactive cleanup.");
-    
+
     if let Some((core_write_id, core_read_id)) = removed_info.pipe_ids {
       core_s_write.remove_pipe_state(core_write_id, core_read_id);
       detached_pipe_read_id = Some(core_read_id); // Store for later async call
       tracing::debug!(handle = core_handle, uri=%endpoint_uri, "Removed pipe state for session.");
     }
-    
+
     #[cfg(feature = "io-uring")]
-    if removed_info.connection_iface.as_any().is::<crate::socket::connection_iface::UringFdConnection>() {
+    if removed_info
+      .connection_iface
+      .as_any()
+      .is::<crate::socket::connection_iface::UringFdConnection>()
+    {
       let fd = removed_info.handle_id as RawFd;
       core_s_write.uring_fd_to_endpoint_uri.remove(&fd);
       crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd);
@@ -333,7 +356,7 @@ pub(crate) async fn cleanup_session_state_by_uri(
     socket_logic_strong.pipe_detached(read_id).await;
     tracing::debug!(handle = core_handle, uri=%ep_info_to_process.endpoint_uri, pipe_read_id = read_id, "Notified ISocket of pipe detachment.");
   }
-  
+
   // Return the EndpointInfo struct that was removed and processed
   Some(ep_info_to_process)
 }
@@ -344,7 +367,11 @@ pub(crate) async fn cleanup_session_state_by_pipe(
   socket_logic_strong: &Arc<dyn ISocket>,
 ) -> Option<String> {
   let core_handle = core_arc.handle;
-  tracing::debug!(handle = core_handle, pipe_read_id, "Cleaning up state by pipe_read_id.");
+  tracing::debug!(
+    handle = core_handle,
+    pipe_read_id,
+    "Cleaning up state by pipe_read_id."
+  );
 
   let mut endpoint_uri_to_remove: Option<String> = None;
   let mut target_uri_for_reconnect: Option<String> = None;
@@ -386,13 +413,19 @@ pub(crate) async fn cleanup_session_state_by_pipe(
       }
       #[cfg(feature = "io-uring")]
       if let Some(fd_to_unregister) = fd_to_unregister_opt {
-        core_s_write.uring_fd_to_endpoint_uri.remove(&fd_to_unregister);
+        core_s_write
+          .uring_fd_to_endpoint_uri
+          .remove(&fd_to_unregister);
         crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd_to_unregister);
       }
       if let (Some(ep_type), Some(ep_uri_event)) = (removed_ep_type, removed_ep_uri_for_event) {
         let event = match ep_type {
-          EndpointType::Session => SocketEvent::Disconnected { endpoint: ep_uri_event },
-          EndpointType::Listener => SocketEvent::Closed { endpoint: ep_uri_event },
+          EndpointType::Session => SocketEvent::Disconnected {
+            endpoint: ep_uri_event,
+          },
+          EndpointType::Listener => SocketEvent::Closed {
+            endpoint: ep_uri_event,
+          },
         };
         core_s_write.send_monitor_event(event);
       }
@@ -428,8 +461,8 @@ pub(crate) async fn process_inproc_binding_request_event(
   core_arc: Arc<SocketCore>,
   socket_logic_strong: &Arc<dyn ISocket>,
   connector_uri: String,
-  pipe_rx_for_binder_to_receive_from_connector: AsyncReceiver<Msg>,
-  pipe_tx_for_binder_to_send_to_connector: AsyncSender<Msg>,
+  pipe_rx_for_binder_to_receive_from_connector: AsyncReceiver<Vec<Msg>>,
+  pipe_tx_for_binder_to_send_to_connector: AsyncSender<Vec<Msg>>,
   binder_write_id_for_this_connection: usize,
   binder_read_id_for_this_connection: usize,
   reply_tx_to_connector: oneshot::Sender<ZmqResult<()>>,
@@ -451,27 +484,52 @@ pub(crate) async fn process_inproc_binding_request_event(
   let accept_result: Result<(), ZmqError> = Ok(());
 
   if accept_result.is_ok() {
-    let pipe_reader_task = tokio::spawn(run_pipe_reader_task(
-      core_arc.context.clone(),
-      binder_core_handle,
-      socket_logic_strong.clone(),
-      binder_read_id_for_this_connection,
-      pipe_rx_for_binder_to_receive_from_connector,
-    ));
+    let socket_logic = socket_logic_strong.clone();
+    tokio::spawn(async move {
+      loop {
+        match pipe_rx_for_binder_to_receive_from_connector.recv().await {
+          Ok(msgs_vec) => {
+            for msg in msgs_vec {
+              let cmd_for_isocket = Command::PipeMessageReceived {
+                pipe_id: binder_read_id_for_this_connection,
+                msg,
+              };
+              if socket_logic
+                .handle_pipe_event(binder_read_id_for_this_connection, cmd_for_isocket)
+                .await
+                .is_err()
+              {
+                break;
+              }
+            }
+          }
+          Err(_) => {
+            let cmd_closed = Command::PipeClosedByPeer {
+              pipe_id: binder_read_id_for_this_connection,
+            };
+            let _ = socket_logic
+              .handle_pipe_event(binder_read_id_for_this_connection, cmd_closed)
+              .await;
+            break;
+          }
+        }
+      }
+    });
 
     let inproc_endpoint_entry_handle_id = core_arc.context.inner().next_handle();
 
     // <<< MODIFIED START [InprocConnection for binder side] >>>
-    let binder_side_inproc_iface = Arc::new(crate::socket::connection_iface::InprocConnection::new(
-      inproc_endpoint_entry_handle_id,                 // connection_id for this EndpointInfo
-      binder_write_id_for_this_connection,             // Binder's local_pipe_write_id_to_peer (connector's read ID)
-      binder_read_id_for_this_connection,              // Binder's local_pipe_read_id_from_peer (connector's write ID)
-      connector_uri.clone(),                           // peer_inproc_name_or_uri is the connector's URI
-      core_arc.context.clone(),                        // Binder's context
-      pipe_tx_for_binder_to_send_to_connector.clone(), // data_tx_to_peer is the sender to the connector
-      core_arc.core_state.read().get_monitor_sender_clone(), // Binder's monitor
-      core_arc.core_state.read().options.clone(),      // Binder's socket options
-    ));
+    let binder_side_inproc_iface =
+      Arc::new(crate::socket::connection_iface::InprocConnection::new(
+        inproc_endpoint_entry_handle_id, // connection_id for this EndpointInfo
+        binder_write_id_for_this_connection, // Binder's local_pipe_write_id_to_peer (connector's read ID)
+        binder_read_id_for_this_connection, // Binder's local_pipe_read_id_from_peer (connector's write ID)
+        connector_uri.clone(),              // peer_inproc_name_or_uri is the connector's URI
+        core_arc.context.clone(),           // Binder's context
+        pipe_tx_for_binder_to_send_to_connector.clone(), // data_tx_to_peer is the sender to the connector
+        core_arc.core_state.read().get_monitor_sender_clone(), // Binder's monitor
+        core_arc.core_state.read().options.clone(),      // Binder's socket options
+      ));
     // <<< MODIFIED END >>>
 
     let endpoint_info_for_binder = EndpointInfo {
@@ -479,7 +537,10 @@ pub(crate) async fn process_inproc_binding_request_event(
       task_handle: None,
       endpoint_type: EndpointType::Session,
       endpoint_uri: connector_uri.clone(),
-      pipe_ids: Some((binder_write_id_for_this_connection, binder_read_id_for_this_connection)),
+      pipe_ids: Some((
+        binder_write_id_for_this_connection,
+        binder_read_id_for_this_connection,
+      )),
       handle_id: inproc_endpoint_entry_handle_id,
       target_endpoint_uri: Some(connector_uri.clone()),
       is_outbound_connection: false,
@@ -493,9 +554,6 @@ pub(crate) async fn process_inproc_binding_request_event(
         binder_write_id_for_this_connection,
         pipe_tx_for_binder_to_send_to_connector,
       );
-      binder_core_state
-        .pipe_reader_task_handles
-        .insert(binder_read_id_for_this_connection, pipe_reader_task);
       binder_core_state
         .endpoints
         .insert(connector_uri.clone(), endpoint_info_for_binder);
@@ -570,7 +628,8 @@ pub(crate) async fn handle_inproc_pipe_peer_closed_event(
       uri = %endpoint_uri_of_closed_conn.as_deref().unwrap_or("N/A"),
       "Found binder's read pipe to clean up for closed inproc connection."
     );
-    let _ = cleanup_session_state_by_pipe(core_arc.clone(), read_id_to_clean, socket_logic_strong).await;
+    let _ =
+      cleanup_session_state_by_pipe(core_arc.clone(), read_id_to_clean, socket_logic_strong).await;
   } else {
     tracing::warn!(
       binder_handle = binder_core_handle,

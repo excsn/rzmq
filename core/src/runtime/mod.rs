@@ -14,7 +14,6 @@ pub mod waitgroup;
 pub use command::Command;
 pub(crate) use mailbox::{mailbox, MailboxReceiver, MailboxSender};
 
-pub use mailbox::DEFAULT_MAILBOX_CAPACITY;
 // System Coordination
 pub use event_bus::EventBus;
 pub use system_events::{ActorType, SystemEvent};

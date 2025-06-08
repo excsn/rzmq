@@ -1,10 +1,8 @@
-// core/src/sessionx/states.rs
-
 #![allow(dead_code)] // Allow dead code for now
 
-use crate::context::Context; // For ActorConfig
+use crate::context::Context;
 use crate::socket::events::MonitorSender;
-use crate::Msg; // For CorePipeManagerX
+use crate::Msg; 
 
 use fibre::mpmc::AsyncReceiver;
 
@@ -22,7 +20,7 @@ pub(crate) struct ActorConfigX {
 // Located here as it's primarily a state holder for pipe-related fields.
 #[derive(Debug)]
 pub(crate) struct CorePipeManagerXState {
-  pub rx_from_core: Option<AsyncReceiver<Msg>>,
+  pub rx_from_core: Option<AsyncReceiver<Vec<Msg>>>,
   pub core_pipe_read_id_for_incoming_routing: Option<usize>,
   pub is_attached: bool,
 }

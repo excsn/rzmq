@@ -8,7 +8,7 @@ use fibre::mpmc;
 /// Default capacity for bounded mailboxes created by the `mailbox()` helper function.
 /// This capacity applies to the single mailbox used by `SocketCore` and other simpler actors.
 /// It can be tuned based on expected load and performance characteristics.
-pub const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
+pub const DEFAULT_MAILBOX_CAPACITY: usize = 512;
 
 /// The sending end of an actor's mailbox.
 /// It is cloneable, allowing multiple actors or tasks to send commands to the same mailbox.

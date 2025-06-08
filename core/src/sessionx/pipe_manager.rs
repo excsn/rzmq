@@ -20,7 +20,7 @@ impl CorePipeManagerX {
   }
 
   /// Attaches the pipes and routing information received from SocketCore.
-  pub(crate) fn attach(&mut self, rx_from_core: AsyncReceiver<Msg>, core_pipe_read_id_for_incoming_routing: usize) {
+  pub(crate) fn attach(&mut self, rx_from_core: AsyncReceiver<Vec<Msg>>, core_pipe_read_id_for_incoming_routing: usize) {
     if self.state.is_attached {
       return;
     }
@@ -37,7 +37,7 @@ impl CorePipeManagerX {
   /// Attempts to receive a message from SocketCore (i.e., an outgoing message
   /// to be sent over the network).
   /// This is an async method that will await if the channel is empty.
-  pub(crate) async fn recv_from_core(&self) -> Result<Msg, RecvError> {
+  pub(crate) async fn recv_from_core(&self) -> Result<Vec<Msg>, RecvError> {
     if let Some(ref rx) = self.state.rx_from_core {
       rx.recv().await
     } else {

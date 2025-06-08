@@ -5,14 +5,14 @@
 use crate::context::Context;
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::runtime::{SystemEvent};
+use crate::runtime::SystemEvent;
 use crate::socket::core::pipe_manager::run_pipe_reader_task;
 use crate::socket::core::{EndpointInfo, EndpointType, SocketCore};
 use crate::socket::SocketEvent;
 
-use fibre::mpmc::{bounded_async};
-use std::sync::Arc;
+use fibre::mpmc::bounded_async;
 use fibre::oneshot;
+use std::sync::Arc;
 
 pub(crate) async fn bind_inproc(name: String, core_arc: Arc<SocketCore>) -> Result<(), ZmqError> {
   tracing::debug!(binder_core_handle = core_arc.handle, inproc_name = %name, "Attempting to bind inproc endpoint");
@@ -75,7 +75,9 @@ pub(crate) async fn connect_inproc(
         inproc_name = %name,
         "connect_inproc: Failed to get ISocket logic for PipeReaderTask spawning. Aborting connect."
       );
-      let err = ZmqError::Internal("ISocket logic unavailable for inproc connector's PipeReaderTask".into());
+      let err = ZmqError::Internal(
+        "ISocket logic unavailable for inproc connector's PipeReaderTask".into(),
+      );
       let _ = reply_tx_user.send(Err(err.clone()));
       let event_failed = SystemEvent::ConnectionAttemptFailed {
         parent_core_id: connector_core_handle,
@@ -88,31 +90,50 @@ pub(crate) async fn connect_inproc(
   };
 
   let pipe_id_connector_writes_to_binder = core_arc.context.inner().next_handle();
-  let pipe_id_connector_reads_from_binder = pipe_id_connector_writes_to_binder + 1;
+  let pipe_id_connector_reads_from_binder = core_arc.context.inner().next_handle();
 
-  let (tx_connector_to_binder, rx_binder_from_connector) = bounded_async::<Msg>(pipe_hwm);
-  let (tx_binder_to_connector, rx_connector_from_binder) = bounded_async::<Msg>(pipe_hwm);
+  let (tx_connector_to_binder, rx_binder_from_connector) = bounded_async::<Vec<Msg>>(pipe_hwm);
+  let (tx_binder_to_connector, rx_connector_from_binder) = bounded_async::<Vec<Msg>>(pipe_hwm);
 
-  core_arc
-    .core_state
-    .write()
-    .pipes_tx
-    .insert(pipe_id_connector_writes_to_binder, tx_connector_to_binder.clone());
+  core_arc.core_state.write().pipes_tx.insert(
+    pipe_id_connector_writes_to_binder,
+    tx_connector_to_binder.clone(),
+  );
 
+  // This task now directly processes Vec<Msg> and forwards individual frames to ISocket.
   let connector_context_clone = core_arc.context.clone();
-  let pipe_reader_task_join_handle = tokio::spawn(run_pipe_reader_task(
-    connector_context_clone,
-    connector_core_handle,
-    socket_logic,
-    pipe_id_connector_reads_from_binder,
-    rx_connector_from_binder.clone(),
-  ));
-
-  core_arc
-    .core_state
-    .write()
-    .pipe_reader_task_handles
-    .insert(pipe_id_connector_reads_from_binder, pipe_reader_task_join_handle);
+  tokio::spawn(async move {
+    loop {
+      match rx_connector_from_binder.recv().await {
+        Ok(msgs_vec) => {
+          for msg in msgs_vec {
+            let cmd_for_isocket = crate::runtime::Command::PipeMessageReceived {
+              pipe_id: pipe_id_connector_reads_from_binder,
+              msg,
+            };
+            if socket_logic
+              .handle_pipe_event(pipe_id_connector_reads_from_binder, cmd_for_isocket)
+              .await
+              .is_err()
+            {
+              // Error from ISocket logic, stop this forwarder.
+              break;
+            }
+          }
+        }
+        Err(_) => {
+          // Binder closed its side of the pipe. Notify ISocket and stop.
+          let cmd_closed = crate::runtime::Command::PipeClosedByPeer {
+            pipe_id: pipe_id_connector_reads_from_binder,
+          };
+          let _ = socket_logic
+            .handle_pipe_event(pipe_id_connector_reads_from_binder, cmd_closed)
+            .await;
+          break;
+        }
+      }
+    }
+  });
 
   let inproc_endpoint_entry_handle_id = core_arc.context.inner().next_handle();
 
@@ -135,7 +156,10 @@ pub(crate) async fn connect_inproc(
     task_handle: None,
     endpoint_type: EndpointType::Session,
     endpoint_uri: connector_uri_str.clone(),
-    pipe_ids: Some((pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder)),
+    pipe_ids: Some((
+      pipe_id_connector_writes_to_binder,
+      pipe_id_connector_reads_from_binder,
+    )),
     handle_id: inproc_endpoint_entry_handle_id,
     target_endpoint_uri: Some(connector_uri_str.clone()),
     is_outbound_connection: true,
@@ -144,12 +168,15 @@ pub(crate) async fn connect_inproc(
   {
     // Scope for write lock
     let mut core_s_write = core_arc.core_state.write();
-    core_s_write.endpoints.insert(connector_uri_str.clone(), endpoint_info);
+    core_s_write
+      .endpoints
+      .insert(connector_uri_str.clone(), endpoint_info);
 
     // Populate the reverse map for the connector's CoreState
-    core_s_write
-      .pipe_read_id_to_endpoint_uri
-      .insert(pipe_id_connector_reads_from_binder, connector_uri_str.clone());
+    core_s_write.pipe_read_id_to_endpoint_uri.insert(
+      pipe_id_connector_reads_from_binder,
+      connector_uri_str.clone(),
+    );
   }
 
   let monitor_tx_for_event = connector_monitor_tx;
@@ -172,7 +199,10 @@ pub(crate) async fn connect_inproc(
     {
       let mut cs = core_arc.core_state.write();
       cs.endpoints.remove(&connector_uri_str);
-      cs.remove_pipe_state(pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder);
+      cs.remove_pipe_state(
+        pipe_id_connector_writes_to_binder,
+        pipe_id_connector_reads_from_binder,
+      );
     }
     let _ = reply_tx_user.send(Err(err));
     return;
@@ -212,7 +242,10 @@ pub(crate) async fn connect_inproc(
       {
         let mut cs = core_arc.core_state.write();
         cs.endpoints.remove(&connector_uri_str);
-        cs.remove_pipe_state(pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder);
+        cs.remove_pipe_state(
+          pipe_id_connector_writes_to_binder,
+          pipe_id_connector_reads_from_binder,
+        );
       }
       if let Some(monitor) = monitor_tx_for_event {
         let event = SocketEvent::ConnectFailed {
@@ -224,13 +257,19 @@ pub(crate) async fn connect_inproc(
       let _ = reply_tx_user.send(Err(e));
     }
     Err(_) => {
-      let error_msg = format!("Binder for inproc endpoint '{}' failed to reply or disappeared", name);
+      let error_msg = format!(
+        "Binder for inproc endpoint '{}' failed to reply or disappeared",
+        name
+      );
       tracing::error!(connector_core_handle = connector_core_handle, inproc_name = %name, "{}", error_msg);
       let zmq_err = ZmqError::Internal(error_msg.clone());
       {
         let mut cs = core_arc.core_state.write();
         cs.endpoints.remove(&connector_uri_str);
-        cs.remove_pipe_state(pipe_id_connector_writes_to_binder, pipe_id_connector_reads_from_binder);
+        cs.remove_pipe_state(
+          pipe_id_connector_writes_to_binder,
+          pipe_id_connector_reads_from_binder,
+        );
       }
       if let Some(monitor) = monitor_tx_for_event {
         let event = SocketEvent::ConnectFailed {
@@ -244,15 +283,20 @@ pub(crate) async fn connect_inproc(
   }
 }
 
-// ... (unbind_inproc, disconnect_inproc remain the same)
 pub(crate) async fn unbind_inproc(name: &str, context: &Context) {
   tracing::debug!(inproc_name = %name, "Unbinding inproc endpoint from context registry");
   context.inner().unregister_inproc(name);
 }
 
-pub(crate) async fn disconnect_inproc(endpoint_uri: &str, core_arc: Arc<SocketCore>) -> Result<(), ZmqError> {
+pub(crate) async fn disconnect_inproc(
+  endpoint_uri: &str,
+  core_arc: Arc<SocketCore>,
+) -> Result<(), ZmqError> {
   let connector_core_handle = core_arc.handle;
-  let inproc_name_to_notify = endpoint_uri.strip_prefix("inproc://").unwrap_or("").to_string();
+  let inproc_name_to_notify = endpoint_uri
+    .strip_prefix("inproc://")
+    .unwrap_or("")
+    .to_string();
   if inproc_name_to_notify.is_empty() {
     tracing::warn!(connector_core_handle = connector_core_handle, %endpoint_uri, "Invalid inproc URI for disconnect");
     return Err(ZmqError::InvalidEndpoint(endpoint_uri.to_string()));
@@ -294,7 +338,12 @@ pub(crate) async fn disconnect_inproc(endpoint_uri: &str, core_arc: Arc<SocketCo
     connector_read_pipe_id_closed = pipe_id_connector_reads,
     "Publishing InprocPipePeerClosed event to notify binder"
   );
-  if core_arc.context.event_bus().publish(close_notification_event).is_err() {
+  if core_arc
+    .context
+    .event_bus()
+    .publish(close_notification_event)
+    .is_err()
+  {
     tracing::warn!(connector_core_handle = connector_core_handle, %endpoint_uri, "Failed to publish InprocPipePeerClosed event (binder likely gone or event bus issue)");
   }
 
@@ -309,7 +358,9 @@ pub(crate) async fn disconnect_inproc(endpoint_uri: &str, core_arc: Arc<SocketCo
 
   if pipes_were_removed {
     if let Some(socket_logic_impl) = core_arc.get_socket_logic().await {
-      socket_logic_impl.pipe_detached(pipe_id_connector_reads).await;
+      socket_logic_impl
+        .pipe_detached(pipe_id_connector_reads)
+        .await;
       tracing::debug!(connector_core_handle = connector_core_handle, %endpoint_uri, "Notified ISocket of inproc pipe detachment");
     } else {
       tracing::error!(

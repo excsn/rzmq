@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
-#[derive(Debug, Clone)] // Clone requires all fields to be Clone
+#[derive(Debug, Clone)]
 pub(crate) struct ScaConnectionIface {
   sca_stop_mailbox: MailboxSender,
   sca_handle_id: usize,
@@ -55,7 +55,7 @@ impl ISocketConnection for ScaConnectionIface {
 
       if send_timeout_opt == Some(Duration::ZERO) {
         // Non-blocking send attempt
-        match pipe_sender.try_send(msg) {
+        match pipe_sender.try_send(vec![msg]) {
           Ok(()) => Ok(()),
           Err(TrySendError::Full(_)) => Err(ZmqError::ResourceLimitReached),
           Err(TrySendError::Closed(_)) => Err(ZmqError::ConnectionClosed),
@@ -64,7 +64,7 @@ impl ISocketConnection for ScaConnectionIface {
       } else {
         // Blocking/timed send
         let timeout_duration = send_timeout_opt.unwrap_or(Duration::from_secs(30)); // Or some other default for None
-        match timeout(timeout_duration, pipe_sender.send(msg)).await {
+        match timeout(timeout_duration, pipe_sender.send(vec![msg])).await {
           Ok(Ok(())) => Ok(()),
           Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
           Err(_) => Err(ZmqError::Timeout), // Use Timeout to match RCVTIMEO behavior
@@ -106,19 +106,17 @@ impl ISocketConnection for ScaConnectionIface {
         .sndtimeo
         .unwrap_or(Duration::from_secs(5));
 
-      for msg in msgs {
-        // TODO: If one part fails, should we attempt others? Or is it atomic?
-        // For now, fail on first error.
-        match timeout(send_timeout, pipe_sender.send(msg)).await {
-          Ok(Ok(())) => continue,
-          Ok(Err(_send_error)) => {
-            return Err(ZmqError::ConnectionClosed);
-          }
-          Err(_timeout_elapsed) => {
-            return Err(ZmqError::ResourceLimitReached);
-          }
+      
+      match timeout(send_timeout, pipe_sender.send(msgs)).await {
+        Ok(Ok(())) => {},
+        Ok(Err(_send_error)) => {
+          return Err(ZmqError::ConnectionClosed);
+        }
+        Err(_timeout_elapsed) => {
+          return Err(ZmqError::ResourceLimitReached);
         }
       }
+
       Ok(())
     } else {
       Err(ZmqError::Internal(format!(

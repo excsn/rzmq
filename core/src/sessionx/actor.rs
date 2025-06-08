@@ -11,13 +11,11 @@ use crate::throttle::{AdaptiveThrottle, AdaptiveThrottleConfig};
 use crate::transport::ZmtpStdStream;
 use crate::{Blob, MailboxReceiver};
 
-use bytes::BytesMut;
-use futures::FutureExt; // Not directly used here, but kept for consistency if needed later
-use std::fmt::Debug; // For Debug bound on S
+use futures::FutureExt;
+use std::fmt::Debug;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd; // For AsRawFd bound if S needs it for cork_info init
 use std::sync::Arc;
-use std::time::Instant as StdInstant; // Explicitly use StdInstant for clarity
 use tokio::sync::broadcast;
 use tokio::task::{yield_now, JoinHandle};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
@@ -33,9 +31,8 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   handle: usize,
   current_phase: ConnectionPhaseX,
   parent_socket_id: usize,
-  actor_config: ActorConfigX, // Contains context, monitor_tx, uris, is_server
+  actor_config: ActorConfigX,
 
-  // ZmtpProtocolHandlerX constructor now takes Arc<ZmtpEngineConfig>
   zmtp_handler: ZmtpProtocolHandlerX<S>,
   core_pipe_manager: CorePipeManagerX,
 
@@ -46,12 +43,6 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   error_for_drop_guard: Option<ZmqError>,
 
   ping_check_timer: Option<tokio::time::Interval>,
-  // pong_timeout_sleep is a one-shot future, created when needed
-  // No field for pong_timeout_timer needed if we use Sleep::new_timeout approach.
-
-  // This flag indicates if the *next* ZMTP frame to be sent out via zmtp_handler.write_data_msg
-  // is the first frame of a new logical ZMQ message.
-  is_next_outgoing_frame_first_of_zmq_msg: bool,
 
   handshake_deadline: Option<TokioInstant>,
   socket_logic: Arc<dyn ISocket>,
@@ -113,7 +104,6 @@ where
       pending_peer_identity_from_handshake: None,
       error_for_drop_guard: None,
       ping_check_timer,
-      is_next_outgoing_frame_first_of_zmq_msg: true, // Initially, any outgoing is first
       handshake_deadline,
       socket_logic,
     };
@@ -219,15 +209,18 @@ where
         }
 
         // --- ARM 5: Outgoing Data (from SocketCore to Network) ---
-        maybe_msg_from_core = async { self.core_pipe_manager.recv_from_core().await },
+        maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
           if self.current_phase == ConnectionPhaseX::Operational && self.core_pipe_manager.is_attached() => {
-          match maybe_msg_from_core {
-            Ok(msg) => {
+          match maybe_msgs_from_core {
+            Ok(msgs) => {
               let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Egress);
 
-              self.handle_outgoing_from_core(msg).await;
+              // println!("LP1 {}", throttle_guard.get_current_balance());
+              if let Err(e) = self.zmtp_handler.write_data_msgs(msgs).await {
+                self.set_fatal_error(e).await;
+              }
 
-              println!("LP {}", throttle_guard.get_current_balance());
+              // println!("LP2 {}", throttle_guard.get_current_balance());
               if throttle_guard.should_throttle() {
                 yield_now().await;
               }
@@ -246,9 +239,11 @@ where
                 Ok(Some(msg)) => {
 
                   let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Ingress);
-                  println!("EP {}", throttle_guard.get_current_balance());
+                  // println!("EP {}", throttle_guard.get_current_balance());
 
                   self.handle_incoming_from_network(msg).await;
+
+                  // println!("EP2 {}", throttle_guard.get_current_balance());
                   
                   if throttle_guard.should_throttle() {
                     yield_now().await;
@@ -483,21 +478,6 @@ where
     }
   }
 
-  async fn handle_outgoing_from_core(&mut self, msg: Msg) {
-    // Pass self.is_next_outgoing_frame_first_of_zmq_msg as the hint
-    match self
-      .zmtp_handler
-      .write_data_msg(msg, self.is_next_outgoing_frame_first_of_zmq_msg)
-      .await
-    {
-      Ok(was_last_part_of_logical_msg) => {
-        // Update state for the *next* frame based on whether the *current* one was the last
-        self.is_next_outgoing_frame_first_of_zmq_msg = was_last_part_of_logical_msg;
-      }
-      Err(e) => self.set_fatal_error(e).await,
-    }
-  }
-
   async fn handle_incoming_from_network(&mut self, msg: Msg) {
     // Get the pipe_id needed for ISocket::handle_pipe_event
     let pipe_read_id = self
@@ -532,8 +512,6 @@ where
         self.set_fatal_error(e).await;
       }
     }
-    // Any incoming activity breaks the contiguity of our own sends for corking.
-    self.is_next_outgoing_frame_first_of_zmq_msg = true;
   }
 
   async fn set_fatal_error(&mut self, error: ZmqError) {

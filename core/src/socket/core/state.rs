@@ -59,7 +59,7 @@ pub(crate) struct CoreState {
   pub options: Arc<SocketOptions>,
   pub socket_type: SocketType,
   // For Session-based path: Map Core's pipe_write_id -> Sender to Session's data pipe
-  pub pipes_tx: HashMap<usize, AsyncSender<Msg>>,
+  pub pipes_tx: HashMap<usize, AsyncSender<Vec<Msg>>>,
   // For Session-based path: Map Core's pipe_read_id -> JoinHandle of PipeReaderTask
   pub pipe_reader_task_handles: HashMap<usize, JoinHandle<()>>,
   // Main map of active endpoints, keyed by resolved endpoint_uri
@@ -100,7 +100,7 @@ impl CoreState {
     }
   }
 
-  pub(crate) fn get_pipe_sender(&self, pipe_write_id: usize) -> Option<AsyncSender<Msg>> {
+  pub(crate) fn get_pipe_sender(&self, pipe_write_id: usize) -> Option<AsyncSender<Vec<Msg>>> {
     self.pipes_tx.get(&pipe_write_id).cloned()
   }
 

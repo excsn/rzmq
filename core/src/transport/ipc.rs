@@ -1,6 +1,4 @@
-// core/src/transport/ipc.rs
-
-#![cfg(feature = "ipc")] // Only compile this file if ipc feature is enabled
+#![cfg(feature = "ipc")]
 
 use crate::context::Context;
 // Use the specific helper for IPC engines, which uses ZmtpEngineCoreStd<UnixStream>
@@ -66,7 +64,6 @@ impl IpcListener {
     context: Context,
     parent_socket_id: usize,
   ) -> Result<(GenericMailboxSender, JoinHandle<()>, String), ZmqError> {
-    let actor_type = ActorType::Listener;
     let capacity = context.inner().get_actor_mailbox_capacity();
     let (tx, rx) = mailbox(capacity);
 

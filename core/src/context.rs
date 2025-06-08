@@ -1,5 +1,6 @@
 use crate::error::{ZmqError, ZmqResult};
-use crate::runtime::{ActorType, EventBus, MailboxSender, SystemEvent, WaitGroup, DEFAULT_MAILBOX_CAPACITY};
+use crate::runtime::mailbox::DEFAULT_MAILBOX_CAPACITY;
+use crate::runtime::{ActorType, EventBus, MailboxSender, SystemEvent, WaitGroup};
 use crate::socket::{Socket, SocketType};
 
 use std::collections::HashMap;

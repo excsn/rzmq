@@ -104,7 +104,7 @@ pub enum Command {
     /// The unique handle of the target SessionConnectionActorX.
     sca_handle_id: usize,
     /// Channel for SCA to receive Msgs (outgoing data) from SocketCore.
-    rx_from_core: AsyncReceiver<Msg>,
+    rx_from_core: AsyncReceiver<Vec<Msg>>,
     /// The ID the SCA should use in the `pipe_id` field when calling `ISocket::handle_pipe_event`.
     core_pipe_read_id_for_incoming_routing: usize,
   },
