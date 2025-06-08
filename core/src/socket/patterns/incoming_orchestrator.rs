@@ -105,7 +105,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
   }
 
   /// Helper to pop a QItem from the main FairQueue with timeout logic.
-  async fn recv_item_from_main_queue(&self, rcvtimeo_opt: Option<Duration>) -> Result<QItem, ZmqError> {
+  pub(crate) async fn recv_item_from_main_queue(&self, rcvtimeo_opt: Option<Duration>) -> Result<QItem, ZmqError> {
     let pop_future = self.main_incoming_queue.pop_item();
     match rcvtimeo_opt {
       Some(duration) if !duration.is_zero() => match tokio_timeout(duration, pop_future).await {

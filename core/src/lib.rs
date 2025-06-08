@@ -38,62 +38,13 @@ pub mod uring;
 
 // Re-export core types for user convenience, making them accessible directly
 // from the crate root (e.g., `rzmq::ZmqError`, `rzmq::Socket`).
+pub use context::Context;
 pub use error::ZmqError;
 pub use message::{Blob, Metadata, Msg, MsgFlags}; // Core message components.
-pub use runtime::{Command,};
-pub use context::Context;
+pub use runtime::Command;
 pub(crate) use runtime::{MailboxReceiver, MailboxSender}; // The main entry point for creating sockets.
-                                                          // CoreState is internal to socket implementation.
-pub(crate) use socket::core::CoreState;
+
+pub(crate) use socket::core::CoreState; // CoreState is internal to socket implementation.
+
 // Socket and SocketType are fundamental for users.
 pub use socket::types::{Socket, SocketType};
-// Socket options might be re-exported later for easier access, e.g., `rzmq::SNDHWM`.
-// pub use socket::options::*;
-
-// --- Top-Level Library Information Functions ---
-
-/// Major version number of the rzmq library.
-const VERSION_MAJOR: i32 = 0;
-/// Minor version number of the rzmq library.
-const VERSION_MINOR: i32 = 1;
-/// Patch version number of the rzmq library.
-const VERSION_PATCH: i32 = 0;
-
-/// Returns the library version as a tuple (major, minor, patch).
-///
-/// # Examples
-///
-/// ```
-/// let (major, minor, patch) = rzmq::version();
-/// println!("rzmq version: {}.{}.{}", major, minor, patch);
-/// ```
-pub fn version() -> (i32, i32, i32) {
-  (VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH)
-}
-
-/// Returns the major version number of the library.
-pub fn version_major() -> i32 {
-  VERSION_MAJOR
-}
-
-/// Returns the minor version number of the library.
-pub fn version_minor() -> i32 {
-  VERSION_MINOR
-}
-
-/// Returns the patch version number of the library.
-pub fn version_patch() -> i32 {
-  VERSION_PATCH
-}
-
-// The `context()` function is now defined within the `context.rs` module
-// and re-exported by `pub use context::Context;` and the `context()` free function there.
-// So, no need for a separate placeholder here if `context.rs` provides it.
-// If `context.rs` only provides `Context::new()`, then a top-level helper might be desired:
-//
-// /// Creates a new rzmq context.
-// /// This is a convenience function equivalent to `Context::new()`.
-// pub fn context() -> Result<Context, ZmqError> {
-//     Context::new()
-// }
-// The current setup (Context::new() and context::context()) is fine.

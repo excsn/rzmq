@@ -1,8 +1,7 @@
 mod common;
 
 use rzmq::{
-  socket::{SocketEvent, LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME},
-  Context, Socket, SocketType, ZmqError,
+  socket::{SocketEvent, LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME}, Socket, SocketType, ZmqError,
 };
 use serial_test::serial; // Add necessary rzmq imports
 use std::time::Duration;

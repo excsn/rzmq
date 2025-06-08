@@ -115,8 +115,8 @@ path = "examples/iouring_throughput.rs"
 required-features = ["io-uring"]
 
 [[example]]
-name = "iouring_multi_throughput"
-path = "examples/iouring_multi_throughput.rs"
+name = "iouring_dealrtr_multitask"
+path = "examples/iouring_dealrtr_multitask.rs"
 required-features = ["io-uring"]
 
 [[test]]

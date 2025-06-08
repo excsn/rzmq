@@ -1,7 +1,3 @@
-// core/src/io_uring_backend/worker/profiler.rs
-
-#![cfg(feature = "io-uring")] // Keep this if the profiler is io_uring specific
-
 // Conditional imports for profiling, only active when debug_assertions is true
 #[cfg(debug_assertions)]
 use std::time::{Duration, Instant};

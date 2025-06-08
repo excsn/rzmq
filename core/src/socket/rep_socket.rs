@@ -266,15 +266,21 @@ impl ISocket for RepSocket {
           let mut delimiter_found = false;
 
           for frame in raw_zmtp_message {
-            if !delimiter_found && frame.size() == 0 {
-              delimiter_found = true;
-            }
             if !delimiter_found {
+              // Keep adding frames to the routing prefix until we find the empty delimiter.
+              let is_delimiter = frame.size() == 0;
               routing_prefix.push(frame);
+              if is_delimiter {
+                delimiter_found = true;
+              }
             } else {
+              // Once the delimiter is found, all subsequent frames are part of the payload.
               payload_frames.push(frame);
             }
           }
+
+          // In the case of a REQ socket, there is no delimiter. The spec says the
+          // entire message is the payload and the routing prefix is empty.
           if !delimiter_found {
             payload_frames = routing_prefix;
             routing_prefix = Vec::new();
