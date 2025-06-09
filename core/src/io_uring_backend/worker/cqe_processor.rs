@@ -15,10 +15,11 @@ use crate::io_uring_backend::connection_handler::{
 use crate::io_uring_backend::ops::{UringOpCompletion, UserData, HANDLER_INTERNAL_SEND_OP_UD};
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
+use crate::io_uring_backend::worker::{CorkSendState, UringWorker};
 use crate::{uring, Command, ZmqError};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring}; // Added IoUring
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::sync::Arc; // Added VecDeque
@@ -26,21 +27,6 @@ use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "io-uring")]
 const CQE_F_NOTIFY_FLAG: u32 = 1 << 3; // (8) for kernels 6.0+
-
-#[cfg(target_os = "linux")]
-fn set_tcp_cork(fd: RawFd, enable: bool) {
-  use socket2::Socket;
-  use std::os::fd::FromRawFd;
-
-  // SAFETY: We are borrowing the FD managed by the UringWorker.
-  // The FD is guaranteed to be valid as long as the handler exists.
-  let socket = unsafe { Socket::from_raw_fd(fd) };
-  if let Err(e) = socket.set_cork(enable) {
-    warn!(raw_fd = fd, enable, error = %e, "UringWorker: Failed to set TCP_CORK socket option directly.");
-  }
-  // We must forget the SockRef so it doesn't close the underlying FD.
-  std::mem::forget(socket);
-}
 
 // process_handler_blueprints (signature confirmed from previous discussions)
 pub(crate) fn process_handler_blueprints(
@@ -55,6 +41,7 @@ pub(crate) fn process_handler_blueprints(
   worker_cfg_send_zerocopy_enabled: bool,
   worker_send_buffer_pool: &Option<Arc<crate::io_uring_backend::send_buffer_pool::SendBufferPool>>,
   external_ops: &ExternalOpTracker,
+  cork_send_states: &mut HashMap<RawFd, CorkSendState>,
 ) {
   if ops_output.initiate_close_due_to_error {
     warn!(
@@ -66,7 +53,39 @@ pub(crate) fn process_handler_blueprints(
     }
   }
 
-  for (idx, blueprint_ref) in ops_output.sqe_blueprints.iter().enumerate() {
+  // --- New Corking Logic: Detect the cork-send-uncork pattern ---
+  let blueprints = ops_output.sqe_blueprints;
+  if blueprints.len() > 2
+    && matches!(
+      blueprints.first(),
+      Some(&HandlerSqeBlueprint::RequestSetCork(true))
+    )
+    && matches!(
+      blueprints.last(),
+      Some(&HandlerSqeBlueprint::RequestSetCork(false))
+    )
+  {
+    trace!(
+      "CQE Processor: Detected cork-send-uncork pattern for FD {}. Initiating async corked send.",
+      fd_from_handler_iteration
+    );
+    // This is a corked send sequence.
+    // Slice out the actual send blueprints.
+    let send_blueprints: Vec<HandlerSqeBlueprint> = blueprints[1..blueprints.len() - 1].to_vec();
+
+    // Initiate the state machine.
+    initiate_corked_send(
+      fd_from_handler_iteration,
+      send_blueprints,
+      internal_ops,
+      sq,
+      cork_send_states,
+    );
+    // The entire batch has been handled, so we can return early from this function.
+    return;
+  }
+
+  for (idx, blueprint_ref) in blueprints.iter().enumerate() {
     if unsafe { sq.is_full() } {
       warn!(
         "CQE Processor: Submission queue full while processing blueprints for FD {}. Blueprint {:?} will be requeued.",
@@ -83,11 +102,12 @@ pub(crate) fn process_handler_blueprints(
     let sqe_build_result_opt: Option<Result<(squeue::Entry, InternalOpType), String>> =
       match blueprint_ref {
         HandlerSqeBlueprint::RequestSetCork(enable) => {
-          #[cfg(target_os = "linux")]
-          set_tcp_cork(fd_from_handler_iteration, *enable);
-
-          // This blueprint is a direct action, not an SQE. Continue to the next blueprint.
-          continue;
+          warn!(
+            fd = fd_from_handler_iteration,
+            ?enable,
+            "CQE Processor: Encountered a lone RequestSetCork blueprint outside of a batch. This is unsupported. Ignoring."
+          );
+          continue; // Ignore and proceed to the next blueprint.
         }
         // Use blueprint
         HandlerSqeBlueprint::RequestRingRead => {
@@ -385,6 +405,7 @@ pub(crate) fn process_all_cqes(
   event_fd_poller: &mut EventFdPoller,
   worker_cfg_send_zerocopy_enabled: bool,
   is_worker_shutting_down: bool,
+  cork_send_states: &mut HashMap<RawFd, CorkSendState>,
 ) -> Result<(), ZmqError> {
   let mut cq = unsafe { ring.completion_shared() };
   cq.sync();
@@ -494,6 +515,7 @@ pub(crate) fn process_all_cqes(
                     worker_cfg_send_zerocopy_enabled,
                     send_buffer_pool,
                     external_ops,
+                    cork_send_states,
                   );
                   UringOpCompletion::ConnectSuccess {
                     user_data: cqe_user_data,
@@ -548,11 +570,7 @@ pub(crate) fn process_all_cqes(
           }
         }
       };
-      if ext_op_ctx
-        .reply_tx
-        .send(Ok(completion_to_send))
-        .is_err()
-      {
+      if ext_op_ctx.reply_tx.send(Ok(completion_to_send)).is_err() {
         tracing::warn!(
           "CQE Processor: Reply_tx for external op ud {} was already taken.",
           cqe_user_data
@@ -632,6 +650,7 @@ pub(crate) fn process_all_cqes(
                     worker_cfg_send_zerocopy_enabled,
                     send_buffer_pool,
                     external_ops,
+                    cork_send_states,
                   );
                 }
               }
@@ -676,6 +695,99 @@ pub(crate) fn process_all_cqes(
       );
 
       match op_type {
+        InternalOpType::UringCmdSetCorkEnable => {
+          if cqe_result < 0 {
+            error!(
+              "Failed to enable TCP_CORK for FD {}. Aborting batched send. Errno: {}",
+              handler_fd, -cqe_result
+            );
+            // Clean up the state.
+            cork_send_states.remove(&handler_fd);
+            // Optionally notify the ZmtpHandler of the failure.
+          } else {
+            trace!("FD {}: Cork enabled. Submitting payload sends.", handler_fd);
+            if let Some(CorkSendState::AwaitingCorkEnable { pending_sends }) =
+              cork_send_states.remove(&handler_fd)
+            {
+              let mut sq_for_payload = unsafe { ring.submission_shared() };
+              let payload_ops = HandlerIoOps {
+                sqe_blueprints: pending_sends,
+                initiate_close_due_to_error: false,
+              };
+
+              // We recursively call process_handler_blueprints to submit the sends.
+              // It's crucial that this inner call does NOT contain a corking pattern
+              // to avoid infinite recursion. Our logic ensures this.
+              process_handler_blueprints(
+                handler_fd,
+                payload_ops,
+                internal_ops,
+                &mut sq_for_payload,
+                default_bgid_val_from_worker,
+                fds_to_initiate_close_queue,
+                pending_sqe_retry_queue,
+                handler_manager,
+                worker_cfg_send_zerocopy_enabled,
+                send_buffer_pool,
+                external_ops,
+                cork_send_states,
+              );
+
+              // After submitting sends, queue the 'uncork' command.
+              let disable: i32 = 0;
+              let disable_op_ud = internal_ops.new_op_id(
+                handler_fd,
+                InternalOpType::UringCmdSetCorkDisable,
+                InternalOpPayload::None,
+              );
+              let disable_entry = opcode::SetSockOpt::new(
+                types::Fd(handler_fd),
+                libc::SOL_TCP as _,
+                libc::TCP_CORK as _,
+                &disable as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&disable) as u32,
+              )
+              .build()
+              .user_data(disable_op_ud);
+
+              unsafe {
+                if sq_for_payload.push(&disable_entry).is_err() {
+                  // This is a problematic state. The sends went out, but we can't guarantee
+                  // the uncork will be submitted. The kernel will eventually time out the cork.
+                  warn!(
+                    "SQ Full when trying to submit 'uncork' for FD {}. The connection may stall.",
+                    handler_fd
+                  );
+                  // Clean up our state anyway.
+                  cork_send_states.remove(&handler_fd);
+                }
+              }
+
+              // Update state to show we are waiting for the disable command.
+              // We don't need a specific state for this, as the UD of the disable op is now in the internal_ops tracker.
+              trace!(
+                "FD {}: Submitted payload and uncork command (ud {}).",
+                handler_fd,
+                disable_op_ud
+              );
+            } else {
+              error!("FD {}: CQE for CorkEnable but no state found!", handler_fd);
+            }
+          }
+        }
+
+        InternalOpType::UringCmdSetCorkDisable => {
+          if cqe_result < 0 {
+            warn!(
+              "Failed to disable TCP_CORK for FD {}. State might be inconsistent. Errno: {}",
+              handler_fd, -cqe_result
+            );
+          } else {
+            trace!("FD {}: Cork disabled. Batched send complete.", handler_fd);
+          }
+          // The operation is complete. No more state to clean up from cork_send_states
+          // as it was removed when we processed the enable CQE.
+        }
         InternalOpType::Accept => {
           if cqe_result >= 0 {
             let client_fd = cqe_result as RawFd;
@@ -721,6 +833,7 @@ pub(crate) fn process_all_cqes(
                     worker_cfg_send_zerocopy_enabled,
                     send_buffer_pool,
                     external_ops,
+                    cork_send_states,
                   );
                 }
                 Err(e) => {
@@ -952,122 +1065,35 @@ pub(crate) fn process_all_cqes(
             }
 
             if app_op_ud != HANDLER_INTERNAL_SEND_OP_UD {
-              if worker_cfg_send_zerocopy_enabled {
-                let mut should_reply_and_take_op = false;
-                let mut completion_to_send_opt: Option<Result<UringOpCompletion, ZmqError>> = None;
-
-                if let Some(ext_op_ctx_mut) = external_ops.get_op_context_mut(app_op_ud) {
-                  if let Some(multi_state) = &mut ext_op_ctx_mut.multipart_state {
-                    multi_state.completed_parts += 1;
-                    if multi_state.completed_parts >= multi_state.total_parts {
-                      should_reply_and_take_op = true;
-                      completion_to_send_opt = Some(if cqe_result >= 0 {
-                        // Assuming overall success if last part is ok
-                        Ok(UringOpCompletion::SendDataViaHandlerAck {
-                          user_data: app_op_ud,
-                          fd: handler_fd,
-                        })
-                      } else {
-                        let zmq_err =
-                          ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
-                        Ok(UringOpCompletion::OpError {
-                          user_data: app_op_ud,
-                          op_name: app_op_name.clone(),
-                          error: zmq_err,
-                        })
-                      });
-                    }
-                  } else {
-                    // Single part send
-                    should_reply_and_take_op = true;
-                    completion_to_send_opt = Some(if cqe_result >= 0 {
-                      Ok(UringOpCompletion::SendDataViaHandlerAck {
-                        user_data: app_op_ud,
-                        fd: handler_fd,
-                      })
-                    } else {
-                      let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
-                      Ok(UringOpCompletion::OpError {
-                        user_data: app_op_ud,
-                        op_name: app_op_name.clone(),
-                        error: zmq_err,
-                      })
-                    });
-                  }
-                } else {
-                  // ext_op_ctx_mut not found - already taken or never added
-                  warn!("[CQE Proc] ZC Final: ExternalOp for app_op_ud {} (name: {}) not found during get_op_context_mut. No reply possible.", app_op_ud, app_op_name);
-                }
-
-                if should_reply_and_take_op {
-                  if let Some(completion_to_send) = completion_to_send_opt {
-                    // Now take the context to send reply
-                    if let Some(ext_op_ctx_final) = external_ops.take_op(app_op_ud) {
-                      if ext_op_ctx_final
-                        .reply_tx
-                        .send(completion_to_send)
-                        .is_err()
-                      {
-                        warn!(
-                          "[CQE Proc] ZC Final: Reply_tx for app_op_ud {} (name: {}) was already taken/dropped.",
-                          app_op_ud, app_op_name
-                        );
-                      }
-                    } else {
-                      // This case should be rare now if get_op_context_mut found it, unless a race.
-                      warn!("[CQE Proc] ZC Final: ExternalOp for app_op_ud {} (name: {}) not found on take_op, though was present before. No reply.", app_op_ud, app_op_name);
-                    }
-                  }
-                } else {
-                  warn!(
-                    "[CQE Proc] ZC Final: ExternalOp for app_op_ud {} not found.",
-                    app_op_ud
-                  );
-                }
-              } else {
-                // ZC is disabled system-wide. The ACK was sent immediately.
-                // Clean up ExternalOpContext if it wasn't already (e.g. by client timeout).
-                if external_ops.take_op(app_op_ud).is_some() {
-                  trace!("[CQE Proc] ZC Final (sys ZC disabled): Cleaned up ExternalOpContext for app_op_ud {} (ACK was immediate).", app_op_ud);
-                }
+              if let Some(ext_op_ctx_mut) = external_ops.get_op_context_mut(app_op_ud) {
                 if cqe_result < 0 {
-                  error!("[CQE Proc] ZC Final (sys ZC disabled): Underlying send for app_op_ud {} (name: {}) FAILED (errno {}), but ACK was already sent.", app_op_ud, app_op_name, -cqe_result);
-                  // <<<MODIFIED START>>>
-                  // Inform handler about the failure of this specific send part
-                  if let Some(handler) = handler_manager.get_mut(handler_fd) {
-                    let interface = UringWorkerInterface::new(
-                      handler_fd,
-                      worker_io_config,
-                      recv_buffer_manager,
-                      default_bgid_val_from_worker,
-                      cqe_user_data,
-                    );
-                    let handler_blueprints_on_error = handler.handle_internal_sqe_completion(
-                      cqe_user_data,
-                      cqe_result,
-                      cqe_flags,
-                      &interface,
-                    );
-                    if !handler_blueprints_on_error.sqe_blueprints.is_empty()
-                      || handler_blueprints_on_error.initiate_close_due_to_error
-                    {
-                      let mut sq_for_handler_error_ops = unsafe { ring.submission_shared() };
-                      process_handler_blueprints(
-                        handler_fd,
-                        handler_blueprints_on_error,
-                        internal_ops,
-                        &mut sq_for_handler_error_ops,
-                        default_bgid_val_from_worker,
-                        fds_to_initiate_close_queue,
-                        pending_sqe_retry_queue,
-                        handler_manager,
-                        worker_cfg_send_zerocopy_enabled,
-                        send_buffer_pool,
-                        external_ops,
-                      );
+                  let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
+                  let completion = Ok(UringOpCompletion::OpError {
+                    user_data: app_op_ud,
+                    op_name: app_op_name.clone(),
+                    error: zmq_err,
+                  });
+                  if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud) {
+                    let _ = ctx_to_reply.reply_tx.send(completion);
+                  }
+                } else if let Some(multi_state) = &mut ext_op_ctx_mut.multipart_state {
+                  multi_state.completed_parts += 1;
+                  if multi_state.completed_parts >= multi_state.total_parts {
+                    let completion = Ok(UringOpCompletion::SendDataViaHandlerAck {
+                      user_data: app_op_ud,
+                      fd: handler_fd,
+                    });
+                    if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud) {
+                      let _ = ctx_to_reply.reply_tx.send(completion);
                     }
-                  } else {
-                    warn!("[CQE Proc] ZC Final (sys ZC disabled): Handler for FD {} not found to report send error for app_op_ud {}.", handler_fd, app_op_ud);
+                  }
+                } else {
+                  let completion = Ok(UringOpCompletion::SendDataViaHandlerAck {
+                    user_data: app_op_ud,
+                    fd: handler_fd,
+                  });
+                  if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud) {
+                    let _ = ctx_to_reply.reply_tx.send(completion);
                   }
                 }
               }
@@ -1095,162 +1121,48 @@ pub(crate) fn process_all_cqes(
           } = op_details.payload
           {
             if app_op_ud_val != HANDLER_INTERNAL_SEND_OP_UD {
-              if worker_cfg_send_zerocopy_enabled {
-                let mut should_reply_and_take_op = false;
-                let mut completion_to_send_opt: Option<Result<UringOpCompletion, ZmqError>> = None;
-
-                if let Some(ext_op_ctx_mut) = external_ops.get_op_context_mut(app_op_ud_val) {
-                  if let Some(multi_state) = &mut ext_op_ctx_mut.multipart_state {
-                    multi_state.completed_parts += 1;
-                    if multi_state.completed_parts >= multi_state.total_parts {
-                      should_reply_and_take_op = true;
-                      completion_to_send_opt = Some(if cqe_result >= 0 {
-                        Ok(UringOpCompletion::SendDataViaHandlerAck {
-                          user_data: app_op_ud_val,
-                          fd: handler_fd,
-                        })
-                      } else {
-                        let zmq_err =
-                          ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
-                        Ok(UringOpCompletion::OpError {
-                          user_data: app_op_ud_val,
-                          op_name: app_op_name.clone(),
-                          error: zmq_err,
-                        })
-                      });
-                    }
-                  } else {
-                    // Single part send
-                    should_reply_and_take_op = true;
-                    completion_to_send_opt = Some(if cqe_result >= 0 {
-                      Ok(UringOpCompletion::SendDataViaHandlerAck {
-                        user_data: app_op_ud_val,
-                        fd: handler_fd,
-                      })
-                    } else {
-                      let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
-                      Ok(UringOpCompletion::OpError {
-                        user_data: app_op_ud_val,
-                        op_name: app_op_name.clone(),
-                        error: zmq_err,
-                      })
-                    });
-                  }
-                } else {
-                  warn!("[CQE Proc] Normal Send: ExternalOp for app_op_ud {} not found. Calling handler.handle_internal_sqe_completion.", app_op_ud_val);
-                  if cqe_result < 0 {
-                    // Still inform handler if this specific send failed
-                    if let Some(handler) = handler_manager.get_mut(handler_fd) {
-                      let interface = UringWorkerInterface::new(
-                        handler_fd,
-                        worker_io_config,
-                        recv_buffer_manager,
-                        default_bgid_val_from_worker,
-                        cqe_user_data,
-                      );
-                      let handler_output = handler.handle_internal_sqe_completion(
-                        cqe_user_data,
-                        cqe_result,
-                        cqe_flags,
-                        &interface,
-                      );
-                      if !handler_output.sqe_blueprints.is_empty()
-                        || handler_output.initiate_close_due_to_error
-                      {
-                        let mut sq_for_handler_resp = unsafe { ring.submission_shared() };
-                        process_handler_blueprints(
-                          handler_fd,
-                          handler_output,
-                          internal_ops,
-                          &mut sq_for_handler_resp,
-                          default_bgid_val_from_worker,
-                          fds_to_initiate_close_queue,
-                          pending_sqe_retry_queue,
-                          handler_manager,
-                          worker_cfg_send_zerocopy_enabled,
-                          send_buffer_pool,
-                          external_ops,
-                        );
-                      }
-                    } else {
-                      warn!(
-                        "[CQE Proc] Handler for FD {} not found for internal send completion (ud:{}).",
-                        handler_fd, cqe_user_data
-                      );
-                    }
-                  }
-                }
-
-                if should_reply_and_take_op {
-                  if let Some(completion_to_send) = completion_to_send_opt {
-                    if let Some(ext_op_ctx_final) = external_ops.take_op(app_op_ud_val) {
-                      if ext_op_ctx_final
-                        .reply_tx
-                        .send(completion_to_send)
-                        .is_err()
-                      {
-                        warn!(
-                          "[CQE Proc] Normal Send: Reply_tx for app_op_ud {} (name: {}) was already taken/dropped.",
-                          app_op_ud_val, app_op_name
-                        );
-                      }
-                    } else {
-                      warn!("[CQE Proc] Normal Send: ExternalOp for app_op_ud {} (name: {}) not found on take_op, though was present before. No reply.", app_op_ud_val, app_op_name);
-                    }
-                  }
-                }
-              } else {
-                // ZC is disabled system-wide. The ACK was sent immediately.
-                // Clean up ExternalOpContext if not already done by client timeout.
-                if external_ops.take_op(app_op_ud_val).is_some() {
-                  trace!("[CQE Proc] Normal Send (sys ZC disabled): Cleaned up ExternalOpContext for app_op_ud {} (ACK was immediate).", app_op_ud_val);
-                }
+              if let Some(ext_op_ctx_mut) = external_ops.get_op_context_mut(app_op_ud_val) {
                 if cqe_result < 0 {
-                  error!("[CQE Proc] Normal Send (sys ZC disabled): Underlying send for app_op_ud {} (name: {}) FAILED (errno {}), but ACK was already sent.", app_op_ud_val, app_op_name, -cqe_result);
-                  // <<<MODIFIED START>>>
-                  // Inform handler about the failure of this specific send part
-                  if let Some(handler) = handler_manager.get_mut(handler_fd) {
-                    let interface = UringWorkerInterface::new(
-                      handler_fd,
-                      worker_io_config,
-                      recv_buffer_manager,
-                      default_bgid_val_from_worker,
-                      cqe_user_data,
-                    );
-                    let handler_blueprints_on_error = handler.handle_internal_sqe_completion(
-                      cqe_user_data,
-                      cqe_result,
-                      cqe_flags,
-                      &interface,
-                    );
-                    if !handler_blueprints_on_error.sqe_blueprints.is_empty()
-                      || handler_blueprints_on_error.initiate_close_due_to_error
-                    {
-                      let mut sq_for_handler_error_ops = unsafe { ring.submission_shared() };
-                      process_handler_blueprints(
-                        handler_fd,
-                        handler_blueprints_on_error,
-                        internal_ops,
-                        &mut sq_for_handler_error_ops,
-                        default_bgid_val_from_worker,
-                        fds_to_initiate_close_queue,
-                        pending_sqe_retry_queue,
-                        handler_manager,
-                        worker_cfg_send_zerocopy_enabled,
-                        send_buffer_pool,
-                        external_ops,
-                      );
+                  // If ANY part fails, we immediately take and reply with an error.
+                  let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
+                  let completion = Ok(UringOpCompletion::OpError {
+                    user_data: app_op_ud_val,
+                    op_name: app_op_name.clone(),
+                    error: zmq_err,
+                  });
+                  // Since the op has failed, we can safely consume the context now.
+                  if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud_val) {
+                    let _ = ctx_to_reply.reply_tx.send(completion);
+                  }
+                } else if let Some(multi_state) = &mut ext_op_ctx_mut.multipart_state {
+                  // This is part of a multipart message and was successful.
+                  multi_state.completed_parts += 1;
+                  if multi_state.completed_parts >= multi_state.total_parts {
+                    // This was the LAST part and it was successful. Take and reply.
+                    let completion = Ok(UringOpCompletion::SendDataViaHandlerAck {
+                      user_data: app_op_ud_val,
+                      fd: handler_fd,
+                    });
+                    if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud_val) {
+                      let _ = ctx_to_reply.reply_tx.send(completion);
                     }
-                  } else {
-                    warn!("[CQE Proc] Normal Send (sys ZC disabled): Handler for FD {} not found to report send error for app_op_ud {}.", handler_fd, app_op_ud_val);
+                  }
+                  // else: not the last part, do nothing, leave the context in the tracker.
+                } else {
+                  // This was a single-part message and it was successful. Take and reply.
+                  let completion = Ok(UringOpCompletion::SendDataViaHandlerAck {
+                    user_data: app_op_ud_val,
+                    fd: handler_fd,
+                  });
+                  if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud_val) {
+                    let _ = ctx_to_reply.reply_tx.send(completion);
                   }
                 }
               }
             } else {
-              // app_op_ud_val == HANDLER_INTERNAL_SEND_OP_UD
-              trace!("[CQE Proc] Normal Send: Send for internal handler op (ud:{}, app_op_ud:{}) completed. Notifying handler if error.", cqe_user_data, app_op_ud_val);
-              // If an internal send (like PING) fails, the handler might want to know.
-              // If it succeeds, handle_internal_sqe_completion might do nothing or log.
+              // This is a send initiated by a handler internally (e.g., a PING).
+              // It doesn't have an external operation to notify, but the handler might care about the result.
+              trace!("[CQE Proc] Normal Send: Send for internal handler op (ud:{}, app_op_ud:{}) completed.", cqe_user_data, app_op_ud_val);
               if let Some(handler) = handler_manager.get_mut(handler_fd) {
                 let interface = UringWorkerInterface::new(
                   handler_fd,
@@ -1281,6 +1193,7 @@ pub(crate) fn process_all_cqes(
                     worker_cfg_send_zerocopy_enabled,
                     send_buffer_pool,
                     external_ops,
+                    cork_send_states,
                   );
                 }
               } else {
@@ -1291,6 +1204,8 @@ pub(crate) fn process_all_cqes(
               }
             }
           } else {
+            // This case handles internal sends that don't have an associated app_op_ud.
+            // For example, if a PING were sent.
             if cqe_result < 0 {
               warn!(
                 "[CQE Proc] Internal normal send (ud:{}) for FD {} FAILED: {}. Notifying handler.",
@@ -1329,6 +1244,7 @@ pub(crate) fn process_all_cqes(
                   worker_cfg_send_zerocopy_enabled,
                   send_buffer_pool,
                   external_ops,
+                  cork_send_states,
                 );
               }
             } else {
@@ -1440,6 +1356,7 @@ pub(crate) fn process_all_cqes(
                 worker_cfg_send_zerocopy_enabled,
                 send_buffer_pool,
                 external_ops,
+                cork_send_states,
               );
             }
           } else {
@@ -1472,4 +1389,64 @@ pub(crate) fn process_all_cqes(
     }
   }
   Ok(())
+}
+
+//// Kicks off an asynchronous, batched send operation using TCP_CORK.
+///
+/// This function:
+/// 1. Stores the pending send blueprints in the worker's state map.
+/// 2. Submits a `SetSockOpt` operation to the kernel to enable TCP_CORK.
+/// 3. The completion of this operation will be handled by the CQE processor,
+///    which will then proceed to send the buffered frames.
+fn initiate_corked_send(
+  fd: RawFd,
+  pending_sends: Vec<HandlerSqeBlueprint>,
+  internal_ops: &mut InternalOpTracker,
+  sq: &mut squeue::SubmissionQueue<'_>,
+  cork_send_states: &mut HashMap<RawFd, CorkSendState>,
+) {
+  // 1. Store the state BEFORE submitting the operation. This prevents a race condition
+  //    where the completion (CQE) could arrive before the state is stored.
+  cork_send_states.insert(fd, CorkSendState::AwaitingCorkEnable { pending_sends });
+
+  // 2. Build the `SetSockOpt` SQE to enable the cork.
+  let enable: i32 = 1;
+  let op_user_data = internal_ops.new_op_id(
+    fd,
+    InternalOpType::UringCmdSetCorkEnable,
+    InternalOpPayload::None,
+  );
+
+  let entry = opcode::SetSockOpt::new(
+    types::Fd(fd),
+    libc::SOL_TCP as _, // Let rust infer the type for i32/u32
+    libc::TCP_CORK as _,
+    &enable as *const _ as *const libc::c_void,
+    std::mem::size_of_val(&enable) as u32,
+  )
+  .build()
+  .user_data(op_user_data);
+
+  // 3. Submit the SQE to the kernel.
+  // SAFETY: This is called within the worker loop which has exclusive access to the ring.
+  unsafe {
+    if sq.push(&entry).is_err() {
+      // If submission fails (e.g., queue is full), we must roll back the state we just added.
+      warn!(
+        "SQ Full when initiating corked send for FD {}. Send dropped.",
+        fd
+      );
+      // Clean up the UserData we allocated for the failed operation.
+      internal_ops.take_op_details(op_user_data);
+      // Clean up the state we stored in the worker's map.
+      cork_send_states.remove(&fd);
+      return;
+    }
+  }
+
+  trace!(
+    fd,
+    "Initiated corked send. State stored. Awaiting cork enable CQE (ud {}).",
+    op_user_data
+  );
 }

@@ -88,11 +88,10 @@ impl UringWorker {
                   bgid
                 );
               }
-              let _ =
-                reply_tx.send(Ok(UringOpCompletion::InitializeBufferRingSuccess {
-                  user_data,
-                  bgid,
-                }));
+              let _ = reply_tx.send(Ok(UringOpCompletion::InitializeBufferRingSuccess {
+                user_data,
+                bgid,
+              }));
             }
             Err(e) => {
               error!("UringWorker: Failed to initialize BufferRingManager: {}", e);
@@ -301,13 +300,11 @@ impl UringWorker {
                 libc::close(socket_fd);
               }
               if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
-                let _ = ctx
-                  .reply_tx
-                  .send(Ok(UringOpCompletion::OpError {
-                    user_data,
-                    op_name: op_name_str,
-                    error: ZmqError::Internal("Failed to queue first accept".into()),
-                  }));
+                let _ = ctx.reply_tx.send(Ok(UringOpCompletion::OpError {
+                  user_data,
+                  op_name: op_name_str,
+                  error: ZmqError::Internal("Failed to queue first accept".into()),
+                }));
               }
               false
             }
@@ -323,13 +320,11 @@ impl UringWorker {
             libc::close(socket_fd);
           }
           if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
-            let _ = ctx
-              .reply_tx
-              .send(Ok(UringOpCompletion::OpError {
-                user_data,
-                op_name: op_name_str,
-                error: ZmqError::Internal("SQ full for first accept".into()),
-              }));
+            let _ = ctx.reply_tx.send(Ok(UringOpCompletion::OpError {
+              user_data,
+              op_name: op_name_str,
+              error: ZmqError::Internal("SQ full for first accept".into()),
+            }));
           }
           false
         };
@@ -337,13 +332,11 @@ impl UringWorker {
 
         if submitted_accept_sqe_ok {
           if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
-            let _ = ctx
-              .reply_tx
-              .send(Ok(UringOpCompletion::ListenSuccess {
-                user_data,
-                listener_fd: socket_fd,
-                actual_addr: actual_bound_addr,
-              }));
+            let _ = ctx.reply_tx.send(Ok(UringOpCompletion::ListenSuccess {
+              user_data,
+              listener_fd: socket_fd,
+              actual_addr: actual_bound_addr,
+            }));
           }
         }
         Ok(submitted_accept_sqe_ok)
@@ -578,6 +571,7 @@ impl UringWorker {
               self.cfg_send_zerocopy_enabled,
               &self.send_buffer_pool,
               &self.external_op_tracker,
+              &mut self.cork_send_states,
             );
             if !self.fds_needing_close_initiated_pass.is_empty() {
               warn!(
@@ -591,9 +585,12 @@ impl UringWorker {
             // Reply with success to the original requester via the ExternalOpContext.
             // We already added to tracker, now take it to reply.
             if let Some(mut op_ctx) = self.external_op_tracker.take_op(user_data) {
-              let _ = op_ctx.reply_tx.send(Ok(
-                UringOpCompletion::RegisterExternalFdSuccess { user_data, fd },
-              ));
+              let _ = op_ctx
+                .reply_tx
+                .send(Ok(UringOpCompletion::RegisterExternalFdSuccess {
+                  user_data,
+                  fd,
+                }));
             } else {
               // Should not happen if add_op was successful
               error!(
@@ -610,13 +607,11 @@ impl UringWorker {
             );
             // Reply with error via the ExternalOpContext
             if let Some(mut op_ctx) = self.external_op_tracker.take_op(user_data) {
-              let _ = op_ctx
-                .reply_tx
-                .send(Ok(UringOpCompletion::OpError {
-                  user_data,
-                  op_name: op_name_str.clone(),
-                  error: ZmqError::Internal(err_msg),
-                }));
+              let _ = op_ctx.reply_tx.send(Ok(UringOpCompletion::OpError {
+                user_data,
+                op_name: op_name_str.clone(),
+                error: ZmqError::Internal(err_msg),
+              }));
             }
             // Important: The external FD was not successfully managed. The caller needs to know.
             // The UringWorker should NOT attempt to close this FD as it doesn't own it yet.
@@ -635,8 +630,7 @@ impl UringWorker {
             "UringWorker: Received StartFdReadLoop for fd {}. Handler will manage reads via prepare_sqes.",
             fd
           );
-          let _ = reply_tx
-            .send(Ok(UringOpCompletion::StartFdReadLoopAck { user_data, fd }));
+          let _ = reply_tx.send(Ok(UringOpCompletion::StartFdReadLoopAck { user_data, fd }));
         } else {
           warn!("UringWorker: StartFdReadLoop for unknown fd {}", fd);
           let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
@@ -696,6 +690,7 @@ impl UringWorker {
             self.cfg_send_zerocopy_enabled,
             &self.send_buffer_pool,
             &self.external_op_tracker,
+            &mut self.cork_send_states,
           );
           drop(sq_for_blueprints);
 
@@ -704,45 +699,19 @@ impl UringWorker {
             .fds_needing_close_initiated_pass
             .extend(local_fds_to_close_queue);
 
-          if !self.cfg_send_zerocopy_enabled {
-            // If zero-copy is OFF, ACK immediately.
-            // The ExternalOpContext's reply_tx is consumed here.
-            // cqe_processor will later find no (or already used) reply_tx for this app_op_ud.
-            if let Some(ctx_for_immediate_ack) = self.external_op_tracker.take_op(user_data) {
-              if ctx_for_immediate_ack
-                .reply_tx
-                .send(Ok(UringOpCompletion::SendDataViaHandlerAck {
-                  user_data,
-                  fd,
-                }))
-                .is_err()
-              {
-                tracing::warn!("UringWorker (No ZC): Reply_tx for SendDataViaHandler (ud {}) was already taken before immediate ACK.", user_data);
-              }
-            } else {
-              // Should ideally not happen if add_op above succeeded.
-              tracing::error!(
-                "UringWorker (No ZC): ExternalOpContext not found for immediate ACK for SendDataViaHandler (ud {}).",
-                user_data
-              );
-            }
-          }
-
           Ok(true)
         } else {
           warn!("UringWorker: SendDataViaHandler for unknown fd {}", fd);
           // Clean up external op tracker if handler not found, and reply with error
           if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
-            let _ = ctx
-              .reply_tx
-              .send(Ok(UringOpCompletion::OpError {
-                user_data,
-                op_name: op_name_for_error.to_string(),
-                error: ZmqError::InvalidArgument(format!(
-                  "FD {} not managed for SendDataViaHandler",
-                  fd
-                )),
-              }));
+            let _ = ctx.reply_tx.send(Ok(UringOpCompletion::OpError {
+              user_data,
+              op_name: op_name_for_error.to_string(),
+              error: ZmqError::InvalidArgument(format!(
+                "FD {} not managed for SendDataViaHandler",
+                fd
+              )),
+            }));
           }
           Ok(false)
         }
@@ -806,6 +775,7 @@ impl UringWorker {
             self.cfg_send_zerocopy_enabled,
             &self.send_buffer_pool,
             &self.external_op_tracker,
+            &mut self.cork_send_states,
           );
           drop(sq_for_multi_blueprints);
 
@@ -814,24 +784,6 @@ impl UringWorker {
             .fds_needing_close_initiated_pass
             .extend(local_fds_to_close_queue_multi);
 
-          if !self.cfg_send_zerocopy_enabled {
-            // If zero-copy is OFF, ACK immediately for the whole multipart.
-            if let Some(ctx_for_immediate_ack) = self.external_op_tracker.take_op(user_data) {
-              if ctx_for_immediate_ack
-                .reply_tx
-                .send(Ok(UringOpCompletion::SendDataViaHandlerAck {
-                  user_data,
-                  fd,
-                }))
-                .is_err()
-              {
-                tracing::warn!("UringWorker (No ZC): Reply_tx for SendDataMultipartViaHandler (ud {}) was already taken before immediate ACK.", user_data);
-              }
-            } else {
-              tracing::error!("UringWorker (No ZC): ExternalOpContext not found for immediate ACK for SendDataMultipartViaHandler (ud {}).", user_data);
-            }
-          }
-
           Ok(true)
         } else {
           warn!(
@@ -839,16 +791,14 @@ impl UringWorker {
             fd
           );
           if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
-            let _ = ctx
-              .reply_tx
-              .send(Ok(UringOpCompletion::OpError {
-                user_data,
-                op_name: op_name_for_error.to_string(),
-                error: ZmqError::InvalidArgument(format!(
-                  "FD {} not managed for SendDataMultipartViaHandler",
-                  fd
-                )),
-              }));
+            let _ = ctx.reply_tx.send(Ok(UringOpCompletion::OpError {
+              user_data,
+              op_name: op_name_for_error.to_string(),
+              error: ZmqError::InvalidArgument(format!(
+                "FD {} not managed for SendDataMultipartViaHandler",
+                fd
+              )),
+            }));
           }
           Ok(false)
         }
@@ -1067,6 +1017,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               worker.cfg_send_zerocopy_enabled,
               &worker.send_buffer_pool,
               &worker.external_op_tracker,
+              &mut worker.cork_send_states,
             );
             // sq_for_retry_blueprint is dropped
           } else {
@@ -1174,6 +1125,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 worker.cfg_send_zerocopy_enabled,
                 &worker.send_buffer_pool,
                 &worker.external_op_tracker,
+          &mut worker.cork_send_states,
               );
             }
           }
@@ -1216,6 +1168,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 worker.cfg_send_zerocopy_enabled,
                 &worker.send_buffer_pool,
                 &worker.external_op_tracker,
+                &mut worker.cork_send_states,
               );
             }
           } else {
@@ -1275,6 +1228,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           &mut worker.event_fd_poller,
           worker.cfg_send_zerocopy_enabled,
           false,
+          &mut worker.cork_send_states,
         ) {
           profiler.log_and_reset_for_next_loop();
           return Err(e);
@@ -1450,6 +1404,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           &mut worker.event_fd_poller,
           worker.cfg_send_zerocopy_enabled,
           true, // is_worker_shutting_down
+          &mut worker.cork_send_states,
         ) {
           error!(
             "UringWorker: Error processing CQEs during Draining state: {}. Forcing stop.",

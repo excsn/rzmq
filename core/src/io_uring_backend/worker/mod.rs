@@ -21,7 +21,7 @@ use crate::io_uring_backend::UserData;
 use crate::uring::{global_state, UringConfig};
 use crate::ZmqError;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -49,6 +49,19 @@ pub(crate) enum WorkerState {
   Stopped,
 }
 
+#[derive(Debug)]
+pub(crate) enum CorkSendState {
+  /// We have received a RequestSetCork(true) and are waiting for the UringCmd to complete.
+  /// The Vec holds all the send blueprints for the message.
+  AwaitingCorkEnable {
+    pending_sends: Vec<HandlerSqeBlueprint>,
+  },
+  /// We are now submitting the actual Send/SendZc operations.
+  /// The UserData is for the final UringCmdSetCorkDisable operation.
+  SendingPayload {
+    disable_cork_op_ud: UserData,
+  },
+}
 
 pub struct UringWorker {
   pub(crate) state: WorkerState,
@@ -70,6 +83,7 @@ pub struct UringWorker {
   pending_sqe_retry_queue: VecDeque<(RawFd, HandlerSqeBlueprint)>,
   pub(crate) event_fd_poller: EventFdPoller,
   send_buffer_pool: Option<Arc<SendBufferPool>>, // For zero-copy sends
+  pub(crate) cork_send_states: HashMap<RawFd, CorkSendState>,
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
   cfg_send_buffer_count: usize, //TODO revisit
@@ -91,6 +105,7 @@ impl fmt::Debug for UringWorker {
       )
       .field("pending_sqe_retry_queue_len", &self.pending_sqe_retry_queue.len())
       .field("event_fd_poller", &self.event_fd_poller)
+      .field("cork_send_states_len", &self.cork_send_states.len())
       .finish_non_exhaustive()
   }
 }
@@ -188,6 +203,7 @@ impl UringWorker {
               fds_needing_close_initiated_pass: VecDeque::new(),
               pending_sqe_retry_queue: VecDeque::new(),
               send_buffer_pool: worker_send_buffer_pool,
+              cork_send_states: HashMap::new(),
               cfg_send_zerocopy_enabled: effective_send_zerocopy_enabled_for_worker,
               // Store original config values for reference if needed, though behavior is driven by effective values.
               cfg_send_buffer_count: config.default_send_buffer_count,

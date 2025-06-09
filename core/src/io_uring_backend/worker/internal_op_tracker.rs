@@ -19,6 +19,8 @@ pub(crate) enum InternalOpType {
   RingReadMultishot,
   AsyncCancel,
   SendZeroCopy,
+  UringCmdSetCorkEnable,
+  UringCmdSetCorkDisable,
 }
 
 /// Payload associated with an internal operation, e.g., buffer for send.
