@@ -17,7 +17,8 @@ use crate::io_uring_backend::connection_handler::{
 use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
-use crate::uring::UringConfig;
+use crate::io_uring_backend::UserData;
+use crate::uring::{global_state, UringConfig};
 use crate::ZmqError;
 
 use std::collections::VecDeque;
@@ -31,7 +32,7 @@ use fibre::mpmc::{unbounded, AsyncSender, Sender as SyncSender, Receiver as Sync
 use io_uring::opcode;
 use io_uring::types;
 use io_uring::IoUring;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // Publicly re-export for use within io_uring_backend module
 pub(crate) use eventfd_poller::EventFdPoller;
@@ -40,7 +41,17 @@ pub(crate) use handler_manager::HandlerManager;
 pub(crate) use internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType};
 pub(crate) use multishot_reader::MultishotReader;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerState {
+  Running,
+  Draining, // Shutdown initiated, processing in-flight completions only
+  CleaningUp, 
+  Stopped,
+}
+
+
 pub struct UringWorker {
+  pub(crate) state: WorkerState,
   ring: IoUring,
   op_rx: SyncReceiver<UringOpRequest>,
 
@@ -54,7 +65,6 @@ pub struct UringWorker {
   worker_io_config: Arc<WorkerIoConfig>,
   default_buffer_ring_group_id_val: Option<u16>,
   fds_needing_close_initiated_pass: VecDeque<RawFd>,
-  shutdown_requested: bool,
   // Added queue for SQEs that couldn't be submitted immediately.
   // Stores (FD to operate on, Blueprint of the SQE to retry)
   pending_sqe_retry_queue: VecDeque<(RawFd, HandlerSqeBlueprint)>,
@@ -62,7 +72,7 @@ pub struct UringWorker {
   send_buffer_pool: Option<Arc<SendBufferPool>>, // For zero-copy sends
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
-  cfg_send_buffer_count: usize,
+  cfg_send_buffer_count: usize, //TODO revisit
   cfg_send_buffer_size: usize,
 }
 
@@ -79,7 +89,6 @@ impl fmt::Debug for UringWorker {
         "default_buffer_ring_group_id_val",
         &self.default_buffer_ring_group_id_val,
       )
-      .field("shutdown_requested", &self.shutdown_requested)
       .field("pending_sqe_retry_queue_len", &self.pending_sqe_retry_queue.len())
       .field("event_fd_poller", &self.event_fd_poller)
       .finish_non_exhaustive()
@@ -106,154 +115,156 @@ impl UringWorker {
     let signaling_op_sender = SignalingOpSender::new(op_tx_async_for_signaler, event_fd_master_instance.clone());
 
     let worker_thread_join_handle = std::thread::Builder::new()
-            .name("rzmq-io-uring-worker".into())
-            .spawn(move || { // config is moved here
-                match IoUring::new(config.ring_entries) {
-                    Ok(ring) => {
-                        let mut internal_tracker = InternalOpTracker::new();
-                        let event_fd_poller_instance = EventFdPoller::new_with_fd(
-                            event_fd_master_instance,
-                            &mut internal_tracker,
-                        );
+      .name("rzmq-io-uring-worker".into())
+      .spawn(move || { // config is moved here
+        match IoUring::new(config.ring_entries) {
+          Ok(ring) => {
+            let mut internal_tracker = InternalOpTracker::new();
+            let event_fd_poller_instance = EventFdPoller::new_with_fd(
+                event_fd_master_instance,
+                &mut internal_tracker,
+            );
 
-                        // --- SendBufferPool Initialization ---
-                        let mut worker_send_buffer_pool: Option<Arc<SendBufferPool>> = None;
-                        // This variable will hold the *actual* state of ZC enablement for this worker instance.
-                        let mut effective_send_zerocopy_enabled_for_worker = config.default_send_zerocopy;
+            // --- SendBufferPool Initialization ---
+            let mut worker_send_buffer_pool: Option<Arc<SendBufferPool>> = None;
+            // This variable will hold the *actual* state of ZC enablement for this worker instance.
+            let mut effective_send_zerocopy_enabled_for_worker = config.default_send_zerocopy;
 
-                        if config.default_send_zerocopy {
-                            if config.default_send_buffer_count > 0 && config.default_send_buffer_size > 0 {
-                                // TODO: Consider RLIMIT_MEMLOCK check here or ensure it's documented.
-                                match SendBufferPool::new(&ring, config.default_send_buffer_count, config.default_send_buffer_size) {
-                                    Ok(pool) => {
-                                        info!("UringWorker: SendBufferPool initialized (count: {}, size: {}). Zero-copy send enabled.", config.default_send_buffer_count, config.default_send_buffer_size);
-                                        worker_send_buffer_pool = Some(Arc::new(pool));
-                                    }
-                                    Err(e) => {
-                                        error!("UringWorker: Failed to initialize SendBufferPool from config: {}. Disabling ZC send for this worker.", e);
-                                        effective_send_zerocopy_enabled_for_worker = false;
-                                    }
-                                }
-                            } else {
-                                info!("UringWorker: Zero-copy send requested by config, but pool count/size is zero. Disabling ZC send for this worker.");
-                                effective_send_zerocopy_enabled_for_worker = false;
-                            }
-                        } else {
-                            info!("UringWorker: Zero-copy send not enabled by config.");
+            if config.default_send_zerocopy {
+                if config.default_send_buffer_count > 0 && config.default_send_buffer_size > 0 {
+                    // TODO: Consider RLIMIT_MEMLOCK check here or ensure it's documented.
+                    match SendBufferPool::new(&ring, config.default_send_buffer_count, config.default_send_buffer_size) {
+                        Ok(pool) => {
+                            info!("UringWorker: SendBufferPool initialized (count: {}, size: {}). Zero-copy send enabled.", config.default_send_buffer_count, config.default_send_buffer_size);
+                            worker_send_buffer_pool = Some(Arc::new(pool));
                         }
+                        Err(e) => {
+                            error!("UringWorker: Failed to initialize SendBufferPool from config: {}. Disabling ZC send for this worker.", e);
+                            effective_send_zerocopy_enabled_for_worker = false;
+                        }
+                    }
+                } else {
+                    info!("UringWorker: Zero-copy send requested by config, but pool count/size is zero. Disabling ZC send for this worker.");
+                    effective_send_zerocopy_enabled_for_worker = false;
+                }
+            } else {
+                info!("UringWorker: Zero-copy send not enabled by config.");
+            }
 
-                        // --- Default BufferRingManager Initialization (for bgid 0) ---
-                        let mut default_worker_buffer_manager: Option<BufferRingManager> = None;
-                        let mut default_worker_bgid_val: Option<u16> = None;
+            // --- Default BufferRingManager Initialization (for bgid 0) ---
+            let mut default_worker_buffer_manager: Option<BufferRingManager> = None;
+            let mut default_worker_bgid_val: Option<u16> = None;
 
-                        // The UringConfig.default_recv_multishot enables/disables the *creation* of the
-                        // default (bgid 0) provided buffer ring at worker startup.
-                        // Individual handlers can still choose to use (or not use) multishot reads
-                        // based on their specific configuration (e.g., ZmtpEngineConfig.use_recv_multishot).
-                        // If a handler wants multishot but the default ring wasn't created, it might fail
-                        // or need to request creation of a specific bgid.
-                        if config.default_recv_multishot {
-                            if config.default_recv_buffer_count > 0 && config.default_recv_buffer_size > 0 {
-                                match BufferRingManager::new(&ring, config.default_recv_buffer_count as u16, 0, config.default_recv_buffer_size) {
-                                    Ok(bm) => {
-                                        info!("UringWorker: Default BufferRingManager (bgid 0) initialized (count: {}, size: {}). Default multishot recv path enabled.", config.default_recv_buffer_count, config.default_recv_buffer_size);
-                                        default_worker_buffer_manager = Some(bm);
-                                        default_worker_bgid_val = Some(0); // Default ring uses bgid 0
-                                    }
-                                    Err(e) => {
-                                        error!("UringWorker: Failed to initialize default BufferRingManager from config: {}. Provided buffer reads on bgid 0 may fail.", e);
-                                    }
-                                }
-                            } else {
-                                info!("UringWorker: Default multishot recv requested by config, but buffer count/size is zero. Default ring (bgid 0) not created.");
-                            }
-                        } else {
-                             info!("UringWorker: Default multishot recv not enabled by config. Default ring (bgid 0) not created at spawn.");
-                        }
-
-                        let mut worker = UringWorker {
-                            ring,
-                            op_rx,
-                            buffer_manager: default_worker_buffer_manager,
-                            handler_manager: HandlerManager::new(factories, worker_io_config.clone()),
-                            external_op_tracker: ExternalOpTracker::new(),
-                            internal_op_tracker: internal_tracker,
-                            event_fd_poller: event_fd_poller_instance,
-                            worker_io_config,
-                            default_buffer_ring_group_id_val: default_worker_bgid_val,
-                            fds_needing_close_initiated_pass: VecDeque::new(),
-                            shutdown_requested: false,
-                            pending_sqe_retry_queue: VecDeque::new(),
-                            send_buffer_pool: worker_send_buffer_pool,
-                            cfg_send_zerocopy_enabled: effective_send_zerocopy_enabled_for_worker,
-                            // Store original config values for reference if needed, though behavior is driven by effective values.
-                            cfg_send_buffer_count: config.default_send_buffer_count,
-                            cfg_send_buffer_size: config.default_send_buffer_size,
-                        };
-
-                        let loop_result = main_loop::run_worker_loop(&mut worker);
-                        
-                        info!("UringWorker (PID: {}) run_loop exited. Performing final cleanup.", std::process::id());
-                        if loop_result.is_err() {
-                            warn!("UringWorker: Loop exited with error, cleanup might be partial.");
-                        }
-                        for (_ud, ext_op_ctx) in worker.external_op_tracker.drain_all() {
-                            let _ = ext_op_ctx.reply_tx.take_and_send_sync(Err(ZmqError::Internal("UringWorker shutting down".into())));
-                        }
-                        let active_fds = worker.handler_manager.get_active_fds();
-                        let mut sq_cleanup = unsafe { worker.ring.submission_shared() };
-                        for fd in active_fds {
-                            if let Some(handler) = worker.handler_manager.get_mut(fd) {
-                                const WORKER_SHUTDOWN_SENTINEL_UD: u64 = 0;
-                                 let interface = crate::io_uring_backend::connection_handler::UringWorkerInterface::new(
-                                    fd,
-                                    &worker.worker_io_config,
-                                    worker.buffer_manager.as_ref(), // Pass the default bgid 0 manager
-                                    worker.default_buffer_ring_group_id_val,
-                                    WORKER_SHUTDOWN_SENTINEL_UD,
-                                );
-                                let close_blueprints = handler.close_initiated(&interface);
-                                for bp in close_blueprints.sqe_blueprints {
-                                    if let crate::io_uring_backend::connection_handler::HandlerSqeBlueprint::RequestClose = bp {
-                                        let close_ud = worker.internal_op_tracker.new_op_id(fd, InternalOpType::CloseFd, InternalOpPayload::None);
-                                        let close_sqe = opcode::Close::new(types::Fd(fd)).build().user_data(close_ud);
-                                        unsafe { let _ = sq_cleanup.push(&close_sqe); }
-                                    }
-                                }
-                            }
-                        }
-                        if !sq_cleanup.is_empty() {
-                             match worker.ring.submit_and_wait(1) {
-                                Ok(count) => trace!("UringWorker cleanup: Submitted {} final SQEs.", count),
-                                Err(e) => warn!("UringWorker cleanup: Error submitting final SQEs: {}", e),
-                            }
-                        }
-                        drop(sq_cleanup);
-                        for mut handler_box in worker.handler_manager.drain_all_handlers_calling_closed() {
-                            handler_box.fd_has_been_closed();
-                        }
-                        if let Some(pool_arc) = &worker.send_buffer_pool {
-                            unsafe {
-                                if let Err(e) = pool_arc.unregister_all(&worker.ring) {
-                                    error!("UringWorker: Error unregistering send buffers on shutdown: {}", e);
-                                }
-                            }
-                        }
-                        // Drop buffer_manager if it was created. Its Drop impl handles unregistering.
-                        drop(worker.buffer_manager);
-
-                        info!("rzmq-io-uring-worker OS thread (PID: {}) finished.", std::process::id());
-                        loop_result
+            // Create the default buffer ring if buffers are configured.
+            // This ring is used for both single-shot and multi-shot provided-buffer reads.
+            // The `config.default_recv_multishot` flag will control which *type* of read is *attempted*,
+            // but the infrastructure (the buffer ring) should exist for either.
+            if config.default_recv_buffer_count > 0 && config.default_recv_buffer_size > 0 {
+                match BufferRingManager::new(&ring, config.default_recv_buffer_count as u16, 0, config.default_recv_buffer_size) {
+                    Ok(bm) => {
+                        info!("UringWorker: Default BufferRingManager (bgid 0) initialized (count: {}, size: {}). Provided-buffer reads are enabled.", config.default_recv_buffer_count, config.default_recv_buffer_size);
+                        default_worker_buffer_manager = Some(bm);
+                        default_worker_bgid_val = Some(0); // Default ring uses bgid 0
                     }
                     Err(e) => {
-                        error!("Failed to initialize IoUring (entries: {}): {}. UringWorker thread cannot start.", config.ring_entries, e);
-                        Err(ZmqError::Internal(format!("IoUring init failed: {}", e)))
+                        error!("UringWorker: Failed to initialize default BufferRingManager from config: {}. Provided-buffer reads may fail.", e);
                     }
                 }
-            })
-            .map_err(|e| ZmqError::Internal(format!("Failed to spawn UringWorker thread: {:?}", e)))?;
+            } else {
+                  info!("UringWorker: Default provided-buffer recv ring not configured (count/size is zero).");
+            }
+
+            let mut worker = UringWorker {
+              state: WorkerState::Running,
+              ring,
+              op_rx,
+              buffer_manager: default_worker_buffer_manager,
+              handler_manager: HandlerManager::new(factories, worker_io_config.clone()),
+              external_op_tracker: ExternalOpTracker::new(),
+              internal_op_tracker: internal_tracker,
+              event_fd_poller: event_fd_poller_instance,
+              worker_io_config,
+              default_buffer_ring_group_id_val: default_worker_bgid_val,
+              fds_needing_close_initiated_pass: VecDeque::new(),
+              pending_sqe_retry_queue: VecDeque::new(),
+              send_buffer_pool: worker_send_buffer_pool,
+              cfg_send_zerocopy_enabled: effective_send_zerocopy_enabled_for_worker,
+              // Store original config values for reference if needed, though behavior is driven by effective values.
+              cfg_send_buffer_count: config.default_send_buffer_count,
+              cfg_send_buffer_size: config.default_send_buffer_size,
+            };
+
+            {
+              let loop_result = main_loop::run_worker_loop(&mut worker);
+              if loop_result.is_err() {
+                warn!("UringWorker: Loop exited with error, cleanup might be partial.");
+              }
+            }
+            
+            info!("rzmq-io-uring-worker OS thread (PID: {}) finished.", std::process::id());
+            Ok(()) // The loop_result is no longer returned, just Ok(())
+          }
+          Err(e) => {
+            error!("Failed to initialize IoUring (entries: {}): {}. UringWorker thread cannot start.", config.ring_entries, e);
+            Err(ZmqError::Internal(format!("IoUring init failed: {}", e)))
+          }
+        }
+      })
+      .map_err(|e| ZmqError::Internal(format!("Failed to spawn UringWorker thread: {:?}", e)))?;
 
     Ok((signaling_op_sender, worker_thread_join_handle))
+  }
+}
+
+impl UringWorker {
+  fn transition_to_draining(&mut self) {
+    info!("UringWorker: Transitioning to DRAINING state.");
+    self.state = WorkerState::Draining;
+    
+    // Instead of aborting, we take and drop the sender side of the
+    // upstream channel. The processor's `recv().await` will then return an
+    // error, causing its loop to terminate gracefully.
+    if let Some(tx) = global_state::get_global_parsed_msg_tx_mutex().lock().take() {
+        drop(tx);
+        debug!("UringWorker: Dropped upstream TX channel to signal processor shutdown.");
+    }
+
+    let mut sq_for_shutdown = unsafe { self.ring.submission_shared() };
+
+    // Cancel all in-flight internal kernel operations.
+    let internal_ops_to_cancel: Vec<UserData> =
+      self.internal_op_tracker.op_to_details.keys().copied().collect();
+
+    info!(
+      "UringWorker: Draining state - Cancelling {} in-flight internal operations.",
+      internal_ops_to_cancel.len()
+    );
+
+    for op_ud in internal_ops_to_cancel {
+      if sq_for_shutdown.is_full() {
+        warn!("UringWorker draining transition: SQ full, cannot submit all cancel ops. CQE processing will need to handle the rest.");
+        break;
+      }
+      trace!(
+        "UringWorker draining transition: Submitting AsyncCancel for internal op_ud {}",
+        op_ud
+      );
+      // The cancel op itself doesn't need its own tracker entry,
+      // as we will be draining all CQEs anyway. We can give it a sentinel UD.
+      let cancel_sqe = opcode::AsyncCancel::new(op_ud).build().user_data(0); // Sentinel UD for cancel op
+      unsafe {
+        let _ = sq_for_shutdown.push(&cancel_sqe);
+      }
+    }
+    drop(sq_for_shutdown);
+
+    // After submitting cancellations, we must submit the ring to make sure the kernel sees them.
+    if let Err(e) = self.ring.submitter().submit() {
+      warn!(
+        "UringWorker draining transition: Error submitting cancellation SQEs: {}",
+        e
+      );
+    }
   }
 }
 

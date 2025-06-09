@@ -4,7 +4,7 @@ use crate::error::ZmqError;
 use crate::runtime::{ActorType, Command, SystemEvent};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::state::{CoreState, EndpointType, ShutdownCoordinator, ShutdownPhase}; // Import from state.rs
-use crate::socket::core::{pipe_manager, SocketCore}; // pipe_manager for cleanup_stopped_child_resources
+use crate::socket::core::{command_processor, pipe_manager, SocketCore}; // pipe_manager for cleanup_stopped_child_resources
 use crate::socket::ISocket;
 
 use std::collections::HashMap;
@@ -41,7 +41,9 @@ impl ShutdownCoordinator {
         EndpointType::Listener => {
           // Only track listeners if SocketCore actually has a task_handle for them.
           if ep_info.task_handle.is_some() {
-            self.pending_child_actors.insert(ep_info.handle_id, ep_uri.clone());
+            self
+              .pending_child_actors
+              .insert(ep_info.handle_id, ep_uri.clone());
             tracing::trace!(handle=core_handle, child_id=ep_info.handle_id, uri=%ep_uri, "Registered Listener for shutdown tracking.");
           }
         }
@@ -77,7 +79,11 @@ impl ShutdownCoordinator {
       return false;
     }
 
-    if self.pending_child_actors.remove(&child_actor_handle).is_some() {
+    if self
+      .pending_child_actors
+      .remove(&child_actor_handle)
+      .is_some()
+    {
       tracing::debug!(
         handle = core_handle,
         child_id = child_actor_handle,
@@ -96,7 +102,11 @@ impl ShutdownCoordinator {
       return false;
     }
 
-    if self.pending_connections_to_close.remove(&connection_id).is_some() {
+    if self
+      .pending_connections_to_close
+      .remove(&connection_id)
+      .is_some()
+    {
       tracing::debug!(
         handle = core_handle,
         conn_id = connection_id,
@@ -107,7 +117,11 @@ impl ShutdownCoordinator {
     false
   }
 
-  pub(crate) fn start_linger_if_needed(&mut self, linger_duration_option: Option<Duration>, core_handle: usize) {
+  pub(crate) fn start_linger_if_needed(
+    &mut self,
+    linger_duration_option: Option<Duration>,
+    core_handle: usize,
+  ) {
     if self.state != ShutdownPhase::Lingering {
       tracing::warn!(handle=core_handle, current_phase = ?self.state, "Attempted to start LINGER in incorrect state.");
       return;
@@ -135,11 +149,18 @@ impl ShutdownCoordinator {
     }
   }
 
-  pub(crate) fn is_linger_expired_or_queues_empty(&self, core_s_reader: &CoreState, core_handle: usize) -> bool {
+  pub(crate) fn is_linger_expired_or_queues_empty(
+    &self,
+    core_s_reader: &CoreState,
+    core_handle: usize,
+  ) -> bool {
     if self.state != ShutdownPhase::Lingering {
       return false;
     }
-    let core_pipes_empty = core_s_reader.pipes_tx.values().all(|sender| sender.is_empty());
+    let core_pipes_empty = core_s_reader
+      .pipes_tx
+      .values()
+      .all(|sender| sender.is_empty());
 
     if core_pipes_empty {
       tracing::debug!(
@@ -164,7 +185,10 @@ impl ShutdownCoordinator {
 
 // --- High-Level Shutdown Orchestration Functions ---
 
-pub(crate) async fn publish_socket_closing_event(context: &crate::context::Context, socket_id: usize) {
+pub(crate) async fn publish_socket_closing_event(
+  context: &crate::context::Context,
+  socket_id: usize,
+) {
   let event = SystemEvent::SocketClosing { socket_id };
   if context.event_bus().publish(event).is_err() {
     // Borrow error from SendError is not Clone.
@@ -173,7 +197,10 @@ pub(crate) async fn publish_socket_closing_event(context: &crate::context::Conte
       "Failed to publish SocketClosing event for self."
     );
   } else {
-    tracing::debug!(socket_handle = socket_id, "Published SocketClosing event for self.");
+    tracing::debug!(
+      socket_handle = socket_id,
+      "Published SocketClosing event for self."
+    );
   }
 }
 
@@ -193,7 +220,7 @@ pub(crate) async fn initiate_core_shutdown(
     was_due_to_error,
     "Initiating SocketCore shutdown steps."
   );
-  
+
   // Event publishing is now done by the caller (command_loop or event_processor)
   // publish_socket_closing_event(&core_arc.context, core_handle).await;
 
@@ -214,7 +241,9 @@ pub(crate) async fn initiate_core_shutdown(
   close_active_connections(core_arc.clone(), connections_to_close).await;
 
   let mut coordinator = core_arc.shutdown_coordinator.lock().await; // Re-acquire lock
-  if coordinator.pending_child_actors.is_empty() && coordinator.pending_connections_to_close.is_empty() {
+  if coordinator.pending_child_actors.is_empty()
+    && coordinator.pending_connections_to_close.is_empty()
+  {
     tracing::debug!(
       handle = core_handle,
       "No pending children/connections after initial stop signals. Moving to Lingering."
@@ -374,72 +403,87 @@ pub(crate) async fn handle_actor_stopping_event(
   error_opt: Option<&ZmqError>,
 ) {
   let core_handle = core_arc.handle;
-  let mut coordinator = core_arc.shutdown_coordinator.lock().await;
-
-  if coordinator.state == ShutdownPhase::Running {
-    tracing::warn!(handle = core_handle, child_id = stopped_actor_id, ?stopped_actor_type, uri = ?endpoint_uri_opt, "Child stopped unexpectedly while Core Running.");
-    drop(coordinator); // Release lock before async cleanup
-
-    pipe_manager::cleanup_stopped_child_resources(
+  
+  // First, perform the resource cleanup regardless of the shutdown phase.
+  // This removes the endpoint from the main map.
+  // This function returns true if the cleanup might warrant a reconnect.
+  let should_consider_reconnect = pipe_manager::cleanup_stopped_child_resources(
       core_arc.clone(),
       socket_logic_strong,
       stopped_actor_id,
       stopped_actor_type,
       endpoint_uri_opt,
       error_opt,
-      false, // Not part of a full core shutdown sequence initiated by SocketCore
-    )
-    .await;
-    return;
-  }
+      false, // Assume not a full shutdown initially, we check phase below.
+  ).await;
 
-  if coordinator.state == ShutdownPhase::Finished {
-    return;
-  }
+  // Now, acquire the coordinator lock to update the shutdown state.
+  let mut coordinator = core_arc.shutdown_coordinator.lock().await;
 
-  let mut was_last_pending = false;
-  match stopped_actor_type {
-        ActorType::Listener /* | ActorType::Connecter */ => {
-            // Connecters stop themselves and aren't usually in pending_child_actors long term.
-            if coordinator.record_child_actor_stopped(stopped_actor_id, core_handle) {
-                was_last_pending = true;
-            }
+  // We no longer need to check if the state is Running at the top. We handle all cases.
+  match coordinator.state {
+    ShutdownPhase::Running => {
+      // Child stopped unexpectedly.
+      tracing::warn!(
+          handle = core_handle,
+          child_id = stopped_actor_id,
+          ?stopped_actor_type,
+          uri = ?endpoint_uri_opt,
+          "Child stopped unexpectedly while Core Running."
+      );
+      // Only reconnect if the cleanup indicated it was an outbound session that failed.
+      if should_consider_reconnect {
+          if let Some(uri) = endpoint_uri_opt {
+              // We need to drop the lock before calling the async reconnect function
+              let target_uri_to_reconnect = uri.to_string();
+              drop(coordinator); // Release lock
+              command_processor::respawn_connecter_actor(
+                  core_arc.clone(),
+                  socket_logic_strong.clone(),
+                  target_uri_to_reconnect,
+              )
+              .await;
+          }
+      }
+    }
+    ShutdownPhase::StoppingChildren => {
+      // This is the expected path during a normal shutdown.
+      let mut was_last_pending = false;
+      match stopped_actor_type {
+        ActorType::Listener => {
+          if coordinator.record_child_actor_stopped(stopped_actor_id, core_handle) {
+            was_last_pending = true;
+          }
         }
         ActorType::Session => {
-            // stopped_actor_id for Session/Engine should be the connection_instance_id (session handle or RawFd)
-            if coordinator.record_connection_closed(stopped_actor_id, core_handle) {
-                was_last_pending = true;
-            }
+          if coordinator.record_connection_closed(stopped_actor_id, core_handle) {
+            was_last_pending = true;
+          }
         }
-        ActorType::PipeReader => {
-            tracing::trace!(handle=core_handle, pipe_reader_id=stopped_actor_id, "PipeReader task stopped, not in primary shutdown tracking lists.");
-        }
-        _ => {
-            tracing::trace!(handle=core_handle, child_id=stopped_actor_id, ?stopped_actor_type, "ActorStopping from other type.");
-        }
-    }
-
-  // If this was the last pending entity and we were waiting for children/connections:
-  if was_last_pending && coordinator.state == ShutdownPhase::StoppingChildren {
-    tracing::debug!(
-      handle = core_handle,
-      "All children/connections now stopped. Moving to Lingering."
-    );
-    coordinator.state = ShutdownPhase::Lingering;
-    let linger_opt = core_arc.core_state.read().options.linger;
-    coordinator.start_linger_if_needed(linger_opt, core_handle);
-
-    if coordinator.is_linger_expired_or_queues_empty(&core_arc.core_state.read(), core_handle) {
-      {
-        let mut core_s_write = core_arc.core_state.write();
-        advance_to_cleaning_phase(&mut coordinator, core_handle, &mut core_s_write);
+        _ => { /* Other types aren't tracked by the coordinator's lists. */ }
       }
-      #[cfg(feature = "inproc")]
-      let pipes_to_clean = coordinator.inproc_connections_to_cleanup.clone();
-      #[cfg(not(feature = "inproc"))]
-      let pipes_to_clean = Vec::new();
-      drop(coordinator);
-      perform_final_pipe_cleanup(core_arc.clone(), socket_logic_strong, pipes_to_clean).await;
+
+      // If this was the last pending entity, advance the state machine.
+      if was_last_pending {
+        tracing::debug!(
+          handle = core_handle,
+          "All children/connections now stopped. Moving to Lingering."
+        );
+        coordinator.state = ShutdownPhase::Lingering;
+        let linger_opt = core_arc.core_state.read().options.linger;
+        coordinator.start_linger_if_needed(linger_opt, core_handle);
+        // The main loop's linger check will handle the rest.
+      }
+    }
+    // If the event arrives while Lingering or later, it's a late arrival.
+    // The resource cleanup was still important, but we don't need to touch the counter.
+    ShutdownPhase::Lingering | ShutdownPhase::CleaningPipes | ShutdownPhase::Finished => {
+      tracing::debug!(
+          handle = core_handle,
+          child_id = stopped_actor_id,
+          "Received late ActorStopping event during phase {:?}. Cleanup already done.",
+          coordinator.state
+      );
     }
   }
 }
@@ -455,7 +499,9 @@ pub(crate) async fn check_and_advance_linger(
     return Ok(());
   }
 
-  if coordinator.linger_deadline.is_none() && core_arc.core_state.read().options.linger != Some(Duration::ZERO) {
+  if coordinator.linger_deadline.is_none()
+    && core_arc.core_state.read().options.linger != Some(Duration::ZERO)
+  {
     let linger_opt = core_arc.core_state.read().options.linger;
     coordinator.start_linger_if_needed(linger_opt, core_handle);
   }
@@ -511,7 +557,7 @@ pub(crate) async fn perform_final_pipe_cleanup(
   };
 
   let _ = pipes_tx_map.drain();
-  
+
   for (id, handle) in reader_tasks_map.drain() {
     handle.abort();
     tracing::trace!(handle = core_handle, pipe_id = id, "Aborted pipe reader.");
@@ -534,7 +580,11 @@ pub(crate) async fn perform_final_pipe_cleanup(
   }
 
   {
-    core_arc.core_state.write().pipe_read_id_to_endpoint_uri.clear();
+    core_arc
+      .core_state
+      .write()
+      .pipe_read_id_to_endpoint_uri
+      .clear();
     #[cfg(feature = "io-uring")]
     {
       for fd_to_unreg in core_arc.core_state.read().uring_fd_to_endpoint_uri.keys() {
@@ -570,99 +620,4 @@ pub(crate) async fn perform_final_pipe_cleanup(
     handle = core_handle,
     "SocketCore final cleanup complete. Shutdown finished."
   );
-}
-
-/// Specific helper called by UringFdError processing to ensure connection is closed and state cleaned.
-/// This is a targeted cleanup for a specific connection that errored out.
-#[cfg(feature = "io-uring")]
-pub(crate) async fn handle_failed_uring_fd_connection(
-  core_arc: Arc<SocketCore>,
-  socket_logic_strong: &Arc<dyn ISocket>,
-  fd: std::os::unix::io::RawFd,
-  uri_of_fd: &str, // Resolved URI of the FD connection
-  error: &ZmqError,
-) {
-  use crate::socket::core::command_processor;
-
-  let core_handle = core_arc.handle;
-  tracing::warn!(handle=core_handle, %fd, uri=%uri_of_fd, %error, "Handling failed Uring FD connection.");
-
-  // 1. Find the EndpointInfo and ISocketConnection for this FD.
-  let (conn_iface_opt, synthetic_read_id_opt) = {
-    let core_s_read = core_arc.core_state.read();
-    let ep_info_opt = core_s_read.endpoints.get(uri_of_fd);
-    (
-      ep_info_opt.map(|ei| ei.connection_iface.clone()),
-      ep_info_opt.and_then(|ei| ei.pipe_ids.map(|pids| pids.1)),
-    )
-  };
-
-  // 2. Attempt to gracefully close the connection via its interface.
-  //    UringFdConnection.close_connection() will send ShutdownConnectionHandler to UringWorker.
-  if let Some(conn_iface) = conn_iface_opt {
-    if let Err(e) = conn_iface.close_connection().await {
-      tracing::warn!(handle=core_handle, %fd, uri=%uri_of_fd, "Error during UringFdConnection.close_connection(): {}", e);
-    }
-  } else {
-    tracing::warn!(handle=core_handle, %fd, uri=%uri_of_fd, "No ISocketConnection found to close for failed Uring FD.");
-  }
-
-  // 3. Notify ISocket logic about the "pipe" (FD) detachment.
-  if let Some(s_read_id) = synthetic_read_id_opt {
-    socket_logic_strong.pipe_detached(s_read_id).await;
-  }
-
-  // 4. Clean up SocketCore's internal state for this FD/connection.
-  //    This reuses cleanup_stopped_child_resources.
-  //    The 'stopped_child_actor_id' is fd as usize.
-  //    'actor_type' is conceptually Session.
-  //    'is_full_core_shutdown' is false because this is a specific connection failure.
-  pipe_manager::cleanup_stopped_child_resources(
-    core_arc.clone(),
-    socket_logic_strong,
-    fd as usize,
-    ActorType::Session, // Or a dedicated ActorType::UringConnection
-    Some(uri_of_fd),
-    Some(error), // The error that triggered this
-    false,       // Not a full core shutdown
-  )
-  .await;
-
-  // 5. If this was an outbound connection, potentially trigger reconnect logic.
-  //    This needs the original target_endpoint_uri.
-  let should_reconnect_and_target_uri_opt: Option<String> = {
-    let core_s_read = core_arc.core_state.read(); // Re-lock if needed, or pass from above
-                                                  // Check if this URI was an outbound connection
-    let is_outbound = core_s_read
-      .endpoints
-      .get(uri_of_fd)
-      .map_or(false, |ei| ei.is_outbound_connection);
-    let target_uri = core_s_read
-      .endpoints
-      .get(uri_of_fd)
-      .and_then(|ei| ei.target_endpoint_uri.clone());
-
-    if is_outbound
-      && target_uri.is_some()
-      && core_s_read.options.reconnect_ivl.map_or(false, |d| d != Duration::ZERO)
-      && !crate::transport::tcp::is_fatal_connect_error(error)
-    {
-      target_uri
-    } else {
-      None
-    }
-  };
-
-  if let Some(target_uri_to_reconnect) = should_reconnect_and_target_uri_opt {
-    if !target_uri_to_reconnect.starts_with("inproc://") {
-      // No auto-reconnect for inproc
-      tracing::info!(
-          handle = core_handle,
-          target_uri = %target_uri_to_reconnect,
-          failed_fd = fd,
-          "Uring FD connection failed. Attempting to respawn connecter."
-      );
-      command_processor::respawn_connecter_actor(core_arc, socket_logic_strong.clone(), target_uri_to_reconnect).await;
-    }
-  }
 }

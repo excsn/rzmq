@@ -16,9 +16,9 @@ use crate::transport::inproc; // For inproc bind/connect directly
 use crate::transport::ipc::{IpcConnecter, IpcListener};
 use crate::transport::tcp::{TcpConnecter, TcpListener}; // For TCP bind/connect
 
+use fibre::oneshot;
 use std::sync::Arc;
 use std::time::Duration;
-use fibre::oneshot;
 
 /// Processes a command received on SocketCore's command mailbox.
 /// Returns Ok(()) if processed, or Err(ZmqError) for fatal errors that should stop SocketCore.
@@ -39,13 +39,51 @@ pub(crate) async fn process_socket_command(
     match command {
       // Allow UserClose and Stop even if shutting down to ensure shutdown completes.
       Command::UserClose { reply_tx } => {
-        tracing::info!(handle = core_handle, "Processing UserClose command during shutdown.");
+        tracing::info!(
+          handle = core_handle,
+          "Processing UserClose command during shutdown."
+        );
         shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
         let _ = reply_tx.send(Ok(()));
       }
       Command::Stop => {
-        tracing::info!(handle = core_handle, "Processing Stop command during shutdown.");
+        tracing::info!(
+          handle = core_handle,
+          "Processing Stop command during shutdown."
+        );
         shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
+      }
+      // These events can arrive from the UringWorker after we've already initiated a shutdown.
+      // It's safe to ignore them as the shutdown process will clean up the corresponding FD.
+      #[cfg(feature = "io-uring")]
+      Command::UringFdError { fd, error } => {
+        // This is the key insight: A UringFdError is functionally identical to an
+        // ActorStopping event for a session. It signifies the termination of a "child" connection.
+        // By calling the same handler, we unify the cleanup logic and ensure the
+        // ShutdownCoordinator is always updated correctly, regardless of timing.
+        tracing::debug!(handle=core_handle, %fd, %error, "UringFdError received. Treating as ActorStopping event.");
+
+        let endpoint_uri_opt = core_arc
+          .core_state
+          .read()
+          .uring_fd_to_endpoint_uri
+          .get(&fd)
+          .cloned();
+
+        // We pass the FD as the `stopped_actor_id` and ActorType::Session.
+        shutdown::handle_actor_stopping_event(
+          core_arc.clone(),
+          socket_logic_strong,
+          fd as usize,
+          ActorType::Session,
+          endpoint_uri_opt.as_deref(),
+          Some(&error),
+        )
+        .await;
+      }
+      #[cfg(feature = "io-uring")]
+      Command::UringFdHandshakeComplete { fd, .. } => {
+        tracing::debug!(handle = core_handle, %fd, "Ignoring UringFdHandshakeComplete during shutdown.");
       }
       // For other commands, if shutting down, reply with an error or ignore.
       Command::UserBind { reply_tx, .. }
@@ -55,13 +93,19 @@ pub(crate) async fn process_socket_command(
       | Command::UserSetOpt { reply_tx, .. }
       | Command::UserMonitor { reply_tx, .. } => {
         tracing::warn!(handle = core_handle, cmd_name = %command_name_str, "Command ignored: SocketCore is shutting down.");
-        let _ = reply_tx.send(Err(ZmqError::InvalidState("Socket is shutting down".into())));
+        let _ = reply_tx.send(Err(ZmqError::InvalidState(
+          "Socket is shutting down".into(),
+        )));
       }
       Command::UserRecv { reply_tx } => {
-        let _ = reply_tx.send(Err(ZmqError::InvalidState("Socket is shutting down".into())));
+        let _ = reply_tx.send(Err(ZmqError::InvalidState(
+          "Socket is shutting down".into(),
+        )));
       }
       Command::UserGetOpt { reply_tx, .. } => {
-        let _ = reply_tx.send(Err(ZmqError::InvalidState("Socket is shutting down".into())));
+        let _ = reply_tx.send(Err(ZmqError::InvalidState(
+          "Socket is shutting down".into(),
+        )));
       }
       // UserSend is fire-and-forget, log and drop.
       Command::UserSend { .. } => {
@@ -110,16 +154,23 @@ pub(crate) async fn process_socket_command(
       value,
       reply_tx,
     } => {
-      let _ = reply_tx.send(handle_set_option(core_arc.clone(), socket_logic_strong, option, &value).await);
+      let _ = reply_tx
+        .send(handle_set_option(core_arc.clone(), socket_logic_strong, option, &value).await);
     }
     Command::UserGetOpt { option, reply_tx } => {
       let _ = reply_tx.send(handle_get_option(core_arc.clone(), socket_logic_strong, option).await);
     }
-    Command::UserMonitor { monitor_tx, reply_tx } => {
+    Command::UserMonitor {
+      monitor_tx,
+      reply_tx,
+    } => {
       handle_user_monitor(core_arc.clone(), monitor_tx, reply_tx).await;
     }
     Command::UserClose { reply_tx } => {
-      tracing::info!(handle = core_handle, "SocketCore received UserClose command.");
+      tracing::info!(
+        handle = core_handle,
+        "SocketCore received UserClose command."
+      );
       // Publish event first, then initiate shutdown
       shutdown::publish_socket_closing_event(&core_arc.context, core_handle).await;
       shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
@@ -127,7 +178,10 @@ pub(crate) async fn process_socket_command(
     }
     Command::Stop => {
       // Direct stop command to SocketCore
-      tracing::info!(handle = core_handle, "SocketCore received direct Stop command.");
+      tracing::info!(
+        handle = core_handle,
+        "SocketCore received direct Stop command."
+      );
       // Publish event first, then initiate shutdown
       shutdown::publish_socket_closing_event(&core_arc.context, core_handle).await;
       shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
@@ -136,7 +190,12 @@ pub(crate) async fn process_socket_command(
     // --- Uring Specific Commands ---
     #[cfg(feature = "io-uring")]
     Command::UringFdMessage { fd, msg } => {
-      let endpoint_uri_opt = core_arc.core_state.read().uring_fd_to_endpoint_uri.get(&fd).cloned();
+      let endpoint_uri_opt = core_arc
+        .core_state
+        .read()
+        .uring_fd_to_endpoint_uri
+        .get(&fd)
+        .cloned();
       if let Some(uri) = endpoint_uri_opt {
         // The synthetic_read_id is what ISocket knows this FD by.
         // We need to find it from the EndpointInfo associated with this FD/URI.
@@ -152,7 +211,10 @@ pub(crate) async fn process_socket_command(
             pipe_id: s_read_id,
             msg,
           };
-          if let Err(e) = socket_logic_strong.handle_pipe_event(s_read_id, cmd_for_isocket).await {
+          if let Err(e) = socket_logic_strong
+            .handle_pipe_event(s_read_id, cmd_for_isocket)
+            .await
+          {
             tracing::error!(handle=core_handle, %fd, "Error from ISocket::handle_pipe_event for UringFdMessage: {}", e);
             // This error might require closing the UringFdConnection.
             // The error should ideally propagate from ISocket::handle_pipe_event if it's fatal for the "pipe".
@@ -166,7 +228,12 @@ pub(crate) async fn process_socket_command(
     }
     #[cfg(feature = "io-uring")]
     Command::UringFdError { fd, error } => {
-      let endpoint_uri_opt = core_arc.core_state.read().uring_fd_to_endpoint_uri.get(&fd).cloned();
+      let endpoint_uri_opt = core_arc
+        .core_state
+        .read()
+        .uring_fd_to_endpoint_uri
+        .get(&fd)
+        .cloned();
 
       if let Some(uri) = endpoint_uri_opt {
         let conn_iface_opt;
@@ -217,7 +284,12 @@ pub(crate) async fn process_socket_command(
     #[cfg(feature = "io-uring")]
     Command::UringFdHandshakeComplete { fd, peer_identity } => {
       // Find the endpoint URI associated with this FD
-      let endpoint_uri_opt = core_arc.core_state.read().uring_fd_to_endpoint_uri.get(&fd).cloned();
+      let endpoint_uri_opt = core_arc
+        .core_state
+        .read()
+        .uring_fd_to_endpoint_uri
+        .get(&fd)
+        .cloned();
       if let Some(uri) = endpoint_uri_opt {
         // Find the synthetic pipe_read_id for this connection
         // This ID is what ISocket uses to identify the "pipe" to this peer.
@@ -234,13 +306,17 @@ pub(crate) async fn process_socket_command(
               "SocketCore: Processing UringFdHandshakeComplete. Notifying ISocket."
           );
           // Notify the ISocket pattern logic (e.g., RouterSocket) about the identity.
-          socket_logic_strong.update_peer_identity(s_read_id, peer_identity).await;
+          socket_logic_strong
+            .update_peer_identity(s_read_id, peer_identity)
+            .await;
 
           // Emit HandshakeSucceeded monitor event for io_uring path
           core_arc
             .core_state
             .read()
-            .send_monitor_event(SocketEvent::HandshakeSucceeded { endpoint: uri.clone() });
+            .send_monitor_event(SocketEvent::HandshakeSucceeded {
+              endpoint: uri.clone(),
+            });
         } else {
           tracing::warn!(
               handle = core_handle, %fd, %uri,
@@ -388,7 +464,8 @@ async fn handle_user_bind(
     }
     #[cfg(feature = "inproc")]
     Ok(Endpoint::Inproc(ref name)) => {
-      let is_already_bound_by_this_socket = core_arc.core_state.read().bound_inproc_names.contains(name);
+      let is_already_bound_by_this_socket =
+        core_arc.core_state.read().bound_inproc_names.contains(name);
       if is_already_bound_by_this_socket {
         bind_result = Err(ZmqError::AddrInUse(format!("inproc://{}", name)));
       } else {
@@ -423,10 +500,13 @@ async fn handle_user_bind(
       tracing::error!(handle=core_handle, %endpoint, "Bind OK but no actual_uri_for_state_update. Internal logic error.");
     }
   } else if let Err(ref e) = bind_result {
-    core_arc.core_state.read().send_monitor_event(SocketEvent::BindFailed {
-      endpoint: endpoint.clone(),
-      error_msg: format!("{}", e),
-    });
+    core_arc
+      .core_state
+      .read()
+      .send_monitor_event(SocketEvent::BindFailed {
+        endpoint: endpoint.clone(),
+        error_msg: format!("{}", e),
+      });
   }
 
   let _ = reply_tx.send(bind_result);
@@ -443,10 +523,16 @@ async fn handle_user_connect(
 
   let parse_result = parse_endpoint(&endpoint_uri);
   match parse_result {
-    Ok(Endpoint::Tcp(_, ref parsed_uri_for_connecter)) | Ok(Endpoint::Ipc(_, ref parsed_uri_for_connecter)) => {
+    Ok(Endpoint::Tcp(_, ref parsed_uri_for_connecter))
+    | Ok(Endpoint::Ipc(_, ref parsed_uri_for_connecter)) => {
       // For TCP/IPC, spawn a Connecter actor.
       // The URI passed to respawn_connecter_actor should be the one used for connection attempts.
-      respawn_connecter_actor(core_arc.clone(), socket_logic, parsed_uri_for_connecter.clone()).await;
+      respawn_connecter_actor(
+        core_arc.clone(),
+        socket_logic,
+        parsed_uri_for_connecter.clone(),
+      )
+      .await;
       let _ = reply_tx.send(Ok(())); // UserConnect is async, Ok(()) means attempt initiated.
     }
     #[cfg(feature = "inproc")]
@@ -471,8 +557,11 @@ async fn handle_user_connect(
 
 /// Spawns a new connecter actor for the given target URI.
 /// This is called by `handle_user_connect` and potentially by `cleanup_stopped_child_resources` for reconnects.
-pub(crate) async fn respawn_connecter_actor(core_arc: Arc<SocketCore>,
-    socket_logic: Arc<dyn ISocket>, target_uri: String) {
+pub(crate) async fn respawn_connecter_actor(
+  core_arc: Arc<SocketCore>,
+  socket_logic: Arc<dyn ISocket>,
+  target_uri: String,
+) {
   let core_handle = core_arc.handle;
   let parent_socket_id = core_handle; // SocketCore is the parent
   let context_clone = core_arc.context.clone();
@@ -494,7 +583,7 @@ pub(crate) async fn respawn_connecter_actor(core_arc: Arc<SocketCore>,
         connecter_actor_handle,
         target_uri.clone(), // Pass the target_uri
         options_clone,
-          socket_logic,
+        socket_logic,
         handle_source_clone,
         monitor_tx_clone,
         context_clone,
@@ -516,7 +605,7 @@ pub(crate) async fn respawn_connecter_actor(core_arc: Arc<SocketCore>,
         target_uri.clone(),
         path_buf,
         options_clone,
-          socket_logic,
+        socket_logic,
         handle_source_clone,
         monitor_tx_clone,
         context_clone,
@@ -545,7 +634,12 @@ pub(crate) async fn respawn_connecter_actor(core_arc: Arc<SocketCore>,
 }
 
 /// Handles the ConnectionAttemptFailed system event.
-pub(crate) async fn handle_connect_failed_event(core_arc: Arc<SocketCore>, socket_logic: Arc<dyn ISocket + 'static>, target_uri: String, error: ZmqError) {
+pub(crate) async fn handle_connect_failed_event(
+  core_arc: Arc<SocketCore>,
+  socket_logic: Arc<dyn ISocket + 'static>,
+  target_uri: String,
+  error: ZmqError,
+) {
   let core_handle = core_arc.handle;
   tracing::warn!(handle = core_handle, uri = %target_uri, error = %error, "ConnectionAttemptFailed event received.");
 
@@ -597,7 +691,9 @@ async fn handle_user_disconnect(
     }
   } else {
     for (resolved_uri, ep_info) in core_arc.core_state.read().endpoints.iter() {
-      if ep_info.endpoint_type == EndpointType::Session && ep_info.target_endpoint_uri.as_deref() == Some(&endpoint) {
+      if ep_info.endpoint_type == EndpointType::Session
+        && ep_info.target_endpoint_uri.as_deref() == Some(&endpoint)
+      {
         endpoint_info_to_close = Some((resolved_uri.clone(), ep_info.connection_iface.clone()));
         break;
       }
@@ -675,13 +771,20 @@ async fn handle_user_unbind(
       let name_part = endpoint.strip_prefix("inproc://").unwrap_or("");
       let mut was_removed_locally = false;
       if !name_part.is_empty() {
-        was_removed_locally = core_arc.core_state.write().bound_inproc_names.remove(name_part);
+        was_removed_locally = core_arc
+          .core_state
+          .write()
+          .bound_inproc_names
+          .remove(name_part);
       }
       if was_removed_locally {
         inproc::unbind_inproc(name_part, &core_arc.context).await; // Global unregister
-        core_arc.core_state.read().send_monitor_event(SocketEvent::Closed {
-          endpoint: endpoint.clone(),
-        });
+        core_arc
+          .core_state
+          .read()
+          .send_monitor_event(SocketEvent::Closed {
+            endpoint: endpoint.clone(),
+          });
         unbind_result = Ok(());
       } else if !was_removed_locally && !name_part.is_empty() {
         unbind_result = Err(ZmqError::InvalidArgument(format!(
@@ -720,7 +823,9 @@ async fn handle_set_option(
     Err(e) => return Err(e), // Pattern returned a different error
   }
 
-  update_core_option(&core_arc, |opts| options::apply_core_option_value(opts, option, value))
+  update_core_option(&core_arc, |opts| {
+    options::apply_core_option_value(opts, option, value)
+  })
 }
 
 pub(crate) fn update_core_option<F>(core_arc: &SocketCore, applier: F) -> Result<(), ZmqError>

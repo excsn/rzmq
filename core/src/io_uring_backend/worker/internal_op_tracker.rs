@@ -81,9 +81,14 @@ impl InternalOpTracker {
     if self.next_id == 0 {
       self.next_id = 1_000_000_000;
     }
-    self
-      .op_to_details
-      .insert(id, InternalOpDetails { fd, op_type, payload });
+    self.op_to_details.insert(
+      id,
+      InternalOpDetails {
+        fd,
+        op_type,
+        payload,
+      },
+    );
     id
   }
 
@@ -105,5 +110,19 @@ impl InternalOpTracker {
     self
       .op_to_details
       .retain(|_user_data, details| details.fd != fd_to_remove);
+  }
+
+  /// Finds all UserData for a given FD that match a predicate on the op_type.
+  pub fn find_ops_for_fd(
+    &self,
+    fd_to_find: RawFd,
+    predicate: impl Fn(InternalOpType) -> bool,
+  ) -> Vec<UserData> {
+    self
+      .op_to_details
+      .iter()
+      .filter(|(_, details)| details.fd == fd_to_find && predicate(details.op_type))
+      .map(|(user_data, _)| *user_data)
+      .collect()
   }
 }

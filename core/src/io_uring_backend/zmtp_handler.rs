@@ -3,8 +3,8 @@
 use super::buffer_manager::BufferRingManager;
 use super::worker::InternalOpTracker;
 use crate::io_uring_backend::connection_handler::{
-  HandlerIoOps, HandlerSqeBlueprint, HandlerUpstreamEvent, ProtocolHandlerFactory, UringConnectionHandler,
-  UringWorkerInterface, UserData, WorkerIoConfig,
+  HandlerIoOps, HandlerSqeBlueprint, HandlerUpstreamEvent, ProtocolHandlerFactory,
+  UringConnectionHandler, UringWorkerInterface, UserData, WorkerIoConfig,
 };
 use crate::io_uring_backend::ops::{ProtocolConfig, HANDLER_INTERNAL_SEND_OP_UD};
 use crate::io_uring_backend::worker::MultishotReader;
@@ -16,7 +16,9 @@ use crate::protocol::zmtp::{
 };
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
-use crate::security::{negotiate_security_mechanism, IDataCipher, Mechanism, NullMechanism, PlainMechanism};
+use crate::security::{
+  negotiate_security_mechanism, IDataCipher, Mechanism, NullMechanism, PlainMechanism,
+};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::{Blob, ZmqError};
 
@@ -30,7 +32,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use tokio_util::codec::Encoder;
 use tracing::{debug, error, info, trace, warn};
 
-const ZC_SEND_THRESHOLD: usize = 4096;
+const ZC_SEND_THRESHOLD: usize = 1024;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ZmtpHandlerPhase {
@@ -46,6 +48,7 @@ enum ZmtpHandlerPhase {
   ReadyServerSend,
   DataPhase,
   Error,
+  Closing,
   Closed,
 }
 
@@ -75,7 +78,7 @@ pub struct ZmtpUringHandler {
 
   handshake_timeout: Duration,
   handshake_timeout_deadline: Instant,
-  read_is_pending: bool,
+  pending_read_op_ud: Option<UserData>,
 
   peer_identity_from_security: Option<Blob>,
   peer_identity_from_ready: Option<Blob>,
@@ -87,7 +90,9 @@ pub struct ZmtpUringHandler {
 
 impl ZmtpUringHandler {
   pub fn new(fd: RawFd, zmtp_config_arg: Arc<ZmtpEngineConfig>, is_server: bool) -> Self {
-    let handshake_timeout_duration = zmtp_config_arg.handshake_timeout.unwrap_or(Duration::from_secs(30));
+    let handshake_timeout_duration = zmtp_config_arg
+      .handshake_timeout
+      .unwrap_or(Duration::from_secs(30));
     let heartbeat_timeout_val = zmtp_config_arg.heartbeat_timeout.unwrap_or_else(|| {
       zmtp_config_arg
         .heartbeat_ivl
@@ -115,7 +120,7 @@ impl ZmtpUringHandler {
       outgoing_multipart_app_messages: VecDeque::new(),
       handshake_timeout: handshake_timeout_duration,
       handshake_timeout_deadline: Instant::now() + handshake_timeout_duration,
-      read_is_pending: false,
+      pending_read_op_ud: None,
       peer_identity_from_security: None,
       peer_identity_from_ready: None,
       final_peer_identity: None,
@@ -133,13 +138,17 @@ impl ZmtpUringHandler {
 
   /// Encodes a Vec<Msg> (representing ZMTP frames) into a Vec<Bytes> (wire frames).
   /// Applies encryption if a data_cipher is active.
-  fn zmtp_encode_and_encrypt_frames(&mut self, zmtp_frames: Vec<Msg>) -> Result<Vec<Bytes>, ZmqError> {
+  fn zmtp_encode_and_encrypt_frames(
+    &mut self,
+    zmtp_frames: Vec<Msg>,
+  ) -> Result<Vec<Bytes>, ZmqError> {
     let mut wire_frames = Vec::with_capacity(zmtp_frames.len());
     for frame in zmtp_frames {
       // ZMTP encode individual frame (already has its flags)
       let zmtp_encoded_bytes = Self::zmtp_encode_msg_to_bytes(&frame)?;
       // Encrypt if needed
-      let wire_frame_bytes = Self::apply_encryption_if_needed(self.data_cipher.as_mut(), zmtp_encoded_bytes)?;
+      let wire_frame_bytes =
+        Self::apply_encryption_if_needed(self.data_cipher.as_mut(), zmtp_encoded_bytes)?;
       wire_frames.push(wire_frame_bytes);
     }
     Ok(wire_frames)
@@ -157,22 +166,45 @@ impl ZmtpUringHandler {
   }
 
   /// Ensures a standard (single-shot) ring read is requested if conditions are met.
-  fn ensure_standard_read_is_pending(&mut self, ops: &mut HandlerIoOps, interface: &UringWorkerInterface<'_>) {
+  fn ensure_standard_read_is_pending(
+    &mut self,
+    ops: &mut HandlerIoOps,
+    interface: &UringWorkerInterface<'_>,
+  ) {
     if self.multishot_reader.is_some() && self.multishot_reader.as_ref().unwrap().is_active() {
       // Multishot is active, don't submit a standard read.
       return;
     }
-    if !self.read_is_pending && !matches!(self.phase, ZmtpHandlerPhase::Closed | ZmtpHandlerPhase::Error) {
+
+    // Check if a standard read is already pending.
+    if self.pending_read_op_ud.is_none()
+      && !matches!(
+        self.phase,
+        ZmtpHandlerPhase::Closed | ZmtpHandlerPhase::Error
+      )
+    {
       if interface.default_buffer_group_id().is_some() {
-        ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestRingRead);
-        self.read_is_pending = true;
-        trace!(fd = self.fd, "ZmtpUringHandler: Requested standard RingRead.");
+        // The handler requests the read. It no longer sets a flag here.
+        // The worker will assign a UD and the handler will be notified if needed,
+        // but for a simple single-shot read, we just need to know it's complete
+        // via `handle_internal_sqe_completion`.
+        ops
+          .sqe_blueprints
+          .push(HandlerSqeBlueprint::RequestRingRead);
+        trace!(
+          fd = self.fd,
+          "ZmtpUringHandler: Requested standard RingRead."
+        );
+        // We will set `pending_read_op_ud` when the worker confirms the submission,
+        // or more simply, we clear it when the read CQE arrives. Let's start with clearing on
       } else {
         error!(
           fd = self.fd,
           "ZmtpUringHandler: Critical - Cannot request standard read, no default_bgid configured for worker."
         );
-        let err = ZmqError::Internal("Standard read required but not configured in worker (no default_bgid).".into());
+        let err = ZmqError::Internal(
+          "Standard read required but not configured in worker (no default_bgid).".into(),
+        );
 
         let mut temp_ops = std::mem::take(ops);
         self.transition_to_error(&mut temp_ops, err.clone(), interface);
@@ -181,7 +213,12 @@ impl ZmtpUringHandler {
     }
   }
 
-  fn transition_to_error(&mut self, ops: &mut HandlerIoOps, error: ZmqError, interface: &UringWorkerInterface<'_>) {
+  fn transition_to_error(
+    &mut self,
+    ops: &mut HandlerIoOps,
+    error: ZmqError,
+    interface: &UringWorkerInterface<'_>,
+  ) {
     if self.phase == ZmtpHandlerPhase::Error || self.phase == ZmtpHandlerPhase::Closed {
       return;
     }
@@ -224,7 +261,10 @@ impl ZmtpUringHandler {
       if !id_blob.is_empty() && id_blob.len() <= 255 {
         props.insert("Identity".to_string(), id_blob.to_vec());
       } else if id_blob.is_empty() {
-        trace!(fd = self.fd, "Local routing_id is empty, not sending in READY.");
+        trace!(
+          fd = self.fd,
+          "Local routing_id is empty, not sending in READY."
+        );
       } else {
         warn!(
           fd = self.fd,
@@ -236,7 +276,10 @@ impl ZmtpUringHandler {
     props
   }
 
-  fn signal_upstream_handshake_complete(&mut self, interface: &UringWorkerInterface<'_>) -> Result<(), ZmqError> {
+  fn signal_upstream_handshake_complete(
+    &mut self,
+    interface: &UringWorkerInterface<'_>,
+  ) -> Result<(), ZmqError> {
     self.final_peer_identity = self
       .peer_identity_from_ready
       .clone()
@@ -302,7 +345,8 @@ impl ZmtpUringHandler {
             fd = self.fd,
             "ZmtpHandler in Initial phase during process_buffered_reads. This is a bug."
           );
-          let err = ZmqError::InvalidState("ZmtpHandler in Initial phase during data processing".into());
+          let err =
+            ZmqError::InvalidState("ZmtpHandler in Initial phase during data processing".into());
           self.transition_to_error(ops, err.clone(), interface);
           return Err(err);
         }
@@ -356,7 +400,9 @@ impl ZmtpUringHandler {
               // Server sends its greeting in response
               let mut greeting_to_send_buf = BytesMut::with_capacity(GREETING_LENGTH);
               ZmtpGreeting::encode(
-                self.zmtp_config.security_mechanism_bytes_to_propose(self.is_server),
+                self
+                  .zmtp_config
+                  .security_mechanism_bytes_to_propose(self.is_server),
                 true,
                 &mut greeting_to_send_buf,
               );
@@ -462,7 +508,10 @@ impl ZmtpUringHandler {
 
               // If there's data from the peer, try to process it.
               if !self.network_read_accumulator.is_empty() {
-                match self.zmtp_parser.decode_from_buffer(&mut self.network_read_accumulator) {
+                match self
+                  .zmtp_parser
+                  .decode_from_buffer(&mut self.network_read_accumulator)
+                {
                   Ok(Some(token_msg_from_peer)) => {
                     debug!(
                       fd = self.fd,
@@ -489,7 +538,8 @@ impl ZmtpUringHandler {
                           "SecurityExchange: Producing response token (len {}).",
                           response_token_vec.len()
                         );
-                        let response_token_msg = Msg::from_vec(response_token_vec).with_flags(MsgFlags::COMMAND);
+                        let response_token_msg =
+                          Msg::from_vec(response_token_vec).with_flags(MsgFlags::COMMAND);
                         ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
                           data: Self::zmtp_encode_msg_to_bytes(&response_token_msg)?,
                           send_op_flags: 0, // Security tokens are ZMTP command frames, usually single.
@@ -507,7 +557,8 @@ impl ZmtpUringHandler {
                   }
                   Err(e) => {
                     mechanism_had_error = true;
-                    error_reason_from_mechanism = format!("Failed to parse ZMTP frame for security token: {}", e);
+                    error_reason_from_mechanism =
+                      format!("Failed to parse ZMTP frame for security token: {}", e);
                   }
                 }
               }
@@ -523,7 +574,8 @@ impl ZmtpUringHandler {
                     sec_mech_ref.name()
                   );
                   mechanism_name_for_log_on_completion = sec_mech_ref.name();
-                  peer_id_from_sec_mech_on_completion = sec_mech_ref.peer_identity().map(Blob::from);
+                  peer_id_from_sec_mech_on_completion =
+                    sec_mech_ref.peer_identity().map(Blob::from);
                   should_transition_out_of_security_exchange = true;
                 } else if sec_mech_ref.is_error() {
                   mechanism_had_error = true; // Mark that the mechanism itself reported an error
@@ -555,22 +607,26 @@ impl ZmtpUringHandler {
               }
             }
           } else {
-            let err =
-              ZmqError::InvalidState("CRITICAL: Security mechanism is None while in SecurityExchange phase.".into());
+            let err = ZmqError::InvalidState(
+              "CRITICAL: Security mechanism is None while in SecurityExchange phase.".into(),
+            );
             self.transition_to_error(ops, err.clone(), interface);
             return Err(err);
           }
 
           if should_transition_out_of_security_exchange {
-            trace!(fd = self.fd, "SecurityExchange: Executing transition post-completion.");
+            trace!(
+              fd = self.fd,
+              "SecurityExchange: Executing transition post-completion."
+            );
             self.peer_identity_from_security = peer_id_from_sec_mech_on_completion;
 
-            let taken_mechanism = self
-              .security_mechanism
-              .take()
-              .expect("INTERNAL ERROR: security_mechanism was Some but now None before take for transition");
+            let taken_mechanism = self.security_mechanism.take().expect(
+              "INTERNAL ERROR: security_mechanism was Some but now None before take for transition",
+            );
 
-            let (cipher, _final_peer_id_from_sec_mech) = taken_mechanism.into_data_cipher_parts()?;
+            let (cipher, _final_peer_id_from_sec_mech) =
+              taken_mechanism.into_data_cipher_parts()?;
             self.data_cipher = Some(cipher);
 
             let old_phase_before_transition = self.phase;
@@ -604,7 +660,10 @@ impl ZmtpUringHandler {
           if self.network_read_accumulator.is_empty() {
             break 'phase_processing_loop; /* Need data */
           }
-          match self.zmtp_parser.decode_from_buffer(&mut self.network_read_accumulator) {
+          match self
+            .zmtp_parser
+            .decode_from_buffer(&mut self.network_read_accumulator)
+          {
             Ok(Some(ready_msg_from_client)) => {
               progress_this_iteration = true;
               match ZmtpCommand::parse(&ready_msg_from_client) {
@@ -619,7 +678,10 @@ impl ZmtpUringHandler {
 
                   // Server now sends its own READY
                   let server_ready_msg = ZmtpReady::create_msg(self.build_ready_properties());
-                  debug!("[ZmtpHandler FD={}] S: Adding its ZMTP READY Send blueprint.", self.fd);
+                  debug!(
+                    "[ZmtpHandler FD={}] S: Adding its ZMTP READY Send blueprint.",
+                    self.fd
+                  );
                   ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
                     data: Self::zmtp_encode_msg_to_bytes(&server_ready_msg)?,
                     send_op_flags: 0, // ZMTP READY is a single ZMTP command frame.
@@ -628,7 +690,9 @@ impl ZmtpUringHandler {
                   self.phase = ZmtpHandlerPhase::ReadyServerSend;
                 }
                 _ => {
-                  let err = ZmqError::ProtocolViolation("S: Expected READY from client, got other/unparseable".into());
+                  let err = ZmqError::ProtocolViolation(
+                    "S: Expected READY from client, got other/unparseable".into(),
+                  );
                   self.transition_to_error(ops, err.clone(), interface);
                   return Err(err);
                 }
@@ -649,7 +713,10 @@ impl ZmtpUringHandler {
           if self.network_read_accumulator.is_empty() {
             break 'phase_processing_loop; /* Need data */
           }
-          match self.zmtp_parser.decode_from_buffer(&mut self.network_read_accumulator) {
+          match self
+            .zmtp_parser
+            .decode_from_buffer(&mut self.network_read_accumulator)
+          {
             Ok(Some(ready_msg_from_server)) => {
               progress_this_iteration = true;
               match ZmtpCommand::parse(&ready_msg_from_server) {
@@ -670,7 +737,9 @@ impl ZmtpUringHandler {
                   self.signal_upstream_handshake_complete(interface)?;
                 }
                 _ => {
-                  let err = ZmqError::ProtocolViolation("C: Expected READY from server, got other/unparseable".into());
+                  let err = ZmqError::ProtocolViolation(
+                    "C: Expected READY from server, got other/unparseable".into(),
+                  );
                   self.transition_to_error(ops, err.clone(), interface);
                   return Err(err);
                 }
@@ -698,7 +767,9 @@ impl ZmtpUringHandler {
               {
                 Ok(Some(plaintext_zmtp_frame_bytes)) => {
                   progress_this_iteration = true;
-                  self.plaintext_zmtp_frame_accumulator.put(plaintext_zmtp_frame_bytes);
+                  self
+                    .plaintext_zmtp_frame_accumulator
+                    .put(plaintext_zmtp_frame_bytes);
                 }
                 Ok(None) => break, // Need more encrypted data
                 Err(e) => {
@@ -736,8 +807,10 @@ impl ZmtpUringHandler {
                     Some(ZmtpCommand::Ping(ping_context_payload)) => {
                       let pong_reply_msg = ZmtpCommand::create_pong(&ping_context_payload);
                       let pong_plaintext_bytes = Self::zmtp_encode_msg_to_bytes(&pong_reply_msg)?;
-                      let pong_wire_bytes =
-                        Self::apply_encryption_if_needed(self.data_cipher.as_mut(), pong_plaintext_bytes)?;
+                      let pong_wire_bytes = Self::apply_encryption_if_needed(
+                        self.data_cipher.as_mut(),
+                        pong_plaintext_bytes,
+                      )?;
                       ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
                         data: pong_wire_bytes,
                         send_op_flags: 0, // PONG is a single ZMTP frame, no MSG_MORE.
@@ -790,6 +863,12 @@ impl ZmtpUringHandler {
             }
           }
         }
+        ZmtpHandlerPhase::Closing => {
+          // If we are in the closing state, we should not process any more data from the buffers.
+          // Just wait for the close operation to complete.
+          trace!(fd=self.fd, phase=?self.phase, "ProcessBufferedReads: In Closing phase, ignoring buffered data.");
+          break 'phase_processing_loop;
+        }
         ZmtpHandlerPhase::Error | ZmtpHandlerPhase::Closed => {
           break 'phase_processing_loop; // Final states, no more processing
         }
@@ -800,7 +879,8 @@ impl ZmtpUringHandler {
       // Check if loop should continue:
       // If no data was consumed from any buffer, and no other progress (like phase change) was made in *this iteration*, break.
       let no_greeting_change_outer = self.greeting_buffer.len() == initial_greeting_len_outer;
-      let no_network_acc_change_outer = self.network_read_accumulator.len() == initial_network_acc_len_outer;
+      let no_network_acc_change_outer =
+        self.network_read_accumulator.len() == initial_network_acc_len_outer;
       let no_plaintext_acc_change_outer =
         self.plaintext_zmtp_frame_accumulator.len() == initial_plaintext_acc_len_outer;
 
@@ -853,8 +933,8 @@ impl ZmtpUringHandler {
   /// Helper to take final ZMTP wire frames, decide on ZC/normal send,
   /// and add appropriate blueprints to HandlerIoOps.
   fn add_send_blueprints_for_wire_frames(
-    &self,                                      // Needs &self to access zmtp_config and ZC_SEND_THRESHOLD
-    final_wire_frames: Vec<Bytes>,              // Already ZMTP encoded & encrypted
+    &self,                         // Needs &self to access zmtp_config and ZC_SEND_THRESHOLD
+    final_wire_frames: Vec<Bytes>, // Already ZMTP encoded & encrypted
     originating_op_ud_for_blueprints: UserData, // Actual app UD or sentinel
     ops: &mut HandlerIoOps,
   ) {
@@ -873,7 +953,11 @@ impl ZmtpUringHandler {
 
     for (idx, final_wire_bytes_for_part) in final_wire_frames.into_iter().enumerate() {
       let is_last_logical_part = idx == num_final_wire_frames - 1;
-      let send_op_flags: i32 = if is_last_logical_part { 0 } else { libc::MSG_MORE };
+      let send_op_flags: i32 = if is_last_logical_part {
+        0
+      } else {
+        libc::MSG_MORE
+      };
 
       if self.zmtp_config.use_send_zerocopy && final_wire_bytes_for_part.len() > ZC_SEND_THRESHOLD {
         trace!(
@@ -883,11 +967,13 @@ impl ZmtpUringHandler {
           app_op_ud = originating_op_ud_for_blueprints,
           "ZmtpHandler (helper): Attempting ZC send."
         );
-        ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSendZeroCopy {
-          data_to_send: final_wire_bytes_for_part,
-          send_op_flags,
-          originating_app_op_ud: originating_op_ud_for_blueprints,
-        });
+        ops
+          .sqe_blueprints
+          .push(HandlerSqeBlueprint::RequestSendZeroCopy {
+            data_to_send: final_wire_bytes_for_part,
+            send_op_flags,
+            originating_app_op_ud: originating_op_ud_for_blueprints,
+          });
       } else {
         trace!(
           fd = self.fd,
@@ -907,9 +993,23 @@ impl ZmtpUringHandler {
   }
 }
 
+impl ZmtpUringHandler {
+  pub fn is_closing_or_closed(&self) -> bool {
+    matches!(
+      self.phase,
+      ZmtpHandlerPhase::Closing | ZmtpHandlerPhase::Closed | ZmtpHandlerPhase::Error
+    )
+  }
+}
+
 impl UringConnectionHandler for ZmtpUringHandler {
   fn fd(&self) -> RawFd {
     self.fd
+  }
+
+  fn is_closing_or_closed(&self) -> bool {
+    // Delegate to the public helper method we already created.
+    self.is_closing_or_closed()
   }
 
   fn connection_ready(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
@@ -944,7 +1044,9 @@ impl UringConnectionHandler for ZmtpUringHandler {
       self.phase = ZmtpHandlerPhase::ServerWaitClientGreeting;
     } else {
       let mut greeting_to_send_buf = BytesMut::with_capacity(GREETING_LENGTH);
-      let proposed_mechanism_bytes = self.zmtp_config.security_mechanism_bytes_to_propose(self.is_server);
+      let proposed_mechanism_bytes = self
+        .zmtp_config
+        .security_mechanism_bytes_to_propose(self.is_server);
       ZmtpGreeting::encode(proposed_mechanism_bytes, false, &mut greeting_to_send_buf);
       ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
         data: greeting_to_send_buf.freeze(),
@@ -965,10 +1067,21 @@ impl UringConnectionHandler for ZmtpUringHandler {
   ) -> HandlerIoOps {
     trace!(fd = self.fd, len = buffer_slice.len(), phase = ?self.phase, "ZmtpUringHandler: process_ring_read_data");
     self.last_activity_time = Instant::now();
-    self.read_is_pending = false;
+
+    // This data came from a standard read, so clear the pending UD flag.
+    // The current_external_op_ud on the interface IS the UD of the completed read operation.
+    if self.pending_read_op_ud == Some(interface.current_external_op_ud) {
+      self.pending_read_op_ud = None;
+    }
+
     let mut ops = HandlerIoOps::new();
 
-    if buffer_slice.is_empty() && !matches!(self.phase, ZmtpHandlerPhase::Closed | ZmtpHandlerPhase::Error) {
+    if buffer_slice.is_empty()
+      && !matches!(
+        self.phase,
+        ZmtpHandlerPhase::Closed | ZmtpHandlerPhase::Error
+      )
+    {
       let original_phase_eof = self.phase;
       info!(
         fd = self.fd,
@@ -1019,7 +1132,11 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
 
-    if self.multishot_reader.as_ref().map_or(true, |r| !r.is_active()) {
+    if self
+      .multishot_reader
+      .as_ref()
+      .map_or(true, |r| !r.is_active())
+    {
       self.ensure_standard_read_is_pending(&mut ops, interface);
     }
 
@@ -1028,7 +1145,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
 
   fn handle_internal_sqe_completion(
     &mut self,
-    _sqe_user_data: UserData,
+    sqe_user_data: UserData,
     cqe_result: i32,
     _cqe_flags: u32,
     interface: &UringWorkerInterface<'_>,
@@ -1036,6 +1153,16 @@ impl UringConnectionHandler for ZmtpUringHandler {
     trace!(fd = self.fd, cqe_res = cqe_result, phase = ?self.phase, "ZmtpUringHandler: handle_internal_sqe_completion (likely Send ACK)");
     self.last_activity_time = Instant::now();
     let mut ops = HandlerIoOps::new();
+
+    // If the completed operation was our pending standard read, clear the flag.
+    if self.pending_read_op_ud == Some(sqe_user_data) {
+      self.pending_read_op_ud = None;
+      tracing::trace!(
+        fd = self.fd,
+        ud = sqe_user_data,
+        "Standard read operation completed, clearing pending_read_op_ud."
+      );
+    }
 
     if cqe_result < 0 {
       let io_err = std::io::Error::from_raw_os_error(-cqe_result);
@@ -1074,7 +1201,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
           }
         }
       }
-      ZmtpHandlerPhase::SecurityExchange => {}
+      ZmtpHandlerPhase::SecurityExchange | ZmtpHandlerPhase::Closing => {}
       ZmtpHandlerPhase::ReadyClientSend => {
         self.phase = ZmtpHandlerPhase::ReadyClientWaitServer;
       }
@@ -1107,7 +1234,11 @@ impl UringConnectionHandler for ZmtpUringHandler {
         {
           match self.zmtp_encode_and_encrypt_frames(multipart_msg_parts.clone()) {
             Ok(wire_frames_to_send) => {
-              self.add_send_blueprints_for_wire_frames(wire_frames_to_send, queued_originating_app_op_ud, &mut ops);
+              self.add_send_blueprints_for_wire_frames(
+                wire_frames_to_send,
+                queued_originating_app_op_ud,
+                &mut ops,
+              );
             }
             Err(e) => {
               /* error handling, potentially re-queue with UD or handle error */
@@ -1124,7 +1255,9 @@ impl UringConnectionHandler for ZmtpUringHandler {
               return ops; // Or continue if error is not fatal for other operations
             }
           }
-        } else if let Some((next_app_msg, queued_originating_app_op_ud)) = self.outgoing_app_messages.pop_front() {
+        } else if let Some((next_app_msg, queued_originating_app_op_ud)) =
+          self.outgoing_app_messages.pop_front()
+        {
           // This app_msg needs to be converted into one or more ZMTP wire frames.
           // For example, a REQ socket sends [empty_delimiter_MORE, payload_NOMORE].
           // A PUSH socket sends [payload_NOMORE].
@@ -1134,7 +1267,11 @@ impl UringConnectionHandler for ZmtpUringHandler {
             Ok(wire_frames_to_send) => {
               // This returns Vec<Bytes>
 
-              self.add_send_blueprints_for_wire_frames(wire_frames_to_send, queued_originating_app_op_ud, &mut ops);
+              self.add_send_blueprints_for_wire_frames(
+                wire_frames_to_send,
+                queued_originating_app_op_ud,
+                &mut ops,
+              );
             }
             Err(e) => {
               error!(
@@ -1170,7 +1307,11 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
 
-    if self.multishot_reader.as_ref().map_or(true, |r| !r.is_active()) {
+    if self
+      .multishot_reader
+      .as_ref()
+      .map_or(true, |r| !r.is_active())
+    {
       self.ensure_standard_read_is_pending(&mut ops, interface);
     }
 
@@ -1202,9 +1343,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
           ops.sqe_blueprints.push(blueprint);
         }
       }
-    } else if !self.read_is_pending {
-      // Fallback to standard read - interface is needed for default_buffer_group_id
-      // Let's pass interface to ensure_standard_read_is_pending
+    } else if self.pending_read_op_ud.is_none() {
       self.ensure_standard_read_is_pending(&mut ops, interface);
     }
 
@@ -1240,7 +1379,9 @@ impl UringConnectionHandler for ZmtpUringHandler {
               // Depending on function's return type, may need to `return ops;` or handle error propagation
             }
           }
-        } else if let Some((app_msg_to_send, queued_originating_app_op_ud)) = self.outgoing_app_messages.pop_front() {
+        } else if let Some((app_msg_to_send, queued_originating_app_op_ud)) =
+          self.outgoing_app_messages.pop_front()
+        {
           match self.prepare_zmtp_wire_frames_for_app_msg(app_msg_to_send.clone()) {
             Ok(final_wire_frames_for_single_msg) => {
               self.add_send_blueprints_for_wire_frames(
@@ -1268,7 +1409,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
           if self.waiting_for_pong {
             if let Some(ping_sent_at) = self.last_ping_sent_time {
               if now.duration_since(ping_sent_at) > self.heartbeat_timeout_duration {
-                warn!(fd = self.fd, "PONG timeout in prepare_sqes. Transitioning to error.");
+                warn!(
+                  fd = self.fd,
+                  "PONG timeout in prepare_sqes. Transitioning to error."
+                );
                 let err = ZmqError::Timeout;
                 let mut temp_ops = std::mem::take(&mut ops);
                 self.transition_to_error(&mut temp_ops, err.clone(), interface);
@@ -1281,7 +1425,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
               let ping_msg = ZmtpCommand::create_ping(0, b"hb_ping");
               match Self::zmtp_encode_msg_to_bytes(&ping_msg) {
                 Ok(ping_plaintext_bytes) => {
-                  match Self::apply_encryption_if_needed(self.data_cipher.as_mut(), ping_plaintext_bytes) {
+                  match Self::apply_encryption_if_needed(
+                    self.data_cipher.as_mut(),
+                    ping_plaintext_bytes,
+                  ) {
                     Ok(ping_wire_bytes) => {
                       ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
                         data: ping_wire_bytes,
@@ -1332,7 +1479,11 @@ impl UringConnectionHandler for ZmtpUringHandler {
           match self.zmtp_encode_and_encrypt_frames(app_data_parts_vec.clone()) {
             Ok(wire_frames_to_send) => {
               // wire_frames_to_send is Vec<Bytes>
-              self.add_send_blueprints_for_wire_frames(wire_frames_to_send, originating_app_op_ud, &mut ops);
+              self.add_send_blueprints_for_wire_frames(
+                wire_frames_to_send,
+                originating_app_op_ud,
+                &mut ops,
+              );
             }
             Err(e) => {
               error!(
@@ -1401,48 +1552,36 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
 
-    if self.multishot_reader.as_ref().map_or(true, |r| !r.is_active()) {
+    if self
+      .multishot_reader
+      .as_ref()
+      .map_or(true, |r| !r.is_active())
+    {
       self.ensure_standard_read_is_pending(&mut ops, interface);
     }
     ops
   }
 
-  fn close_initiated(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
-    info!(fd = self.fd, "ZmtpUringHandler: close_initiated called.");
-    let mut ops = HandlerIoOps::new();
-    let previous_phase_on_close = self.phase;
+  fn close_initiated(&mut self, _interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
+    info!(
+      fd = self.fd,
+      "ZmtpUringHandler: close_initiated called. Worker will handle cancellation and close."
+    );
 
-    if self.zmtp_config.use_recv_multishot {
-      if let Some(bgid) = interface.default_buffer_group_id() {
-        self.multishot_reader = Some(MultishotReader::new(self.fd, bgid));
-        tracing::debug!(
-          "[ZmtpUringHandler FD={}] MultishotReader initialized. Initial read will be requested via prepare_sqes.",
-          self.fd
-        );
-      } else {
-        tracing::error!("[ZmtpUringHandler FD={}] Multishot configured (use_recv_multishot=true) but no default_bgid available from worker interface! Falling back to standard reads.", self.fd);
-        self.ensure_standard_read_is_pending(&mut ops, interface);
-      }
-    } else {
-      self.ensure_standard_read_is_pending(&mut ops, interface);
+    // If already closing/closed, do nothing further.
+    if self.is_closing_or_closed() {
+      return HandlerIoOps::new();
     }
 
-    self.phase = ZmtpHandlerPhase::Closed;
+    // Transition to the Closing state.
+    self.phase = ZmtpHandlerPhase::Closing;
     self.outgoing_app_messages.clear();
+    self.outgoing_multipart_app_messages.clear();
 
-    let close_error_signal = if !matches!(
-      previous_phase_on_close,
-      ZmtpHandlerPhase::DataPhase | ZmtpHandlerPhase::Error | ZmtpHandlerPhase::Closed
-    ) {
-      ZmqError::Internal("Connection closed during handshake by local request".into())
-    } else {
-      ZmqError::ConnectionClosed
-    };
-
-    self.transition_to_error(&mut ops, close_error_signal, interface);
-
-    self.phase = ZmtpHandlerPhase::Closed;
-    ops
+    // The handler's job is done. It no longer needs to generate blueprints for close/cancel.
+    // The worker, upon receiving ShutdownConnectionHandler, now orchestrates the cancellation and close.
+    // Return empty ops.
+    HandlerIoOps::new()
   }
 
   fn fd_has_been_closed(&mut self) {
@@ -1498,6 +1637,18 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
     None // CQE not for an active multishot reader of this handler, or no reader.
+  }
+
+  fn inform_standard_read_op_submitted(&mut self, op_user_data: UserData) {
+    if self.pending_read_op_ud.is_some() {
+      warn!(fd = self.fd, old_ud = ?self.pending_read_op_ud, new_ud = op_user_data, "Informed of new standard read submission while another was already pending. Overwriting.");
+    }
+    self.pending_read_op_ud = Some(op_user_data);
+    tracing::trace!(
+      fd = self.fd,
+      ud = op_user_data,
+      "Standard read operation submitted, tracking pending_read_op_ud."
+    );
   }
 
   fn inform_multishot_reader_op_submitted(
@@ -1581,16 +1732,23 @@ impl MsgWithFlags for Msg {
 }
 
 trait ZmtpConfigSecurityExt {
-  fn security_mechanism_bytes_to_propose(&self, is_handler_server_role: bool) -> &'static [u8; MECHANISM_LENGTH];
+  fn security_mechanism_bytes_to_propose(
+    &self,
+    is_handler_server_role: bool,
+  ) -> &'static [u8; MECHANISM_LENGTH];
 }
 impl ZmtpConfigSecurityExt for ZmtpEngineConfig {
-  fn security_mechanism_bytes_to_propose(&self, is_handler_server_role: bool) -> &'static [u8; MECHANISM_LENGTH] {
+  fn security_mechanism_bytes_to_propose(
+    &self,
+    is_handler_server_role: bool,
+  ) -> &'static [u8; MECHANISM_LENGTH] {
     #[cfg(feature = "noise_xx")]
     if self.use_noise_xx {
       let can_propose_noise = if is_handler_server_role {
         self.noise_xx_local_sk_bytes_for_engine.is_some()
       } else {
-        self.noise_xx_local_sk_bytes_for_engine.is_some() && self.noise_xx_remote_pk_bytes_for_engine.is_some()
+        self.noise_xx_local_sk_bytes_for_engine.is_some()
+          && self.noise_xx_remote_pk_bytes_for_engine.is_some()
       };
       if can_propose_noise {
         return NoiseXxMechanism::NAME_BYTES;

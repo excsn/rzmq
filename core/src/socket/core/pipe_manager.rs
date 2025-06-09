@@ -126,7 +126,7 @@ pub(crate) async fn cleanup_stopped_child_resources(
   endpoint_uri_opt: Option<&str>,
   error_opt: Option<&ZmqError>,
   is_full_core_shutdown: bool,
-) {
+) -> bool {
   let core_handle = core_arc.handle;
   tracing::debug!(
     parent_core_handle = core_handle,
@@ -134,41 +134,47 @@ pub(crate) async fn cleanup_stopped_child_resources(
     ?stopped_child_actor_type,
     uri = ?endpoint_uri_opt,
     error = ?error_opt,
-    full_core_shutdown = is_full_core_shutdown,
     "Cleaning up resources for stopped child actor."
   );
 
   let mut removed_endpoint_info: Option<EndpointInfo> = None;
   let mut detached_pipe_read_id: Option<usize> = None;
+  let mut should_consider_reconnect = false;
 
-  if let Some(uri_key_to_remove) = endpoint_uri_opt {
-    let mut core_s_write = core_arc.core_state.write();
-    if let Some(ep_info) = core_s_write.endpoints.get(uri_key_to_remove) {
-      if ep_info.handle_id == stopped_child_actor_id {
-        removed_endpoint_info = core_s_write.endpoints.remove(uri_key_to_remove);
-        tracing::debug!(handle=core_handle, child_id=stopped_child_actor_id, uri=%uri_key_to_remove, "Removed EndpointInfo by URI for stopped child.");
-      } else {
-        tracing::warn!(handle=core_handle, child_id=stopped_child_actor_id, uri=%uri_key_to_remove, "URI found but handle_id mismatch. Will iterate.");
+  // Find and remove the EndpointInfo from the main map.
+  // This is the most reliable way to get all associated info (URI, pipe IDs, etc.).
+  let mut key_to_remove: Option<String> = None;
+  {
+    let core_s_read = core_arc.core_state.read();
+    if let Some(uri_str) = endpoint_uri_opt {
+      // Fast path: if URI is provided, check if the handle matches.
+      if let Some(ep_info) = core_s_read.endpoints.get(uri_str) {
+        if ep_info.handle_id == stopped_child_actor_id {
+          key_to_remove = Some(uri_str.to_string());
+        }
       }
     }
-  }
 
-  if removed_endpoint_info.is_none() {
-    let mut core_s_write = core_arc.core_state.write();
-    let mut key_of_endpoint_to_remove: Option<String> = None;
-    for (uri, info) in core_s_write.endpoints.iter() {
-      if info.handle_id == stopped_child_actor_id {
-        key_of_endpoint_to_remove = Some(uri.clone());
-        break;
+    // Fallback: If no URI or handle didn't match, iterate to find by handle_id.
+    if key_to_remove.is_none() {
+      for (uri, info) in core_s_read.endpoints.iter() {
+        if info.handle_id == stopped_child_actor_id {
+          key_to_remove = Some(uri.clone());
+          break;
+        }
       }
     }
-    if let Some(key) = key_of_endpoint_to_remove {
-      removed_endpoint_info = core_s_write.endpoints.remove(&key);
-      tracing::debug!(handle=core_handle, child_id=stopped_child_actor_id, uri=%key, "Removed EndpointInfo by iteration for stopped child.");
+  } // Read lock is dropped here.
+
+  if let Some(key) = key_to_remove {
+    if let Some(ep_info) = core_arc.core_state.write().endpoints.remove(&key) {
+      tracing::debug!(handle=core_handle, child_id=stopped_child_actor_id, uri=%key, "Removed EndpointInfo for stopped child.");
+      removed_endpoint_info = Some(ep_info);
     }
   }
 
   if let Some(ep_info) = &removed_endpoint_info {
+    // Abort the task handle if it exists and isn't finished.
     if let Some(task_handle) = &ep_info.task_handle {
       if !task_handle.is_finished() {
         task_handle.abort();
@@ -176,6 +182,7 @@ pub(crate) async fn cleanup_stopped_child_resources(
       }
     }
 
+    // Clean up pipe state if it exists.
     if let Some((core_write_id, core_read_id)) = ep_info.pipe_ids {
       core_arc
         .core_state
@@ -183,24 +190,26 @@ pub(crate) async fn cleanup_stopped_child_resources(
         .remove_pipe_state(core_write_id, core_read_id);
       detached_pipe_read_id = Some(core_read_id);
       tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, uri=%ep_info.endpoint_uri, "Removed pipe state for stopped child.");
-
-      #[cfg(feature = "io-uring")]
-      if ep_info
-        .connection_iface
-        .as_any()
-        .is::<crate::socket::connection_iface::UringFdConnection>()
-      {
-        let fd = ep_info.handle_id as std::os::unix::io::RawFd;
-        core_arc
-          .core_state
-          .write()
-          .uring_fd_to_endpoint_uri
-          .remove(&fd);
-        crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd);
-        tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, %fd, "Unregistered UringFD state for stopped child.");
-      }
     }
 
+    // Clean up io_uring specific mappings if this was a uring connection.
+    #[cfg(feature = "io-uring")]
+    if ep_info
+      .connection_iface
+      .as_any()
+      .is::<crate::socket::connection_iface::UringFdConnection>()
+    {
+      let fd = ep_info.handle_id as std::os::unix::io::RawFd;
+      core_arc
+        .core_state
+        .write()
+        .uring_fd_to_endpoint_uri
+        .remove(&fd);
+      crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd);
+      tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, %fd, "Unregistered UringFD state for stopped child.");
+    }
+
+    // Send monitor event for the disconnection/closure.
     let monitor_event = match ep_info.endpoint_type {
       EndpointType::Session => SocketEvent::Disconnected {
         endpoint: ep_info.endpoint_uri.clone(),
@@ -210,6 +219,26 @@ pub(crate) async fn cleanup_stopped_child_resources(
       },
     };
     core_arc.core_state.read().send_monitor_event(monitor_event);
+
+    // Determine if a reconnect should be considered.
+    if !is_full_core_shutdown
+        && error_opt.is_some() // Reconnect only on error, not clean disconnect
+        && ep_info.endpoint_type == EndpointType::Session
+        && ep_info.is_outbound_connection
+    {
+      let reconnect_ivl_is_positive = core_arc
+        .core_state
+        .read()
+        .options
+        .reconnect_ivl
+        .map_or(false, |d| !d.is_zero());
+
+      if reconnect_ivl_is_positive
+        && !crate::transport::tcp::is_fatal_connect_error(error_opt.unwrap())
+      {
+        should_consider_reconnect = true;
+      }
+    }
   } else {
     tracing::debug!(
       handle = core_handle,
@@ -219,6 +248,7 @@ pub(crate) async fn cleanup_stopped_child_resources(
     );
   }
 
+  // Notify the ISocket logic that its pipe has been detached.
   if let Some(read_id) = detached_pipe_read_id {
     socket_logic_strong.pipe_detached(read_id).await;
     tracing::debug!(
@@ -229,49 +259,8 @@ pub(crate) async fn cleanup_stopped_child_resources(
     );
   }
 
-  if !is_full_core_shutdown
-    && error_opt.is_some()
-    && matches!(stopped_child_actor_type, ActorType::Session)
-  {
-    if let Some(ep_info) = removed_endpoint_info {
-      if ep_info.endpoint_type == EndpointType::Session && ep_info.is_outbound_connection {
-        if let Some(target_uri_to_reconnect) = ep_info.target_endpoint_uri {
-          if !target_uri_to_reconnect.starts_with("inproc://") {
-            let reconnect_enabled = core_arc
-              .core_state
-              .read()
-              .options
-              .reconnect_ivl
-              .map_or(false, |d| !d.is_zero());
-            let is_fatal_for_reconnect =
-              error_opt.map_or(false, crate::transport::tcp::is_fatal_connect_error);
-
-            if reconnect_enabled && !is_fatal_for_reconnect {
-              tracing::info!(
-                handle = core_handle,
-                target_uri = %target_uri_to_reconnect,
-                "Unexpected session/engine stop for outbound connection. Initiating reconnect..."
-              );
-              command_processor::respawn_connecter_actor(
-                core_arc.clone(),
-                socket_logic_strong.clone(),
-                target_uri_to_reconnect,
-              )
-              .await;
-            } else {
-              tracing::warn!(
-                handle = core_handle,
-                target_uri = %target_uri_to_reconnect,
-                reconnect_enabled,
-                is_fatal_for_reconnect,
-                "Reconnect SKIPPED for stopped outbound session."
-              );
-            }
-          }
-        }
-      }
-    }
-  }
+  // Return the flag.
+  should_consider_reconnect
 }
 
 pub(crate) async fn cleanup_session_state_by_uri(

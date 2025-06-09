@@ -239,4 +239,13 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     // For now, this ensures no stale data from a disconnected pipe is accidentally delivered.
     self.reset_recv_message_buffer().await;
   }
+
+  pub async fn close(&self) {
+    
+    self.main_incoming_queue.close();
+    // Also clear the partial message buffers
+    self.partial_pipe_messages.clear();
+    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
+    *buffer_guard = VecDeque::new();
+  }
 }

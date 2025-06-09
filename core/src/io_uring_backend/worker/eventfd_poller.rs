@@ -118,6 +118,7 @@ impl EventFdPoller {
     cqe_user_data: UserData,
     cqe_result: i32,
     internal_op_tracker: &mut InternalOpTracker,
+    is_shutting_down: bool,
   ) -> bool {
     if cqe_user_data == self.current_poll_user_data {
       tracing::debug!(
@@ -192,18 +193,25 @@ impl EventFdPoller {
         // For now, we will still set up for a re-poll.
       }
 
-      // Regardless of the outcome of the previous poll (success or failure),
-      // we need to generate a new UserData for the *next* poll submission attempt.
-      // The old one (`self.current_poll_user_data`) has been "used up" by this CQE.
-      self.current_poll_user_data = internal_op_tracker.new_op_id(
-        self.event_fd_raw(),
-        InternalOpType::EventFdPoll,
-        InternalOpPayload::None,
-      );
-      tracing::debug!(
-        "[EventFdPoller] Prepared for next poll submission with new UserData: {}",
-        self.current_poll_user_data
-      );
+
+      if !is_shutting_down {
+        // Regardless of the outcome of the previous poll (success or failure),
+        // we need to generate a new UserData for the *next* poll submission attempt.
+        // The old one (`self.current_poll_user_data`) has been "used up" by this CQE.
+        self.current_poll_user_data = internal_op_tracker.new_op_id(
+          self.event_fd_raw(),
+          InternalOpType::EventFdPoll,
+          InternalOpPayload::None,
+        );
+        tracing::debug!(
+          "[EventFdPoller] Prepared for next poll submission with new UserData: {}",
+          self.current_poll_user_data
+        );
+      } else {
+        // If we are shutting down, we do NOT create a new poll operation.
+        // We just handled the completion of the last one, and now the poller is idle.
+        tracing::debug!("[EventFdPoller] Worker is shutting down. Not preparing new poll operation.");
+      }
 
       return true; // CQE was handled by this poller
     }

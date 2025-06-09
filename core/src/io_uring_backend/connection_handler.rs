@@ -136,6 +136,10 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
 pub trait UringConnectionHandler: Send {
   fn fd(&self) -> RawFd;
 
+
+  /// Checks if the handler is in a terminal (Closing, Closed, Error) state.
+  fn is_closing_or_closed(&self) -> bool;
+  
   /// Called when the connection is first established and ready.
   /// Handler should return blueprints for initial I/O (e.g., start reading, send greeting).
   fn connection_ready(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps;
@@ -202,6 +206,10 @@ pub trait UringConnectionHandler: Send {
     worker_interface: &UringWorkerInterface<'_>,
     internal_op_tracker: &mut InternalOpTracker,
   ) -> Option<Result<(HandlerIoOps, bool), ZmqError>>;
+
+  /// Called by `cqe_processor` (specifically `process_handler_blueprints`) after it successfully
+  /// submits a standard (non-multishot) read operation for this handler.
+  fn inform_standard_read_op_submitted(&mut self, op_user_data: UserData);
 
   /// Called by `cqe_processor` (specifically `process_handler_blueprints`) after it successfully
   /// submits an SQE that was initiated by this handler's `MultishotReader` (either a new

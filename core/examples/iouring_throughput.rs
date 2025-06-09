@@ -1,5 +1,3 @@
-// examples/dealer_router_iouring_throughput.rs
-
 use bytes::Bytes;
 use rzmq::socket::options as zmq_opts; // For socket option constants
 use rzmq::uring::{initialize_uring_backend, shutdown_uring_backend, UringConfig};
@@ -19,7 +17,7 @@ async fn main() -> Result<(), ZmqError> {
   }
 
   tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::WARN) // Adjust log level (INFO, DEBUG, TRACE)
+    .with_max_level(tracing::Level::DEBUG) // Adjust log level (INFO, DEBUG, TRACE)
     .with_thread_ids(true)
     .with_thread_names(true)
     .with_target(true)
@@ -31,7 +29,7 @@ async fn main() -> Result<(), ZmqError> {
   let uring_config = UringConfig {
     default_send_zerocopy: false,
     ring_entries: 1024,
-    default_recv_multishot: true,
+    default_recv_multishot: false,
     default_recv_buffer_count: 64,
     default_recv_buffer_size: 4096,
     default_send_buffer_count: 64,  // For ZC pool if default_send_zerocopy is true
@@ -62,8 +60,10 @@ async fn main() -> Result<(), ZmqError> {
   router_socket.bind(endpoint).await?;
   println!("ROUTER: Bound successfully.");
 
+  let router_socket_for_task = router_socket.clone();
   // Spawn a task for ROUTER to echo messages
   let router_task_handle = tokio::spawn(async move {
+    let router_socket = router_socket_for_task;
     println!("ROUTER: Echo task started, waiting for messages...");
     let mut messages_echoed = 0u64;
     let mut bytes_echoed = 0u64;
@@ -166,6 +166,7 @@ async fn main() -> Result<(), ZmqError> {
   tokio::time::sleep(Duration::from_millis(250)).await;
   println!("DEALER: Assumed connected and handshake complete.");
 
+  
   // --- Throughput Test Logic ---
   let num_messages_to_send: u64 = 100_000; // Number of logical messages
   let payload_size_bytes: usize = 1024; // 1KB
@@ -284,6 +285,13 @@ async fn main() -> Result<(), ZmqError> {
   }
   println!("DEALER: Dealer socket closed.");
 
+
+  println!("ROUTER: Closing router socket...");
+  if let Err(e) = router_socket.close().await {
+      eprintln!("ROUTER: Error closing router socket: {}", e);
+  }
+  println!("ROUTER: Router socket closed.");
+
   // Router task will be implicitly asked to stop when its socket is closed by ctx.term()
   // Or we could explicitly close router_socket here too.
   // For now, let ctx.term() handle ROUTER socket closure.
@@ -312,7 +320,9 @@ async fn main() -> Result<(), ZmqError> {
   println!("Terminating context...");
   ctx.term().await?;
 
-  match shutdown_uring_backend() {
+
+  println!("Terminated context...");
+  match shutdown_uring_backend().await {
     Ok(_) => println!("io_uring backend shutdown."),
     Err(e) => eprintln!("Error shutting down io_uring backend: {:?}", e),
   }
