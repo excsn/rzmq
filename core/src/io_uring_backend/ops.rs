@@ -2,22 +2,21 @@
 
 #![cfg(feature = "io-uring")]
 
-use fibre::oneshot;
-
 use crate::message::Msg;
 use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
 
-use std::any::Any;
 use std::fmt;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
+use fibre::{mpsc, oneshot};
+
 pub const HANDLER_INTERNAL_SEND_OP_UD: UserData = 0;
 
 #[derive(Clone, Debug)]
-pub enum ProtocolConfig {
+pub(crate) enum ProtocolConfig {
   Zmtp(Arc<ZmtpEngineConfig>),
   // Example: Http(Arc<HttpConfig>),
 }
@@ -63,22 +62,11 @@ pub enum UringOpRequest {
     protocol_config: ProtocolConfig,
     is_server_role: bool, // True if this FD is from an accepted connection on server-side
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
+    mpsc_rx_for_worker: Arc<mpsc::Receiver<Arc<Vec<Msg>>>>,
   },
   StartFdReadLoop {
     user_data: UserData,
     fd: RawFd,
-    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
-  },
-  SendDataViaHandler {
-    user_data: UserData,
-    fd: RawFd,
-    app_data: Arc<dyn Any + Send + Sync>,
-    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
-  },
-  SendDataMultipartViaHandler {
-    user_data: UserData,
-    fd: RawFd,
-    app_data_parts: Arc<Vec<Msg>>,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   ShutdownConnectionHandler {
@@ -89,7 +77,7 @@ pub enum UringOpRequest {
 }
 
 impl UringOpRequest {
-  // This helper was in sqe_builder.rs, but it's better here with its enum.
+  
   pub(crate) fn get_user_data_ref(&self) -> UserData {
     match self {
       Self::Nop { user_data, .. }
@@ -99,13 +87,10 @@ impl UringOpRequest {
       | Self::Connect { user_data, .. }
       | Self::RegisterExternalFd { user_data, .. }
       | Self::StartFdReadLoop { user_data, .. }
-      | Self::SendDataViaHandler { user_data, .. }
-      | Self::SendDataMultipartViaHandler { user_data, .. }
       | Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
     }
   }
 
-  // ADDED op_name_str METHOD
   pub(crate) fn op_name_str(&self) -> String {
     match self {
       Self::Nop { .. } => "Nop".to_string(),
@@ -115,13 +100,10 @@ impl UringOpRequest {
       Self::Connect { .. } => "Connect".to_string(),
       Self::RegisterExternalFd { .. } => "RegisterExternalFd".to_string(),
       Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
-      Self::SendDataViaHandler { .. } => "SendDataViaHandler".to_string(),
-      Self::SendDataMultipartViaHandler { .. } => "SendDataMultipartViaHandler".to_string(),
       Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
     }
   }
 
-  // ADDED get_reply_tx_ref METHOD
   pub(crate) fn get_reply_tx_ref(&self) -> &oneshot::Sender<Result<UringOpCompletion, ZmqError>> {
     match self {
       Self::Nop { reply_tx, .. }
@@ -131,8 +113,6 @@ impl UringOpRequest {
       | Self::RegisterExternalFd { reply_tx, .. }
       | Self::Connect { reply_tx, .. }
       | Self::StartFdReadLoop { reply_tx, .. }
-      | Self::SendDataViaHandler { reply_tx, .. }
-      | Self::SendDataMultipartViaHandler { reply_tx, .. }
       | Self::ShutdownConnectionHandler { reply_tx, .. } => reply_tx,
     }
   }
@@ -202,28 +182,6 @@ impl fmt::Debug for UringOpRequest {
         .debug_struct("StartFdReadLoop")
         .field("user_data", user_data)
         .field("fd", fd)
-        .finish_non_exhaustive(),
-      UringOpRequest::SendDataViaHandler {
-        user_data,
-        fd,
-        app_data,
-        ..
-      } => f
-        .debug_struct("SendDataViaHandler")
-        .field("user_data", user_data)
-        .field("fd", fd)
-        .field("app_data_type", &(*app_data).type_id())
-        .finish_non_exhaustive(),
-      UringOpRequest::SendDataMultipartViaHandler {
-        user_data,
-        fd,
-        app_data_parts,
-        ..
-      } => f
-        .debug_struct("SendDataMultipartViaHandler")
-        .field("user_data", user_data)
-        .field("fd", fd)
-        .field("num_parts", &app_data_parts.len())
         .finish_non_exhaustive(),
       UringOpRequest::ShutdownConnectionHandler { user_data, fd, .. } => f
         .debug_struct("ShutdownConnectionHandler")

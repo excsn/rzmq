@@ -1,5 +1,3 @@
-// core/src/io_uring_backend/worker/internal_op_tracker.rs
-
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::ops::UserData;
@@ -19,8 +17,6 @@ pub(crate) enum InternalOpType {
   RingReadMultishot,
   AsyncCancel,
   SendZeroCopy,
-  UringCmdSetCorkEnable,
-  UringCmdSetCorkDisable,
 }
 
 /// Payload associated with an internal operation, e.g., buffer for send.

@@ -17,11 +17,16 @@ use crate::io_uring_backend::ops::{
   UringOpRequest as WorkerUringOpRequest,
 };
 #[cfg(feature = "io-uring")]
+use crate::socket::connection_iface::UringFdConnection;
+#[cfg(feature = "io-uring")]
 use crate::uring;
 #[cfg(feature = "io-uring")]
-use std::os::unix::io::{AsRawFd, IntoRawFd};
+use fibre::mpsc;
 #[cfg(feature = "io-uring")]
 use fibre::oneshot::oneshot;
+
+#[cfg(feature = "io-uring")]
+use std::os::unix::io::{AsRawFd, IntoRawFd};
 
 use core::fmt;
 use std::io;
@@ -56,8 +61,14 @@ impl fmt::Debug for TcpListener {
     f.debug_struct("TcpListener")
       .field("handle", &self.handle)
       .field("endpoint", &self.endpoint)
-      .field("mailbox_receiver_is_closed", &self.mailbox_receiver.is_closed())
-      .field("listener_handle_is_finished", &self.listener_handle.is_finished())
+      .field(
+        "mailbox_receiver_is_closed",
+        &self.mailbox_receiver.is_closed(),
+      )
+      .field(
+        "listener_handle_is_finished",
+        &self.listener_handle.is_finished(),
+      )
       .field("context_present", &true)
       .field("parent_socket_id", &self.parent_socket_id)
       .field("socket_logic_present", &true)
@@ -93,9 +104,12 @@ impl TcpListener {
       } else {
         bind_addr_str_for_parse
       };
-    let parsed_socket_addr: StdSocketAddr = addr_for_socket2_parse
-      .parse()
-      .map_err(|e| ZmqError::InvalidEndpoint(format!("Parse bind address '{}': {}", addr_for_socket2_parse, e)))?;
+    let parsed_socket_addr: StdSocketAddr = addr_for_socket2_parse.parse().map_err(|e| {
+      ZmqError::InvalidEndpoint(format!(
+        "Parse bind address '{}': {}",
+        addr_for_socket2_parse, e
+      ))
+    })?;
 
     let domain = if parsed_socket_addr.is_ipv4() {
       socket2::Domain::IPV4
@@ -105,12 +119,14 @@ impl TcpListener {
     let s = socket2::Socket::new(domain, socket2::Type::STREAM, None).map_err(ZmqError::from)?;
     s.set_reuse_address(true).map_err(ZmqError::from)?;
 
-    let addr_for_bind_call = bind_addr_str_for_parse.parse::<StdSocketAddr>().map_err(|e| {
-      ZmqError::InvalidEndpoint(format!(
-        "Parse bind address for bind call'{}': {}",
-        bind_addr_str_for_parse, e
-      ))
-    })?;
+    let addr_for_bind_call = bind_addr_str_for_parse
+      .parse::<StdSocketAddr>()
+      .map_err(|e| {
+        ZmqError::InvalidEndpoint(format!(
+          "Parse bind address for bind call'{}': {}",
+          bind_addr_str_for_parse, e
+        ))
+      })?;
     s.bind(&addr_for_bind_call.into())
       .map_err(|e| ZmqError::from_io_endpoint(e, &endpoint))?;
     s.listen(options.backlog.unwrap_or(128) as i32)
@@ -118,8 +134,11 @@ impl TcpListener {
     let actual_bind_addr = s.local_addr().map_err(ZmqError::from)?.as_socket().unwrap();
 
     let std_listener_os: std::net::TcpListener = s.into();
-    std_listener_os.set_nonblocking(true).map_err(ZmqError::from)?;
-    let tokio_listener = underlying_std_net::TcpListener::from_std(std_listener_os).map_err(ZmqError::from)?;
+    std_listener_os
+      .set_nonblocking(true)
+      .map_err(ZmqError::from)?;
+    let tokio_listener =
+      underlying_std_net::TcpListener::from_std(std_listener_os).map_err(ZmqError::from)?;
 
     let resolved_uri = format!("tcp://{}", actual_bind_addr);
     tracing::info!(listener_handle = handle, local_addr = %resolved_uri, user_uri = %endpoint, "TCP Listener bound");
@@ -235,7 +254,10 @@ impl TcpListener {
       if !e.is_cancelled() {
         tracing::error!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener accept loop task panicked: {:?}", e);
         if final_error_for_actor_stopping.is_none() {
-          final_error_for_actor_stopping = Some(ZmqError::Internal(format!("Listener accept loop panicked: {:?}", e)));
+          final_error_for_actor_stopping = Some(ZmqError::Internal(format!(
+            "Listener accept loop panicked: {:?}",
+            e
+          )));
         }
       } else {
         tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener accept loop task was cancelled as expected.");
@@ -269,7 +291,8 @@ impl TcpListener {
   ) {
     #[cfg(feature = "io-uring")]
     if socket_options.io_uring.session_enabled {
-      uring::global_state::get_global_uring_worker_op_tx().expect("URING HAS NOT BEEN INITIALIZED!");
+      uring::global_state::get_global_uring_worker_op_tx()
+        .expect("URING HAS NOT BEEN INITIALIZED!");
     }
 
     let mut actor_drop_guard = ActorDropGuard::new(
@@ -308,7 +331,8 @@ impl TcpListener {
             });
           }
 
-          let use_io_uring_for_session = socket_options.io_uring.session_enabled && cfg!(feature = "io-uring");
+          let use_io_uring_for_session =
+            socket_options.io_uring.session_enabled && cfg!(feature = "io-uring");
           let connection_specific_uri = format!("tcp://{}", peer_addr_str);
 
           tokio::spawn({
@@ -349,17 +373,35 @@ impl TcpListener {
                         }
                       }
 
-                      if let Err(e) = apply_tcp_socket_options_to_std(&std_stream, &transport_config_clone) {
-                        tracing::error!("Opt apply failed (std stream) for {}: {}. Dropping.", peer_addr_str, e);
+                      if let Err(e) =
+                        apply_tcp_socket_options_to_std(&std_stream, &transport_config_clone)
+                      {
+                        tracing::error!(
+                          "Opt apply failed (std stream) for {}: {}. Dropping.",
+                          peer_addr_str,
+                          e
+                        );
                         setup_successful = false;
                       } else {
+
                         let raw_fd = std_stream.into_raw_fd();
 
-                        let worker_op_tx = uring::global_state::get_global_uring_worker_op_tx().unwrap();
-                        let protocol_config =
-                          WorkerProtocolConfig::Zmtp(Arc::new(ZmtpEngineConfig::from(&*socket_options_clone)));
+                        let worker_op_tx =
+                          uring::global_state::get_global_uring_worker_op_tx().unwrap();
+                        let protocol_config = WorkerProtocolConfig::Zmtp(Arc::new(
+                          ZmtpEngineConfig::from(&*socket_options_clone),
+                        ));
                         let user_data_for_op = context_clone.inner().next_handle() as u64;
                         let (reply_tx_for_op, reply_rx_for_op) = oneshot();
+
+                        let hwm = socket_options_clone.sndhwm.max(1); // TODO Needs bounded mpsc fibre to respect this
+                        let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::unbounded();
+
+                        let new_conn_iface = Arc::new(UringFdConnection::new(
+                          raw_fd,
+                          mpsc_tx_for_conn.to_async(),
+                          context_clone.clone(),
+                        ));
 
                         let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
                           user_data: user_data_for_op,
@@ -368,22 +410,31 @@ impl TcpListener {
                           protocol_config,
                           is_server_role: true,
                           reply_tx: reply_tx_for_op,
+                          mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
                         };
 
                         if let Err(e) = worker_op_tx.send(register_fd_req).await {
-                          tracing::error!("Send RegisterExternalFd to UringWorker for fd {}: {}", raw_fd, e);
+                          tracing::error!(
+                            "Send RegisterExternalFd to UringWorker for fd {}: {}",
+                            raw_fd,
+                            e
+                          );
                           unsafe {
                             let _ = libc::close(raw_fd);
                           }
                           setup_successful = false;
                         } else {
                           match reply_rx_for_op.recv().await {
-                            Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. }))
+                            Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess {
+                              fd: returned_fd,
+                              ..
+                            }))
                               if returned_fd == raw_fd =>
                             {
                               info!("Registered accepted FD {} with UringWorker.", raw_fd);
-                              connection_iface_for_event = None;
-                              interaction_model_for_event = Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
+                              connection_iface_for_event = Some(new_conn_iface);
+                              interaction_model_for_event =
+                                Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
                               // managing_actor_task_id_for_event remains None for UringFd path
                             }
                             Ok(Ok(other_completion)) => {
@@ -424,7 +475,10 @@ impl TcpListener {
                       }
                     }
                     Err(e) => {
-                      tracing::error!("tokio_tcp_stream to std failed for accepted conn: {}. Dropping.", e);
+                      tracing::error!(
+                        "tokio_tcp_stream to std failed for accepted conn: {}. Dropping.",
+                        e
+                      );
                       setup_successful = false;
                     }
                   }
@@ -436,7 +490,9 @@ impl TcpListener {
                 }
               } else {
                 // Standard path: SessionBase + ZmtpEngineCoreStd
-                if let Err(e) = apply_tcp_socket_options_to_tokio(&tokio_tcp_stream, &transport_config_clone) {
+                if let Err(e) =
+                  apply_tcp_socket_options_to_tokio(&tokio_tcp_stream, &transport_config_clone)
+                {
                   tracing::error!(
                     "Opt apply failed (tokio stream) for {}: {}. Dropping.",
                     peer_addr_str,
@@ -444,7 +500,8 @@ impl TcpListener {
                   );
                   setup_successful = false;
                 } else {
-                  let sca_handle_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                  let sca_handle_id =
+                    handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                   let actor_conf = ActorConfigX {
                     context: context_clone.clone(),
                     monitor_tx: monitor_tx_clone,
@@ -517,7 +574,11 @@ impl TcpListener {
         }
         Err(e) => {
           drop(permit);
-          tracing::error!("Error accepting TCP connection (listener {}): {}", endpoint_uri, e);
+          tracing::error!(
+            "Error accepting TCP connection (listener {}): {}",
+            endpoint_uri,
+            e
+          );
           if let Some(ref tx) = monitor_tx {
             let _ = tx.try_send(SocketEvent::AcceptFailed {
               endpoint: endpoint_uri.clone(),
@@ -553,7 +614,7 @@ pub(crate) struct TcpConnecter {
   handle: usize,
   endpoint: String,
   config: TcpTransportConfig,
-  context_options: Arc<SocketOptions>,
+  socket_options: Arc<SocketOptions>,
   socket_logic: Arc<dyn ISocket>,
   context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
   context: Context,
@@ -566,7 +627,7 @@ impl fmt::Debug for TcpConnecter {
       .field("handle", &self.handle)
       .field("endpoint", &self.endpoint)
       .field("config", &self.config)
-      .field("context_options", &self.context_options)
+      .field("context_options", &self.socket_options)
       .field("socket_logic_present", &true)
       .field("context_present", &true)
       .field("parent_socket_id", &self.parent_socket_id)
@@ -595,13 +656,14 @@ impl TcpConnecter {
       handle,
       endpoint: endpoint.clone(),
       config: transport_config,
-      context_options: options,
+      socket_options: options,
       socket_logic,
       context_handle_source,
       context: context.clone(),
       parent_socket_id,
     };
-    let task_join_handle = tokio::spawn(connecter_actor.run_connect_loop(monitor_tx, parent_socket_id));
+    let task_join_handle =
+      tokio::spawn(connecter_actor.run_connect_loop(monitor_tx, parent_socket_id));
 
     task_join_handle
   }
@@ -624,46 +686,54 @@ impl TcpConnecter {
       Some(addr_str) => match addr_str.parse() {
         Ok(addr) => addr,
         Err(e) => {
-          let err = ZmqError::InvalidEndpoint(format!("Parse target address '{}': {}", addr_str, e));
-          let _ = self.context.event_bus().publish(SystemEvent::ConnectionAttemptFailed {
-            parent_core_id: self.parent_socket_id,
-            target_endpoint_uri: self.endpoint.clone(),
-            error_msg: err.to_string(),
-          });
+          let err =
+            ZmqError::InvalidEndpoint(format!("Parse target address '{}': {}", addr_str, e));
+          let _ = self
+            .context
+            .event_bus()
+            .publish(SystemEvent::ConnectionAttemptFailed {
+              parent_core_id: self.parent_socket_id,
+              target_endpoint_uri: self.endpoint.clone(),
+              error_msg: err.to_string(),
+            });
           actor_drop_guard.set_error(err);
           return;
         }
       },
       None => {
         let err = ZmqError::InvalidEndpoint(endpoint_uri_clone.clone());
-        let _ = self.context.event_bus().publish(SystemEvent::ConnectionAttemptFailed {
-          parent_core_id: self.parent_socket_id,
-          target_endpoint_uri: self.endpoint.clone(),
-          error_msg: err.to_string(),
-        });
+        let _ = self
+          .context
+          .event_bus()
+          .publish(SystemEvent::ConnectionAttemptFailed {
+            parent_core_id: self.parent_socket_id,
+            target_endpoint_uri: self.endpoint.clone(),
+            error_msg: err.to_string(),
+          });
         actor_drop_guard.set_error(err);
         return;
       }
     };
 
     let initial_reconnect_ivl = self
-      .context_options
+      .socket_options
       .reconnect_ivl
       .unwrap_or(Duration::from_millis(DEFAULT_RECONNECT_IVL_MS));
-    let no_retry_after_first_connect_fail = self.context_options.reconnect_ivl == Some(Duration::ZERO)
-      && (self.context_options.reconnect_ivl_max == Some(Duration::ZERO)
-        || self.context_options.reconnect_ivl_max.is_none());
-    let mut current_retry_delay = if self.context_options.reconnect_ivl == Some(Duration::ZERO)
+    let no_retry_after_first_connect_fail = self.socket_options.reconnect_ivl
+      == Some(Duration::ZERO)
+      && (self.socket_options.reconnect_ivl_max == Some(Duration::ZERO)
+        || self.socket_options.reconnect_ivl_max.is_none());
+    let mut current_retry_delay = if self.socket_options.reconnect_ivl == Some(Duration::ZERO)
       && self
-        .context_options
+        .socket_options
         .reconnect_ivl_max
         .map_or(false, |d| d > Duration::ZERO)
     {
-      self.context_options.reconnect_ivl_max.unwrap()
+      self.socket_options.reconnect_ivl_max.unwrap()
     } else {
       initial_reconnect_ivl
     };
-    let reconnect_ivl_max_opt = self.context_options.reconnect_ivl_max;
+    let reconnect_ivl_max_opt = self.socket_options.reconnect_ivl_max;
     let mut attempt_count = 0;
     let mut system_event_rx = self.context.event_bus().subscribe();
     let mut last_connect_attempt_error: Option<ZmqError> = None;
@@ -685,15 +755,21 @@ impl TcpConnecter {
         {
           Ok(true) => {}
           Ok(false) => {
-            last_connect_attempt_error = Some(ZmqError::Internal("Connecter shutdown by event retry delay.".into()));
+            last_connect_attempt_error = Some(ZmqError::Internal(
+              "Connecter shutdown by event retry delay.".into(),
+            ));
             break 'connecter_life_loop;
           }
           Err(()) => {
-            last_connect_attempt_error = Some(ZmqError::Internal("Connecter shutdown error retry delay.".into()));
+            last_connect_attempt_error = Some(ZmqError::Internal(
+              "Connecter shutdown error retry delay.".into(),
+            ));
             break 'connecter_life_loop;
           }
         }
-        if current_retry_delay > Duration::ZERO && reconnect_ivl_max_opt.map_or(true, |max_d| max_d > Duration::ZERO) {
+        if current_retry_delay > Duration::ZERO
+          && reconnect_ivl_max_opt.map_or(true, |max_d| max_d > Duration::ZERO)
+        {
           if let Some(max_d) = reconnect_ivl_max_opt {
             current_retry_delay = (current_retry_delay * 2).min(max_d);
           } else {
@@ -719,11 +795,13 @@ impl TcpConnecter {
           break 'connecter_life_loop;
         }
         Err(broadcast::error::TryRecvError::Closed) => {
-          last_connect_attempt_error = Some(ZmqError::Internal("Event bus closed (pre-connect).".into()));
+          last_connect_attempt_error =
+            Some(ZmqError::Internal("Event bus closed (pre-connect).".into()));
           break 'connecter_life_loop;
         }
         Err(broadcast::error::TryRecvError::Lagged(_)) => {
-          last_connect_attempt_error = Some(ZmqError::Internal("Event bus lagged (pre-connect).".into()));
+          last_connect_attempt_error =
+            Some(ZmqError::Internal("Event bus lagged (pre-connect).".into()));
           break 'connecter_life_loop;
         }
         _ => {}
@@ -756,7 +834,9 @@ impl TcpConnecter {
               "Connecter: Failed to publish NewConnectionEstablished for {}.",
               endpoint_uri_clone
             );
-            last_connect_attempt_error = Some(ZmqError::Internal("Failed to publish NewConnectionEstablished".into()));
+            last_connect_attempt_error = Some(ZmqError::Internal(
+              "Failed to publish NewConnectionEstablished".into(),
+            ));
           } else {
             last_connect_attempt_error = None;
           }
@@ -788,12 +868,16 @@ impl TcpConnecter {
     }
 
     if let Some(ref final_err) = last_connect_attempt_error {
-      if !matches!(final_err, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus error")) {
-        let _ = self.context.event_bus().publish(SystemEvent::ConnectionAttemptFailed {
-          parent_core_id: self.parent_socket_id,
-          target_endpoint_uri: endpoint_uri_clone.clone(),
-          error_msg: final_err.to_string(),
-        });
+      if !matches!(final_err, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus error"))
+      {
+        let _ = self
+          .context
+          .event_bus()
+          .publish(SystemEvent::ConnectionAttemptFailed {
+            parent_core_id: self.parent_socket_id,
+            target_endpoint_uri: endpoint_uri_clone.clone(),
+            error_msg: final_err.to_string(),
+          });
         if let Some(ref mon_tx_final) = monitor_tx {
           let _ = mon_tx_final.try_send(SocketEvent::ConnectFailed {
             endpoint: endpoint_uri_clone.clone(),
@@ -818,7 +902,7 @@ impl TcpConnecter {
     system_event_rx: &mut broadcast::Receiver<SystemEvent>,
     monitor_tx: &Option<MonitorSender>,
   ) -> Result<UnifiedConnectOutcome, ZmqError> {
-    let use_io_uring = self.context_options.io_uring.session_enabled && cfg!(feature = "io-uring");
+    let use_io_uring = self.socket_options.io_uring.session_enabled && cfg!(feature = "io-uring");
 
     let connect_future = async {
       if use_io_uring {
@@ -829,11 +913,12 @@ impl TcpConnecter {
           } else {
             socket2::Domain::IPV6
           };
-          let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None).map_err(ZmqError::from)?;
+          let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, None).map_err(ZmqError::from)?;
           apply_socket2_options_pre_connect(&socket, &self.config)?;
 
           // Apply TCP_CORK before connect if enabled in context_options
-          if self.context_options.tcp_cork {
+          if self.socket_options.tcp_cork {
             tracing::debug!(
               handle = self.handle,
               "TcpConnecter: Applying TCP_CORK to outgoing connection FD before connect for IO URing."
@@ -869,10 +954,19 @@ impl TcpConnecter {
           let raw_fd = std_stream.into_raw_fd();
 
           let worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
-          let protocol_config = WorkerProtocolConfig::Zmtp(Arc::new(ZmtpEngineConfig::from(&*self.context_options)));
+          let protocol_config =
+            WorkerProtocolConfig::Zmtp(Arc::new(ZmtpEngineConfig::from(&*self.socket_options)));
           let user_data_for_op = self.context.inner().next_handle() as u64;
           let (reply_tx_for_op, reply_rx_for_op) = oneshot();
 
+
+          let hwm = self.socket_options.sndhwm.max(1); // TODO Needs bounded mpsc fibre to respect this
+          let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::unbounded();
+          let new_conn_iface = Arc::new(UringFdConnection::new(
+              raw_fd,
+              mpsc_tx_for_conn.to_async(),
+              self.context.clone(),
+          ));
           let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
             user_data: user_data_for_op,
             fd: raw_fd,
@@ -880,20 +974,25 @@ impl TcpConnecter {
             protocol_config,
             is_server_role: false,
             reply_tx: reply_tx_for_op,
+            mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
           };
 
-          worker_op_tx
-            .send(register_fd_req)
-            .await
-            .map_err(|e| ZmqError::Internal(format!("Send RegisterExternalFd to UringWorker: {}", e)))?;
+          worker_op_tx.send(register_fd_req).await.map_err(|e| {
+            ZmqError::Internal(format!("Send RegisterExternalFd to UringWorker: {}", e))
+          })?;
 
           match reply_rx_for_op.recv().await {
-            Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. }))
+            Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess {
+              fd: returned_fd, ..
+            }))
               if returned_fd == raw_fd =>
             {
-              info!("Successfully registered connected FD {} with UringWorker.", raw_fd);
+              info!(
+                "Successfully registered connected FD {} with UringWorker.",
+                raw_fd
+              );
 
-              let connection_iface = None;
+              let connection_iface: Option<Arc<dyn ISocketConnection>> = Some(new_conn_iface);
               let interaction_model = ConnectionInteractionModel::ViaUringFd { fd: raw_fd };
               Ok((
                 connection_iface,
@@ -976,7 +1075,7 @@ impl TcpConnecter {
           connected_endpoint_uri: actual_connected_uri.clone(),
           is_server_role: false, // Outgoing connection is client role
         };
-        let engine_conf = Arc::new(ZmtpEngineConfig::from(&*self.context_options));
+        let engine_conf = Arc::new(ZmtpEngineConfig::from(&*self.socket_options));
 
         // Create a standard Command mailbox for the SCA
         let (command_sender_for_sca, command_receiver_for_sca) =
@@ -1039,7 +1138,9 @@ impl TcpConnecter {
   ) -> Result<bool, ()> {
     if delay.is_zero() {
       match system_event_rx.try_recv() {
-        Ok(SystemEvent::ContextTerminating) | Ok(SystemEvent::SocketClosing { .. }) => return Ok(false),
+        Ok(SystemEvent::ContextTerminating) | Ok(SystemEvent::SocketClosing { .. }) => {
+          return Ok(false)
+        }
         _ => return Ok(true),
       }
     }
@@ -1068,7 +1169,10 @@ impl TcpConnecter {
 // --- Helper Functions ---
 // ... (is_fatal_accept_error, is_fatal_connect_error, apply_socket2_options_pre_connect, apply_tcp_socket_options_to_tokio, apply_tcp_socket_options_to_std, ZmtpEngineConfig::from remain the same)
 pub(crate) fn is_fatal_accept_error(e: &io::Error) -> bool {
-  matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe)
+  matches!(
+    e.kind(),
+    io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe
+  )
 }
 
 pub(crate) fn is_fatal_connect_error(e: &ZmqError) -> bool {
@@ -1091,9 +1195,17 @@ pub(crate) fn is_fatal_connect_error(e: &ZmqError) -> bool {
   }
 }
 
-fn apply_socket2_options_pre_connect(socket: &socket2::Socket, config: &TcpTransportConfig) -> Result<(), ZmqError> {
-  socket.set_nodelay(config.tcp_nodelay).map_err(ZmqError::from)?;
-  if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
+fn apply_socket2_options_pre_connect(
+  socket: &socket2::Socket,
+  config: &TcpTransportConfig,
+) -> Result<(), ZmqError> {
+  socket
+    .set_nodelay(config.tcp_nodelay)
+    .map_err(ZmqError::from)?;
+  if config.keepalive_time.is_some()
+    || config.keepalive_interval.is_some()
+    || config.keepalive_count.is_some()
+  {
     let mut keepalive = TcpKeepalive::new();
     if let Some(time) = config.keepalive_time {
       keepalive = keepalive.with_time(time);
@@ -1106,7 +1218,9 @@ fn apply_socket2_options_pre_connect(socket: &socket2::Socket, config: &TcpTrans
     if let Some(count) = config.keepalive_count {
       keepalive = keepalive.with_retries(count);
     }
-    socket.set_tcp_keepalive(&keepalive).map_err(ZmqError::from)?;
+    socket
+      .set_tcp_keepalive(&keepalive)
+      .map_err(ZmqError::from)?;
   }
   Ok(())
 }
@@ -1117,7 +1231,10 @@ fn apply_tcp_socket_options_to_tokio(
 ) -> Result<(), ZmqError> {
   let socket_ref = SockRef::from(stream);
   socket_ref.set_nodelay(config.tcp_nodelay)?;
-  if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
+  if config.keepalive_time.is_some()
+    || config.keepalive_interval.is_some()
+    || config.keepalive_count.is_some()
+  {
     let mut keepalive = TcpKeepalive::new();
     if let Some(time) = config.keepalive_time {
       keepalive = keepalive.with_time(time);
@@ -1135,10 +1252,16 @@ fn apply_tcp_socket_options_to_tokio(
   Ok(())
 }
 
-fn apply_tcp_socket_options_to_std(stream: &std::net::TcpStream, config: &TcpTransportConfig) -> Result<(), ZmqError> {
+fn apply_tcp_socket_options_to_std(
+  stream: &std::net::TcpStream,
+  config: &TcpTransportConfig,
+) -> Result<(), ZmqError> {
   let socket_ref = SockRef::from(stream);
   socket_ref.set_nodelay(config.tcp_nodelay)?;
-  if config.keepalive_time.is_some() || config.keepalive_interval.is_some() || config.keepalive_count.is_some() {
+  if config.keepalive_time.is_some()
+    || config.keepalive_interval.is_some()
+    || config.keepalive_count.is_some()
+  {
     let mut keepalive = TcpKeepalive::new();
     if let Some(time) = config.keepalive_time {
       keepalive = keepalive.with_time(time);

@@ -29,7 +29,7 @@ const NUM_MESSAGES_PER_DEALER: u64 = 100_000;
 const PAYLOAD_SIZE_BYTES: usize = 1024;
 const ROUTER_ENDPOINT: &'static str = "tcp://127.0.0.1:5558";
 const HANDSHAKE_TIMEOUT_MS: u64 = 5000;
-const CENTRAL_RECEIVER_IDLE_TIMEOUT_MS: u64 = 5000;
+const CENTRAL_RECEIVER_IDLE_TIMEOUT_MS: u64 = 15000;
 const TOTAL_MESSAGES_EXPECTED_BY_ROUTER: u64 = (NUM_DEALER_TASKS as u64) * NUM_MESSAGES_PER_DEALER;
 
 // --- MODIFIED: Implemented PrintLogLevel system ---
@@ -170,7 +170,7 @@ async fn run_dealer_central_receiver(
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   // --- Setup ---
-  tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).compact().init();
+  tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).compact().init();
   if PRINT_LEVEL >= PrintLogLevel::Info {
     println!(
       "Starting DEALER-ROUTER Throughput Example ({} DEALER tasks, {} msgs/task, {} max concurrent)...",
@@ -180,7 +180,7 @@ async fn main() -> Result<(), ZmqError> {
   let uring_config = UringConfig {
     default_recv_multishot: DEALER_IO_URING_ENABLED || ROUTER_IO_URING_ENABLED,
     default_send_zerocopy: SNDZEROCPY_IO_URING_ENABLED,
-    ring_entries: 1024,
+    ring_entries: 10240,
     default_recv_buffer_count: 16,
     default_recv_buffer_size: 65536,
     default_send_buffer_count: 16,

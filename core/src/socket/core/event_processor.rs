@@ -356,19 +356,11 @@ async fn handle_new_connection_established(
         "NewConnectionEstablished: io_uring FD path."
       );
 
-      // SocketCore now always constructs the UringFdConnection.
-      // connection_iface_from_event_opt should be None from the event.
-      if connection_iface_from_event_opt.is_some() {
-        tracing::warn!(handle = core_handle, fd = fd, "NewConnectionEstablished for ViaUringFd unexpectedly received a pre-existing ISocketConnection. This is unusual and will be ignored.");
-      }
-
-      let arc_socket_options_uring = core_arc.core_state.read().options.clone();
-      let core_context_clone_uring = core_arc.context.clone();
-      final_connection_iface = Arc::new(UringFdConnection::new(
-        fd,
-        arc_socket_options_uring,
-        core_context_clone_uring,
-      ));
+      final_connection_iface = connection_iface_from_event_opt.ok_or_else(|| {
+        ZmqError::Internal(
+          "UringFdConnection missing from NewConnectionEstablished event".into(),
+        )
+      })?;
 
       let uring_fd_as_endpoint_handle_id = fd as usize;
 

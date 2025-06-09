@@ -98,8 +98,6 @@ pub(crate) fn build_sqe_for_external_request(
     UringOpRequest::Listen { .. } | // Listen setup is complex, first Accept SQE is internal.
     UringOpRequest::RegisterExternalFd { .. } |
     UringOpRequest::StartFdReadLoop { .. } |
-    UringOpRequest::SendDataViaHandler { .. } |
-    UringOpRequest::SendDataMultipartViaHandler { .. } |
     UringOpRequest::ShutdownConnectionHandler { .. } => {
         tracing::trace!(
             "build_sqe_for_external_request: Op '{}' does not produce a direct SQE from this function.",

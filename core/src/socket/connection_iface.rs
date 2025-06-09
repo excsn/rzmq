@@ -23,9 +23,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fibre::mpmc::AsyncSender;
 #[cfg(feature = "io-uring")]
+use fibre::mpsc;
+#[cfg(feature = "io-uring")]
 use fibre::oneshot::oneshot;
 use fibre::{SendError, TrySendError};
-use tokio::task::yield_now;
 use tokio::time::timeout as tokio_timeout;
 
 #[async_trait]
@@ -218,14 +219,11 @@ impl ISocketConnection for SessionConnection {
   }
 }
 
-// UringFdConnection::send_message already has its own timeout logic for worker reply,
-// which could be tied to SNDTIMEO if passed or accessed.
 #[cfg(feature = "io-uring")]
-#[derive(Clone)]
 pub(crate) struct UringFdConnection {
   fd: RawFd,
-  worker_op_tx: SignalingOpSender,
-  socket_options: Arc<SocketOptions>,
+  // The application pushes messages here.
+  mpsc_tx: mpsc::AsyncSender<Arc<Vec<Msg>>>,
   context: Context,
 }
 
@@ -234,8 +232,7 @@ impl fmt::Debug for UringFdConnection {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("UringFdConnection")
       .field("fd", &self.fd)
-      .field("worker_op_tx_closed", &self.worker_op_tx.is_closed())
-      .field("socket_options", &self.socket_options)
+      .field("mpsc_tx_is_closed", &self.mpsc_tx.is_closed())
       .field("context_present", &true)
       .finish()
   }
@@ -243,12 +240,32 @@ impl fmt::Debug for UringFdConnection {
 
 #[cfg(feature = "io-uring")]
 impl UringFdConnection {
-  pub(crate) fn new(fd: RawFd, socket_options: Arc<SocketOptions>, context: Context) -> Self {
+  pub(crate) fn new(
+    fd: RawFd,
+    mpsc_tx: mpsc::AsyncSender<Arc<Vec<Msg>>>,
+    context: Context,
+  ) -> Self {
     Self {
       fd,
-      worker_op_tx: uring::global_state::get_global_uring_worker_op_tx().unwrap(),
-      socket_options,
+      mpsc_tx,
       context,
+    }
+  }
+
+  /// Synchronously and non-blockingly attempts to send a multipart message.
+  /// This is the primary method for sending data on this connection type.
+  pub fn send_multipart_sync(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+    match self.mpsc_tx.try_send(Arc::new(msgs)) {
+      Ok(()) => Ok(()),
+      Err(TrySendError::Full(_)) => {
+        // This is the expected backpressure signal when the worker can't keep up.
+        Err(ZmqError::ResourceLimitReached)
+      }
+      Err(TrySendError::Closed(_)) => {
+        // The worker has dropped the receiver, meaning the connection is dead.
+        Err(ZmqError::ConnectionClosed)
+      }
+      _ => unreachable!(),
     }
   }
 }
@@ -256,193 +273,36 @@ impl UringFdConnection {
 #[cfg(feature = "io-uring")]
 #[async_trait]
 impl ISocketConnection for UringFdConnection {
-  async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = oneshot();
-    let unique_user_data = self.context.inner().next_handle() as u64;
-    let req = UringOpRequest::SendDataViaHandler {
-      user_data: unique_user_data,
-      fd: self.fd,
-      app_data: Arc::new(msg),
-      reply_tx,
-    };
-
-    self.worker_op_tx.send(req).await.map_err(|e| {
-      tracing::error!(
-        fd = self.fd,
-        "Failed to send SendDataViaHandler request to UringWorker: {}",
-        e
-      );
-      ZmqError::Internal(format!("UringWorker op channel error for send: {}", e))
-    })?;
-
-    // Use SNDTIMEO for the timeout waiting for UringWorker's ACK.
-    // If SNDTIMEO is None (infinite), wait indefinitely.
-    // If SNDTIMEO is Some(ZERO), it's tricky. SendDataViaHandler is async to worker.
-    // A true non-blocking check isn't simple here. For now, use a very small timeout or default if ZERO.
-    let ack_timeout = self
-      .socket_options
-      .sndtimeo
-      .unwrap_or(Duration::from_secs(5)); // Default 5s if infinite SNDTIMEO
-    let effective_ack_timeout = if ack_timeout.is_zero() {
-      Duration::from_millis(1)
-    } else {
-      ack_timeout
-    };
-
-    match tokio_timeout(effective_ack_timeout, reply_rx.recv()).await {
-      Ok(Ok(Ok(_completion))) => Ok(()),
-      Ok(Ok(Err(e))) => {
-        tracing::warn!(
-          fd = self.fd,
-          "UringWorker reported error for SendDataViaHandler: {}",
-          e
-        );
-        Err(e)
-      }
-      Ok(Err(oneshot_err)) => {
-        tracing::error!(
-          fd = self.fd,
-          "OneShot channel error waiting for SendDataViaHandler ack: {}",
-          oneshot_err
-        );
-        Err(ZmqError::Internal(
-          "UringWorker reply channel error for send".into(),
-        ))
-      }
-      Err(_timeout_elapsed) => {
-        tracing::error!(
-          fd = self.fd,
-          "Timeout waiting for SendDataViaHandler ack from UringWorker (timeout used: {:?}).",
-          effective_ack_timeout
-        );
-        // If original SNDTIMEO was zero, ResourceLimitReached might be more appropriate if the intent was "don't wait for worker ack"
-        if self.socket_options.sndtimeo == Some(Duration::ZERO) {
-          Err(ZmqError::ResourceLimitReached)
-        } else {
-          Err(ZmqError::Timeout)
-        }
-      }
-    }
-  }
-
+  
+  /// This method is now effectively synchronous, wrapping the non-blocking `try_send`.
+  /// The `async` keyword is only here to satisfy the trait definition.
   async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
-
-    let (reply_tx, reply_rx) = oneshot();
-    let unique_user_data = self.context.inner().next_handle() as u64;
-
-    // Create the new request variant
-    let req = UringOpRequest::SendDataMultipartViaHandler {
-      user_data: unique_user_data,
-      fd: self.fd,
-      app_data_parts: Arc::new(msgs), // Wrap Vec<Msg> in Arc
-      reply_tx,
-    };
-
-    self.worker_op_tx.send(req).await.map_err(|e| {
-      tracing::error!(
-        fd = self.fd,
-        "Failed to send SendDataMultipartViaHandler request to UringWorker: {}",
-        e
-      );
-      ZmqError::Internal(format!(
-        "UringWorker op channel error for multipart send: {}",
-        e
-      ))
-    })?;
-
-    // Timeout logic remains similar to send_message
-    let ack_timeout = self
-      .socket_options
-      .sndtimeo
-      .unwrap_or(Duration::from_secs(5));
-    let effective_ack_timeout = if ack_timeout.is_zero() {
-      Duration::from_millis(1)
-    } else {
-      ack_timeout
-    };
-
-    match tokio_timeout(effective_ack_timeout, reply_rx.recv()).await {
-      Ok(Ok(Ok(_completion))) => Ok(()), // Assumes SendDataViaHandlerAck is used for multipart too
-      Ok(Ok(Err(e))) => {
-        tracing::warn!(
-          fd = self.fd,
-          "UringWorker reported error for SendDataMultipartViaHandler: {}",
-          e
-        );
-        Err(e)
-      }
-      Ok(Err(oneshot_err)) => {
-        tracing::error!(
-          fd = self.fd,
-          "OneShot channel error waiting for SendDataMultipartViaHandler ack: {}",
-          oneshot_err
-        );
-        Err(ZmqError::Internal(
-          "UringWorker reply channel error for multipart send".into(),
-        ))
-      }
-      Err(_timeout_elapsed) => {
-        tracing::error!(
-          fd = self.fd,
-          "Timeout waiting for SendDataMultipartViaHandler ack from UringWorker (timeout: {:?}).",
-          effective_ack_timeout
-        );
-        if self.socket_options.sndtimeo == Some(Duration::ZERO) {
-          Err(ZmqError::ResourceLimitReached)
-        } else {
-          Err(ZmqError::Timeout)
-        }
-      }
-    }
+    self.send_multipart_sync(msgs)
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
-
+    // This logic remains the same. Closing is an async request to the worker.
     let (reply_tx, reply_rx) = oneshot();
-
     let unique_user_data = self.context.inner().next_handle() as u64;
     let req = UringOpRequest::ShutdownConnectionHandler {
       user_data: unique_user_data,
       fd: self.fd,
       reply_tx,
     };
-    self.worker_op_tx.send(req).await.map_err(|e| {
-      tracing::error!(
-        fd = self.fd,
-        "Failed to send ShutdownConnectionHandler request to UringWorker: {}",
-        e
-      );
+    
+    let worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
+    worker_op_tx.send(req).await.map_err(|e| {
       ZmqError::Internal(format!("UringWorker op channel error for close: {}", e))
     })?;
+
     match tokio::time::timeout(Duration::from_secs(5), reply_rx.recv()).await {
-      Ok(Ok(Ok(_completion))) => Ok(()),
-      Ok(Ok(Err(e))) => {
-        tracing::warn!(
-          fd = self.fd,
-          "UringWorker reported error for ShutdownConnectionHandler: {}",
-          e
-        );
-        Err(e)
-      }
-      Ok(Err(oneshot_err)) => {
-        tracing::error!(
-          fd = self.fd,
-          "OneShot channel error waiting for ShutdownConnectionHandler ack: {}",
-          oneshot_err
-        );
-        Err(ZmqError::Internal(
-          "UringWorker reply channel error for close".into(),
-        ))
-      }
-      Err(_timeout_elapsed) => {
-        tracing::error!(
-          fd = self.fd,
-          "Timeout waiting for ShutdownConnectionHandler ack from UringWorker."
-        );
-        Err(ZmqError::Timeout)
-      }
+      Ok(Ok(Ok(_))) => Ok(()),
+      Ok(Ok(Err(e))) => Err(e),
+      Ok(Err(_)) => Err(ZmqError::Internal("UringWorker reply channel error for close".into())),
+      Err(_) => Err(ZmqError::Timeout),
     }
   }
+
   fn get_connection_id(&self) -> usize {
     self.fd as usize
   }

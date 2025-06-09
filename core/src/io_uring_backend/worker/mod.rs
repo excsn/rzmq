@@ -19,7 +19,7 @@ use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::io_uring_backend::UserData;
 use crate::uring::{global_state, UringConfig};
-use crate::ZmqError;
+use crate::{Msg, ZmqError};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -29,8 +29,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use fibre::mpmc::{unbounded, AsyncSender, Sender as SyncSender, Receiver as SyncReceiver};
+use fibre::mpsc;
 use io_uring::opcode;
-use io_uring::types;
 use io_uring::IoUring;
 use tracing::{debug, error, info, trace, warn};
 
@@ -47,15 +47,6 @@ pub(crate) enum WorkerState {
   Draining, // Shutdown initiated, processing in-flight completions only
   CleaningUp, 
   Stopped,
-}
-
-#[derive(Debug)]
-pub(crate) enum CorkSendState {
-  /// We have received a RequestSetCork(true) and are waiting for the UringCmd to complete.
-  /// The Vec holds all the send blueprints for the message.
-  AwaitingCorkEnable {
-    pending_sends: Vec<HandlerSqeBlueprint>,
-  },
 }
 
 pub struct UringWorker {
@@ -78,7 +69,7 @@ pub struct UringWorker {
   pending_sqe_retry_queue: VecDeque<(RawFd, HandlerSqeBlueprint)>,
   pub(crate) event_fd_poller: EventFdPoller,
   send_buffer_pool: Option<Arc<SendBufferPool>>, // For zero-copy sends
-  pub(crate) cork_send_states: HashMap<RawFd, CorkSendState>,
+  pub(crate) fd_to_mpsc_rx: HashMap<RawFd, Arc<mpsc::Receiver<Arc<Vec<Msg>>>>>,
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
   cfg_send_buffer_count: usize, //TODO revisit
@@ -88,19 +79,16 @@ pub struct UringWorker {
 impl fmt::Debug for UringWorker {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("UringWorker")
-      .field("ring_fd", &self.ring.as_raw_fd()) // as_raw_fd() on IoUring
+      .field("ring_fd", &self.ring.as_raw_fd())
       .field("op_rx_len", &self.op_rx.len())
       .field("op_rx_is_closed", &self.op_rx.is_closed())
       .field("buffer_manager_is_some", &self.buffer_manager.is_some())
       .field("external_op_tracker_len", &self.external_op_tracker.in_flight.len())
       .field("internal_op_tracker_len", &self.internal_op_tracker.op_to_details.len())
-      .field(
-        "default_buffer_ring_group_id_val",
-        &self.default_buffer_ring_group_id_val,
-      )
+      .field("default_buffer_ring_group_id_val", &self.default_buffer_ring_group_id_val)
       .field("pending_sqe_retry_queue_len", &self.pending_sqe_retry_queue.len())
       .field("event_fd_poller", &self.event_fd_poller)
-      .field("cork_send_states_len", &self.cork_send_states.len())
+      .field("fd_to_mpsc_rx_len", &self.fd_to_mpsc_rx.len())
       .finish_non_exhaustive()
   }
 }
@@ -198,7 +186,7 @@ impl UringWorker {
               fds_needing_close_initiated_pass: VecDeque::new(),
               pending_sqe_retry_queue: VecDeque::new(),
               send_buffer_pool: worker_send_buffer_pool,
-              cork_send_states: HashMap::new(),
+              fd_to_mpsc_rx: HashMap::new(),
               cfg_send_zerocopy_enabled: effective_send_zerocopy_enabled_for_worker,
               // Store original config values for reference if needed, though behavior is driven by effective values.
               cfg_send_buffer_count: config.default_send_buffer_count,

@@ -263,7 +263,6 @@ impl DealerSocket {
     }
   }
 
-  // <<< MODIFIED START [Corrected Dealer incoming message processing] >>>
   fn process_incoming_zmtp_message_for_dealer(
     &self,
     pipe_read_id: usize,
@@ -339,7 +338,6 @@ impl DealerSocket {
     // `frames` now contains only the application payload parts.
     Ok(frames)
   }
-  // <<< MODIFIED END >>>
 
   fn prepare_full_multipart_send_sequence(&self, user_frames: Vec<Msg>) -> Vec<Msg> {
     if user_frames.is_empty() {

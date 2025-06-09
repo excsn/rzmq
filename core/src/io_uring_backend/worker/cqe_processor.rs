@@ -2,27 +2,21 @@
 
 #![cfg(feature = "io-uring")]
 
-use super::eventfd_poller::EventFdPoller;
-use super::external_op_tracker::ExternalOpTracker;
-use super::handler_manager::HandlerManager;
 use super::internal_op_tracker::{
-  InternalOpDetails, InternalOpPayload, InternalOpTracker, InternalOpType,
+  InternalOpDetails, InternalOpPayload, InternalOpType,
 };
-use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
-  HandlerIoOps, HandlerSqeBlueprint, UringWorkerInterface, WorkerIoConfig,
+  HandlerIoOps, HandlerSqeBlueprint, UringWorkerInterface,
 };
 use crate::io_uring_backend::ops::{UringOpCompletion, UserData, HANDLER_INTERNAL_SEND_OP_UD};
-use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
-use crate::io_uring_backend::worker::CorkSendState;
+use crate::io_uring_backend::worker::UringWorker;
 use crate::{uring, Command, ZmqError};
 
-use io_uring::{cqueue, opcode, squeue, types, IoUring}; // Added IoUring
-use std::collections::{HashMap, VecDeque};
+use io_uring::cqueue::Entry;
+use io_uring::{cqueue, opcode, squeue, types};
 use std::mem;
 use std::os::unix::io::RawFd;
-use std::sync::Arc; // Added VecDeque
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "io-uring")]
@@ -30,19 +24,22 @@ const CQE_F_NOTIFY_FLAG: u32 = 1 << 3; // (8) for kernels 6.0+
 
 // process_handler_blueprints (signature confirmed from previous discussions)
 pub(crate) fn process_handler_blueprints(
+  worker: &mut UringWorker,
   fd_from_handler_iteration: RawFd,
   ops_output: HandlerIoOps,
-  internal_ops: &mut InternalOpTracker,
-  sq: &mut squeue::SubmissionQueue<'_>,
-  default_bgid_for_read_sqe: Option<u16>,
-  fds_to_initiate_close_queue: &mut VecDeque<RawFd>,
-  pending_sqe_retry_queue: &mut VecDeque<(RawFd, HandlerSqeBlueprint)>,
-  handler_manager: &mut HandlerManager,
-  worker_cfg_send_zerocopy_enabled: bool,
-  worker_send_buffer_pool: &Option<Arc<crate::io_uring_backend::send_buffer_pool::SendBufferPool>>,
-  external_ops: &ExternalOpTracker,
-  cork_send_states: &mut HashMap<RawFd, CorkSendState>,
 ) {
+
+  let ring = &mut worker.ring;
+  let sq = &mut unsafe { ring.submission_shared() };
+  let external_ops = &mut worker.external_op_tracker;
+  let internal_ops = &mut worker.internal_op_tracker;
+  let handler_manager = &mut worker.handler_manager;
+  let send_buffer_pool = &worker.send_buffer_pool;
+  let default_bgid_for_read_sqe = worker.default_buffer_ring_group_id_val;
+  let fds_to_initiate_close_queue = &mut worker.fds_needing_close_initiated_pass;
+  let pending_sqe_retry_queue = &mut worker.pending_sqe_retry_queue;
+  let worker_cfg_send_zerocopy_enabled = worker.cfg_send_zerocopy_enabled;
+
   if ops_output.initiate_close_due_to_error {
     warn!(
       "CQE Processor: Handler for FD {} requested error close via HandlerIoOps.",
@@ -53,41 +50,25 @@ pub(crate) fn process_handler_blueprints(
     }
   }
 
-  // --- New Corking Logic: Detect the cork-send-uncork pattern ---
   let blueprints = ops_output.sqe_blueprints;
-  if blueprints.len() > 2
-    && matches!(
-      blueprints.first(),
-      Some(&HandlerSqeBlueprint::RequestSetCork(true))
-    )
-    && matches!(
-      blueprints.last(),
-      Some(&HandlerSqeBlueprint::RequestSetCork(false))
-    )
-  {
-    trace!(
-      "CQE Processor: Detected cork-send-uncork pattern for FD {}. Initiating async corked send.",
-      fd_from_handler_iteration
-    );
-    // This is a corked send sequence.
-    // Slice out the actual send blueprints.
-    let send_blueprints: Vec<HandlerSqeBlueprint> = blueprints[1..blueprints.len() - 1].to_vec();
 
-    // Initiate the state machine.
-    initiate_corked_send(
-      fd_from_handler_iteration,
-      send_blueprints,
-      internal_ops,
-      sq,
-      cork_send_states,
+  // Atomic Blueprint Submission: Check if there is enough space in the submission queue for ALL blueprints from this operation.
+  if sq.capacity() - sq.len() < blueprints.len() {
+    debug!(
+      "CQE Processor: Not enough space in SQ for atomic blueprint submission ({} required, {} available). Re-queueing all.",
+      blueprints.len(),
+      sq.capacity() - sq.len()
     );
-    // The entire batch has been handled, so we can return early from this function.
+    // If not enough space, add the entire batch to the retry queue and return.
+    for blueprint in blueprints {
+      pending_sqe_retry_queue.push_back((fd_from_handler_iteration, blueprint));
+    }
     return;
   }
 
-  for (idx, blueprint_ref) in blueprints.iter().enumerate() {
-    if unsafe { sq.is_full() } {
-      warn!(
+  for (_idx, blueprint_ref) in blueprints.iter().enumerate() {
+    if sq.is_full() {
+      debug!(
         "CQE Processor: Submission queue full while processing blueprints for FD {}. Blueprint {:?} will be requeued.",
         fd_from_handler_iteration, blueprint_ref
       );
@@ -102,14 +83,20 @@ pub(crate) fn process_handler_blueprints(
     let sqe_build_result_opt: Option<Result<(squeue::Entry, InternalOpType), String>> =
       match blueprint_ref {
         HandlerSqeBlueprint::RequestSetCork(enable) => {
-          warn!(
-            fd = fd_from_handler_iteration,
-            ?enable,
-            "CQE Processor: Encountered a lone RequestSetCork blueprint outside of a batch. This is unsupported. Ignoring."
-          );
-          continue; // Ignore and proceed to the next blueprint.
+          let cork_val: i32 = if *enable { 1 } else { 0 };
+          let entry = opcode::SetSockOpt::new(
+            types::Fd(fd_from_handler_iteration),
+            libc::SOL_TCP as _,
+            libc::TCP_CORK as _,
+            &cork_val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&cork_val) as u32,
+          )
+          .build();
+          // We don't need to track the completion of cork commands specifically
+          // because the kernel handles their ordering relative to sends.
+          // We assign a generic op type that requires no special completion logic.
+          Some(Ok((entry, InternalOpType::GenericHandlerOp)))
         }
-        // Use blueprint
         HandlerSqeBlueprint::RequestRingRead => {
           if let Some(bgid) = default_bgid_for_read_sqe {
             let read_op_builder = opcode::Read::new(
@@ -163,7 +150,7 @@ pub(crate) fn process_handler_blueprints(
             None;
 
           if worker_cfg_send_zerocopy_enabled {
-            if let Some(pool_arc) = worker_send_buffer_pool {
+            if let Some(pool_arc) = send_buffer_pool {
               // Use the passed-in worker field
               if let Some((reg_buf_id, buffer_ptr, len_copied)) =
                 pool_arc.acquire_and_prep_buffer(data_to_send)
@@ -188,13 +175,13 @@ pub(crate) fn process_handler_blueprints(
                   fd_from_handler_iteration
                 );
               } else {
-                warn!(
+                debug!(
                 "CQE Processor: ZC Send - Failed to acquire/prep registered buffer for FD {}. Falling back.",
                 fd_from_handler_iteration
               );
               }
             } else {
-              warn!(
+              debug!(
                 "CQE Processor: ZC Send - SendBufferPool not available for FD {}. Falling back.",
                 fd_from_handler_iteration
               );
@@ -202,7 +189,7 @@ pub(crate) fn process_handler_blueprints(
           }
 
           if !submitted_via_zc_path {
-            warn!(
+            debug!(
               "CQE Processor: Falling back to normal send for FD {} (ZC intended for op_ud {}).",
               fd_from_handler_iteration, *originating_app_op_ud
             );
@@ -252,7 +239,7 @@ pub(crate) fn process_handler_blueprints(
 
           unsafe {
             if sq.push(&entry).is_err() {
-              warn!(
+              debug!(
                 "CQE Processor: SQ push failed for FD {} RecvMulti. Op requeued.",
                 fd
               );
@@ -271,7 +258,7 @@ pub(crate) fn process_handler_blueprints(
               if let Some(handler) = handler_manager.get_mut(fd) {
                 handler.inform_multishot_reader_op_submitted(op_user_data, false, None);
               } else {
-                warn!(
+                debug!(
                 "CQE Processor: Handler for FD {} not found after submitting RecvMulti. Reader not informed.",
                 fd
               );
@@ -304,7 +291,7 @@ pub(crate) fn process_handler_blueprints(
 
           unsafe {
             if sq.push(&entry).is_err() {
-              warn!(
+              debug!(
                 "CQE Processor: SQ push failed for FD {} AsyncCancel (target_ud: {}). Op requeued.",
                 fd, target_user_data
               );
@@ -330,7 +317,7 @@ pub(crate) fn process_handler_blueprints(
                   Some(target_user_data),
                 );
               } else {
-                warn!(
+                debug!(
                 "CQE Processor: Handler for FD {} not found after submitting AsyncCancel. Reader not informed.",
                 fd
               );
@@ -352,7 +339,7 @@ pub(crate) fn process_handler_blueprints(
             let push_result = sq.push(&entry_to_submit);
 
             if push_result.is_err() {
-              warn!("CQE Processor: SQ push failed for FD {} blueprint {:?} (race condition or SQ became full?). Op requeued.", fd_from_handler_iteration, entry_to_submit);
+              debug!("CQE Processor: SQ push failed for FD {} blueprint {:?} (race condition or SQ became full?). Op requeued.", fd_from_handler_iteration, entry_to_submit);
 
               // Requeue if push fails even after initial SQ full check (race condition).
               // Also, need to clean up the internal_op_tracker entry for this failed push.
@@ -392,25 +379,16 @@ pub(crate) fn process_handler_blueprints(
 }
 
 pub(crate) fn process_all_cqes(
-  ring: &mut IoUring,
-  external_ops: &mut ExternalOpTracker,
-  internal_ops: &mut InternalOpTracker,
-  handler_manager: &mut HandlerManager,
-  recv_buffer_manager: Option<&BufferRingManager>,
-  send_buffer_pool: &Option<Arc<SendBufferPool>>,
-  worker_io_config: &WorkerIoConfig,
-  default_bgid_val_from_worker: Option<u16>,
-  fds_to_initiate_close_queue: &mut VecDeque<RawFd>,
-  pending_sqe_retry_queue: &mut VecDeque<(RawFd, HandlerSqeBlueprint)>,
-  event_fd_poller: &mut EventFdPoller,
-  worker_cfg_send_zerocopy_enabled: bool,
+  worker: &mut UringWorker,
   is_worker_shutting_down: bool,
-  cork_send_states: &mut HashMap<RawFd, CorkSendState>,
 ) -> Result<(), ZmqError> {
-  let mut cq = unsafe { ring.completion_shared() };
-  cq.sync();
 
-  for cqe in &mut cq {
+
+  let mut cq: cqueue::CompletionQueue<'_> = unsafe { worker.ring.completion_shared() };
+  cq.sync();
+  let entries: Vec<Entry> = cq.into_iter().collect();
+
+  for cqe in entries {
     let cqe_user_data = cqe.user_data();
     let cqe_result = cqe.result();
     let cqe_flags = cqe.flags();
@@ -422,13 +400,14 @@ pub(crate) fn process_all_cqes(
       cqe_flags
     );
 
+    let event_fd_poller = &mut worker.event_fd_poller;
     if event_fd_poller.handle_cqe_if_matches(
       cqe_user_data,
       cqe_result,
-      internal_ops,
+      &mut worker.internal_op_tracker,
       is_worker_shutting_down,
     ) {
-      if internal_ops.take_op_details(cqe_user_data).is_none() {
+      if worker.internal_op_tracker.take_op_details(cqe_user_data).is_none() {
         warn!(
           "[CQE Proc] EventFdPoll CQE (ud:{}) handled, but no InternalOpDetails found to consume.",
           cqe_user_data
@@ -437,7 +416,7 @@ pub(crate) fn process_all_cqes(
       continue;
     }
 
-    if let Some(mut ext_op_ctx) = external_ops.take_op(cqe_user_data) {
+    if let Some(mut ext_op_ctx) = worker.external_op_tracker.take_op(cqe_user_data) {
       trace!(
         "[CQE Proc] EXTERNAL op '{}' (ud:{}, res:{})",
         ext_op_ctx.op_name,
@@ -488,7 +467,9 @@ pub(crate) fn process_all_cqes(
             if let Some(ref factory_id) = ext_op_ctx.protocol_handler_factory_id {
               let protocol_config = ext_op_ctx.protocol_config.as_ref().unwrap();
 
-              match handler_manager.create_and_add_handler(
+              let recv_buffer_manager = worker.buffer_manager.as_ref();
+              let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
+              match worker.handler_manager.create_and_add_handler(
                 connected_fd,
                 factory_id,
                 protocol_config,
@@ -502,20 +483,10 @@ pub(crate) fn process_all_cqes(
                     "CQE Processor: Connect successful (ext_ud:{}), new FD:{}. Handler created. Peer: {}, Local: {}",
                     cqe_user_data, connected_fd, peer_addr, local_addr
                   );
-                  let mut sq_for_initial_ops = unsafe { ring.submission_shared() };
                   process_handler_blueprints(
+                    worker,
                     connected_fd,
                     initial_ops,
-                    internal_ops,
-                    &mut sq_for_initial_ops,
-                    default_bgid_val_from_worker,
-                    fds_to_initiate_close_queue,
-                    pending_sqe_retry_queue,
-                    handler_manager,
-                    worker_cfg_send_zerocopy_enabled,
-                    send_buffer_pool,
-                    external_ops,
-                    cork_send_states,
                   );
                   UringOpCompletion::ConnectSuccess {
                     user_data: cqe_user_data,
@@ -584,7 +555,7 @@ pub(crate) fn process_all_cqes(
     let mut is_multishot_read_pending_more = false;
     let mut was_delegated_to_multishot_handler = false;
 
-    if let Some(peeked_details) = internal_ops.get_op_details(cqe_user_data) {
+    if let Some(peeked_details) = worker.internal_op_tracker.get_op_details(cqe_user_data) {
       let handler_fd_peeked = peeked_details.fd;
       let op_type_peeked = peeked_details.op_type;
 
@@ -611,7 +582,12 @@ pub(crate) fn process_all_cqes(
       }
 
       if matches!(op_type_peeked, InternalOpType::RingReadMultishot) {
-        if let Some(handler) = handler_manager.get_mut(handler_fd_peeked) {
+        if let Some(handler) = worker.handler_manager.get_mut(handler_fd_peeked) {
+
+          let recv_buffer_manager = worker.buffer_manager.as_ref();
+          let worker_io_config = &worker.worker_io_config;
+          let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
+          let fds_to_initiate_close_queue = &mut worker.fds_needing_close_initiated_pass;
           let recv_bm_ref =
             recv_buffer_manager.expect("Recv BufferManager missing for multishot op");
           let interface = UringWorkerInterface::new(
@@ -622,13 +598,13 @@ pub(crate) fn process_all_cqes(
             cqe_user_data,
           );
           if let Some(delegation_result) =
-            handler.delegate_cqe_to_multishot_reader(&cqe, recv_bm_ref, &interface, internal_ops)
+            handler.delegate_cqe_to_multishot_reader(&cqe, recv_bm_ref, &interface, &mut worker.internal_op_tracker)
           {
             was_delegated_to_multishot_handler = true;
             match delegation_result {
               Ok((handler_blueprints, should_cleanup_delegated_op_ud)) => {
                 if should_cleanup_delegated_op_ud {
-                  if internal_ops.take_op_details(cqe_user_data).is_none() {
+                  if worker.internal_op_tracker.take_op_details(cqe_user_data).is_none() {
                     warn!("[CQE Proc] Multishot delegate requested cleanup for ud:{}, but it was already taken or not found.", cqe_user_data);
                   }
                 } else if op_type_peeked == InternalOpType::RingReadMultishot {
@@ -637,20 +613,10 @@ pub(crate) fn process_all_cqes(
                 if !handler_blueprints.sqe_blueprints.is_empty()
                   || handler_blueprints.initiate_close_due_to_error
                 {
-                  let mut sq_for_delegate_ops = unsafe { ring.submission_shared() };
                   process_handler_blueprints(
+                    worker,
                     handler_fd_peeked,
                     handler_blueprints,
-                    internal_ops,
-                    &mut sq_for_delegate_ops,
-                    default_bgid_val_from_worker,
-                    fds_to_initiate_close_queue,
-                    pending_sqe_retry_queue,
-                    handler_manager,
-                    worker_cfg_send_zerocopy_enabled,
-                    send_buffer_pool,
-                    external_ops,
-                    cork_send_states,
                   );
                 }
               }
@@ -662,7 +628,7 @@ pub(crate) fn process_all_cqes(
                 if !fds_to_initiate_close_queue.contains(&handler_fd_peeked) {
                   fds_to_initiate_close_queue.push_back(handler_fd_peeked);
                 }
-                internal_ops.take_op_details(cqe_user_data);
+                worker.internal_op_tracker.take_op_details(cqe_user_data);
               }
             }
           }
@@ -671,7 +637,7 @@ pub(crate) fn process_all_cqes(
             "[CQE Proc] Handler for FD {} (ud:{}, type:{:?}) not found for multishot/cancel. Orphaned op.",
             handler_fd_peeked, cqe_user_data, op_type_peeked
           );
-          internal_ops.take_op_details(cqe_user_data);
+          worker.internal_op_tracker.take_op_details(cqe_user_data);
         }
       }
     }
@@ -680,7 +646,7 @@ pub(crate) fn process_all_cqes(
       && !is_multishot_read_pending_more
       && !was_delegated_to_multishot_handler
     {
-      op_details_taken_for_final_processing = internal_ops.take_op_details(cqe_user_data);
+      op_details_taken_for_final_processing = worker.internal_op_tracker.take_op_details(cqe_user_data);
     }
 
     if let Some(op_details) = op_details_taken_for_final_processing {
@@ -695,99 +661,6 @@ pub(crate) fn process_all_cqes(
       );
 
       match op_type {
-        InternalOpType::UringCmdSetCorkEnable => {
-          if cqe_result < 0 {
-            error!(
-              "Failed to enable TCP_CORK for FD {}. Aborting batched send. Errno: {}",
-              handler_fd, -cqe_result
-            );
-            // Clean up the state.
-            cork_send_states.remove(&handler_fd);
-            // Optionally notify the ZmtpHandler of the failure.
-          } else {
-            trace!("FD {}: Cork enabled. Submitting payload sends.", handler_fd);
-            if let Some(CorkSendState::AwaitingCorkEnable { pending_sends }) =
-              cork_send_states.remove(&handler_fd)
-            {
-              let mut sq_for_payload = unsafe { ring.submission_shared() };
-              let payload_ops = HandlerIoOps {
-                sqe_blueprints: pending_sends,
-                initiate_close_due_to_error: false,
-              };
-
-              // We recursively call process_handler_blueprints to submit the sends.
-              // It's crucial that this inner call does NOT contain a corking pattern
-              // to avoid infinite recursion. Our logic ensures this.
-              process_handler_blueprints(
-                handler_fd,
-                payload_ops,
-                internal_ops,
-                &mut sq_for_payload,
-                default_bgid_val_from_worker,
-                fds_to_initiate_close_queue,
-                pending_sqe_retry_queue,
-                handler_manager,
-                worker_cfg_send_zerocopy_enabled,
-                send_buffer_pool,
-                external_ops,
-                cork_send_states,
-              );
-
-              // After submitting sends, queue the 'uncork' command.
-              let disable: i32 = 0;
-              let disable_op_ud = internal_ops.new_op_id(
-                handler_fd,
-                InternalOpType::UringCmdSetCorkDisable,
-                InternalOpPayload::None,
-              );
-              let disable_entry = opcode::SetSockOpt::new(
-                types::Fd(handler_fd),
-                libc::SOL_TCP as _,
-                libc::TCP_CORK as _,
-                &disable as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&disable) as u32,
-              )
-              .build()
-              .user_data(disable_op_ud);
-
-              unsafe {
-                if sq_for_payload.push(&disable_entry).is_err() {
-                  // This is a problematic state. The sends went out, but we can't guarantee
-                  // the uncork will be submitted. The kernel will eventually time out the cork.
-                  warn!(
-                    "SQ Full when trying to submit 'uncork' for FD {}. The connection may stall.",
-                    handler_fd
-                  );
-                  // Clean up our state anyway.
-                  cork_send_states.remove(&handler_fd);
-                }
-              }
-
-              // Update state to show we are waiting for the disable command.
-              // We don't need a specific state for this, as the UD of the disable op is now in the internal_ops tracker.
-              trace!(
-                "FD {}: Submitted payload and uncork command (ud {}).",
-                handler_fd,
-                disable_op_ud
-              );
-            } else {
-              error!("FD {}: CQE for CorkEnable but no state found!", handler_fd);
-            }
-          }
-        }
-
-        InternalOpType::UringCmdSetCorkDisable => {
-          if cqe_result < 0 {
-            warn!(
-              "Failed to disable TCP_CORK for FD {}. State might be inconsistent. Errno: {}",
-              handler_fd, -cqe_result
-            );
-          } else {
-            trace!("FD {}: Cork disabled. Batched send complete.", handler_fd);
-          }
-          // The operation is complete. No more state to clean up from cork_send_states
-          // as it was removed when we processed the enable CQE.
-        }
         InternalOpType::Accept => {
           if cqe_result >= 0 {
             let client_fd = cqe_result as RawFd;
@@ -797,10 +670,13 @@ pub(crate) fn process_all_cqes(
               cqe_user_data, listener_fd, client_fd
             );
 
+            let recv_buffer_manager = worker.buffer_manager.as_ref();
+            let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
+
             let factory_id_opt;
             let protocol_config_opt;
             {
-              let listener_meta_opt = handler_manager.get_listener_metadata(listener_fd);
+              let listener_meta_opt = worker.handler_manager.get_listener_metadata(listener_fd);
               factory_id_opt =
                 listener_meta_opt.map(|m| m.factory_id_for_accepted_connections.clone());
               protocol_config_opt =
@@ -810,7 +686,7 @@ pub(crate) fn process_all_cqes(
             if let (Some(factory_id), Some(protocol_config)) = (factory_id_opt, protocol_config_opt)
             {
               const ACCEPTED_CONNECTION_SENTINEL_UD: UserData = 0;
-              match handler_manager.create_and_add_handler(
+              match worker.handler_manager.create_and_add_handler(
                 client_fd,
                 &factory_id,
                 &protocol_config,
@@ -820,20 +696,10 @@ pub(crate) fn process_all_cqes(
                 ACCEPTED_CONNECTION_SENTINEL_UD,
               ) {
                 Ok(initial_ops) => {
-                  let mut sq_for_accept_initial_ops = unsafe { ring.submission_shared() };
                   process_handler_blueprints(
+                    worker,
                     client_fd,
                     initial_ops,
-                    internal_ops,
-                    &mut sq_for_accept_initial_ops,
-                    default_bgid_val_from_worker,
-                    fds_to_initiate_close_queue,
-                    pending_sqe_retry_queue,
-                    handler_manager,
-                    worker_cfg_send_zerocopy_enabled,
-                    send_buffer_pool,
-                    external_ops,
-                    cork_send_states,
                   );
                 }
                 Err(e) => {
@@ -854,7 +720,7 @@ pub(crate) fn process_all_cqes(
             }
 
             if !is_worker_shutting_down {
-              let new_accept_internal_ud = internal_ops.new_op_id(
+              let new_accept_internal_ud = worker.internal_op_tracker.new_op_id(
                 listener_fd,
                 InternalOpType::Accept,
                 InternalOpPayload::None,
@@ -871,14 +737,16 @@ pub(crate) fn process_all_cqes(
               .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
               .build()
               .user_data(new_accept_internal_ud);
-              let mut sq_for_reaccept_op = unsafe { ring.submission_shared() };
+              let mut sq_for_reaccept_op = unsafe { worker.ring.submission_shared() };
               unsafe {
                 if sq_for_reaccept_op.push(&accept_sqe_reaccept).is_err() {
                   error!(
                     "Worker: Failed to re-submit Accept SQE for listener fd {} (SQ FULL?). Listener may stop accepting.",
                     listener_fd
                   );
-                  internal_ops.take_op_details(new_accept_internal_ud);
+
+                  let fds_to_initiate_close_queue = &mut worker.fds_needing_close_initiated_pass;
+                  worker.internal_op_tracker.take_op_details(new_accept_internal_ud);
                   if !fds_to_initiate_close_queue.contains(&listener_fd) {
                     fds_to_initiate_close_queue.push_back(listener_fd);
                   }
@@ -906,7 +774,7 @@ pub(crate) fn process_all_cqes(
 
             if !is_worker_shutting_down {
               let new_accept_internal_ud_on_err =
-                internal_ops.new_op_id(handler_fd, InternalOpType::Accept, InternalOpPayload::None);
+                worker.internal_op_tracker.new_op_id(handler_fd, InternalOpType::Accept, InternalOpPayload::None);
               let mut client_addr_storage_err: libc::sockaddr_storage = unsafe { mem::zeroed() };
               let mut client_addr_len_err =
                 mem::size_of_val(&client_addr_storage_err) as libc::socklen_t;
@@ -918,11 +786,13 @@ pub(crate) fn process_all_cqes(
               .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
               .build()
               .user_data(new_accept_internal_ud_on_err);
-              let mut sq_for_reaccept_err_op = unsafe { ring.submission_shared() };
+              let mut sq_for_reaccept_err_op = unsafe { worker.ring.submission_shared() };
+              
+              let fds_to_initiate_close_queue = &mut worker.fds_needing_close_initiated_pass;
               unsafe {
                 if sq_for_reaccept_err_op.push(&accept_sqe_on_err).is_err() {
                   error!("Worker: Failed to re-submit Accept SQE after error for listener_fd {} (SQ FULL?). Listener may stop accepting.", handler_fd);
-                  internal_ops.take_op_details(new_accept_internal_ud_on_err);
+                  worker.internal_op_tracker.take_op_details(new_accept_internal_ud_on_err);
                   if !fds_to_initiate_close_queue.contains(&handler_fd) {
                     fds_to_initiate_close_queue.push_back(handler_fd);
                   }
@@ -938,9 +808,14 @@ pub(crate) fn process_all_cqes(
               cqe_user_data, handler_fd
             );
 
+            // Remove the corresponding MPSC receiver when an FD is closed.
+            if worker.fd_to_mpsc_rx.remove(&handler_fd).is_some() {
+              trace!("CQE Processor: Removed MPSC receiver for closed FD {}", handler_fd);
+            }
+
             // Loop to find and reply to ALL pending shutdown requests for this FD.
             loop {
-              if let Some((ext_ud, ext_ctx)) = external_ops.take_op_if_shutdown_for_fd(handler_fd) {
+              if let Some((ext_ud, ext_ctx)) = worker.external_op_tracker.take_op_if_shutdown_for_fd(handler_fd) {
                 info!(
                         "CQE Processor: Notifying external shutdown requester (ext_ud: {}) for closed FD {}.",
                         ext_ud, handler_fd
@@ -961,7 +836,7 @@ pub(crate) fn process_all_cqes(
               }
             }
 
-            if let Some(mut h) = handler_manager.remove_handler(handler_fd) {
+            if let Some(mut h) = worker.handler_manager.remove_handler(handler_fd) {
               h.fd_has_been_closed();
               info!(
                 "CQE Processor: Handler for FD {} removed after successful CloseFd.",
@@ -1012,13 +887,13 @@ pub(crate) fn process_all_cqes(
               "CQE Processor: Internal CloseFd op (ud:{}) for FD {} FAILED: {}. Forcing handler removal.",
               cqe_user_data, handler_fd, close_err
             );
-            if let Some(mut h) = handler_manager.remove_handler(handler_fd) {
+            if let Some(mut h) = worker.handler_manager.remove_handler(handler_fd) {
               h.fd_has_been_closed();
             }
 
             // Also notify any pending shutdown requesters of the failure.
             loop {
-              if let Some((ext_ud, ext_ctx)) = external_ops.take_op_if_shutdown_for_fd(handler_fd) {
+              if let Some((ext_ud, ext_ctx)) = worker.external_op_tracker.take_op_if_shutdown_for_fd(handler_fd) {
                 let err_completion = UringOpCompletion::OpError {
                   user_data: ext_ud,
                   op_name: "ShutdownConnectionHandler (via CloseFd failure)".to_string(),
@@ -1050,7 +925,7 @@ pub(crate) fn process_all_cqes(
             ..
           } = op_details.payload
           {
-            if let Some(pool_arc) = send_buffer_pool {
+            if let Some(pool_arc) = &worker.send_buffer_pool {
               pool_arc.release_buffer(send_buf_id);
               trace!(
                 "[CQE Proc] Released ZC send_buf_id {:?} for ud:{}",
@@ -1065,7 +940,7 @@ pub(crate) fn process_all_cqes(
             }
 
             if app_op_ud != HANDLER_INTERNAL_SEND_OP_UD {
-              if let Some(ext_op_ctx_mut) = external_ops.get_op_context_mut(app_op_ud) {
+              if let Some(ext_op_ctx_mut) = worker.external_op_tracker.get_op_context_mut(app_op_ud) {
                 if cqe_result < 0 {
                   let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
                   let completion = Ok(UringOpCompletion::OpError {
@@ -1073,7 +948,7 @@ pub(crate) fn process_all_cqes(
                     op_name: app_op_name.clone(),
                     error: zmq_err,
                   });
-                  if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud) {
+                  if let Some(ctx_to_reply) = worker.external_op_tracker.take_op(app_op_ud) {
                     let _ = ctx_to_reply.reply_tx.send(completion);
                   }
                 } else if let Some(multi_state) = &mut ext_op_ctx_mut.multipart_state {
@@ -1083,7 +958,7 @@ pub(crate) fn process_all_cqes(
                       user_data: app_op_ud,
                       fd: handler_fd,
                     });
-                    if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud) {
+                    if let Some(ctx_to_reply) = worker.external_op_tracker.take_op(app_op_ud) {
                       let _ = ctx_to_reply.reply_tx.send(completion);
                     }
                   }
@@ -1092,7 +967,7 @@ pub(crate) fn process_all_cqes(
                     user_data: app_op_ud,
                     fd: handler_fd,
                   });
-                  if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud) {
+                  if let Some(ctx_to_reply) = worker.external_op_tracker.take_op(app_op_ud) {
                     let _ = ctx_to_reply.reply_tx.send(completion);
                   }
                 }
@@ -1121,7 +996,7 @@ pub(crate) fn process_all_cqes(
           } = op_details.payload
           {
             if app_op_ud_val != HANDLER_INTERNAL_SEND_OP_UD {
-              if let Some(ext_op_ctx_mut) = external_ops.get_op_context_mut(app_op_ud_val) {
+              if let Some(ext_op_ctx_mut) = worker.external_op_tracker.get_op_context_mut(app_op_ud_val) {
                 if cqe_result < 0 {
                   // If ANY part fails, we immediately take and reply with an error.
                   let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
@@ -1131,7 +1006,7 @@ pub(crate) fn process_all_cqes(
                     error: zmq_err,
                   });
                   // Since the op has failed, we can safely consume the context now.
-                  if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud_val) {
+                  if let Some(ctx_to_reply) = worker.external_op_tracker.take_op(app_op_ud_val) {
                     let _ = ctx_to_reply.reply_tx.send(completion);
                   }
                 } else if let Some(multi_state) = &mut ext_op_ctx_mut.multipart_state {
@@ -1143,7 +1018,7 @@ pub(crate) fn process_all_cqes(
                       user_data: app_op_ud_val,
                       fd: handler_fd,
                     });
-                    if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud_val) {
+                    if let Some(ctx_to_reply) = worker.external_op_tracker.take_op(app_op_ud_val) {
                       let _ = ctx_to_reply.reply_tx.send(completion);
                     }
                   }
@@ -1154,7 +1029,7 @@ pub(crate) fn process_all_cqes(
                     user_data: app_op_ud_val,
                     fd: handler_fd,
                   });
-                  if let Some(ctx_to_reply) = external_ops.take_op(app_op_ud_val) {
+                  if let Some(ctx_to_reply) = worker.external_op_tracker.take_op(app_op_ud_val) {
                     let _ = ctx_to_reply.reply_tx.send(completion);
                   }
                 }
@@ -1163,7 +1038,10 @@ pub(crate) fn process_all_cqes(
               // This is a send initiated by a handler internally (e.g., a PING).
               // It doesn't have an external operation to notify, but the handler might care about the result.
               trace!("[CQE Proc] Normal Send: Send for internal handler op (ud:{}, app_op_ud:{}) completed.", cqe_user_data, app_op_ud_val);
-              if let Some(handler) = handler_manager.get_mut(handler_fd) {
+              if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+                let recv_buffer_manager = worker.buffer_manager.as_ref();
+                let worker_io_config = &worker.worker_io_config;
+                let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
                 let interface = UringWorkerInterface::new(
                   handler_fd,
                   worker_io_config,
@@ -1180,20 +1058,10 @@ pub(crate) fn process_all_cqes(
                 if !handler_output.sqe_blueprints.is_empty()
                   || handler_output.initiate_close_due_to_error
                 {
-                  let mut sq_for_handler_resp = unsafe { ring.submission_shared() };
                   process_handler_blueprints(
+                    worker,
                     handler_fd,
                     handler_output,
-                    internal_ops,
-                    &mut sq_for_handler_resp,
-                    default_bgid_val_from_worker,
-                    fds_to_initiate_close_queue,
-                    pending_sqe_retry_queue,
-                    handler_manager,
-                    worker_cfg_send_zerocopy_enabled,
-                    send_buffer_pool,
-                    external_ops,
-                    cork_send_states,
                   );
                 }
               } else {
@@ -1214,7 +1082,12 @@ pub(crate) fn process_all_cqes(
                 std::io::Error::from_raw_os_error(-cqe_result)
               );
             }
-            if let Some(handler) = handler_manager.get_mut(handler_fd) {
+
+            if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+              let recv_buffer_manager = worker.buffer_manager.as_ref();
+              let worker_io_config = &worker.worker_io_config;
+              let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
+              
               let interface = UringWorkerInterface::new(
                 handler_fd,
                 worker_io_config,
@@ -1231,20 +1104,10 @@ pub(crate) fn process_all_cqes(
               if !handler_output.sqe_blueprints.is_empty()
                 || handler_output.initiate_close_due_to_error
               {
-                let mut sq_for_handler_resp = unsafe { ring.submission_shared() };
                 process_handler_blueprints(
+                  worker,
                   handler_fd,
                   handler_output,
-                  internal_ops,
-                  &mut sq_for_handler_resp,
-                  default_bgid_val_from_worker,
-                  fds_to_initiate_close_queue,
-                  pending_sqe_retry_queue,
-                  handler_manager,
-                  worker_cfg_send_zerocopy_enabled,
-                  send_buffer_pool,
-                  external_ops,
-                  cork_send_states,
                 );
               }
             } else {
@@ -1256,7 +1119,11 @@ pub(crate) fn process_all_cqes(
           }
         }
         InternalOpType::RingRead | InternalOpType::GenericHandlerOp => {
-          if let Some(handler) = handler_manager.get_mut(handler_fd) {
+          if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+            let recv_buffer_manager = worker.buffer_manager.as_ref();
+            let worker_io_config = &worker.worker_io_config;
+            let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
+
             let interface = UringWorkerInterface::new(
               handler_fd,
               worker_io_config,
@@ -1267,6 +1134,8 @@ pub(crate) fn process_all_cqes(
             let handler_output: HandlerIoOps;
             if op_type == InternalOpType::RingRead && cqueue::buffer_select(cqe_flags).is_some() {
               if cqe_result >= 0 {
+                
+                let fds_to_initiate_close_queue = &mut worker.fds_needing_close_initiated_pass;
                 if let Some(bid) = cqueue::buffer_select(cqe_flags) {
                   // Check bid is valid
                   let bytes_read = cqe_result as usize;
@@ -1343,20 +1212,10 @@ pub(crate) fn process_all_cqes(
             if !handler_output.sqe_blueprints.is_empty()
               || handler_output.initiate_close_due_to_error
             {
-              let mut sq_for_handler_resp = unsafe { ring.submission_shared() };
               process_handler_blueprints(
+                worker,
                 handler_fd,
                 handler_output,
-                internal_ops,
-                &mut sq_for_handler_resp,
-                default_bgid_val_from_worker,
-                fds_to_initiate_close_queue,
-                pending_sqe_retry_queue,
-                handler_manager,
-                worker_cfg_send_zerocopy_enabled,
-                send_buffer_pool,
-                external_ops,
-                cork_send_states,
               );
             }
           } else {
@@ -1369,14 +1228,8 @@ pub(crate) fn process_all_cqes(
         InternalOpType::EventFdPoll => {
           warn!("[CQE Proc] Reached InternalOpType::EventFdPoll (ud:{}) in final processing path. Should have been handled by event_fd_poller.handle_cqe_if_matches.", cqe_user_data);
         }
-        InternalOpType::RingReadMultishot => {
+        InternalOpType::RingReadMultishot | InternalOpType::AsyncCancel => {
           warn!("[CQE Proc] Reached InternalOpType::{:?} (ud:{}) in final processing path. Should have been handled by delegate_cqe_to_multishot_reader.", op_type, cqe_user_data);
-        }
-        InternalOpType::AsyncCancel => {
-          trace!(
-            "[CQE Proc] Finalized processing for AsyncCancel op (ud:{}).",
-            cqe_user_data
-          );
         }
       }
     } else if is_zc_initial_pending_notify
@@ -1389,64 +1242,4 @@ pub(crate) fn process_all_cqes(
     }
   }
   Ok(())
-}
-
-//// Kicks off an asynchronous, batched send operation using TCP_CORK.
-///
-/// This function:
-/// 1. Stores the pending send blueprints in the worker's state map.
-/// 2. Submits a `SetSockOpt` operation to the kernel to enable TCP_CORK.
-/// 3. The completion of this operation will be handled by the CQE processor,
-///    which will then proceed to send the buffered frames.
-fn initiate_corked_send(
-  fd: RawFd,
-  pending_sends: Vec<HandlerSqeBlueprint>,
-  internal_ops: &mut InternalOpTracker,
-  sq: &mut squeue::SubmissionQueue<'_>,
-  cork_send_states: &mut HashMap<RawFd, CorkSendState>,
-) {
-  // 1. Store the state BEFORE submitting the operation. This prevents a race condition
-  //    where the completion (CQE) could arrive before the state is stored.
-  cork_send_states.insert(fd, CorkSendState::AwaitingCorkEnable { pending_sends });
-
-  // 2. Build the `SetSockOpt` SQE to enable the cork.
-  let enable: i32 = 1;
-  let op_user_data = internal_ops.new_op_id(
-    fd,
-    InternalOpType::UringCmdSetCorkEnable,
-    InternalOpPayload::None,
-  );
-
-  let entry = opcode::SetSockOpt::new(
-    types::Fd(fd),
-    libc::SOL_TCP as _, // Let rust infer the type for i32/u32
-    libc::TCP_CORK as _,
-    &enable as *const _ as *const libc::c_void,
-    std::mem::size_of_val(&enable) as u32,
-  )
-  .build()
-  .user_data(op_user_data);
-
-  // 3. Submit the SQE to the kernel.
-  // SAFETY: This is called within the worker loop which has exclusive access to the ring.
-  unsafe {
-    if sq.push(&entry).is_err() {
-      // If submission fails (e.g., queue is full), we must roll back the state we just added.
-      warn!(
-        "SQ Full when initiating corked send for FD {}. Send dropped.",
-        fd
-      );
-      // Clean up the UserData we allocated for the failed operation.
-      internal_ops.take_op_details(op_user_data);
-      // Clean up the state we stored in the worker's map.
-      cork_send_states.remove(&fd);
-      return;
-    }
-  }
-
-  trace!(
-    fd,
-    "Initiated corked send. State stored. Awaiting cork enable CQE (ud {}).",
-    op_user_data
-  );
 }
