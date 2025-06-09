@@ -1188,13 +1188,29 @@ impl UringConnectionHandler for ZmtpUringHandler {
     }
 
     if cqe_result < 0 {
-      let io_err = std::io::Error::from_raw_os_error(-cqe_result);
-      let zmq_err = ZmqError::from(io_err);
-      error!(fd = self.fd, error = %zmq_err, "Kernel error on send operation.");
-      let mut temp_ops = std::mem::take(&mut ops);
-      self.transition_to_error(&mut temp_ops, zmq_err, interface);
-      ops = temp_ops;
-      return ops;
+      let raw_errno = -cqe_result;
+      if raw_errno == libc::EAGAIN || raw_errno == libc::EWOULDBLOCK {
+        // This is not a real error. It just means the read operation found no data.
+        // We simply need to request another read for the future.
+        trace!(
+          fd = self.fd,
+          ud = sqe_user_data,
+          "Read operation completed with EAGAIN/EWOULDBLOCK. This is normal. Requesting new read."
+        );
+        // The `ensure_standard_read_is_pending` call at the end of this function
+        // will now correctly queue a new read since `pending_read_op_ud` was just cleared.
+      } else {
+        // This is a real, fatal kernel error.
+        let io_err = std::io::Error::from_raw_os_error(raw_errno);
+        let zmq_err = ZmqError::from(io_err);
+        // The log message "Kernel error on send operation" is a bit misleading, as this
+        // could also be a read error. Let's make it more generic.
+        error!(fd = self.fd, error = %zmq_err, "Fatal kernel error on I/O operation.");
+        let mut temp_ops = std::mem::take(&mut ops);
+        self.transition_to_error(&mut temp_ops, zmq_err, interface);
+        ops = temp_ops;
+        return ops;
+      }
     }
 
     let previous_phase = self.phase;

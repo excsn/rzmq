@@ -15,7 +15,7 @@ use crate::io_uring_backend::connection_handler::{
 use crate::io_uring_backend::ops::{UringOpCompletion, UserData, HANDLER_INTERNAL_SEND_OP_UD};
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
-use crate::io_uring_backend::worker::{CorkSendState, UringWorker};
+use crate::io_uring_backend::worker::CorkSendState;
 use crate::{uring, Command, ZmqError};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring}; // Added IoUring

@@ -56,11 +56,6 @@ pub(crate) enum CorkSendState {
   AwaitingCorkEnable {
     pending_sends: Vec<HandlerSqeBlueprint>,
   },
-  /// We are now submitting the actual Send/SendZc operations.
-  /// The UserData is for the final UringCmdSetCorkDisable operation.
-  SendingPayload {
-    disable_cork_op_ud: UserData,
-  },
 }
 
 pub struct UringWorker {

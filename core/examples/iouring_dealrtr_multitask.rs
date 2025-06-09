@@ -24,7 +24,7 @@ const SNDZEROCPY_IO_URING_ENABLED: bool = false;
 const TCP_CORK_ENABLED: bool = true;
 const USE_MULTIPART_API: bool = true;
 const NUM_DEALER_TASKS: usize = 8;
-const MAX_CONCURRENT_REQUESTS: usize = 100000;
+const MAX_CONCURRENT_REQUESTS: usize = 10_000;
 const NUM_MESSAGES_PER_DEALER: u64 = 100_000;
 const PAYLOAD_SIZE_BYTES: usize = 1024;
 const ROUTER_ENDPOINT: &'static str = "tcp://127.0.0.1:5558";
@@ -170,7 +170,7 @@ async fn run_dealer_central_receiver(
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   // --- Setup ---
-  tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).compact().init();
+  tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).compact().init();
   if PRINT_LEVEL >= PrintLogLevel::Info {
     println!(
       "Starting DEALER-ROUTER Throughput Example ({} DEALER tasks, {} msgs/task, {} max concurrent)...",
@@ -178,8 +178,13 @@ async fn main() -> Result<(), ZmqError> {
     );
   }
   let uring_config = UringConfig {
+    default_recv_multishot: DEALER_IO_URING_ENABLED || ROUTER_IO_URING_ENABLED,
     default_send_zerocopy: SNDZEROCPY_IO_URING_ENABLED,
-    ring_entries: 1024, ..Default::default()
+    ring_entries: 1024,
+    default_recv_buffer_count: 16,
+    default_recv_buffer_size: 65536,
+    default_send_buffer_count: 16,
+    default_send_buffer_size: 65536,
   };
   if let Err(e) = initialize_uring_backend(uring_config) {
       if !matches!(&e, ZmqError::InvalidState(s) if s.contains("already initialized")) {

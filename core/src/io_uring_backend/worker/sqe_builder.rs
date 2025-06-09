@@ -41,74 +41,74 @@ pub(crate) fn build_sqe_for_external_request(
   let user_data = request.get_user_data_ref(); // Use the helper
 
   match request {
-        UringOpRequest::Nop { .. } => {
-            Ok(Some(opcode::Nop::new().build().user_data(user_data)))
-        }
-        UringOpRequest::Connect { target_addr, .. } => {
-            let socket_fd = match target_addr {
-                SocketAddr::V4(_) => unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) },
-                SocketAddr::V6(_) => unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) },
-            };
-
-            if socket_fd < 0 {
-                let e = std::io::Error::last_os_error();
-                tracing::error!("Connect: Failed to create socket: {}", e);
-                return Err(UringOpCompletion::OpError {
-                    user_data,
-                    op_name: "ConnectSocketCreate".to_string(),
-                    error: ZmqError::from(e),
-                });
-            }
-            *out_connect_fd = Some(socket_fd); // Store the created FD
-
-            let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
-            let addr_len = socket_addr_to_sockaddr_storage(target_addr, &mut storage);
-
-            if addr_len == 0 {
-                // This case should ideally be caught by SocketAddr parsing earlier,
-                // but as a safeguard if socket_addr_to_sockaddr_storage fails.
-                unsafe { libc::close(socket_fd); } // Clean up the created socket
-                *out_connect_fd = None;             // Clear the stored FD
-                tracing::error!("Connect: Address conversion failed for target_addr: {:?}", target_addr);
-                return Err(UringOpCompletion::OpError {
-                    user_data,
-                    op_name: "ConnectAddrConversion".to_string(),
-                    error: ZmqError::InvalidArgument(format!("Address conversion failed for {:?}", target_addr)),
-                });
-            }
-
-            Ok(Some(
-                opcode::Connect::new(types::Fd(socket_fd), &storage as *const _ as *const libc::sockaddr, addr_len)
-                    .build()
-                    .user_data(user_data), // UserData for Connect SQE is the external UserData
-            ))
-        }
-        UringOpRequest::RegisterRawBuffers { .. } => {
-            // This operation itself (registering buffers with IORING_REGISTER_BUFFERS)
-            // is usually done by the IoUring::register_buffers method directly on the ring,
-            // not as a typical SQE that goes through the submission queue for I/O.
-            // If the intent was a different kind of buffer registration, it needs clarification.
-            // For now, assume it's handled by UringWorker directly or not an SQE from here.
-            tracing::trace!("build_sqe_for_external_request: RegisterRawBuffers is handled directly by worker, not as an SQE from here.");
-            Ok(None)
-        }
-
-        // Operations handled by worker state changes or delegated to handlers, not by direct SQE from this function:
-        UringOpRequest::InitializeBufferRing { .. } |
-        UringOpRequest::Listen { .. } | // Listen setup is complex, first Accept SQE is internal.
-        UringOpRequest::RegisterExternalFd { .. } |
-        UringOpRequest::StartFdReadLoop { .. } |
-        UringOpRequest::SendDataViaHandler { .. } |
-        UringOpRequest::SendDataMultipartViaHandler { .. } |
-        UringOpRequest::ShutdownConnectionHandler { .. } => {
-            tracing::trace!(
-                "build_sqe_for_external_request: Op '{}' does not produce a direct SQE from this function.",
-                request.op_name_str()
-            );
-            Ok(None) // These ops don't produce an SQE *through this builder*.
-                     // Their logic is in UringWorker::handle_external_op_request_submission.
-        }
-        // Note: If any new UringOpRequest variants are added that *should* produce an SQE here,
-        // they need to be explicitly handled.
+    UringOpRequest::Nop { .. } => {
+      Ok(Some(opcode::Nop::new().build().user_data(user_data)))
     }
+    UringOpRequest::Connect { target_addr, .. } => {
+        let socket_fd = match target_addr {
+            SocketAddr::V4(_) => unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) },
+            SocketAddr::V6(_) => unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) },
+        };
+
+        if socket_fd < 0 {
+            let e = std::io::Error::last_os_error();
+            tracing::error!("Connect: Failed to create socket: {}", e);
+            return Err(UringOpCompletion::OpError {
+                user_data,
+                op_name: "ConnectSocketCreate".to_string(),
+                error: ZmqError::from(e),
+            });
+        }
+        *out_connect_fd = Some(socket_fd); // Store the created FD
+
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let addr_len = socket_addr_to_sockaddr_storage(target_addr, &mut storage);
+
+        if addr_len == 0 {
+            // This case should ideally be caught by SocketAddr parsing earlier,
+            // but as a safeguard if socket_addr_to_sockaddr_storage fails.
+            unsafe { libc::close(socket_fd); } // Clean up the created socket
+            *out_connect_fd = None;             // Clear the stored FD
+            tracing::error!("Connect: Address conversion failed for target_addr: {:?}", target_addr);
+            return Err(UringOpCompletion::OpError {
+                user_data,
+                op_name: "ConnectAddrConversion".to_string(),
+                error: ZmqError::InvalidArgument(format!("Address conversion failed for {:?}", target_addr)),
+            });
+        }
+
+        Ok(Some(
+            opcode::Connect::new(types::Fd(socket_fd), &storage as *const _ as *const libc::sockaddr, addr_len)
+                .build()
+                .user_data(user_data), // UserData for Connect SQE is the external UserData
+        ))
+    }
+    UringOpRequest::RegisterRawBuffers { .. } => {
+        // This operation itself (registering buffers with IORING_REGISTER_BUFFERS)
+        // is usually done by the IoUring::register_buffers method directly on the ring,
+        // not as a typical SQE that goes through the submission queue for I/O.
+        // If the intent was a different kind of buffer registration, it needs clarification.
+        // For now, assume it's handled by UringWorker directly or not an SQE from here.
+        tracing::trace!("build_sqe_for_external_request: RegisterRawBuffers is handled directly by worker, not as an SQE from here.");
+        Ok(None)
+    }
+
+    // Operations handled by worker state changes or delegated to handlers, not by direct SQE from this function:
+    UringOpRequest::InitializeBufferRing { .. } |
+    UringOpRequest::Listen { .. } | // Listen setup is complex, first Accept SQE is internal.
+    UringOpRequest::RegisterExternalFd { .. } |
+    UringOpRequest::StartFdReadLoop { .. } |
+    UringOpRequest::SendDataViaHandler { .. } |
+    UringOpRequest::SendDataMultipartViaHandler { .. } |
+    UringOpRequest::ShutdownConnectionHandler { .. } => {
+        tracing::trace!(
+            "build_sqe_for_external_request: Op '{}' does not produce a direct SQE from this function.",
+            request.op_name_str()
+        );
+        Ok(None) // These ops don't produce an SQE *through this builder*.
+                  // Their logic is in UringWorker::handle_external_op_request_submission.
+    }
+    // Note: If any new UringOpRequest variants are added that *should* produce an SQE here,
+    // they need to be explicitly handled.
+  }
 }

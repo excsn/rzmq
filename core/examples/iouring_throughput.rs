@@ -32,8 +32,8 @@ async fn main() -> Result<(), ZmqError> {
     default_recv_multishot: false,
     default_recv_buffer_count: 64,
     default_recv_buffer_size: 4096,
-    default_send_buffer_count: 64,  // For ZC pool if default_send_zerocopy is true
-    default_send_buffer_size: 4096, // For ZC pool
+    default_send_buffer_count: 64,
+    default_send_buffer_size: 4096,
   };
   match initialize_uring_backend(uring_config) {
     Ok(_) => println!("io_uring backend initialized explicitly."),

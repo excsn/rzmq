@@ -8,7 +8,6 @@ use crate::io_uring_backend::connection_handler::{HandlerIoOps, UringWorkerInter
 use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest};
 use crate::io_uring_backend::worker::external_op_tracker::MultipartSendState;
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerState};
-use crate::io_uring_backend::UserData;
 use crate::profiler::LoopProfiler;
 use crate::ZmqError;
 
@@ -19,7 +18,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fibre::{RecvError, TryRecvError};
+use fibre::TryRecvError;
 use io_uring::{opcode, types};
 use tracing::{debug, error, info, trace, warn};
 
@@ -41,7 +40,7 @@ impl UringWorker {
   ) -> Result<bool, UringOpRequest> {
     let user_data_from_req = request.get_user_data_ref();
     let op_name_str = request.op_name_str();
-    let original_request_reply_tx = request.get_reply_tx_ref().clone(); // Clone for local use, original stays with request for retry
+    let _original_request_reply_tx = request.get_reply_tx_ref().clone(); // Clone for local use, original stays with request for retry
 
     trace!(
       "UringWorker: Handling external op request: {}, ud: {}",
@@ -107,8 +106,8 @@ impl UringWorker {
       }
       UringOpRequest::RegisterRawBuffers {
         user_data,
-        ref buffers,
         reply_tx,
+        ..
       } => {
         warn!("UringWorker: RegisterRawBuffers direct ring call not fully implemented. Sending placeholder ack.");
         // Real implementation: self.ring.register_buffers(buffers_as_ioslices_or_vecs).map_err...
@@ -584,7 +583,7 @@ impl UringWorker {
 
             // Reply with success to the original requester via the ExternalOpContext.
             // We already added to tracker, now take it to reply.
-            if let Some(mut op_ctx) = self.external_op_tracker.take_op(user_data) {
+            if let Some(op_ctx) = self.external_op_tracker.take_op(user_data) {
               let _ = op_ctx
                 .reply_tx
                 .send(Ok(UringOpCompletion::RegisterExternalFdSuccess {
@@ -606,7 +605,7 @@ impl UringWorker {
               fd, err_msg
             );
             // Reply with error via the ExternalOpContext
-            if let Some(mut op_ctx) = self.external_op_tracker.take_op(user_data) {
+            if let Some(op_ctx) = self.external_op_tracker.take_op(user_data) {
               let _ = op_ctx.reply_tx.send(Ok(UringOpCompletion::OpError {
                 user_data,
                 op_name: op_name_str.clone(),
@@ -736,15 +735,10 @@ impl UringWorker {
             fd_created_for_connect_op: None,   // Not relevant
             listener_fd: None,                 // Not relevant
             target_fd_for_shutdown: Some(fd),  // Associate with the FD for context
-            multipart_state: if self.cfg_send_zerocopy_enabled {
-              // Only track multipart if ZC is on
-              Some(MultipartSendState {
-                total_parts: num_parts,
-                completed_parts: 0,
-              })
-            } else {
-              None // No multipart state tracking needed if ZC is off (immediate ACK)
-            },
+            multipart_state: Some(MultipartSendState {
+              total_parts: num_parts,
+              completed_parts: 0,
+            }),
           },
         );
         if let Some(handler) = self.handler_manager.get_mut(fd) {
@@ -810,7 +804,7 @@ impl UringWorker {
         reply_tx,
       } => {
         // The worker is now responsible for cancellation before closing.
-        info!(
+        debug!(
           fd,
           "UringWorker: Processing ShutdownConnectionHandler for FD."
         );
@@ -943,7 +937,6 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
   let mut kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
   const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(64);
 
-  // MODIFIED: Replaced `loop` with `while` and `match` on state
   while worker.state != WorkerState::Stopped {
     profiler.loop_start();
 
