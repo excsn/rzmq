@@ -239,8 +239,16 @@ impl ISocket for RepSocket {
     Err(ZmqError::UnsupportedOption(option))
   }
 
-  async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
-    Ok(false)
+  async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
+
+    match command {
+      Command::Stop => {
+        self.incoming_orchestrator.close().await;
+      }
+      _ => return Ok(false),
+    }
+    
+    Ok(true)
   }
 
   async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {

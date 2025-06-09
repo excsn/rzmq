@@ -215,6 +215,7 @@ pub(crate) async fn initiate_core_shutdown(
   if coordinator.state != ShutdownPhase::Running {
     return;
   }
+  
   tracing::info!(
     handle = core_handle,
     was_due_to_error,

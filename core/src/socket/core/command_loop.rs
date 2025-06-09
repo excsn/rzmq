@@ -3,6 +3,7 @@ use crate::runtime::{ActorDropGuard, ActorType, MailboxReceiver, SystemEvent};
 use crate::socket::core::state::ShutdownPhase;
 use crate::socket::core::{command_processor, event_processor, shutdown, SocketCore};
 use crate::socket::ISocket;
+use crate::Command;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -172,11 +173,46 @@ pub(crate) async fn run_command_loop(
 
   // --- Post-Loop Cleanup & ActorStopping Event ---
   // This section runs after the main loop breaks (due to shutdown or fatal error).
-  tracing::info!(
+  tracing::debug!(
       handle = core_handle,
-      socket_type = ?socket_type_for_log,
-      "SocketCore main loop finished execution."
+      "SocketCore loop exited. Performing final cleanup and ISocket::close()."
   );
+  
+  // 1. Close the public-facing API resources to unblock any waiting user tasks.
+  //    This is the most critical part of the fix.
+  if let Err(e) = socket_logic_strong.process_command(Command
+  ::Stop).await {
+      tracing::error!(handle = core_handle, "Error during final ISocket::close(): {}", e);
+      if final_error_for_actorstop.is_none() {
+          final_error_for_actorstop = Some(e);
+      }
+  }
+
+  // 2. Drain any remaining commands that arrived after shutdown started.
+  //    This prevents panics from senders whose receivers have been dropped.
+  // while let Some(cmd) = command_receiver.try_recv().ok() {
+  //     // Log and drop the command, replying with an error if possible.
+  //     tracing::warn!(handle = core_handle, cmd = %cmd.variant_name(), "Dropping command received during final shutdown.");
+  //     // Best-effort attempt to notify the caller that the socket is closed.
+  //     match cmd {
+  //         Command::UserBind { reply_tx, .. } |
+  //         Command::UserConnect { reply_tx, .. } |
+  //         Command::UserDisconnect { reply_tx, .. } |
+  //         Command::UserUnbind { reply_tx, .. } |
+  //         Command::UserSetOpt { reply_tx, .. } |
+  //         Command::UserMonitor { reply_tx, .. } |
+  //         Command::UserClose { reply_tx, .. } => {
+  //             let _ = reply_tx.send(Err(ZmqError::InvalidState("Socket closed")));
+  //         },
+  //         Command::UserGetOpt { reply_tx, .. } => {
+  //             let _ = reply_tx.send(Err(ZmqError::InvalidState("Socket closed")));
+  //         },
+  //         Command::UserRecv { reply_tx, .. } => {
+  //             let _ = reply_tx.send(Err(ZmqError::InvalidState("Socket closed")));
+  //         },
+  //         _ => {} // Other commands have no reply channel
+  //     }
+  // }
 
   // If loop exited due to an error that wasn't already part of a graceful shutdown,
   // ensure shutdown is initiated and as much cleanup as possible happens.

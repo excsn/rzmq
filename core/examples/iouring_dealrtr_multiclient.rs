@@ -263,6 +263,6 @@ async fn main() -> Result<(), ZmqError> {
     }
 
     ctx.term().await?;
-    shutdown_uring_backend()?;
+    shutdown_uring_backend().await?;
     Ok(())
 }

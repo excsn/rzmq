@@ -480,7 +480,7 @@ async fn main() -> Result<(), ZmqError> {
 
   println!("[Main] Terminating context...");
   ctx.term().await?;
-  shutdown_uring_backend().unwrap_or_else(|e| eprintln!("Error shutting down io_uring backend: {:?}", e));
+  shutdown_uring_backend().await.unwrap_or_else(|e| eprintln!("Error shutting down io_uring backend: {:?}", e));
   
   println!("[Main] Example finished.");
   Ok(())

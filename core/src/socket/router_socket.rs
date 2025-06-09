@@ -155,18 +155,10 @@ impl ISocket for RouterSocket {
     delegate_to_core!(self, UserGetOpt, option: option)
   }
   async fn close(&self) -> Result<(), ZmqError> {
-    // First, delegate the close command to the core to start its shutdown.
-    let core_close_result = delegate_to_core!(self, UserClose,);
-
-    // Now, close the internal orchestrator to unblock any waiting recv() calls.
-    // This is the crucial step that was missing.
-    self.incoming_orchestrator.close().await;
-
-    // Return the result from the core shutdown initiation.
-    core_close_result
+    delegate_to_core!(self, UserClose,)
   }
 
-  async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
+  async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
@@ -548,8 +540,16 @@ impl ISocket for RouterSocket {
     }
   }
 
-  async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
-    Ok(false)
+  async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
+    
+    match command {
+      Command::Stop => {
+        self.incoming_orchestrator.close().await;
+      }
+      _ => return Ok(false),
+    }
+    
+    Ok(true)
   }
 
   async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {

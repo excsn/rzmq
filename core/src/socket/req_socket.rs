@@ -99,7 +99,6 @@ impl ISocket for ReqSocket {
     delegate_to_core!(self, UserGetOpt, option: option)
   }
   async fn close(&self) -> Result<(), ZmqError> {
-    self.reply_available_notifier.notify_waiters();
     delegate_to_core!(self, UserClose,)
   }
 
@@ -369,8 +368,16 @@ impl ISocket for ReqSocket {
     Err(ZmqError::UnsupportedOption(option))
   }
 
-  async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
-    Ok(false)
+  async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
+    
+    match command {
+      Command::Stop => {
+        self.reply_available_notifier.notify_waiters();
+      }
+      _ => return Ok(false),
+    }
+    
+    Ok(true)
   }
 
   async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {

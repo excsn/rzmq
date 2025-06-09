@@ -11,6 +11,13 @@ use rzmq::{
 
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
+  tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::TRACE) // Adjust log level (INFO, DEBUG, TRACE)
+    .with_thread_ids(true)
+    .with_thread_names(true)
+    .with_target(true)
+    .compact()
+    .init();
   // --- Explicitly initialize the io_uring backend with custom settings ---
   // Here, we enable default_send_zerocopy to true globally for the io_uring backend.
   // This means sends (especially zero-copy ones) handled by the UringWorker
@@ -123,17 +130,19 @@ async fn main() -> Result<(), ZmqError> {
   ctx.term().await?;
   println!("Main: Context terminated.");
 
+  println!("Waiting for rep socket");
   // Wait for REP task to finish if it hasn't already due to ctx.term()
   if let Err(e) = rep_handle.await {
     eprintln!("Error joining REP task: {:?}", e);
   }
 
+  println!("Shutting down iouring");
   // --- Explicitly shutdown the io_uring backend (optional but good practice for cleanup) ---
   // This is more relevant if your application has a very specific point where it no longer
   // needs the io_uring backend and wants to release its global resources.
   // In many cases, letting OS clean up on process exit is fine if `ctx.term()` already joined worker.
   // However, for libraries or long-running apps with re-init needs, this is useful.
-  match shutdown_uring_backend() {
+  match shutdown_uring_backend().await {
     Ok(_) => println!("io_uring backend shutdown."),
     Err(e) => eprintln!("Error shutting down io_uring backend: {:?}", e),
   }

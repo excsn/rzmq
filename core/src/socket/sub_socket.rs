@@ -178,15 +178,11 @@ impl ISocket for SubSocket {
       .recv_logical_message(rcvtimeo_opt, transform_fn)
       .await
   }
-  // <<< MODIFIED END >>>
 
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     delegate_to_core!(self, UserGetOpt, option: option)
   }
   async fn close(&self) -> Result<(), ZmqError> {
-    // <<< MODIFIED [Signal notifier on close to unblock recv if waiting, if SubSocket had one like REQ] >>>
-    // SubSocket's orchestrator has its own internal buffer, which clear_pipe_state will handle.
-    // No separate socket-level notifier like ReqSocket for this specific scenario.
     delegate_to_core!(self, UserClose,)
   }
 

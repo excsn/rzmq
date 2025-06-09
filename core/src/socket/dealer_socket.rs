@@ -399,20 +399,7 @@ impl ISocket for DealerSocket {
     delegate_to_core!(self, UserGetOpt, option: option)
   }
   async fn close(&self) -> Result<(), ZmqError> {
-    self.processor_stop_signal.notify_one();
-    if let Some(handle) = self.processor_task_handle.lock().await.take() {
-      if let Err(e) = tokio_timeout(Duration::from_millis(100), handle).await {
-        tracing::warn!(
-          "[Dealer {}] Timeout or error waiting for processor task on close: {:?}",
-          self.core.handle,
-          e
-        );
-      }
-    }
-    let res = delegate_to_core!(self, UserClose,);
-    self.outgoing_queue_activity_notifier.notify_waiters();
-    self.peer_availability_notifier.notify_waiters();
-    res
+    delegate_to_core!(self, UserClose,)
   }
 
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
@@ -572,8 +559,28 @@ impl ISocket for DealerSocket {
     Err(ZmqError::UnsupportedOption(option))
   }
 
-  async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
-    Ok(false)
+  async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
+
+    match command {
+      Command::Stop => {
+        self.incoming_orchestrator.close().await;
+        self.processor_stop_signal.notify_one();
+        if let Some(handle) = self.processor_task_handle.lock().await.take() {
+          if let Err(e) = tokio_timeout(Duration::from_millis(100), handle).await {
+            tracing::warn!(
+              "[Dealer {}] Timeout or error waiting for processor task on close: {:?}",
+              self.core.handle,
+              e
+            );
+          }
+        }
+        self.outgoing_queue_activity_notifier.notify_waiters();
+        self.peer_availability_notifier.notify_waiters();
+      }
+      _ => return Ok(false),
+    }
+    
+    Ok(true)
   }
 
   async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
