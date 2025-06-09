@@ -1,23 +1,18 @@
-// core/src/io_uring_backend/worker/main_loop.rs
-
 #![cfg(feature = "io-uring")]
 
-use super::{cqe_processor, sqe_builder, ExternalOpContext, UringWorker};
+use super::{cqe_processor, ExternalOpContext, UringWorker};
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
-use crate::io_uring_backend::connection_handler::{HandlerIoOps, UringWorkerInterface};
+use crate::io_uring_backend::connection_handler::{UringWorkerInterface};
 use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest};
-use crate::io_uring_backend::worker::external_op_tracker::MultipartSendState;
-use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerState};
+use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkItem, WorkerState};
 use crate::io_uring_backend::UserData;
 use crate::profiler::LoopProfiler;
 use crate::ZmqError;
 
-use std::collections::VecDeque;
 use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
 
-use fibre::TryRecvError;
 use io_uring::{opcode, types};
 use tracing::{debug, error, info, trace, warn};
 
@@ -42,7 +37,6 @@ impl UringWorker {
   ) -> Result<bool, UringOpRequest> {
     let user_data_from_req = request.get_user_data_ref();
     let op_name_str = request.op_name_str();
-    let _original_request_reply_tx = request.get_reply_tx_ref().clone(); // Clone for local use, original stays with request for retry
 
     trace!(
       "UringWorker: Handling external op request: {}, ud: {}",
@@ -69,14 +63,18 @@ impl UringWorker {
             error: ZmqError::InvalidState("Buffer ring already initialized".into()),
           }));
         } else {
-          match BufferRingManager::new(&self.ring, num_buffers, bgid, buffer_capacity) {
+          match BufferRingManager::new(
+            &self.ring,
+            num_buffers,
+            bgid,
+            buffer_capacity,
+          ) {
             Ok(bm) => {
               info!(
                 "UringWorker: BufferRingManager initialized with bgid: {}, {} buffers of {} capacity.",
                 bgid, num_buffers, buffer_capacity
               );
               self.buffer_manager = Some(bm);
-              // Set the worker's owned default_bgid_val
               if self.default_buffer_ring_group_id_val.is_none() {
                 self.default_buffer_ring_group_id_val = Some(bgid);
                 debug!(
@@ -112,7 +110,6 @@ impl UringWorker {
         ..
       } => {
         warn!("UringWorker: RegisterRawBuffers direct ring call not fully implemented. Sending placeholder ack.");
-        // Real implementation: self.ring.register_buffers(buffers_as_ioslices_or_vecs).map_err...
         let _ = reply_tx.send(Ok(UringOpCompletion::RegisterRawBuffersSuccess {
           user_data,
         }));
@@ -353,19 +350,15 @@ impl UringWorker {
         let mut fd_created_for_connect_op: Option<RawFd> = None;
         let ring_has_ext_arg = self.ring.params().is_feature_ext_arg();
 
-        // Need to reconstruct a temporary UringOpRequest for sqe_builder if it expects a reference.
-        // Or, pass individual fields to sqe_builder.
-        // Let's assume sqe_builder can take fields or a reconstructed temporary request.
-        // The current sqe_builder takes &UringOpRequest.
         let temp_connect_req_for_builder = UringOpRequest::Connect {
           user_data,
           target_addr,
           protocol_handler_factory_id: protocol_handler_factory_id.clone(),
           protocol_config: protocol_config.clone(),
-          reply_tx: reply_tx.clone(), // Use the cloned reply_tx
+          reply_tx: reply_tx.clone(),
         };
 
-        match sqe_builder::build_sqe_for_external_request(
+        match super::sqe_builder::build_sqe_for_external_request(
           &temp_connect_req_for_builder,
           &mut fd_created_for_connect_op,
           ring_has_ext_arg,
@@ -416,7 +409,6 @@ impl UringWorker {
                   libc::close(fd_conn);
                 }
               }
-              // Reconstruct the original UringOpRequest::Connect to return for retry
               Err(UringOpRequest::Connect {
                 user_data,
                 target_addr,
@@ -455,12 +447,12 @@ impl UringWorker {
         user_data,
         reply_tx,
       } => {
-        let mut fd_created_dummy: Option<RawFd> = None; // Not used for Nop
-        match sqe_builder::build_sqe_for_external_request(
+        let mut fd_created_dummy: Option<RawFd> = None;
+        match super::sqe_builder::build_sqe_for_external_request(
           &UringOpRequest::Nop {
             user_data,
             reply_tx: reply_tx.clone(),
-          }, // Reconstruct
+          },
           &mut fd_created_dummy,
           false,
         ) {
@@ -527,20 +519,16 @@ impl UringWorker {
           "UringWorker: Received RegisterExternalFd (ud: {}, fd: {}, factory: {}, server_role: {})",
           user_data, fd, protocol_handler_factory_id, is_server_role
         );
-        // Add to external_op_tracker BEFORE calling handler_manager,
-        // so if handler_manager errors, we can reply with OpError.
         self.external_op_tracker.add_op(
           user_data,
           ExternalOpContext {
-            reply_tx: reply_tx.clone(), // Use the cloned reply_tx
+            reply_tx: reply_tx.clone(),
             op_name: op_name_str.clone(),
-            // These fields might not be strictly necessary for RegisterExternalFd's ExternalOpContext
-            // but kept for consistency if some generic error reply logic uses them.
             protocol_handler_factory_id: Some(protocol_handler_factory_id.clone()),
             protocol_config: Some(protocol_config.clone()),
-            fd_created_for_connect_op: None, // FD is provided, not created by worker
+            fd_created_for_connect_op: None,
             listener_fd: None,
-            target_fd_for_shutdown: Some(fd), // For potential shutdown later
+            target_fd_for_shutdown: Some(fd),
             multipart_state: None,
           },
         );
@@ -562,22 +550,24 @@ impl UringWorker {
               "UringWorker: Handler created for registered FD {}. Processing initial ops.",
               fd
             );
-            // Process any initial blueprints from the handler (e.g., start reading)
-            cqe_processor::process_handler_blueprints(
+            if let Err(remaining_blueprints) = cqe_processor::process_handler_blueprints(
               self,
               fd,
-              initial_ops_from_handler,
-            );
-            if !self.fds_needing_close_initiated_pass.is_empty() {
+              initial_ops_from_handler.sqe_blueprints,
+            ) {
+              warn!("UringWorker: SQ full during initial op submission for registered FD {}. Re-queueing {} blueprints.", fd, remaining_blueprints.len());
+              for bp in remaining_blueprints {
+                self.pending_sqe_retry_queue.push_back((fd, bp));
+              }
+            }
+            if initial_ops_from_handler.initiate_close_due_to_error {
               warn!(
-                "UringWorker: RegisterExternalFd for FD {} generated unexpected close requests immediately.",
+                "UringWorker: Registered FD {} handler requested immediate close.",
                 fd
               );
-              // TODO: Handle these if necessary by adding to worker's main close queue
+              self.fds_needing_close_initiated_pass.push_back(fd);
             }
 
-            // Reply with success to the original requester via the ExternalOpContext.
-            // We already added to tracker, now take it to reply.
             if let Some(op_ctx) = self.external_op_tracker.take_op(user_data) {
               let _ = op_ctx
                 .reply_tx
@@ -586,27 +576,20 @@ impl UringWorker {
                   fd,
                 }));
             } else {
-              // Should not happen if add_op was successful
               error!(
                 "UringWorker: ExternalOpContext missing for ud {} after successful RegisterExternalFd.",
                 user_data
               );
             }
-            Ok(true) // Indicated SQEs might have been pushed by process_handler_blueprints
+            Ok(true)
           }
           Err(err_msg) => {
             error!(
               "UringWorker: Failed to create handler for registered FD {}: {}",
               fd, err_msg
             );
-
-            error!(
-              "UringWorker: Failed to create handler for registered FD {}: {}",
-              fd, err_msg
-            );
             self.fd_to_mpsc_rx.remove(&fd);
 
-            // Reply with error via the ExternalOpContext
             if let Some(op_ctx) = self.external_op_tracker.take_op(user_data) {
               let _ = op_ctx.reply_tx.send(Ok(UringOpCompletion::OpError {
                 user_data,
@@ -614,9 +597,7 @@ impl UringWorker {
                 error: ZmqError::Internal(err_msg),
               }));
             }
-            // Important: The external FD was not successfully managed. The caller needs to know.
-            // The UringWorker should NOT attempt to close this FD as it doesn't own it yet.
-            Ok(false) // No SQEs pushed by this path itself, though handler creation failed.
+            Ok(false)
           }
         }
       }
@@ -648,17 +629,15 @@ impl UringWorker {
         fd,
         reply_tx,
       } => {
-        // The worker is now responsible for cancellation before closing.
         debug!(
           fd,
           "UringWorker: Processing ShutdownConnectionHandler for FD."
         );
-        // 1. ALWAYS add the operation to the tracker first. This ensures we have the reply channel.
         self.external_op_tracker.add_op(
           user_data,
           ExternalOpContext {
             reply_tx: reply_tx.clone(),
-            op_name: op_name_str, // Use the op_name_str from the outer scope
+            op_name: op_name_str,
             protocol_handler_factory_id: None,
             protocol_config: None,
             fd_created_for_connect_op: None,
@@ -668,30 +647,36 @@ impl UringWorker {
           },
         );
 
-        // 2. Now, perform the idempotency check.
         if let Some(handler) = self.handler_manager.get_mut(fd) {
           if handler.is_closing_or_closed() {
             debug!(
                     fd,
                     "UringWorker: Received ShutdownConnectionHandler for FD that is already closing. Acknowledging immediately."
                 );
-            // Acknowledge the request successfully, as the desired state (closed) will be achieved.
             let ack = UringOpCompletion::ShutdownConnectionHandlerComplete { user_data, fd };
-            // Don't care about the result, it's a best-effort reply.
             let _ = reply_tx.send(Ok(ack));
-            // Return false because we didn't queue any *new* SQEs.
             return Ok(false);
           }
-          // If not closing, let the handler know we are starting the process now.
-          handler.close_initiated(&UringWorkerInterface::new(
+          let close_ops = handler.close_initiated(&UringWorkerInterface::new(
             fd,
             &self.worker_io_config,
             self.buffer_manager.as_ref(),
             self.default_buffer_ring_group_id_val,
-            user_data, // Pass the originating UD for context
+            user_data,
           ));
+          if let Err(remaining) =
+            cqe_processor::process_handler_blueprints(self, fd, close_ops.sqe_blueprints)
+          {
+            warn!(
+              "SQ Full during shutdown of FD {}. Requeuing {} blueprints.",
+              fd,
+              remaining.len()
+            );
+            for bp in remaining {
+              self.pending_sqe_retry_queue.push_back((fd, bp));
+            }
+          }
         } else {
-          // No handler found, it's likely already been fully closed and removed.
           warn!(
                 fd,
                 "UringWorker: Received ShutdownConnectionHandler for FD with no handler. Assuming already closed."
@@ -701,67 +686,6 @@ impl UringWorker {
           return Ok(false);
         }
 
-        // 2. The rest of the logic proceeds as before, but now it will only run ONCE.
-        let read_ops_to_cancel = self.internal_op_tracker.find_ops_for_fd(fd, |op_type| {
-          matches!(
-            op_type,
-            InternalOpType::RingRead | InternalOpType::RingReadMultishot
-          )
-        });
-
-        // We will submit all cancellations and the final close in one batch.
-        let mut sq = unsafe { self.ring.submission_shared() };
-
-        // 3. Queue AsyncCancel for each pending read.
-        for op_to_cancel_ud in &read_ops_to_cancel {
-          info!(
-            fd,
-            target_ud = *op_to_cancel_ud,
-            "UringWorker: Queuing AsyncCancel for pending read before close."
-          );
-          let cancel_op_payload = InternalOpPayload::CancelTarget {
-            target_user_data: *op_to_cancel_ud,
-          };
-          let cancel_op_user_data =
-            self
-              .internal_op_tracker
-              .new_op_id(fd, InternalOpType::AsyncCancel, cancel_op_payload);
-          let entry = opcode::AsyncCancel::new(*op_to_cancel_ud)
-            .build()
-            .user_data(cancel_op_user_data);
-
-          if unsafe { sq.push(&entry) }.is_err() {
-            debug!(
-              "UringWorker: SQ full, could not submit AsyncCancel for target_ud {}.",
-              op_to_cancel_ud
-            );
-          }
-        }
-
-        // 4. Queue the final close operation immediately after. The kernel will ensure it runs last for this FD.
-        let close_op_user_data =
-          self
-            .internal_op_tracker
-            .new_op_id(fd, InternalOpType::CloseFd, InternalOpPayload::None);
-        let close_entry = opcode::Close::new(types::Fd(fd))
-          .build()
-          .user_data(close_op_user_data);
-
-        if unsafe { sq.push(&close_entry) }.is_err() {
-          warn!(
-            "UringWorker: SQ full, could not submit CloseFd for FD {}.",
-            fd
-          );
-          // If this fails, we should requeue the *entire* shutdown sequence.
-          // For now, this warning is sufficient to indicate a potential issue under high load.
-        } else {
-          info!(
-            fd,
-            "UringWorker: Queued CloseFd operation to run after cancellations."
-          );
-        }
-
-        // We have queued operations, so return true.
         Ok(true)
       }
     }
@@ -775,9 +699,8 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
     worker.ring.as_raw_fd()
   );
 
+  // <<< MODIFIED START >>>
   let mut profiler = LoopProfiler::new(Duration::from_millis(10), 10000);
-  let mut pending_external_op_retry_queue: VecDeque<UringOpRequest> = VecDeque::new();
-
   let mut kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
 
   while worker.state != WorkerState::Stopped {
@@ -787,445 +710,231 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
       WorkerState::Running => {
         if worker.op_rx.is_closed() {
           worker.transition_to_draining();
-          continue; // Re-evaluate the loop with the new Draining state
+          continue;
         }
 
-        let mut user_space_activity_this_cycle = false; // Tracks if user-space queues/handlers had items/generated ops
-        let mut sqes_submitted_to_kernel_this_batch = 0;
-        let mut cqe_processed_this_batch = 0;
+        // --- PHASE 1: Gather ALL potential new work into the unified queue ---
+        profiler.mark_segment_end_and_start_new("gather_work");
+        let mut work_was_available = !worker.work_queue.is_empty();
 
-        profiler.mark_segment_end_and_start_new("submit_eventfd_poll_if_needed");
-        // Only attempt if not shutting down
-        let mut sq_for_eventfd_poll = unsafe { worker.ring.submission_shared() };
-        // try_submit_initial_poll_sqe handles the `is_poll_submitted` check internally.
-        // It will also handle SQ full condition by returning false, leading to retry next loop.
-        let _eventfd_poll_submitted_or_already_active = worker
-          .event_fd_poller
-          .try_submit_initial_poll_sqe(&mut sq_for_eventfd_poll);
-        // We don't strictly need to track if an SQE was pushed here for user_space_activity_this_cycle,
-        // as the main SQ submit phase will catch it.
-        // However, if it *was* submitted, it implies activity.
-        if _eventfd_poll_submitted_or_already_active && !worker.event_fd_poller.is_poll_submitted {
-          // This means it *tried* to submit but SQ was full.
-          // Actual submission success is tracked by event_fd_poller.is_poll_submitted
+        // 1a. Prioritize retries
+        if !worker.pending_sqe_retry_queue.is_empty() {
+          let retries = worker
+            .pending_sqe_retry_queue
+            .drain(..)
+            .map(|(fd, bp)| WorkItem::BlueprintBatch(fd, vec![bp]));
+          worker.work_queue.extend(retries);
+          work_was_available = true;
         }
-        drop(sq_for_eventfd_poll);
 
-        // --- PHASE 0: Process Pending SQE Retry Queue ---
-
-        // Only attempt if SQ is not full and queue has items.
-        let items_to_process_from_sqe_retry_queue = worker.pending_sqe_retry_queue.len();
-        if items_to_process_from_sqe_retry_queue > 0 {
-          trace!(
-            "UringWorker: Processing SQE retry queue ({} items)",
-            items_to_process_from_sqe_retry_queue
-          );
-          user_space_activity_this_cycle = true;
+        // 1b. Drain external command channel
+        while let Ok(request) = worker.op_rx.try_recv() {
+          worker.work_queue.push_back(WorkItem::ExternalOp(request));
+          work_was_available = true;
         }
-        profiler.mark_segment_end_and_start_new("process_sqe_retry_q");
 
-        for _ in 0..items_to_process_from_sqe_retry_queue {
-          if unsafe { worker.ring.submission_shared().is_full() } {
-            debug!(
-              "UringWorker: SQ full during SQE retry queue processing. {} items remain.",
-              worker.pending_sqe_retry_queue.len()
-            );
-            break;
+        // 1c. Poll handlers for I/O readiness
+        let handler_ops_list = worker.handler_manager.prepare_all_handler_io_ops(
+          worker.buffer_manager.as_ref(),
+          worker.default_buffer_ring_group_id_val,
+        );
+        for (fd, ops) in handler_ops_list {
+          if !ops.sqe_blueprints.is_empty() {
+            worker
+              .work_queue
+              .push_back(WorkItem::BlueprintBatch(fd, ops.sqe_blueprints));
+            work_was_available = true;
           }
-          if let Some((fd, blueprint_to_retry)) = worker.pending_sqe_retry_queue.pop_front() {
-            // Re-process this blueprint. process_handler_blueprints handles SQ full by re-adding to the *same* queue.
-            // This is okay as long as progress is made eventually.
-            // We pass a temporary HandlerIoOps containing just this one blueprint.
-            let single_blueprint_ops = HandlerIoOps {
-              sqe_blueprints: vec![blueprint_to_retry], // clone might not be needed if it was already owned. For now, assume it's cheap or it was already moved to queue.
-              initiate_close_due_to_error: false,
-            };
-            
-            cqe_processor::process_handler_blueprints(
-              worker,
-              fd,
-              single_blueprint_ops,
-            );
-            // sq_for_retry_blueprint is dropped
-          } else {
-            break;
-          } // Should not happen if len > 0
-        }
-
-        profiler.mark_segment_end_and_start_new("process_ext_op_retry_q");
-        // --- PHASE 1: Handle User-Space Requests and Handler Logic (Generate SQEs) ---
-
-        // 1a. Process Retry Queue
-        let items_to_process_this_retry_cycle = pending_external_op_retry_queue.len();
-        if items_to_process_this_retry_cycle > 0 {
-          debug!(
-            "UringWorker: Processing retry queue ({} items)",
-            items_to_process_this_retry_cycle
-          );
-          user_space_activity_this_cycle = true;
-        }
-        for _ in 0..items_to_process_this_retry_cycle {
-          if unsafe { worker.ring.submission_shared().is_full() } {
-            debug!(
-              "UringWorker: SQ full during retry queue. {} items remain.",
-              pending_external_op_retry_queue.len()
-            );
-            break;
-          }
-          if let Some(request_to_retry) = pending_external_op_retry_queue.pop_front() {
-            match worker.handle_external_op_request_submission(request_to_retry.clone()) {
-              Ok(_sqe_produced) => { /* SQEs are pushed by handle_external_op_request_submission if needed */
-              }
-              Err(req_failed_submission) => {
-                pending_external_op_retry_queue.push_back(req_failed_submission);
-              }
-            }
-          } else {
-            break;
+          if ops.initiate_close_due_to_error
+            && !worker.fds_needing_close_initiated_pass.contains(&fd)
+          {
+            worker.fds_needing_close_initiated_pass.push_back(fd);
           }
         }
 
-        profiler.mark_segment_end_and_start_new("process_new_op_rx");
-
-        // 1b. Process New External Ops from op_rx
-        loop {
-          if unsafe { worker.ring.submission_shared().is_full() } {
-            trace!("UringWorker: SQ full processing new ops from op_rx.");
-            break;
-          }
-          match worker.op_rx.try_recv() {
-            Ok(request_from_channel) => {
-              user_space_activity_this_cycle = true;
-              match worker.handle_external_op_request_submission(request_from_channel.clone()) {
-                Ok(_sqe_produced) => {}
-                Err(req_for_retry_queue) => {
-                  pending_external_op_retry_queue.push_back(req_for_retry_queue);
-                }
-              }
-            }
-            Err(TryRecvError::Empty) => {
-              break;
-            }
-            Err(TryRecvError::Disconnected) => {
-              break;
-            }
-          }
-        }
-
-        profiler.mark_segment_end_and_start_new("poll_conn_handlers");
-        // 1c. Poll Connection Handlers
-        if !unsafe { worker.ring.submission_shared().is_full() } {
-          let handler_io_ops_list = worker.handler_manager.prepare_all_handler_io_ops(
-            worker.buffer_manager.as_ref(),
-            worker.default_buffer_ring_group_id_val,
-          );
-          if !handler_io_ops_list.is_empty() {
-            user_space_activity_this_cycle = true;
-            for (fd, handler_ops) in handler_io_ops_list {
-              let sq_for_handler_blueprints = unsafe { worker.ring.submission_shared() };
-              if !handler_ops.sqe_blueprints.is_empty() && sq_for_handler_blueprints.is_full() {
-                debug!("UringWorker: SQ full for HandlerIoOps for FD {}.", fd);
-
-                // Requeue blueprints from handler if SQ is full
-                for bp_to_requeue in handler_ops.sqe_blueprints {
-                  worker
-                    .pending_sqe_retry_queue
-                    .push_back((fd, bp_to_requeue));
-                }
-                if handler_ops.initiate_close_due_to_error
-                  && !worker.fds_needing_close_initiated_pass.contains(&fd)
-                {
-                  worker.fds_needing_close_initiated_pass.push_back(fd);
-                }
-                continue;
-              }
-              drop(sq_for_handler_blueprints);
-              cqe_processor::process_handler_blueprints(
-                worker,
-                fd,
-                handler_ops,
-              );
-            }
-          }
-        }
-
-        profiler.mark_segment_end_and_start_new("process_fds_to_close");
         // 1d. Process FDs flagged for close
-        let fds_to_process_this_close_cycle = worker.fds_needing_close_initiated_pass.len();
-        if fds_to_process_this_close_cycle > 0 {
-          user_space_activity_this_cycle = true;
+        while let Some(fd_to_close) = worker.fds_needing_close_initiated_pass.pop_front() {
+          worker
+            .work_queue
+            .push_back(WorkItem::InitiateClose(fd_to_close));
+          work_was_available = true;
         }
-        for _ in 0..fds_to_process_this_close_cycle {
-          if unsafe { worker.ring.submission_shared().is_full() } {
-            break;
-          }
-          if let Some(fd_to_close) = worker.fds_needing_close_initiated_pass.pop_front() {
-            if let Some(handler) = worker.handler_manager.get_mut(fd_to_close) {
-              // For close_initiated not directly tied to an external op reply,
-              // pass a sentinel UserData or a conventionally understood "internal" UD.
-              // 0 is often used for internal/unspecific ops if not otherwise reserved.
-              const INTERNAL_OP_SENTINEL_UD: u64 = 0;
-              let interface_for_close = UringWorkerInterface::new(
-                fd_to_close,
-                &worker.worker_io_config,
-                worker.buffer_manager.as_ref(),
-                worker.default_buffer_ring_group_id_val,
-                INTERNAL_OP_SENTINEL_UD,
-              );
-              let close_io_ops = handler.close_initiated(&interface_for_close);
-              
-              cqe_processor::process_handler_blueprints(
-                worker,
-                fd_to_close,
-                close_io_ops,
-              );
+
+        // 1e. Drain MPSC data queues from all sockets (one message per socket per loop to ensure fairness)
+        let fds_to_drain: Vec<RawFd> = worker.fd_to_mpsc_rx.keys().copied().collect();
+        for fd in fds_to_drain {
+          if let Some(rx) = worker.fd_to_mpsc_rx.get(&fd) {
+            if let Ok(msg_parts) = rx.try_recv() {
+              worker
+                .work_queue
+                .push_back(WorkItem::ApplicationData(fd, msg_parts));
+              work_was_available = true;
             }
-          } else {
-            break;
           }
         }
 
-        // 1e Drain work queue
-        profiler.mark_segment_end_and_start_new("drain_mpsc_queues");
-        if !worker.fd_to_mpsc_rx.is_empty() {
-          let mut fds_to_drain: Vec<RawFd> = worker.fd_to_mpsc_rx.keys().copied().collect();
-          for fd in fds_to_drain {
-            if let Some(rx) = worker.fd_to_mpsc_rx.get(&fd).cloned() {
-              // Drain all available messages without blocking
-              while let Ok(msg_parts) = rx.try_recv() {
-                user_space_activity_this_cycle = true;
-                if let Some(handler) = worker.handler_manager.get_mut(fd) {
-                  // We need a dummy UserData because handle_outgoing_app_data expects it.
-                  // This highlights a small remaining awkwardness in the API.
-                  const DRAIN_OP_UD: UserData = 0;
-                  let interface = UringWorkerInterface::new(
+        // --- PHASE 2: Process the unified work queue sequentially ---
+        profiler.mark_segment_end_and_start_new("process_work_queue");
+        let mut sq_was_full = false;
+        while let Some(item) = worker.work_queue.pop_front() {
+          if sq_was_full {
+            // If the queue filled up on a previous item, put this one back at the front
+            // and stop processing for this cycle.
+            worker.work_queue.push_front(item);
+            break;
+          }
+
+          match item {
+            WorkItem::ExternalOp(req) => {
+              if let Err(retry_req) = worker.handle_external_op_request_submission(req) {
+                worker
+                  .work_queue
+                  .push_front(WorkItem::ExternalOp(retry_req));
+                sq_was_full = true;
+              }
+            }
+            WorkItem::BlueprintBatch(fd, blueprints) => {
+              if let Err(remaining_blueprints) =
+                cqe_processor::process_handler_blueprints(worker, fd, blueprints)
+              {
+                // Re-queue the failed batch at the front and stop processing.
+                worker
+                  .work_queue
+                  .push_front(WorkItem::BlueprintBatch(fd, remaining_blueprints));
+                sq_was_full = true;
+              }
+            }
+            WorkItem::ApplicationData(fd, msg_parts) => {
+              if let Some(handler) = worker.handler_manager.get_mut(fd) {
+                const DRAIN_OP_UD: UserData = 0; // Sentinel UD for this context
+                let interface =
+                  crate::io_uring_backend::connection_handler::UringWorkerInterface::new(
                     fd,
                     &worker.worker_io_config,
                     worker.buffer_manager.as_ref(),
                     worker.default_buffer_ring_group_id_val,
                     DRAIN_OP_UD,
                   );
+                let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
 
-                  // Call the handler to get blueprints.
-                  // We pass the Arc<Vec<Msg>> as an Arc<dyn Any...>.
-                  let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
-                  
-                  // Process the blueprints immediately.
-                  cqe_processor::process_handler_blueprints(
-                    worker,
+                if let Err(remaining) =
+                  cqe_processor::process_handler_blueprints(worker, fd, ops_output.sqe_blueprints)
+                {
+                  worker
+                    .work_queue
+                    .push_front(WorkItem::BlueprintBatch(fd, remaining));
+                  sq_was_full = true;
+                }
+                if ops_output.initiate_close_due_to_error
+                  && !worker.fds_needing_close_initiated_pass.contains(&fd)
+                {
+                  worker.fds_needing_close_initiated_pass.push_back(fd);
+                }
+              }
+            }
+            WorkItem::InitiateClose(fd) => {
+              if let Some(handler) = worker.handler_manager.get_mut(fd) {
+                const INTERNAL_OP_SENTINEL_UD: u64 = 0;
+                let interface_for_close =
+                  crate::io_uring_backend::connection_handler::UringWorkerInterface::new(
                     fd,
-                    ops_output,
+                    &worker.worker_io_config,
+                    worker.buffer_manager.as_ref(),
+                    worker.default_buffer_ring_group_id_val,
+                    INTERNAL_OP_SENTINEL_UD,
                   );
+                let close_io_ops = handler.close_initiated(&interface_for_close);
+                if let Err(remaining) =
+                  cqe_processor::process_handler_blueprints(worker, fd, close_io_ops.sqe_blueprints)
+                {
+                  worker
+                    .work_queue
+                    .push_front(WorkItem::BlueprintBatch(fd, remaining));
+                  sq_was_full = true;
                 }
               }
             }
           }
         }
 
-        profiler.mark_segment_end_and_start_new("submit_sqes_to_kernel");
-        // --- PHASE 2: Submit SQEs to Kernel ---
-        let sq_len_at_submit_time = unsafe { worker.ring.submission_shared().len() };
-        if sq_len_at_submit_time > 0 {
-          user_space_activity_this_cycle = true;
-          match worker.ring.submitter().submit() {
-            Ok(submitted_count) => {
-              sqes_submitted_to_kernel_this_batch = submitted_count;
-              trace!(
-                "UringWorker: Submitted {} SQEs to kernel (SQ had {}).",
-                submitted_count,
-                sq_len_at_submit_time
-              );
+        // --- PHASE 3: Submit to Kernel and Process Completions ---
+        profiler.mark_segment_end_and_start_new("submit_and_process");
+
+        let sq_len = unsafe { worker.ring.submission_shared().len() };
+        let mut sqes_submitted_to_kernel_this_batch = 0;
+
+        let needs_wait = !work_was_available
+          && sq_len == 0
+          && unsafe { worker.ring.completion_shared().is_empty() };
+
+        if sq_len > 0 || needs_wait {
+          let submitted_count_res = if needs_wait {
+            let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
+            let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
+            worker.ring.submitter().submit_with_args(1, &submit_args)
+          } else {
+            worker.ring.submitter().submit()
+          };
+
+          match submitted_count_res {
+            Ok(count) => {
+              sqes_submitted_to_kernel_this_batch = count;
+              if needs_wait {
+                kernel_poll_timeout_duration = if count > 0 {
+                  KERNEL_POLL_INITIAL
+                } else {
+                  (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION)
+                };
+              }
             }
             Err(e) => {
-              if e.raw_os_error() == Some(libc::EBUSY) || e.raw_os_error() == Some(libc::EINTR) {
-                debug!("UringWorker: ring.submit() failed with EBUSY/EINTR. SQEs remain.");
+              if e.kind() == std::io::ErrorKind::TimedOut || e.raw_os_error() == Some(libc::ETIME) {
+                if needs_wait {
+                  kernel_poll_timeout_duration =
+                    (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
+                }
+              } else if e.raw_os_error() == Some(libc::EBUSY)
+                || e.raw_os_error() == Some(libc::EINTR)
+              {
+                warn!("UringWorker: submit/submit_with_args returned EBUSY/EINTR");
               } else {
-                profiler.log_and_reset_for_next_loop();
                 error!(
                   "UringWorker: ring.submit() failed critically: {}. Shutting down.",
                   e
                 );
-                return Err(ZmqError::IoError {
-                  kind: e.kind(),
-                  message: e.to_string(),
-                });
+                return Err(ZmqError::from(e));
               }
             }
           }
         }
 
-        profiler.mark_segment_end_and_start_new("process_kernel_cqes");
-        // --- PHASE 3: Process Kernel Completions (CQEs) ---
-        let cq_len_before_processing = unsafe { worker.ring.completion_shared().len() };
-        // worker.ring.completion().sync(); // Not strictly needed if iterating directly after submit
+        let cqe_processed_count = if let Ok(count) = cqe_processor::process_all_cqes(worker, false)
+        {
+          count
+        } else {
+          break;
+        };
 
-        if let Err(e) = cqe_processor::process_all_cqes(
-          worker,
-          false,
-        ) {
-          profiler.log_and_reset_for_next_loop();
-          return Err(e);
-        }
-        let cq_len_after_processing = unsafe { worker.ring.completion_shared().len() };
-        cqe_processed_this_batch = cq_len_before_processing.saturating_sub(cq_len_after_processing);
-        if cqe_processed_this_batch > 0 {
-          trace!(
-            "UringWorker: Processed {} CQEs this batch.",
-            cqe_processed_this_batch
-          );
-          kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
-        }
-
-        // --- PHASE 4: Idle Wait Strategy ---
-        let had_any_sq_submission_this_batch = sqes_submitted_to_kernel_this_batch > 0;
-        let any_effective_work_done_this_cycle = had_any_sq_submission_this_batch
-          || cqe_processed_this_batch > 0
-          || user_space_activity_this_cycle;
-
-        if !any_effective_work_done_this_cycle {
-          let kernel_ops_are_pending =
-            !worker.internal_op_tracker.is_empty() || !worker.external_op_tracker.is_empty();
-
-          let eventfd_poll_is_active = worker.event_fd_poller.is_poll_submitted;
-
-          if eventfd_poll_is_active {
-            if kernel_ops_are_pending {
-              // Kernel ops are outstanding.
-              // Strategy:
-              // 1. Try a non-blocking check on op_rx. If something is there, process it next loop.
-              // 2. If op_rx is empty, then briefly ask kernel for events.
-              // This gives op_rx higher priority than a blocking kernel wait.
-
-              match worker.op_rx.try_recv() {
-                Ok(request_from_channel) => {
-                  trace!("UringWorker: Polled op_rx while kernel ops pending; got new request. Will process next iter.");
-                  match worker.handle_external_op_request_submission(request_from_channel) {
-                    Ok(_sqe_produced) => {}
-                    Err(req_for_retry_queue) => {
-                      pending_external_op_retry_queue.push_back(req_for_retry_queue);
-                    }
-                  }
-                  kernel_poll_timeout_duration = KERNEL_POLL_INITIAL; // Activity, reset kernel poll
-                }
-                Err(TryRecvError::Empty) => {
-                  // op_rx is empty
-                  trace!(
-                                    "UringWorker: op_rx empty. Kernel ops pending (int:{}, ext:{}, ev_poll:{}) or eventfd poll active. Waiting for CQEs with timeout: {:?}.",
-                                    worker.internal_op_tracker.op_to_details.len(),
-                                    worker.external_op_tracker.in_flight.len(),
-                                    eventfd_poll_is_active,
-                                    kernel_poll_timeout_duration
-                                );
-                  let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
-                  let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
-
-                  // We are waiting for *existing* ops, so wait_nr = 1 is appropriate.
-                  // submit_with_args will also submit any SQEs if the SQ wasn't empty (though it should be here).
-                  match worker.ring.submitter().submit_with_args(1, &submit_args) {
-                    Ok(reaped_count) => {
-                      trace!(
-                        "UringWorker: submit_with_args (timed wait for pending kernel ops) reaped {} CQEs.",
-                        reaped_count
-                      );
-                      if reaped_count > 0 {
-                        // Kernel activity
-                        kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
-                      } else {
-                        // Kernel timed out or reaped 0
-                        kernel_poll_timeout_duration =
-                          (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
-                        trace!(
-                          "UringWorker: Kernel wait timed out/reaped 0. New kernel_poll_timeout: {:?}",
-                          kernel_poll_timeout_duration
-                        );
-                      }
-                    }
-                    Err(e) => {
-                      if e.kind() == std::io::ErrorKind::TimedOut
-                        || e.raw_os_error() == Some(libc::ETIME)
-                      {
-                        trace!(
-                          "UringWorker: submit_with_args (timed wait for pending kernel ops) resulted in ETIME/TimedOut."
-                        );
-                        kernel_poll_timeout_duration =
-                          (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
-                      } else if e.raw_os_error() == Some(libc::EINTR) {
-                        debug!("UringWorker: submit_with_args (timed wait for pending kernel ops) interrupted (EINTR).");
-                        kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
-                      } else {
-                        error!("UringWorker: ring.submit_with_args (timed wait for pending kernel ops) critical error: {}. Shutting down.", e);
-
-                        profiler.mark_segment_end_and_start_new("kernel_wait_submit_with_args");
-                        profiler.log_and_reset_for_next_loop();
-                        return Err(ZmqError::IoError {
-                          kind: e.kind(),
-                          message: e.to_string(),
-                        });
-                      }
-                    }
-                  }
-
-                  profiler.mark_segment_end_and_start_new("kernel_wait_submit_with_args");
-                }
-                Err(TryRecvError::Disconnected) => {
-                  info!(
-                    "UringWorker: op_rx channel closed while checking (kernel ops pending branch)."
-                  );
-                }
-              }
-            } else {
-              // Truly idle: No user-space work, no kernel ops outstanding.
-              trace!(
-                            "UringWorker: No user-space work, no other kernel ops. Waiting for eventfd or kernel ops with timeout: {:?}.",
-                            kernel_poll_timeout_duration
-                        );
-              let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
-              let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
-              match worker.ring.submitter().submit_with_args(1, &submit_args) {
-                Ok(reaped_count) => {
-                  if reaped_count > 0 {
-                    kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
-                  } else {
-                    kernel_poll_timeout_duration =
-                      (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
-                  }
-                }
-                Err(e) => {
-                  /* Same error handling as above */
-                  if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.raw_os_error() == Some(libc::ETIME)
-                  {
-                    kernel_poll_timeout_duration =
-                      (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
-                  } else if e.raw_os_error() == Some(libc::EINTR) {
-                    kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
-                  } else {
-                    error!(
-                      "UringWorker: ring.submit_with_args (idle branch) critical error: {}. Shutting down.",
-                      e
-                    );
-                    profiler.log_and_reset_for_next_loop();
-                    return Err(ZmqError::IoError {
-                      kind: e.kind(),
-                      message: e.to_string(),
-                    });
-                  }
-                }
-              }
-
-              profiler.mark_segment_end_and_start_new("unified_kernel_wait");
-            }
+        // --- PHASE 4: Idle Strategy ---
+        profiler.mark_segment_end_and_start_new("idle_strategy");
+        if sqes_submitted_to_kernel_this_batch == 0
+          && cqe_processed_count == 0
+          && !work_was_available
+          && worker.work_queue.is_empty()
+        {
+          if needs_wait { /* The wait already happened */
+          } else {
+            kernel_poll_timeout_duration =
+              (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
           }
         } else {
-          // Work *was* done in this cycle. Reset kernel poll timeout to be responsive.
           kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
         }
       }
       WorkerState::Draining => {
         // First, always process any completions that might be on the ring.
         if let Err(e) = cqe_processor::process_all_cqes(
-          worker,
-          true, // is_worker_shutting_down
+          worker, true, // is_worker_shutting_down
         ) {
           error!(
             "UringWorker: Error processing CQEs during Draining state: {}. Forcing stop.",

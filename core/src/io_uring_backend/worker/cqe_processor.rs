@@ -2,9 +2,7 @@
 
 #![cfg(feature = "io-uring")]
 
-use super::internal_op_tracker::{
-  InternalOpDetails, InternalOpPayload, InternalOpType,
-};
+use super::internal_op_tracker::{InternalOpDetails, InternalOpPayload, InternalOpType};
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringWorkerInterface,
 };
@@ -22,13 +20,12 @@ use tracing::{debug, error, info, trace, warn};
 #[cfg(feature = "io-uring")]
 const CQE_F_NOTIFY_FLAG: u32 = 1 << 3; // (8) for kernels 6.0+
 
-// process_handler_blueprints (signature confirmed from previous discussions)
+// The signature is changed to take blueprints directly and return a Result for backpressure.
 pub(crate) fn process_handler_blueprints(
   worker: &mut UringWorker,
   fd_from_handler_iteration: RawFd,
-  ops_output: HandlerIoOps,
-) {
-
+  mut blueprints: Vec<HandlerSqeBlueprint>,
+) -> Result<(), Vec<HandlerSqeBlueprint>> {
   let ring = &mut worker.ring;
   let sq = &mut unsafe { ring.submission_shared() };
   let external_ops = &mut worker.external_op_tracker;
@@ -36,46 +33,20 @@ pub(crate) fn process_handler_blueprints(
   let handler_manager = &mut worker.handler_manager;
   let send_buffer_pool = &worker.send_buffer_pool;
   let default_bgid_for_read_sqe = worker.default_buffer_ring_group_id_val;
-  let fds_to_initiate_close_queue = &mut worker.fds_needing_close_initiated_pass;
-  let pending_sqe_retry_queue = &mut worker.pending_sqe_retry_queue;
+
   let worker_cfg_send_zerocopy_enabled = worker.cfg_send_zerocopy_enabled;
 
-  if ops_output.initiate_close_due_to_error {
-    warn!(
-      "CQE Processor: Handler for FD {} requested error close via HandlerIoOps.",
-      fd_from_handler_iteration
-    );
-    if !fds_to_initiate_close_queue.contains(&fd_from_handler_iteration) {
-      fds_to_initiate_close_queue.push_back(fd_from_handler_iteration);
-    }
-  }
-
-  let blueprints = ops_output.sqe_blueprints;
-
-  // Atomic Blueprint Submission: Check if there is enough space in the submission queue for ALL blueprints from this operation.
-  if sq.capacity() - sq.len() < blueprints.len() {
-    debug!(
-      "CQE Processor: Not enough space in SQ for atomic blueprint submission ({} required, {} available). Re-queueing all.",
-      blueprints.len(),
-      sq.capacity() - sq.len()
-    );
-    // If not enough space, add the entire batch to the retry queue and return.
-    for blueprint in blueprints {
-      pending_sqe_retry_queue.push_back((fd_from_handler_iteration, blueprint));
-    }
-    return;
-  }
-
-  for (_idx, blueprint_ref) in blueprints.iter().enumerate() {
+  // Loop signature changed to get the index `idx`.
+  for (idx, blueprint_ref) in blueprints.iter().enumerate() {
     if sq.is_full() {
       debug!(
-        "CQE Processor: Submission queue full while processing blueprints for FD {}. Blueprint {:?} will be requeued.",
-        fd_from_handler_iteration, blueprint_ref
+        "CQE Processor: Submission queue full. Re-queueing {} remaining blueprints for FD {}.",
+        blueprints.len() - idx,
+        fd_from_handler_iteration
       );
-      // Requeue the blueprint instead of dropping it.
-      // Need to clone the blueprint as we only have a reference.
-      pending_sqe_retry_queue.push_back((fd_from_handler_iteration, (*blueprint_ref).clone()));
-      continue;
+      // Return the portion of the vec that was not processed.
+      let remaining = blueprints.split_off(idx);
+      return Err(remaining);
     }
 
     let mut op_payload_for_tracker = InternalOpPayload::None;
@@ -92,9 +63,6 @@ pub(crate) fn process_handler_blueprints(
             std::mem::size_of_val(&cork_val) as u32,
           )
           .build();
-          // We don't need to track the completion of cork commands specifically
-          // because the kernel handles their ordering relative to sends.
-          // We assign a generic op type that requires no special completion logic.
           Some(Ok((entry, InternalOpType::GenericHandlerOp)))
         }
         HandlerSqeBlueprint::RequestRingRead => {
@@ -151,7 +119,6 @@ pub(crate) fn process_handler_blueprints(
 
           if worker_cfg_send_zerocopy_enabled {
             if let Some(pool_arc) = send_buffer_pool {
-              // Use the passed-in worker field
               if let Some((reg_buf_id, buffer_ptr, len_copied)) =
                 pool_arc.acquire_and_prep_buffer(data_to_send)
               {
@@ -211,7 +178,7 @@ pub(crate) fn process_handler_blueprints(
             .build();
             temp_sqe_gen_result = Some(Ok((entry_fb, InternalOpType::Send)));
           }
-          temp_sqe_gen_result // This arm returns the Option<Result<...>>
+          temp_sqe_gen_result
         }
         HandlerSqeBlueprint::RequestClose => {
           let entry = opcode::Close::new(types::Fd(fd_from_handler_iteration)).build();
@@ -220,7 +187,6 @@ pub(crate) fn process_handler_blueprints(
         HandlerSqeBlueprint::RequestNewRingReadMultishot { fd, bgid } => {
           let fd = *fd;
           let bgid = *bgid;
-          // fd from blueprint should match fd_from_handler_iteration
           if fd != fd_from_handler_iteration {
             error!(
             "CQE Processor: FD mismatch in RequestNewRingReadMultishot! Handler FD {}, Blueprint FD {}. Dropping.",
@@ -237,24 +203,22 @@ pub(crate) fn process_handler_blueprints(
             .build()
             .user_data(op_user_data);
 
+          // Logic for handling push failure is now to return Err.
           unsafe {
             if sq.push(&entry).is_err() {
               debug!(
-                "CQE Processor: SQ push failed for FD {} RecvMulti. Op requeued.",
+                "CQE Processor: SQ push failed for FD {} RecvMulti. Re-queueing work.",
                 fd
               );
               internal_ops.take_op_details(op_user_data); // Cleanup tracker for failed push
-              pending_sqe_retry_queue.push_back((
-                fd,
-                HandlerSqeBlueprint::RequestNewRingReadMultishot { fd, bgid },
-              ));
+              let remaining = blueprints.split_off(idx);
+              return Err(remaining);
             } else {
               trace!(
                 "CQE Processor: Queued RecvMulti SQE (ud:{}) for FD {}.",
                 op_user_data,
                 fd
               );
-              // Inform the handler's MultishotReader about the submission
               if let Some(handler) = handler_manager.get_mut(fd) {
                 handler.inform_multishot_reader_op_submitted(op_user_data, false, None);
               } else {
@@ -262,8 +226,6 @@ pub(crate) fn process_handler_blueprints(
                 "CQE Processor: Handler for FD {} not found after submitting RecvMulti. Reader not informed.",
                 fd
               );
-                // This is problematic, as the reader won't know its active UserData.
-                // Might need to cancel this op if handler is gone.
               }
             }
           }
@@ -289,20 +251,16 @@ pub(crate) fn process_handler_blueprints(
             .build()
             .user_data(cancel_op_user_data);
 
+          // Logic for handling push failure is now to return Err.
           unsafe {
             if sq.push(&entry).is_err() {
               debug!(
-                "CQE Processor: SQ push failed for FD {} AsyncCancel (target_ud: {}). Op requeued.",
+                "CQE Processor: SQ push failed for FD {} AsyncCancel (target_ud: {}). Re-queueing work.",
                 fd, target_user_data
               );
               internal_ops.take_op_details(cancel_op_user_data);
-              pending_sqe_retry_queue.push_back((
-                fd,
-                HandlerSqeBlueprint::RequestNewAsyncCancel {
-                  fd,
-                  target_user_data,
-                },
-              ));
+              let remaining = blueprints.split_off(idx);
+              return Err(remaining);
             } else {
               trace!(
                 "CQE Processor: Queued AsyncCancel SQE (ud:{}, target_ud:{}) for FD {}.",
@@ -335,17 +293,15 @@ pub(crate) fn process_handler_blueprints(
             internal_ops.new_op_id(fd_from_handler_iteration, op_type, op_payload_for_tracker);
           entry_to_submit = entry_to_submit.user_data(user_data);
 
+          // Logic for handling push failure is now to return Err.
           unsafe {
             let push_result = sq.push(&entry_to_submit);
 
             if push_result.is_err() {
-              debug!("CQE Processor: SQ push failed for FD {} blueprint {:?} (race condition or SQ became full?). Op requeued.", fd_from_handler_iteration, entry_to_submit);
-
-              // Requeue if push fails even after initial SQ full check (race condition).
-              // Also, need to clean up the internal_op_tracker entry for this failed push.
+              debug!("CQE Processor: SQ push failed for FD {} blueprint {:?} (race condition). Re-queueing work.", fd_from_handler_iteration, entry_to_submit);
               let _dropped_details = internal_ops.take_op_details(user_data); // Clean up tracker
-              pending_sqe_retry_queue.push_back((fd_from_handler_iteration, blueprint_ref.clone()));
-            // Requeue
+              let remaining = blueprints.split_off(idx);
+              return Err(remaining);
             } else {
               // After a successful push, inform the handler if it was a standard read.
               if op_type == InternalOpType::RingRead {
@@ -376,17 +332,18 @@ pub(crate) fn process_handler_blueprints(
       }
     }
   }
+  // If the loop completes successfully, return Ok.
+  Ok(())
 }
 
 pub(crate) fn process_all_cqes(
   worker: &mut UringWorker,
   is_worker_shutting_down: bool,
-) -> Result<(), ZmqError> {
-
-
+) -> Result<usize, ZmqError> {
   let mut cq: cqueue::CompletionQueue<'_> = unsafe { worker.ring.completion_shared() };
   cq.sync();
   let entries: Vec<Entry> = cq.into_iter().collect();
+  let num_processed = entries.len();
 
   for cqe in entries {
     let cqe_user_data = cqe.user_data();
@@ -407,7 +364,11 @@ pub(crate) fn process_all_cqes(
       &mut worker.internal_op_tracker,
       is_worker_shutting_down,
     ) {
-      if worker.internal_op_tracker.take_op_details(cqe_user_data).is_none() {
+      if worker
+        .internal_op_tracker
+        .take_op_details(cqe_user_data)
+        .is_none()
+      {
         warn!(
           "[CQE Proc] EventFdPoll CQE (ud:{}) handled, but no InternalOpDetails found to consume.",
           cqe_user_data
@@ -451,18 +412,19 @@ pub(crate) fn process_all_cqes(
             let connected_fd = ext_op_ctx
               .fd_created_for_connect_op
               .expect("Connect op context missing FD after successful CQE");
-            let (peer_addr, local_addr) =
-              crate::io_uring_backend::worker::get_peer_local_addr(connected_fd) // Assuming helper path
-                .unwrap_or_else(|e| {
-                  warn!(
-                    "CQE ConnectSuccess: Failed to get peer/local addr for connected_fd {}: {}",
-                    connected_fd, e
-                  );
-                  (
-                    crate::io_uring_backend::worker::dummy_socket_addr(),
-                    crate::io_uring_backend::worker::dummy_socket_addr(),
-                  ) // Assuming helper path
-                });
+            let (peer_addr, local_addr) = crate::io_uring_backend::worker::get_peer_local_addr(
+              connected_fd,
+            )
+            .unwrap_or_else(|e| {
+              warn!(
+                "CQE ConnectSuccess: Failed to get peer/local addr for connected_fd {}: {}",
+                connected_fd, e
+              );
+              (
+                crate::io_uring_backend::worker::dummy_socket_addr(),
+                crate::io_uring_backend::worker::dummy_socket_addr(),
+              )
+            });
 
             if let Some(ref factory_id) = ext_op_ctx.protocol_handler_factory_id {
               let protocol_config = ext_op_ctx.protocol_config.as_ref().unwrap();
@@ -483,11 +445,26 @@ pub(crate) fn process_all_cqes(
                     "CQE Processor: Connect successful (ext_ud:{}), new FD:{}. Handler created. Peer: {}, Local: {}",
                     cqe_user_data, connected_fd, peer_addr, local_addr
                   );
-                  process_handler_blueprints(
-                    worker,
-                    connected_fd,
-                    initial_ops,
-                  );
+                  
+                  // Call site must now handle the Result from process_handler_blueprints.
+                  if let Err(remaining_blueprints) =
+                    process_handler_blueprints(worker, connected_fd, initial_ops.sqe_blueprints)
+                  {
+                    warn!("CQE Processor: SQ full during initial op submission for new connection FD {}. Re-queueing {} blueprints.", connected_fd, remaining_blueprints.len());
+                    for bp in remaining_blueprints {
+                      worker.pending_sqe_retry_queue.push_back((connected_fd, bp));
+                    }
+                  }
+                  if initial_ops.initiate_close_due_to_error {
+                    warn!(
+                      "CQE Processor: New connection handler for FD {} requested immediate close.",
+                      connected_fd
+                    );
+                    worker
+                      .fds_needing_close_initiated_pass
+                      .push_back(connected_fd);
+                  }
+                  
                   UringOpCompletion::ConnectSuccess {
                     user_data: cqe_user_data,
                     connected_fd,
@@ -583,7 +560,6 @@ pub(crate) fn process_all_cqes(
 
       if matches!(op_type_peeked, InternalOpType::RingReadMultishot) {
         if let Some(handler) = worker.handler_manager.get_mut(handler_fd_peeked) {
-
           let recv_buffer_manager = worker.buffer_manager.as_ref();
           let worker_io_config = &worker.worker_io_config;
           let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
@@ -597,28 +573,47 @@ pub(crate) fn process_all_cqes(
             default_bgid_val_from_worker,
             cqe_user_data,
           );
-          if let Some(delegation_result) =
-            handler.delegate_cqe_to_multishot_reader(&cqe, recv_bm_ref, &interface, &mut worker.internal_op_tracker)
-          {
+          if let Some(delegation_result) = handler.delegate_cqe_to_multishot_reader(
+            &cqe,
+            recv_bm_ref,
+            &interface,
+            &mut worker.internal_op_tracker,
+          ) {
             was_delegated_to_multishot_handler = true;
             match delegation_result {
-              Ok((handler_blueprints, should_cleanup_delegated_op_ud)) => {
+              Ok((handler_ops, should_cleanup_delegated_op_ud)) => {
                 if should_cleanup_delegated_op_ud {
-                  if worker.internal_op_tracker.take_op_details(cqe_user_data).is_none() {
+                  if worker
+                    .internal_op_tracker
+                    .take_op_details(cqe_user_data)
+                    .is_none()
+                  {
                     warn!("[CQE Proc] Multishot delegate requested cleanup for ud:{}, but it was already taken or not found.", cqe_user_data);
                   }
                 } else if op_type_peeked == InternalOpType::RingReadMultishot {
                   is_multishot_read_pending_more = true;
                 }
-                if !handler_blueprints.sqe_blueprints.is_empty()
-                  || handler_blueprints.initiate_close_due_to_error
-                {
-                  process_handler_blueprints(
+                
+                if !handler_ops.sqe_blueprints.is_empty() {
+                  if let Err(remaining_blueprints) = process_handler_blueprints(
                     worker,
                     handler_fd_peeked,
-                    handler_blueprints,
-                  );
+                    handler_ops.sqe_blueprints,
+                  ) {
+                    warn!("CQE Processor: SQ full during multishot delegate op submission for FD {}. Re-queueing {} blueprints.", handler_fd_peeked, remaining_blueprints.len());
+                    for bp in remaining_blueprints {
+                      worker
+                        .pending_sqe_retry_queue
+                        .push_back((handler_fd_peeked, bp));
+                    }
+                  }
                 }
+                if handler_ops.initiate_close_due_to_error {
+                  worker
+                    .fds_needing_close_initiated_pass
+                    .push_back(handler_fd_peeked);
+                }
+                
               }
               Err(e) => {
                 error!(
@@ -646,7 +641,8 @@ pub(crate) fn process_all_cqes(
       && !is_multishot_read_pending_more
       && !was_delegated_to_multishot_handler
     {
-      op_details_taken_for_final_processing = worker.internal_op_tracker.take_op_details(cqe_user_data);
+      op_details_taken_for_final_processing =
+        worker.internal_op_tracker.take_op_details(cqe_user_data);
     }
 
     if let Some(op_details) = op_details_taken_for_final_processing {
@@ -696,11 +692,24 @@ pub(crate) fn process_all_cqes(
                 ACCEPTED_CONNECTION_SENTINEL_UD,
               ) {
                 Ok(initial_ops) => {
-                  process_handler_blueprints(
-                    worker,
-                    client_fd,
-                    initial_ops,
-                  );
+                  
+                  // Call site must now handle the Result from process_handler_blueprints.
+                  if let Err(remaining_blueprints) =
+                    process_handler_blueprints(worker, client_fd, initial_ops.sqe_blueprints)
+                  {
+                    warn!("CQE Processor: SQ full during initial op submission for accepted FD {}. Re-queueing {} blueprints.", client_fd, remaining_blueprints.len());
+                    for bp in remaining_blueprints {
+                      worker.pending_sqe_retry_queue.push_back((client_fd, bp));
+                    }
+                  }
+                  if initial_ops.initiate_close_due_to_error {
+                    warn!(
+                      "CQE Processor: New accepted handler for FD {} requested immediate close.",
+                      client_fd
+                    );
+                    worker.fds_needing_close_initiated_pass.push_back(client_fd);
+                  }
+                  
                 }
                 Err(e) => {
                   error!(
@@ -746,7 +755,9 @@ pub(crate) fn process_all_cqes(
                   );
 
                   let fds_to_initiate_close_queue = &mut worker.fds_needing_close_initiated_pass;
-                  worker.internal_op_tracker.take_op_details(new_accept_internal_ud);
+                  worker
+                    .internal_op_tracker
+                    .take_op_details(new_accept_internal_ud);
                   if !fds_to_initiate_close_queue.contains(&listener_fd) {
                     fds_to_initiate_close_queue.push_back(listener_fd);
                   }
@@ -765,7 +776,6 @@ pub(crate) fn process_all_cqes(
               );
             }
           } else {
-            // Accept failed
             let accept_err = std::io::Error::from_raw_os_error(-cqe_result);
             error!(
               "CQE Processor: Internal Accept op (ud:{}) for listener FD {} FAILED with errno {}: {}",
@@ -773,8 +783,11 @@ pub(crate) fn process_all_cqes(
             );
 
             if !is_worker_shutting_down {
-              let new_accept_internal_ud_on_err =
-                worker.internal_op_tracker.new_op_id(handler_fd, InternalOpType::Accept, InternalOpPayload::None);
+              let new_accept_internal_ud_on_err = worker.internal_op_tracker.new_op_id(
+                handler_fd,
+                InternalOpType::Accept,
+                InternalOpPayload::None,
+              );
               let mut client_addr_storage_err: libc::sockaddr_storage = unsafe { mem::zeroed() };
               let mut client_addr_len_err =
                 mem::size_of_val(&client_addr_storage_err) as libc::socklen_t;
@@ -787,12 +800,14 @@ pub(crate) fn process_all_cqes(
               .build()
               .user_data(new_accept_internal_ud_on_err);
               let mut sq_for_reaccept_err_op = unsafe { worker.ring.submission_shared() };
-              
+
               let fds_to_initiate_close_queue = &mut worker.fds_needing_close_initiated_pass;
               unsafe {
                 if sq_for_reaccept_err_op.push(&accept_sqe_on_err).is_err() {
                   error!("Worker: Failed to re-submit Accept SQE after error for listener_fd {} (SQ FULL?). Listener may stop accepting.", handler_fd);
-                  worker.internal_op_tracker.take_op_details(new_accept_internal_ud_on_err);
+                  worker
+                    .internal_op_tracker
+                    .take_op_details(new_accept_internal_ud_on_err);
                   if !fds_to_initiate_close_queue.contains(&handler_fd) {
                     fds_to_initiate_close_queue.push_back(handler_fd);
                   }
@@ -808,14 +823,18 @@ pub(crate) fn process_all_cqes(
               cqe_user_data, handler_fd
             );
 
-            // Remove the corresponding MPSC receiver when an FD is closed.
             if worker.fd_to_mpsc_rx.remove(&handler_fd).is_some() {
-              trace!("CQE Processor: Removed MPSC receiver for closed FD {}", handler_fd);
+              trace!(
+                "CQE Processor: Removed MPSC receiver for closed FD {}",
+                handler_fd
+              );
             }
 
-            // Loop to find and reply to ALL pending shutdown requests for this FD.
             loop {
-              if let Some((ext_ud, ext_ctx)) = worker.external_op_tracker.take_op_if_shutdown_for_fd(handler_fd) {
+              if let Some((ext_ud, ext_ctx)) = worker
+                .external_op_tracker
+                .take_op_if_shutdown_for_fd(handler_fd)
+              {
                 info!(
                         "CQE Processor: Notifying external shutdown requester (ext_ud: {}) for closed FD {}.",
                         ext_ud, handler_fd
@@ -831,7 +850,6 @@ pub(crate) fn process_all_cqes(
                         );
                 }
               } else {
-                // No more shutdown requests for this FD were found.
                 break;
               }
             }
@@ -849,16 +867,10 @@ pub(crate) fn process_all_cqes(
               );
             }
 
-            // After successfully closing the FD and notifying external callers,
-            // we must now notify the owning SocketCore so it can clean up its
-            // internal state and complete its shutdown sequence.
-
-            // Step 1: Get the global map if it exists.
             let mailbox_map_opt =
               uring::global_state::get_uring_fd_to_socket_core_mailbox_map_oncecell().get();
 
             if let Some(map_arc) = mailbox_map_opt {
-              // Step 2: Lock the map and get a clone of the mailbox sender.
               let mailbox_clone_opt = map_arc.read().get(&handler_fd).cloned();
 
               if let Some(socket_core_mailbox) = mailbox_clone_opt {
@@ -868,16 +880,12 @@ pub(crate) fn process_all_cqes(
                 );
                 let notification_cmd = Command::UringFdError {
                   fd: handler_fd,
-                  // Use a specific error to indicate a clean, intentional close.
                   error: ZmqError::ConnectionClosed,
                 };
                 if socket_core_mailbox.try_send(notification_cmd).is_err() {
                   warn!("CQE Processor: Failed to send final close notification to SocketCore for FD {}. Channel might be full or closed.", handler_fd);
                 }
               }
-              // After this, we can unregister the FD from the global map.
-              // We can do this right after getting the clone, or here.
-              // Doing it here is fine.
               uring::global_state::unregister_uring_fd_socket_core_mailbox(handler_fd);
             }
           } else {
@@ -891,14 +899,14 @@ pub(crate) fn process_all_cqes(
               h.fd_has_been_closed();
             }
 
-            // Also notify any pending shutdown requesters of the failure.
             loop {
-              if let Some((ext_ud, ext_ctx)) = worker.external_op_tracker.take_op_if_shutdown_for_fd(handler_fd) {
+              if let Some((ext_ud, ext_ctx)) = worker
+                .external_op_tracker
+                .take_op_if_shutdown_for_fd(handler_fd)
+              {
                 let err_completion = UringOpCompletion::OpError {
                   user_data: ext_ud,
                   op_name: "ShutdownConnectionHandler (via CloseFd failure)".to_string(),
-                  // FIX: Create a new `io::Error` from the raw errno and convert that to ZmqError.
-                  // Our `From<io::Error>` impl will correctly destructure it into a cloneable ZmqError.
                   error: ZmqError::from(std::io::Error::from_raw_os_error(raw_errno)),
                 };
                 let _ = ext_ctx.reply_tx.send(Ok(err_completion));
@@ -909,7 +917,6 @@ pub(crate) fn process_all_cqes(
           }
         }
         InternalOpType::SendZeroCopy => {
-          // This arm is hit for F_NOTIFY or an initial error for SendZeroCopy.
           trace!(
             "[CQE Proc] Finalizing SendZeroCopy (ud:{}, fd:{}, res:{}, notify_flag:{})",
             cqe_user_data,
@@ -940,7 +947,8 @@ pub(crate) fn process_all_cqes(
             }
 
             if app_op_ud != HANDLER_INTERNAL_SEND_OP_UD {
-              if let Some(ext_op_ctx_mut) = worker.external_op_tracker.get_op_context_mut(app_op_ud) {
+              if let Some(ext_op_ctx_mut) = worker.external_op_tracker.get_op_context_mut(app_op_ud)
+              {
                 if cqe_result < 0 {
                   let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
                   let completion = Ok(UringOpCompletion::OpError {
@@ -996,24 +1004,22 @@ pub(crate) fn process_all_cqes(
           } = op_details.payload
           {
             if app_op_ud_val != HANDLER_INTERNAL_SEND_OP_UD {
-              if let Some(ext_op_ctx_mut) = worker.external_op_tracker.get_op_context_mut(app_op_ud_val) {
+              if let Some(ext_op_ctx_mut) =
+                worker.external_op_tracker.get_op_context_mut(app_op_ud_val)
+              {
                 if cqe_result < 0 {
-                  // If ANY part fails, we immediately take and reply with an error.
                   let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
                   let completion = Ok(UringOpCompletion::OpError {
                     user_data: app_op_ud_val,
                     op_name: app_op_name.clone(),
                     error: zmq_err,
                   });
-                  // Since the op has failed, we can safely consume the context now.
                   if let Some(ctx_to_reply) = worker.external_op_tracker.take_op(app_op_ud_val) {
                     let _ = ctx_to_reply.reply_tx.send(completion);
                   }
                 } else if let Some(multi_state) = &mut ext_op_ctx_mut.multipart_state {
-                  // This is part of a multipart message and was successful.
                   multi_state.completed_parts += 1;
                   if multi_state.completed_parts >= multi_state.total_parts {
-                    // This was the LAST part and it was successful. Take and reply.
                     let completion = Ok(UringOpCompletion::SendDataViaHandlerAck {
                       user_data: app_op_ud_val,
                       fd: handler_fd,
@@ -1022,9 +1028,7 @@ pub(crate) fn process_all_cqes(
                       let _ = ctx_to_reply.reply_tx.send(completion);
                     }
                   }
-                  // else: not the last part, do nothing, leave the context in the tracker.
                 } else {
-                  // This was a single-part message and it was successful. Take and reply.
                   let completion = Ok(UringOpCompletion::SendDataViaHandlerAck {
                     user_data: app_op_ud_val,
                     fd: handler_fd,
@@ -1035,9 +1039,8 @@ pub(crate) fn process_all_cqes(
                 }
               }
             } else {
-              // This is a send initiated by a handler internally (e.g., a PING).
-              // It doesn't have an external operation to notify, but the handler might care about the result.
               trace!("[CQE Proc] Normal Send: Send for internal handler op (ud:{}, app_op_ud:{}) completed.", cqe_user_data, app_op_ud_val);
+              
               if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
                 let recv_buffer_manager = worker.buffer_manager.as_ref();
                 let worker_io_config = &worker.worker_io_config;
@@ -1055,14 +1058,20 @@ pub(crate) fn process_all_cqes(
                   cqe_flags,
                   &interface,
                 );
-                if !handler_output.sqe_blueprints.is_empty()
-                  || handler_output.initiate_close_due_to_error
-                {
-                  process_handler_blueprints(
-                    worker,
-                    handler_fd,
-                    handler_output,
-                  );
+                if !handler_output.sqe_blueprints.is_empty() {
+                  if let Err(remaining_blueprints) =
+                    process_handler_blueprints(worker, handler_fd, handler_output.sqe_blueprints)
+                  {
+                    warn!("CQE Processor: SQ full during internal send op submission for FD {}. Re-queueing {} blueprints.", handler_fd, remaining_blueprints.len());
+                    for bp in remaining_blueprints {
+                      worker.pending_sqe_retry_queue.push_back((handler_fd, bp));
+                    }
+                  }
+                }
+                if handler_output.initiate_close_due_to_error {
+                  worker
+                    .fds_needing_close_initiated_pass
+                    .push_back(handler_fd);
                 }
               } else {
                 warn!(
@@ -1070,10 +1079,9 @@ pub(crate) fn process_all_cqes(
                   handler_fd, cqe_user_data
                 );
               }
+              
             }
           } else {
-            // This case handles internal sends that don't have an associated app_op_ud.
-            // For example, if a PING were sent.
             if cqe_result < 0 {
               warn!(
                 "[CQE Proc] Internal normal send (ud:{}) for FD {} FAILED: {}. Notifying handler.",
@@ -1083,11 +1091,12 @@ pub(crate) fn process_all_cqes(
               );
             }
 
+            
             if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
               let recv_buffer_manager = worker.buffer_manager.as_ref();
               let worker_io_config = &worker.worker_io_config;
               let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
-              
+
               let interface = UringWorkerInterface::new(
                 handler_fd,
                 worker_io_config,
@@ -1101,14 +1110,20 @@ pub(crate) fn process_all_cqes(
                 cqe_flags,
                 &interface,
               );
-              if !handler_output.sqe_blueprints.is_empty()
-                || handler_output.initiate_close_due_to_error
-              {
-                process_handler_blueprints(
-                  worker,
-                  handler_fd,
-                  handler_output,
-                );
+              if !handler_output.sqe_blueprints.is_empty() {
+                if let Err(remaining_blueprints) =
+                  process_handler_blueprints(worker, handler_fd, handler_output.sqe_blueprints)
+                {
+                  warn!("CQE Processor: SQ full during internal send (no app_op_ud) op submission for FD {}. Re-queueing {} blueprints.", handler_fd, remaining_blueprints.len());
+                  for bp in remaining_blueprints {
+                    worker.pending_sqe_retry_queue.push_back((handler_fd, bp));
+                  }
+                }
+              }
+              if handler_output.initiate_close_due_to_error {
+                worker
+                  .fds_needing_close_initiated_pass
+                  .push_back(handler_fd);
               }
             } else {
               warn!(
@@ -1116,6 +1131,7 @@ pub(crate) fn process_all_cqes(
                 handler_fd, cqe_user_data
               );
             }
+            
           }
         }
         InternalOpType::RingRead | InternalOpType::GenericHandlerOp => {
@@ -1134,10 +1150,8 @@ pub(crate) fn process_all_cqes(
             let handler_output: HandlerIoOps;
             if op_type == InternalOpType::RingRead && cqueue::buffer_select(cqe_flags).is_some() {
               if cqe_result >= 0 {
-                
                 let fds_to_initiate_close_queue = &mut worker.fds_needing_close_initiated_pass;
                 if let Some(bid) = cqueue::buffer_select(cqe_flags) {
-                  // Check bid is valid
                   let bytes_read = cqe_result as usize;
                   if let Some(bm) = recv_buffer_manager {
                     match unsafe { bm.borrow_kernel_filled_buffer(bid, bytes_read) } {
@@ -1167,7 +1181,6 @@ pub(crate) fn process_all_cqes(
                     }
                   }
                 } else {
-                  // cqueue::buffer_select was None even if flag was set, or bid invalid
                   error!("[CQE Proc] RingRead (ud:{}): CQE_F_BUFFER set but buffer_select() is None or invalid. Closing FD {}.", cqe_user_data, handler_fd);
                   handler_output = HandlerIoOps::default().set_error_close();
                   if !fds_to_initiate_close_queue.contains(&handler_fd) {
@@ -1175,7 +1188,6 @@ pub(crate) fn process_all_cqes(
                   }
                 }
               } else {
-                // cqe_result < 0 for RingRead
                 error!(
                   "[CQE Proc] RingRead op (ud:{}) for FD {} FAILED: {}. Notifying handler.",
                   cqe_user_data,
@@ -1190,7 +1202,6 @@ pub(crate) fn process_all_cqes(
                 );
               }
             } else {
-              // GenericHandlerOp or RingRead without buffer selection (should not happen for our RingRead SQEs)
               handler_output = handler.handle_internal_sqe_completion(
                 cqe_user_data,
                 cqe_result,
@@ -1198,7 +1209,6 @@ pub(crate) fn process_all_cqes(
                 &interface,
               );
               if cqe_result < 0 && op_type != InternalOpType::RingRead {
-                // Don't double log RingRead errors
                 warn!(
                   "[CQE Proc] Generic op (ud:{}, type:{:?}) for FD {} FAILED: {}. Handler notified.",
                   cqe_user_data,
@@ -1209,15 +1219,23 @@ pub(crate) fn process_all_cqes(
               }
             }
 
-            if !handler_output.sqe_blueprints.is_empty()
-              || handler_output.initiate_close_due_to_error
-            {
-              process_handler_blueprints(
-                worker,
-                handler_fd,
-                handler_output,
-              );
+            
+            if !handler_output.sqe_blueprints.is_empty() {
+              if let Err(remaining_blueprints) =
+                process_handler_blueprints(worker, handler_fd, handler_output.sqe_blueprints)
+              {
+                warn!("CQE Processor: SQ full during RingRead/Generic op submission for FD {}. Re-queueing {} blueprints.", handler_fd, remaining_blueprints.len());
+                for bp in remaining_blueprints {
+                  worker.pending_sqe_retry_queue.push_back((handler_fd, bp));
+                }
+              }
             }
+            if handler_output.initiate_close_due_to_error {
+              worker
+                .fds_needing_close_initiated_pass
+                .push_back(handler_fd);
+            }
+          
           } else {
             warn!(
               "[CQE Proc] Handler for FD {} not found for op type {:?} (ud:{}).",
@@ -1241,5 +1259,5 @@ pub(crate) fn process_all_cqes(
       trace!("[CQE Proc] CQE (ud:{}, res:{}, flags:{:x}) - UNKNOWN or ALREADY PROCESSED (no op_details and not peek/delegate-handled). Ignored.", cqe_user_data, cqe_result, cqe_flags);
     }
   }
-  Ok(())
+  Ok(num_processed)
 }

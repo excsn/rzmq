@@ -21,7 +21,7 @@ use common::capacity_gate::{CapacityGate, OwnedPermitGuard};
 const ROUTER_IO_URING_ENABLED: bool = true;
 const DEALER_IO_URING_ENABLED: bool = true;
 const SNDZEROCPY_IO_URING_ENABLED: bool = false;
-const TCP_CORK_ENABLED: bool = true;
+const TCP_CORK_ENABLED: bool = false;
 const USE_MULTIPART_API: bool = true;
 const NUM_DEALER_TASKS: usize = 8;
 const MAX_CONCURRENT_REQUESTS: usize = 10_000;
