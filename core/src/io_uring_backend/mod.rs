@@ -4,7 +4,6 @@ use crate::ZmqError; // Common error type from the crate root
 
 pub mod buffer_manager;
 pub mod connection_handler;
-pub mod one_shot_sender;
 pub mod ops;
 pub mod send_buffer_pool;
 pub mod signaling_op_sender;

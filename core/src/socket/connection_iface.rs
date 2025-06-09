@@ -1,7 +1,5 @@
 use crate::error::ZmqError;
 #[cfg(feature = "io-uring")]
-use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSender;
-#[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::UringOpRequest;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
@@ -24,12 +22,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fibre::mpmc::AsyncSender;
+#[cfg(feature = "io-uring")]
+use fibre::oneshot::oneshot;
 use fibre::{SendError, TrySendError};
 use tokio::task::yield_now;
 use tokio::time::timeout as tokio_timeout;
-
-#[cfg(feature = "io-uring")]
-use tokio::sync::oneshot as tokio_oneshot;
 
 #[async_trait]
 pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
@@ -260,13 +257,13 @@ impl UringFdConnection {
 #[async_trait]
 impl ISocketConnection for UringFdConnection {
   async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = tokio_oneshot::channel();
+    let (reply_tx, reply_rx) = oneshot();
     let unique_user_data = self.context.inner().next_handle() as u64;
     let req = UringOpRequest::SendDataViaHandler {
       user_data: unique_user_data,
       fd: self.fd,
       app_data: Arc::new(msg),
-      reply_tx: WorkerOneShotSender::new(reply_tx),
+      reply_tx,
     };
 
     self.worker_op_tx.send(req).await.map_err(|e| {
@@ -292,7 +289,7 @@ impl ISocketConnection for UringFdConnection {
       ack_timeout
     };
 
-    match tokio_timeout(effective_ack_timeout, reply_rx).await {
+    match tokio_timeout(effective_ack_timeout, reply_rx.recv()).await {
       Ok(Ok(Ok(_completion))) => Ok(()),
       Ok(Ok(Err(e))) => {
         tracing::warn!(
@@ -329,7 +326,8 @@ impl ISocketConnection for UringFdConnection {
   }
 
   async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = tokio_oneshot::channel();
+
+    let (reply_tx, reply_rx) = oneshot();
     let unique_user_data = self.context.inner().next_handle() as u64;
 
     // Create the new request variant
@@ -337,7 +335,7 @@ impl ISocketConnection for UringFdConnection {
       user_data: unique_user_data,
       fd: self.fd,
       app_data_parts: Arc::new(msgs), // Wrap Vec<Msg> in Arc
-      reply_tx: WorkerOneShotSender::new(reply_tx),
+      reply_tx,
     };
 
     self.worker_op_tx.send(req).await.map_err(|e| {
@@ -363,7 +361,7 @@ impl ISocketConnection for UringFdConnection {
       ack_timeout
     };
 
-    match tokio_timeout(effective_ack_timeout, reply_rx).await {
+    match tokio_timeout(effective_ack_timeout, reply_rx.recv()).await {
       Ok(Ok(Ok(_completion))) => Ok(()), // Assumes SendDataViaHandlerAck is used for multipart too
       Ok(Ok(Err(e))) => {
         tracing::warn!(
@@ -399,13 +397,14 @@ impl ISocketConnection for UringFdConnection {
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = tokio_oneshot::channel();
+
+    let (reply_tx, reply_rx) = oneshot();
 
     let unique_user_data = self.context.inner().next_handle() as u64;
     let req = UringOpRequest::ShutdownConnectionHandler {
       user_data: unique_user_data,
       fd: self.fd,
-      reply_tx: WorkerOneShotSender::new(reply_tx),
+      reply_tx,
     };
     self.worker_op_tx.send(req).await.map_err(|e| {
       tracing::error!(
@@ -415,7 +414,7 @@ impl ISocketConnection for UringFdConnection {
       );
       ZmqError::Internal(format!("UringWorker op channel error for close: {}", e))
     })?;
-    match tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+    match tokio::time::timeout(Duration::from_secs(5), reply_rx.recv()).await {
       Ok(Ok(Ok(_completion))) => Ok(()),
       Ok(Ok(Err(e))) => {
         tracing::warn!(

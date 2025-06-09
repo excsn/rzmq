@@ -2,7 +2,8 @@
 
 #![cfg(feature = "io-uring")]
 
-use super::one_shot_sender::OneShotSender;
+use fibre::oneshot;
+
 use crate::message::Msg;
 use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
@@ -27,33 +28,33 @@ pub type UserData = u64;
 pub enum UringOpRequest {
   Nop {
     user_data: UserData,
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   InitializeBufferRing {
     user_data: UserData,
     bgid: u16,
     num_buffers: u16,
     buffer_capacity: usize,
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   RegisterRawBuffers {
     user_data: UserData,
     buffers: Vec<Vec<u8>>,
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   Listen {
     user_data: UserData,
     addr: SocketAddr,
     protocol_handler_factory_id: String,
     protocol_config: ProtocolConfig,
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   Connect {
     user_data: UserData,
     target_addr: SocketAddr,
     protocol_handler_factory_id: String,
     protocol_config: ProtocolConfig,
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   RegisterExternalFd {
     user_data: UserData,
@@ -61,29 +62,29 @@ pub enum UringOpRequest {
     protocol_handler_factory_id: String,
     protocol_config: ProtocolConfig,
     is_server_role: bool, // True if this FD is from an accepted connection on server-side
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   StartFdReadLoop {
     user_data: UserData,
     fd: RawFd,
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   SendDataViaHandler {
     user_data: UserData,
     fd: RawFd,
     app_data: Arc<dyn Any + Send + Sync>,
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   SendDataMultipartViaHandler {
     user_data: UserData,
     fd: RawFd,
     app_data_parts: Arc<Vec<Msg>>,
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   ShutdownConnectionHandler {
     user_data: UserData,
     fd: RawFd,
-    reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
 }
 
@@ -121,7 +122,7 @@ impl UringOpRequest {
   }
 
   // ADDED get_reply_tx_ref METHOD
-  pub(crate) fn get_reply_tx_ref(&self) -> &OneShotSender<Result<UringOpCompletion, ZmqError>> {
+  pub(crate) fn get_reply_tx_ref(&self) -> &oneshot::Sender<Result<UringOpCompletion, ZmqError>> {
     match self {
       Self::Nop { reply_tx, .. }
       | Self::InitializeBufferRing { reply_tx, .. }

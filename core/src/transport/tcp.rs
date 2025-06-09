@@ -12,8 +12,6 @@ use crate::socket::options::{SocketOptions, TcpTransportConfig, ZmtpEngineConfig
 use crate::socket::{ISocket, DEFAULT_RECONNECT_IVL_MS};
 
 #[cfg(feature = "io-uring")]
-use crate::io_uring_backend::one_shot_sender::OneShotSender as WorkerOneShotSender;
-#[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::{
   ProtocolConfig as WorkerProtocolConfig, UringOpCompletion as WorkerUringOpCompletion,
   UringOpRequest as WorkerUringOpRequest,
@@ -23,7 +21,7 @@ use crate::uring;
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::{AsRawFd, IntoRawFd};
 #[cfg(feature = "io-uring")]
-use tokio::sync::oneshot as tokio_oneshot;
+use fibre::oneshot::oneshot;
 
 use core::fmt;
 use std::io;
@@ -361,7 +359,7 @@ impl TcpListener {
                         let protocol_config =
                           WorkerProtocolConfig::Zmtp(Arc::new(ZmtpEngineConfig::from(&*socket_options_clone)));
                         let user_data_for_op = context_clone.inner().next_handle() as u64;
-                        let (reply_tx_for_op, reply_rx_for_op) = tokio_oneshot::channel();
+                        let (reply_tx_for_op, reply_rx_for_op) = oneshot();
 
                         let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
                           user_data: user_data_for_op,
@@ -369,7 +367,7 @@ impl TcpListener {
                           protocol_handler_factory_id: "zmtp-uring/3.1".to_string(),
                           protocol_config,
                           is_server_role: true,
-                          reply_tx: WorkerOneShotSender::new(reply_tx_for_op),
+                          reply_tx: reply_tx_for_op,
                         };
 
                         if let Err(e) = worker_op_tx.send(register_fd_req).await {
@@ -379,7 +377,7 @@ impl TcpListener {
                           }
                           setup_successful = false;
                         } else {
-                          match reply_rx_for_op.await {
+                          match reply_rx_for_op.recv().await {
                             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. }))
                               if returned_fd == raw_fd =>
                             {
@@ -873,7 +871,7 @@ impl TcpConnecter {
           let worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
           let protocol_config = WorkerProtocolConfig::Zmtp(Arc::new(ZmtpEngineConfig::from(&*self.context_options)));
           let user_data_for_op = self.context.inner().next_handle() as u64;
-          let (reply_tx_for_op, reply_rx_for_op) = tokio_oneshot::channel();
+          let (reply_tx_for_op, reply_rx_for_op) = oneshot();
 
           let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
             user_data: user_data_for_op,
@@ -881,7 +879,7 @@ impl TcpConnecter {
             protocol_handler_factory_id: "zmtp-uring/3.1".to_string(),
             protocol_config,
             is_server_role: false,
-            reply_tx: WorkerOneShotSender::new(reply_tx_for_op),
+            reply_tx: reply_tx_for_op,
           };
 
           worker_op_tx
@@ -889,7 +887,7 @@ impl TcpConnecter {
             .await
             .map_err(|e| ZmqError::Internal(format!("Send RegisterExternalFd to UringWorker: {}", e)))?;
 
-          match reply_rx_for_op.await {
+          match reply_rx_for_op.recv().await {
             Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess { fd: returned_fd, .. }))
               if returned_fd == raw_fd =>
             {

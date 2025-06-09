@@ -62,7 +62,7 @@ impl UringWorker {
             "UringWorker: BufferRingManager already initialized. Ignoring InitializeBufferRing (ud: {})",
             user_data
           );
-          let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+          let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
             user_data,
             op_name: op_name_str,
             error: ZmqError::InvalidState("Buffer ring already initialized".into()),
@@ -89,14 +89,14 @@ impl UringWorker {
                 );
               }
               let _ =
-                reply_tx.take_and_send_sync(Ok(UringOpCompletion::InitializeBufferRingSuccess {
+                reply_tx.send(Ok(UringOpCompletion::InitializeBufferRingSuccess {
                   user_data,
                   bgid,
                 }));
             }
             Err(e) => {
               error!("UringWorker: Failed to initialize BufferRingManager: {}", e);
-              let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+              let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
                 user_data,
                 op_name: op_name_str,
                 error: e,
@@ -113,7 +113,7 @@ impl UringWorker {
       } => {
         warn!("UringWorker: RegisterRawBuffers direct ring call not fully implemented. Sending placeholder ack.");
         // Real implementation: self.ring.register_buffers(buffers_as_ioslices_or_vecs).map_err...
-        let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::RegisterRawBuffersSuccess {
+        let _ = reply_tx.send(Ok(UringOpCompletion::RegisterRawBuffersSuccess {
           user_data,
         }));
         Ok(false)
@@ -144,7 +144,7 @@ impl UringWorker {
         if socket_fd < 0 {
           let e = ZmqError::from(std::io::Error::last_os_error());
           error!("Listen(ud:{}): Failed to create socket: {}", user_data, e);
-          let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+          let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
             user_data,
             op_name: op_name_str,
             error: e,
@@ -171,7 +171,7 @@ impl UringWorker {
           unsafe {
             libc::close(socket_fd);
           }
-          let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+          let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
             user_data,
             op_name: op_name_str,
             error: e,
@@ -197,7 +197,7 @@ impl UringWorker {
           unsafe {
             libc::close(socket_fd);
           }
-          let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+          let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
             user_data,
             op_name: op_name_str,
             error: e,
@@ -230,7 +230,7 @@ impl UringWorker {
           unsafe {
             libc::close(socket_fd);
           }
-          let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+          let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
             user_data,
             op_name: op_name_str,
             error: e,
@@ -303,7 +303,7 @@ impl UringWorker {
               if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
                 let _ = ctx
                   .reply_tx
-                  .take_and_send_sync(Ok(UringOpCompletion::OpError {
+                  .send(Ok(UringOpCompletion::OpError {
                     user_data,
                     op_name: op_name_str,
                     error: ZmqError::Internal("Failed to queue first accept".into()),
@@ -325,7 +325,7 @@ impl UringWorker {
           if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
             let _ = ctx
               .reply_tx
-              .take_and_send_sync(Ok(UringOpCompletion::OpError {
+              .send(Ok(UringOpCompletion::OpError {
                 user_data,
                 op_name: op_name_str,
                 error: ZmqError::Internal("SQ full for first accept".into()),
@@ -339,7 +339,7 @@ impl UringWorker {
           if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
             let _ = ctx
               .reply_tx
-              .take_and_send_sync(Ok(UringOpCompletion::ListenSuccess {
+              .send(Ok(UringOpCompletion::ListenSuccess {
                 user_data,
                 listener_fd: socket_fd,
                 actual_addr: actual_bound_addr,
@@ -406,7 +406,7 @@ impl UringWorker {
                       libc::close(fd_conn);
                     }
                   }
-                  let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+                  let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
                     user_data,
                     op_name: op_name_str,
                     error: ZmqError::Internal("SQ push failed".into()),
@@ -437,7 +437,7 @@ impl UringWorker {
               "UringWorker: build_sqe_for_external_request returned Ok(None) for op: {}",
               op_name_str
             );
-            let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+            let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
               user_data,
               op_name: op_name_str.clone(),
               error: ZmqError::Internal(format!(
@@ -452,7 +452,7 @@ impl UringWorker {
               "UringWorker: Failed to build SQE for {}: {:?}",
               op_name_str, op_completion_error
             );
-            let _ = reply_tx.take_and_send_sync(Ok(op_completion_error));
+            let _ = reply_tx.send(Ok(op_completion_error));
             Ok(false)
           }
         }
@@ -490,7 +490,7 @@ impl UringWorker {
                 Ok(true)
               } else {
                 self.external_op_tracker.take_op(user_data);
-                let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+                let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
                   user_data,
                   op_name: op_name_str,
                   error: ZmqError::Internal("SQ Nop push failed".into()),
@@ -506,7 +506,7 @@ impl UringWorker {
             }
           }
           Ok(None) => {
-            let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+            let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
               user_data,
               op_name: op_name_str,
               error: ZmqError::Internal("Nop build returned None".into()),
@@ -514,7 +514,7 @@ impl UringWorker {
             Ok(false)
           }
           Err(e) => {
-            let _ = reply_tx.take_and_send_sync(Ok(e));
+            let _ = reply_tx.send(Ok(e));
             Ok(false)
           }
         }
@@ -591,7 +591,7 @@ impl UringWorker {
             // Reply with success to the original requester via the ExternalOpContext.
             // We already added to tracker, now take it to reply.
             if let Some(mut op_ctx) = self.external_op_tracker.take_op(user_data) {
-              let _ = op_ctx.reply_tx.take_and_send_sync(Ok(
+              let _ = op_ctx.reply_tx.send(Ok(
                 UringOpCompletion::RegisterExternalFdSuccess { user_data, fd },
               ));
             } else {
@@ -612,7 +612,7 @@ impl UringWorker {
             if let Some(mut op_ctx) = self.external_op_tracker.take_op(user_data) {
               let _ = op_ctx
                 .reply_tx
-                .take_and_send_sync(Ok(UringOpCompletion::OpError {
+                .send(Ok(UringOpCompletion::OpError {
                   user_data,
                   op_name: op_name_str.clone(),
                   error: ZmqError::Internal(err_msg),
@@ -636,10 +636,10 @@ impl UringWorker {
             fd
           );
           let _ = reply_tx
-            .take_and_send_sync(Ok(UringOpCompletion::StartFdReadLoopAck { user_data, fd }));
+            .send(Ok(UringOpCompletion::StartFdReadLoopAck { user_data, fd }));
         } else {
           warn!("UringWorker: StartFdReadLoop for unknown fd {}", fd);
-          let _ = reply_tx.take_and_send_sync(Ok(UringOpCompletion::OpError {
+          let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
             user_data,
             op_name: op_name_str,
             error: ZmqError::InvalidArgument(format!("FD {} not managed for StartFdReadLoop", fd)),
@@ -711,11 +711,11 @@ impl UringWorker {
             if let Some(ctx_for_immediate_ack) = self.external_op_tracker.take_op(user_data) {
               if ctx_for_immediate_ack
                 .reply_tx
-                .take_and_send_sync(Ok(UringOpCompletion::SendDataViaHandlerAck {
+                .send(Ok(UringOpCompletion::SendDataViaHandlerAck {
                   user_data,
                   fd,
                 }))
-                .is_none()
+                .is_err()
               {
                 tracing::warn!("UringWorker (No ZC): Reply_tx for SendDataViaHandler (ud {}) was already taken before immediate ACK.", user_data);
               }
@@ -735,7 +735,7 @@ impl UringWorker {
           if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
             let _ = ctx
               .reply_tx
-              .take_and_send_sync(Ok(UringOpCompletion::OpError {
+              .send(Ok(UringOpCompletion::OpError {
                 user_data,
                 op_name: op_name_for_error.to_string(),
                 error: ZmqError::InvalidArgument(format!(
@@ -819,11 +819,11 @@ impl UringWorker {
             if let Some(ctx_for_immediate_ack) = self.external_op_tracker.take_op(user_data) {
               if ctx_for_immediate_ack
                 .reply_tx
-                .take_and_send_sync(Ok(UringOpCompletion::SendDataViaHandlerAck {
+                .send(Ok(UringOpCompletion::SendDataViaHandlerAck {
                   user_data,
                   fd,
                 }))
-                .is_none()
+                .is_err()
               {
                 tracing::warn!("UringWorker (No ZC): Reply_tx for SendDataMultipartViaHandler (ud {}) was already taken before immediate ACK.", user_data);
               }
@@ -841,7 +841,7 @@ impl UringWorker {
           if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
             let _ = ctx
               .reply_tx
-              .take_and_send_sync(Ok(UringOpCompletion::OpError {
+              .send(Ok(UringOpCompletion::OpError {
                 user_data,
                 op_name: op_name_for_error.to_string(),
                 error: ZmqError::InvalidArgument(format!(
@@ -889,7 +889,7 @@ impl UringWorker {
             // Acknowledge the request successfully, as the desired state (closed) will be achieved.
             let ack = UringOpCompletion::ShutdownConnectionHandlerComplete { user_data, fd };
             // Don't care about the result, it's a best-effort reply.
-            let _ = reply_tx.take_and_send_sync(Ok(ack));
+            let _ = reply_tx.send(Ok(ack));
             // Return false because we didn't queue any *new* SQEs.
             return Ok(false);
           }
@@ -908,7 +908,7 @@ impl UringWorker {
                 "UringWorker: Received ShutdownConnectionHandler for FD with no handler. Assuming already closed."
             );
           let ack = UringOpCompletion::ShutdownConnectionHandlerComplete { user_data, fd };
-          let _ = reply_tx.take_and_send_sync(Ok(ack));
+          let _ = reply_tx.send(Ok(ack));
           return Ok(false);
         }
 
@@ -1544,7 +1544,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
   for (_ud, ext_op_ctx) in worker.external_op_tracker.drain_all() {
     let _ = ext_op_ctx
       .reply_tx
-      .take_and_send_sync(Err(ZmqError::Internal("UringWorker shutting down".into())));
+      .send(Err(ZmqError::Internal("UringWorker shutting down".into())));
   }
 
   Ok(())

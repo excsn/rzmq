@@ -7,7 +7,6 @@ pub mod command;
 pub mod event_bus;
 pub mod latch;
 pub mod mailbox;
-pub mod one_shot_sender;
 pub mod system_events;
 pub mod waitgroup;
 
@@ -21,5 +20,4 @@ pub use system_events::{ActorType, SystemEvent};
 // Sync Primitives
 pub(crate) use actor_drop_guard::ActorDropGuard;
 pub(crate) use latch::CountDownLatch;
-pub(crate) use one_shot_sender::OneShotSender;
 pub(crate) use waitgroup::WaitGroup;

@@ -951,6 +951,19 @@ impl ZmtpUringHandler {
       return;
     }
 
+    let should_cork =
+      num_final_wire_frames > 1 && self.zmtp_config.use_cork && cfg!(target_os = "linux");
+
+    if should_cork {
+      trace!(
+        fd = self.fd,
+        "ZmtpHandler: Adding RequestSetCork(true) blueprint."
+      );
+      ops
+        .sqe_blueprints
+        .push(HandlerSqeBlueprint::RequestSetCork(true));
+    }
+
     for (idx, final_wire_bytes_for_part) in final_wire_frames.into_iter().enumerate() {
       let is_last_logical_part = idx == num_final_wire_frames - 1;
       let send_op_flags: i32 = if is_last_logical_part {
@@ -989,6 +1002,16 @@ impl ZmtpUringHandler {
           originating_app_op_ud: originating_op_ud_for_blueprints,
         });
       }
+    }
+
+    if should_cork {
+      trace!(
+        fd = self.fd,
+        "ZmtpHandler: Adding RequestSetCork(false) blueprint."
+      );
+      ops
+        .sqe_blueprints
+        .push(HandlerSqeBlueprint::RequestSetCork(false));
     }
   }
 }

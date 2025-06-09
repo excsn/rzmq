@@ -138,9 +138,7 @@ impl DealerSocketOutgoingProcessor {
                       e
                     );
                     self.load_balancer.remove_connection(&endpoint_uri);
-                    if let Some(sem) = self.pipe_send_coordinator.remove_pipe(conn_id_for_coord).await {
-                      sem.close();
-                    }
+                    self.pipe_send_coordinator.remove_pipe(conn_id_for_coord).await;
                     self.peer_availability_notifier.notify_waiters();
                   }
                   Err(e) => {
@@ -668,9 +666,7 @@ impl ISocket for DealerSocket {
           .map(|ep_info| ep_info.handle_id)
       };
       if let Some(conn_id) = connection_id_to_remove_opt {
-        if let Some(semaphore) = self.pipe_send_coordinator.remove_pipe(conn_id).await {
-          semaphore.close();
-        }
+        self.pipe_send_coordinator.remove_pipe(conn_id).await;
       }
     }
     self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await;
@@ -753,9 +749,7 @@ impl DealerSocket {
           }
           Err(e @ ZmqError::ConnectionClosed) | Err(e @ ZmqError::HostUnreachable(_)) => {
             self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-            if let Some(sem) = self.pipe_send_coordinator.remove_pipe(connection_id_for_coord).await {
-              sem.close();
-            }
+            self.pipe_send_coordinator.remove_pipe(connection_id_for_coord).await;
             self.peer_availability_notifier.notify_waiters();
             tracing::warn!(
               "[Dealer {}] Conn {} (URI {}) closed/unreachable for send_multipart: {}. Removed.",

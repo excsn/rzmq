@@ -46,6 +46,9 @@ pub enum HandlerSqeBlueprint {
     fd: RawFd,                  // For context, and to find the MultishotReader
     target_user_data: UserData, // UserData of the operation to be cancelled
   },
+  /// Request to set the TCP_CORK option on the handler's FD. This is a direct
+  /// worker action, not an SQE submission.
+  RequestSetCork(bool),
   // Potentially others: RequestPollAdd, RequestTimeout, etc.
 }
 

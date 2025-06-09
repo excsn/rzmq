@@ -27,6 +27,21 @@ use tracing::{debug, error, info, trace, warn};
 #[cfg(feature = "io-uring")]
 const CQE_F_NOTIFY_FLAG: u32 = 1 << 3; // (8) for kernels 6.0+
 
+#[cfg(target_os = "linux")]
+fn set_tcp_cork(fd: RawFd, enable: bool) {
+  use socket2::Socket;
+  use std::os::fd::FromRawFd;
+
+  // SAFETY: We are borrowing the FD managed by the UringWorker.
+  // The FD is guaranteed to be valid as long as the handler exists.
+  let socket = unsafe { Socket::from_raw_fd(fd) };
+  if let Err(e) = socket.set_cork(enable) {
+    warn!(raw_fd = fd, enable, error = %e, "UringWorker: Failed to set TCP_CORK socket option directly.");
+  }
+  // We must forget the SockRef so it doesn't close the underlying FD.
+  std::mem::forget(socket);
+}
+
 // process_handler_blueprints (signature confirmed from previous discussions)
 pub(crate) fn process_handler_blueprints(
   fd_from_handler_iteration: RawFd,
@@ -67,6 +82,13 @@ pub(crate) fn process_handler_blueprints(
 
     let sqe_build_result_opt: Option<Result<(squeue::Entry, InternalOpType), String>> =
       match blueprint_ref {
+        HandlerSqeBlueprint::RequestSetCork(enable) => {
+          #[cfg(target_os = "linux")]
+          set_tcp_cork(fd_from_handler_iteration, *enable);
+
+          // This blueprint is a direct action, not an SQE. Continue to the next blueprint.
+          continue;
+        }
         // Use blueprint
         HandlerSqeBlueprint::RequestRingRead => {
           if let Some(bgid) = default_bgid_for_read_sqe {
@@ -379,7 +401,12 @@ pub(crate) fn process_all_cqes(
       cqe_flags
     );
 
-    if event_fd_poller.handle_cqe_if_matches(cqe_user_data, cqe_result, internal_ops, is_worker_shutting_down) {
+    if event_fd_poller.handle_cqe_if_matches(
+      cqe_user_data,
+      cqe_result,
+      internal_ops,
+      is_worker_shutting_down,
+    ) {
       if internal_ops.take_op_details(cqe_user_data).is_none() {
         warn!(
           "[CQE Proc] EventFdPoll CQE (ud:{}) handled, but no InternalOpDetails found to consume.",
@@ -523,8 +550,8 @@ pub(crate) fn process_all_cqes(
       };
       if ext_op_ctx
         .reply_tx
-        .take_and_send_sync(Ok(completion_to_send))
-        .is_none()
+        .send(Ok(completion_to_send))
+        .is_err()
       {
         tracing::warn!(
           "CQE Processor: Reply_tx for external op ud {} was already taken.",
@@ -565,10 +592,7 @@ pub(crate) fn process_all_cqes(
         }
       }
 
-      if matches!(
-        op_type_peeked,
-        InternalOpType::RingReadMultishot
-      ) {
+      if matches!(op_type_peeked, InternalOpType::RingReadMultishot) {
         if let Some(handler) = handler_manager.get_mut(handler_fd_peeked) {
           let recv_bm_ref =
             recv_buffer_manager.expect("Recv BufferManager missing for multishot op");
@@ -717,9 +741,13 @@ pub(crate) fn process_all_cqes(
             }
 
             if !is_worker_shutting_down {
-              let new_accept_internal_ud =
-                internal_ops.new_op_id(listener_fd, InternalOpType::Accept, InternalOpPayload::None);
-              let mut client_addr_storage_reaccept: libc::sockaddr_storage = unsafe { mem::zeroed() };
+              let new_accept_internal_ud = internal_ops.new_op_id(
+                listener_fd,
+                InternalOpType::Accept,
+                InternalOpPayload::None,
+              );
+              let mut client_addr_storage_reaccept: libc::sockaddr_storage =
+                unsafe { mem::zeroed() };
               let mut client_addr_len_reaccept =
                 mem::size_of_val(&client_addr_storage_reaccept) as libc::socklen_t;
               let accept_sqe_reaccept = opcode::Accept::new(
@@ -750,7 +778,10 @@ pub(crate) fn process_all_cqes(
                 }
               }
             } else {
-              info!("Worker: Not re-arming Accept on listener fd {} because worker is shutting down.", listener_fd);
+              info!(
+                "Worker: Not re-arming Accept on listener fd {} because worker is shutting down.",
+                listener_fd
+              );
             }
           } else {
             // Accept failed
@@ -805,7 +836,7 @@ pub(crate) fn process_all_cqes(
                   user_data: ext_ud,
                   fd: handler_fd,
                 };
-                if ext_ctx.reply_tx.take_and_send_sync(Ok(ack)).is_none() {
+                if ext_ctx.reply_tx.send(Ok(ack)).is_err() {
                   tracing::warn!(
                             "CQE Processor: Reply_tx for external Shutdown op (ext_ud {}) was already taken.",
                             ext_ud
@@ -882,7 +913,7 @@ pub(crate) fn process_all_cqes(
                   // Our `From<io::Error>` impl will correctly destructure it into a cloneable ZmqError.
                   error: ZmqError::from(std::io::Error::from_raw_os_error(raw_errno)),
                 };
-                let _ = ext_ctx.reply_tx.take_and_send_sync(Ok(err_completion));
+                let _ = ext_ctx.reply_tx.send(Ok(err_completion));
               } else {
                 break;
               }
@@ -974,8 +1005,8 @@ pub(crate) fn process_all_cqes(
                     if let Some(ext_op_ctx_final) = external_ops.take_op(app_op_ud) {
                       if ext_op_ctx_final
                         .reply_tx
-                        .take_and_send_sync(completion_to_send)
-                        .is_none()
+                        .send(completion_to_send)
+                        .is_err()
                       {
                         warn!(
                           "[CQE Proc] ZC Final: Reply_tx for app_op_ud {} (name: {}) was already taken/dropped.",
@@ -1155,8 +1186,8 @@ pub(crate) fn process_all_cqes(
                     if let Some(ext_op_ctx_final) = external_ops.take_op(app_op_ud_val) {
                       if ext_op_ctx_final
                         .reply_tx
-                        .take_and_send_sync(completion_to_send)
-                        .is_none()
+                        .send(completion_to_send)
+                        .is_err()
                       {
                         warn!(
                           "[CQE Proc] Normal Send: Reply_tx for app_op_ud {} (name: {}) was already taken/dropped.",
@@ -1425,7 +1456,10 @@ pub(crate) fn process_all_cqes(
           warn!("[CQE Proc] Reached InternalOpType::{:?} (ud:{}) in final processing path. Should have been handled by delegate_cqe_to_multishot_reader.", op_type, cqe_user_data);
         }
         InternalOpType::AsyncCancel => {
-          trace!("[CQE Proc] Finalized processing for AsyncCancel op (ud:{}).", cqe_user_data);
+          trace!(
+            "[CQE Proc] Finalized processing for AsyncCancel op (ud:{}).",
+            cqe_user_data
+          );
         }
       }
     } else if is_zc_initial_pending_notify

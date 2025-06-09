@@ -2,7 +2,8 @@
 
 #![cfg(feature = "io-uring")]
 
-use crate::io_uring_backend::one_shot_sender::OneShotSender;
+use fibre::oneshot;
+
 use crate::io_uring_backend::ops::{ProtocolConfig, UringOpCompletion, UserData};
 use crate::ZmqError;
 use std::collections::HashMap;
@@ -16,7 +17,7 @@ pub(crate) struct MultipartSendState {
 
 #[derive(Debug)]
 pub(crate) struct ExternalOpContext {
-  pub reply_tx: OneShotSender<Result<UringOpCompletion, ZmqError>>,
+  pub reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   pub op_name: String,
   pub protocol_handler_factory_id: Option<String>, // For Listen/Connect
   pub protocol_config: Option<ProtocolConfig>,

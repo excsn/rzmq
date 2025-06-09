@@ -693,9 +693,7 @@ impl ISocket for RouterSocket {
     self.pipe_to_identity_shared_map.remove(&pipe_read_id);
 
     if let Some(conn_id) = connection_id_opt {
-      if let Some(semaphore) = self.pipe_send_coordinator.remove_pipe(conn_id).await {
-        semaphore.close();
-      }
+      self.pipe_send_coordinator.remove_pipe(conn_id).await;
 
       let mut active_frag_guard = self.current_send_target.lock().await;
       if let Some(active_info) = &*active_frag_guard {
