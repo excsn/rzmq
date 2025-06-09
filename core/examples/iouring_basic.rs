@@ -12,7 +12,7 @@ use rzmq::{
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::TRACE) // Adjust log level (INFO, DEBUG, TRACE)
+    .with_max_level(tracing::Level::INFO) // Adjust log level (INFO, DEBUG, TRACE)
     .with_thread_ids(true)
     .with_thread_names(true)
     .with_target(true)

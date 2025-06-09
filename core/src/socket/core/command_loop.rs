@@ -29,8 +29,13 @@ pub(crate) async fn run_command_loop(
   );
 
   // Publish ActorStarted event after spawning
-  let mut actor_drop_guard = ActorDropGuard::new(context_clone_for_stop.clone(), core_handle, ActorType::SocketCore, None, None);
-
+  let mut actor_drop_guard = ActorDropGuard::new(
+    context_clone_for_stop.clone(),
+    core_handle,
+    ActorType::SocketCore,
+    None,
+    None,
+  );
 
   // Linger check interval
   let mut linger_check_interval: Interval = interval(Duration::from_millis(100)); // Adjusted interval
@@ -174,18 +179,21 @@ pub(crate) async fn run_command_loop(
   // --- Post-Loop Cleanup & ActorStopping Event ---
   // This section runs after the main loop breaks (due to shutdown or fatal error).
   tracing::debug!(
-      handle = core_handle,
-      "SocketCore loop exited. Performing final cleanup and ISocket::close()."
+    handle = core_handle,
+    "SocketCore loop exited. Performing final cleanup and ISocket::close()."
   );
-  
+
   // 1. Close the public-facing API resources to unblock any waiting user tasks.
   //    This is the most critical part of the fix.
-  if let Err(e) = socket_logic_strong.process_command(Command
-  ::Stop).await {
-      tracing::error!(handle = core_handle, "Error during final ISocket::close(): {}", e);
-      if final_error_for_actorstop.is_none() {
-          final_error_for_actorstop = Some(e);
-      }
+  if let Err(e) = socket_logic_strong.process_command(Command::Stop).await {
+    tracing::error!(
+      handle = core_handle,
+      "Error during final ISocket::close(): {}",
+      e
+    );
+    if final_error_for_actorstop.is_none() {
+      final_error_for_actorstop = Some(e);
+    }
   }
 
   // 2. Drain any remaining commands that arrived after shutdown started.
