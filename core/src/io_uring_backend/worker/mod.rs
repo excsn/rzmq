@@ -76,7 +76,7 @@ pub struct UringWorker {
   fds_needing_close_initiated_pass: VecDeque<RawFd>,
   pub(crate) event_fd_poller: EventFdPoller,
   send_buffer_pool: Option<Arc<SendBufferPool>>, // For zero-copy sends
-  pub(crate) fd_to_mpsc_rx: HashMap<RawFd, Arc<mpsc::UnboundedReceiver<Arc<Vec<Msg>>>>>,
+  pub(crate) fd_to_mpsc_rx: HashMap<RawFd, Arc<mpsc::BoundedReceiver<Arc<Vec<Msg>>>>>,
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
   cfg_send_buffer_count: usize, //TODO revisit

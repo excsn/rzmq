@@ -62,7 +62,7 @@ pub enum UringOpRequest {
     protocol_config: ProtocolConfig,
     is_server_role: bool, // True if this FD is from an accepted connection on server-side
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
-    mpsc_rx_for_worker: Arc<mpsc::Receiver<Arc<Vec<Msg>>>>,
+    mpsc_rx_for_worker: Arc<mpsc::BoundedReceiver<Arc<Vec<Msg>>>>,
   },
   StartFdReadLoop {
     user_data: UserData,

@@ -394,7 +394,7 @@ impl TcpListener {
                         let (reply_tx_for_op, reply_rx_for_op) = oneshot();
 
                         let hwm = socket_options_clone.sndhwm.max(1); // TODO Needs bounded mpsc fibre to respect this
-                        let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::unbounded();
+                        let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::bounded(hwm);
 
                         let new_conn_iface = Arc::new(UringFdConnection::new(
                           raw_fd,
@@ -959,7 +959,7 @@ impl TcpConnecter {
           let (reply_tx_for_op, reply_rx_for_op) = oneshot();
 
           let hwm = self.socket_options.sndhwm.max(1); // TODO Needs bounded mpsc fibre to respect this
-          let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::unbounded();
+          let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::bounded(hwm);
           let new_conn_iface = Arc::new(UringFdConnection::new(
             raw_fd,
             mpsc_tx_for_conn.to_async(),
