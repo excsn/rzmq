@@ -9,6 +9,7 @@ pub(crate) struct ActorDropGuard {
   context: Context,
   handle_id: usize,
   actor_type: ActorType,
+  parent_id: Option<usize>, 
   endpoint_uri: Option<String>,
   // Use an Arc<AtomicBool> to signal normal exit, preventing double publish
   stopped_normally: bool,
@@ -22,6 +23,7 @@ impl ActorDropGuard {
     Self {
       context,
       handle_id,
+      parent_id: parent_handle_id,
       actor_type,
       endpoint_uri,
       stopped_normally: false,
@@ -63,6 +65,7 @@ impl Drop for ActorDropGuard {
     self.context.publish_actor_stopping(
       self.handle_id,
       self.actor_type,
+      self.parent_id,
       self.endpoint_uri.take(),
       error,
     );

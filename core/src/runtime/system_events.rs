@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::message::Msg;
-use crate::runtime::mailbox::{MailboxSender as SessionCommandMailboxSender};
+use crate::runtime::mailbox::MailboxSender as SessionCommandMailboxSender;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::{error::ZmqError, Blob};
 
@@ -71,6 +71,7 @@ pub enum SystemEvent {
     handle_id: usize,
     /// The type of the actor task that is stopping.
     actor_type: ActorType,
+    parent_id: Option<usize>,
     /// Optional URI associated with the actor, e.g., for a Session or Listener.
     endpoint_uri: Option<String>,
     /// Optional error message string if the actor stopped due to an error.
@@ -174,10 +175,11 @@ impl fmt::Debug for SystemEvent {
           .field("actor_type", actor_type)
           .field("parent_id", parent_id)
           .finish(),
-      SystemEvent::ActorStopping { handle_id, actor_type, endpoint_uri, error } => f
+      SystemEvent::ActorStopping { handle_id, actor_type, endpoint_uri, parent_id, error } => f
           .debug_struct("ActorStopping")
           .field("handle_id", handle_id)
           .field("actor_type", actor_type)
+          .field("parent_id", parent_id) 
           .field("endpoint_uri", endpoint_uri)
           .field("error", error)
           .finish(),
@@ -227,7 +229,8 @@ impl fmt::Debug for SystemEvent {
 // This enum describes how SocketCore interacts with an established connection.
 #[derive(Clone)] // ISocketConnection is Arc'd, RawFd is Copy, MailboxSender is Clone
 pub enum ConnectionInteractionModel {
-  ViaSca { // SCA = SessionConnectionActor
+  ViaSca {
+    // SCA = SessionConnectionActor
     sca_mailbox: SessionCommandMailboxSender,
     sca_handle_id: usize,
   },
@@ -244,17 +247,23 @@ pub enum ConnectionInteractionModel {
 impl fmt::Debug for ConnectionInteractionModel {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      ConnectionInteractionModel::ViaSca { sca_mailbox, sca_handle_id } => 
-        f.debug_struct("ViaSca")
-         .field("sca_mailbox_closed", &sca_mailbox.is_closed())
-         .field("sca_handle_id", sca_handle_id)
-         .finish(),
+      ConnectionInteractionModel::ViaSca {
+        sca_mailbox,
+        sca_handle_id,
+      } => f
+        .debug_struct("ViaSca")
+        .field("sca_mailbox_closed", &sca_mailbox.is_closed())
+        .field("sca_handle_id", sca_handle_id)
+        .finish(),
       #[cfg(feature = "io-uring")]
-      ConnectionInteractionModel::ViaUringFd { fd } => f.debug_struct("ViaUringFd").field("fd", fd).finish(),
-      #[cfg(not(feature = "io-uring"))]
-      ConnectionInteractionModel::ViaUringFd { _fd_placeholder } => {
-        f.debug_struct("ViaUringFd").field("_fd_placeholder", &()).finish()
+      ConnectionInteractionModel::ViaUringFd { fd } => {
+        f.debug_struct("ViaUringFd").field("fd", fd).finish()
       }
+      #[cfg(not(feature = "io-uring"))]
+      ConnectionInteractionModel::ViaUringFd { _fd_placeholder } => f
+        .debug_struct("ViaUringFd")
+        .field("_fd_placeholder", &())
+        .finish(),
     }
   }
 }

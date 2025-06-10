@@ -2,9 +2,9 @@ use crate::error::ZmqError;
 use crate::runtime::system_events::ConnectionInteractionModel;
 use crate::runtime::{Command, SystemEvent};
 use crate::sessionx::ScaConnectionIface;
+use crate::socket::connection_iface::ISocketConnection;
 #[cfg(feature = "io-uring")]
 use crate::socket::connection_iface::UringFdConnection;
-use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
 use crate::socket::core::{command_processor, pipe_manager, shutdown, SocketCore};
 use crate::socket::ISocket;
@@ -30,13 +30,19 @@ pub(crate) async fn process_system_event(
 
   match event {
     SystemEvent::ContextTerminating => {
-      tracing::info!(handle = core_handle, "SocketCore received ContextTerminating event.");
+      tracing::info!(
+        handle = core_handle,
+        "SocketCore received ContextTerminating event."
+      );
       shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
     }
 
     SystemEvent::SocketClosing { socket_id } => {
       if socket_id == core_handle {
-        tracing::debug!(handle = core_handle, "SocketCore received its own SocketClosing event.");
+        tracing::debug!(
+          handle = core_handle,
+          "SocketCore received its own SocketClosing event."
+        );
         shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
       } else {
         // This event is for another socket, SocketCore ignores it.
@@ -51,17 +57,20 @@ pub(crate) async fn process_system_event(
       handle_id: child_actor_id,
       actor_type,
       endpoint_uri,
+      parent_id,
       error,
     } => {
-      shutdown::handle_actor_stopping_event(
-        core_arc.clone(),
-        socket_logic_strong,
-        child_actor_id,
-        actor_type,
-        endpoint_uri.as_deref(),
-        error.as_ref(),
-      )
-      .await;
+      if Some(core_handle) == parent_id {
+        shutdown::handle_actor_stopping_event(
+          core_arc.clone(),
+          socket_logic_strong,
+          child_actor_id,
+          actor_type,
+          endpoint_uri.as_deref(),
+          error.as_ref(),
+        )
+        .await;
+      }
     }
 
     SystemEvent::NewConnectionEstablished {
@@ -96,7 +105,7 @@ pub(crate) async fn process_system_event(
               tracing::error!(handle = core_handle, new_conn_uri = %endpoint_uri, "Error closing orphaned new connection: {}", e);
             }
           }
-          
+
           if let ConnectionInteractionModel::ViaSca { sca_mailbox, .. } = interaction_model {
             let _ = sca_mailbox.try_send(Command::Stop);
           }
@@ -176,8 +185,9 @@ pub(crate) async fn process_system_event(
           .await?;
         } else {
           tracing::debug!(handle = core_handle, target_inproc_name = %target_inproc_name, "SocketCore (binder) ignoring InprocBindingRequest during shutdown.");
-          let _ = reply_tx
-            .send(Err(ZmqError::InvalidState("Binder socket is shutting down".into())));
+          let _ = reply_tx.send(Err(ZmqError::InvalidState(
+            "Binder socket is shutting down".into(),
+          )));
         }
       }
     }
@@ -244,7 +254,8 @@ async fn handle_new_connection_established(
   let is_outbound_this_core_initiated = {
     let core_s_guard = core_arc.core_state.read();
     !core_s_guard.endpoints.values().any(|ep_info| {
-      ep_info.endpoint_type == EndpointType::Listener && ep_info.endpoint_uri == target_endpoint_uri_from_event
+      ep_info.endpoint_type == EndpointType::Listener
+        && ep_info.endpoint_uri == target_endpoint_uri_from_event
     })
   };
 
@@ -320,9 +331,17 @@ async fn handle_new_connection_established(
       };
 
       {
-        core_arc.core_state.write().pipes_tx.insert(core_write_id, tx_core_to_sca); // Store sender end of data pipe
+        core_arc
+          .core_state
+          .write()
+          .pipes_tx
+          .insert(core_write_id, tx_core_to_sca); // Store sender end of data pipe
 
-        let old_info_result = core_arc.core_state.write().endpoints.insert(endpoint_uri_from_event.clone(), endpoint_info);
+        let old_info_result = core_arc
+          .core_state
+          .write()
+          .endpoints
+          .insert(endpoint_uri_from_event.clone(), endpoint_info);
 
         if let Some(old_info) = old_info_result {
           tracing::warn!(handle=core_handle, uri=%endpoint_uri_from_event, "Overwrote existing EndpointInfo for NewConnection (SCA).");
@@ -334,7 +353,9 @@ async fn handle_new_connection_established(
             }
           });
         }
-        core_arc.core_state.write()
+        core_arc
+          .core_state
+          .write()
           .pipe_read_id_to_endpoint_uri
           .insert(core_read_id, endpoint_uri_from_event.clone());
       }
@@ -342,7 +363,11 @@ async fn handle_new_connection_established(
       // 7. Notify ISocket logic that pipes are attached
       // The ISocket pattern logic uses these IDs to manage its internal state for the connection.
       socket_logic_strong
-        .pipe_attached(core_read_id, core_write_id, None /* peer_identity comes later */)
+        .pipe_attached(
+          core_read_id,
+          core_write_id,
+          None, /* peer_identity comes later */
+        )
         .await;
       tracing::info!(handle=core_handle, sca_id=sca_handle_id, conn_uri=%endpoint_uri_from_event, "SessionConnectionActorX connection fully attached to SocketCore.");
     }
@@ -357,9 +382,7 @@ async fn handle_new_connection_established(
       );
 
       final_connection_iface = connection_iface_from_event_opt.ok_or_else(|| {
-        ZmqError::Internal(
-          "UringFdConnection missing from NewConnectionEstablished event".into(),
-        )
+        ZmqError::Internal("UringFdConnection missing from NewConnectionEstablished event".into())
       })?;
 
       let uring_fd_as_endpoint_handle_id = fd as usize;
@@ -383,7 +406,10 @@ async fn handle_new_connection_established(
 
       {
         let mut core_s = core_arc.core_state.write();
-        if let Some(old_info) = core_s.endpoints.insert(endpoint_uri_from_event.clone(), endpoint_info) {
+        if let Some(old_info) = core_s
+          .endpoints
+          .insert(endpoint_uri_from_event.clone(), endpoint_info)
+        {
           tracing::warn!(handle=core_handle, uri=%endpoint_uri_from_event, "Overwrote existing EndpointInfo for NewConnectionEstablished (io_uring).");
           if let Some(old_task_handle) = old_info.task_handle {
             old_task_handle.abort();

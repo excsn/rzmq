@@ -62,9 +62,8 @@ impl ContextInner {
     // Auto initialize io uring if cfg enabled
     #[cfg(feature = "io-uring")]
     {
-      match global_state::ensure_global_uring_systems_started()
-      {
-        Ok(_) | Err(ZmqError::InvalidState(_)) => {},
+      match global_state::ensure_global_uring_systems_started() {
+        Ok(_) | Err(ZmqError::InvalidState(_)) => {}
         Err(err) => {
           return Err(err);
         }
@@ -108,7 +107,10 @@ impl ContextInner {
   pub(crate) fn unregister_socket(&self, handle: usize) {
     let mut sockets_w = self.sockets.write();
     if sockets_w.remove(&handle).is_some() {
-      tracing::debug!(socket_handle = handle, "Socket command mailbox unregistered");
+      tracing::debug!(
+        socket_handle = handle,
+        "Socket command mailbox unregistered"
+      );
     } else {
       tracing::warn!(
         socket_handle = handle,
@@ -184,7 +186,11 @@ impl ContextInner {
   /// Registers an in-process binding. The `binder_core_id` identifies the `SocketCore`
   /// that is binding to this name, allowing it to filter `InprocBindingRequest` events.
   #[cfg(feature = "inproc")]
-  pub(crate) fn register_inproc(&self, name: String, binder_core_id: usize) -> Result<(), ZmqError> {
+  pub(crate) fn register_inproc(
+    &self,
+    name: String,
+    binder_core_id: usize,
+  ) -> Result<(), ZmqError> {
     let mut registry = self.inproc_registry.write();
     if registry.contains_key(&name) {
       Err(ZmqError::AddrInUse(format!("inproc://{}", name)))
@@ -258,7 +264,8 @@ impl Context {
     tracing::debug!(socket_type = ?socket_type, handle = handle, "Creating socket");
 
     // `create_socket_actor` now returns the ISocket logic and the single command_sender.
-    let (socket_logic, command_sender) = crate::socket::create_socket_actor(handle, self.clone(), socket_type)?;
+    let (socket_logic, command_sender) =
+      crate::socket::create_socket_actor(handle, self.clone(), socket_type)?;
 
     self.inner.register_socket(handle, command_sender.clone());
 
@@ -295,7 +302,12 @@ impl Context {
 
   /// Publishes an `ActorStarted` event. This is typically called by the code
   /// that spawns a new actor task, immediately after successful spawning.
-  pub(crate) fn publish_actor_started(&self, handle_id: usize, actor_type: ActorType, parent_id: Option<usize>) {
+  pub(crate) fn publish_actor_started(
+    &self,
+    handle_id: usize,
+    actor_type: ActorType,
+    parent_id: Option<usize>,
+  ) {
     let event = SystemEvent::ActorStarted {
       handle_id,
       actor_type,
@@ -320,12 +332,14 @@ impl Context {
     &self,
     handle_id: usize,
     actor_type: ActorType,
+    parent_id: Option<usize>,
     endpoint_uri: Option<String>,
     error: Option<ZmqError>,
   ) {
     let event = SystemEvent::ActorStopping {
       handle_id,
       actor_type,
+      parent_id,
       endpoint_uri,
       error,
     };
