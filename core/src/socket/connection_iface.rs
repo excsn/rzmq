@@ -223,7 +223,7 @@ impl ISocketConnection for SessionConnection {
 pub(crate) struct UringFdConnection {
   fd: RawFd,
   // The application pushes messages here.
-  mpsc_tx: mpsc::AsyncSender<Arc<Vec<Msg>>>,
+  mpsc_tx: mpsc::UnboundedAsyncSender<Arc<Vec<Msg>>>,
   context: Context,
 }
 
@@ -242,7 +242,7 @@ impl fmt::Debug for UringFdConnection {
 impl UringFdConnection {
   pub(crate) fn new(
     fd: RawFd,
-    mpsc_tx: mpsc::AsyncSender<Arc<Vec<Msg>>>,
+    mpsc_tx: mpsc::UnboundedAsyncSender<Arc<Vec<Msg>>>,
     context: Context,
   ) -> Self {
     Self {
