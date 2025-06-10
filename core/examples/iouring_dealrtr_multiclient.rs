@@ -200,6 +200,18 @@ async fn main() -> Result<(), ZmqError> {
     )
     .await?;
   router_socket
+    .set_option(
+      zmq_opts::IO_URING_RCVMULTISHOT,
+      ROUTER_IO_URING_ENABLED as i32,
+    )
+    .await?;
+  router_socket
+    .set_option(
+      zmq_opts::IO_URING_SNDZEROCOPY,
+      SNDZEROCPY_IO_URING_ENABLED as i32,
+    )
+    .await?;
+  router_socket
     .set_option(zmq_opts::TCP_CORK, TCP_CORK_ENABLED as i32)
     .await?;
   router_socket
@@ -223,6 +235,18 @@ async fn main() -> Result<(), ZmqError> {
       .set_option(
         zmq_opts::IO_URING_SESSION_ENABLED,
         DEALER_IO_URING_ENABLED as i32,
+      )
+      .await?;
+    dealer
+      .set_option(
+        zmq_opts::IO_URING_RCVMULTISHOT,
+        DEALER_IO_URING_ENABLED as i32,
+      )
+      .await?;
+    dealer
+      .set_option(
+        zmq_opts::IO_URING_SNDZEROCOPY,
+        SNDZEROCPY_IO_URING_ENABLED as i32,
       )
       .await?;
     dealer
