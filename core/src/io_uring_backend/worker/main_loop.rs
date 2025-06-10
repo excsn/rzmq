@@ -9,6 +9,7 @@ use crate::profiler::LoopProfiler;
 use crate::transport::endpoint::parse_endpoint;
 use crate::ZmqError;
 
+use std::collections::VecDeque;
 use std::mem;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -21,6 +22,7 @@ use tracing::{debug, error, info, trace, warn};
 // Constants for the kernel polling strategy
 const KERNEL_POLL_INITIAL: Duration = Duration::from_millis(1);
 const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(128);
+const MAX_BATCHES_PER_ITERATION: usize = 64;
 
 // Helper from the original `sqe_builder` module, now integrated here.
 fn socket_addr_to_sockaddr_storage(
@@ -304,16 +306,16 @@ impl UringWorker {
           user_data,
         ) {
           Ok(initial_ops) => {
-            if let Err(remaining) =
-              cqe_processor::process_handler_blueprints(self, fd, initial_ops.sqe_blueprints)
-            {
+            // Treat the entire set of initial blueprints as one atomic batch.
+            if !initial_ops.sqe_blueprints.is_empty() {
               self
                 .work_map
                 .entry(fd)
                 .or_default()
-                .blueprints
-                .extend(remaining);
+                .atomic_batches
+                .push_back(initial_ops.sqe_blueprints);
             }
+
             if initial_ops.initiate_close_due_to_error {
               self.fds_needing_close_initiated_pass.push_back(fd);
             }
@@ -398,14 +400,17 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           continue;
         }
 
+        // --- PHASE 1: GATHER ALL WORK ---
         profiler.mark_segment_end_and_start_new("gather_work");
         let mut work_was_available = !worker.work_map.is_empty();
 
+        // 1a. Drain external commands
         while let Ok(request) = worker.op_rx.try_recv() {
           work_was_available = true;
           worker.process_external_op_request(request);
         }
 
+        // 1b. Drain application data into the work_map
         let fds_to_drain: Vec<_> = worker.fd_to_mpsc_rx.keys().copied().collect();
         for fd in &fds_to_drain {
           if let Some(rx) = worker.fd_to_mpsc_rx.get(fd) {
@@ -421,17 +426,23 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           }
         }
 
+        // 1c. Poll handlers for periodic work
         let handler_ops_list = worker.handler_manager.prepare_all_handler_io_ops(
           worker.buffer_manager.as_ref(),
           worker.default_buffer_ring_group_id_val,
         );
-
         if !handler_ops_list.is_empty() {
           work_was_available = true;
         }
         for (fd, ops) in handler_ops_list {
-          let entry = worker.work_map.entry(fd).or_default();
-          entry.blueprints.extend(ops.sqe_blueprints);
+          if !ops.sqe_blueprints.is_empty() {
+            worker
+              .work_map
+              .entry(fd)
+              .or_default()
+              .atomic_batches
+              .push_back(ops.sqe_blueprints);
+          }
           if ops.initiate_close_due_to_error
             && !worker.fds_needing_close_initiated_pass.contains(&fd)
           {
@@ -439,6 +450,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           }
         }
 
+        // 1d. Process FDs flagged for closure
         while let Some(fd_to_close) = worker.fds_needing_close_initiated_pass.pop_front() {
           work_was_available = true;
           if let Some(handler) = worker.handler_manager.get_mut(fd_to_close) {
@@ -450,59 +462,89 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               0,
             );
             let close_io_ops = handler.close_initiated(&interface);
-            worker
-              .work_map
-              .entry(fd_to_close)
-              .or_default()
-              .blueprints
-              .extend(close_io_ops.sqe_blueprints);
+            if !close_io_ops.sqe_blueprints.is_empty() {
+              worker
+                .work_map
+                .entry(fd_to_close)
+                .or_default()
+                .atomic_batches
+                .push_back(close_io_ops.sqe_blueprints);
+            }
           }
         }
 
+        // --- PHASE 2: PROCESS THE WORK MAP WITH A BUDGET ---
         profiler.mark_segment_end_and_start_new("process_work_map");
+        let mut batches_processed_this_iteration = 0;
         let fds_with_work: Vec<_> = worker.work_map.keys().copied().collect();
+
         for fd in fds_with_work {
+          if batches_processed_this_iteration >= MAX_BATCHES_PER_ITERATION {
+            trace!("Work budget for this iteration consumed. Deferring remaining FDs.");
+            break;
+          }
           if unsafe { worker.ring.submission_shared().is_full() } {
             trace!("UringWorker: SQ full, pausing work map processing for this cycle.");
             break;
           }
 
-          if let Some(mut work) = worker.work_map.remove(&fd) {
-            if let Some(handler) = worker.handler_manager.get_mut(fd) {
-              while let Some(msg_parts) = work.app_data.pop_front() {
-                let interface = UringWorkerInterface::new(
-                  fd,
-                  &worker.worker_io_config,
-                  worker.buffer_manager.as_ref(),
-                  worker.default_buffer_ring_group_id_val,
-                  0,
-                );
-                let mut ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
-                work.blueprints.append(&mut ops_output.sqe_blueprints);
-              }
-            }
+          // Take the work for the current FD out of the map.
+          // This moves ownership of the `FdWork` struct and releases the mutable borrow on the map.
+          let mut work = worker.work_map.remove(&fd).unwrap_or_default();
 
-            if !work.blueprints.is_empty() {
-              if let Err(remaining) =
-                cqe_processor::process_handler_blueprints(worker, fd, work.blueprints)
-              {
-                warn!("UringWorker: SQ full during blueprint processing for FD {}. Re-queueing {} blueprints.", fd, remaining.len());
-                worker
-                  .work_map
-                  .entry(fd)
-                  .or_default()
-                  .blueprints
-                  .extend(remaining);
-                break;
+          // Convert all pending app_data to atomic_batches
+          if let Some(handler) = worker.handler_manager.get_mut(fd) {
+            while let Some(msg_parts) = work.app_data.pop_front() {
+              let interface = UringWorkerInterface::new(
+                fd,
+                &worker.worker_io_config,
+                worker.buffer_manager.as_ref(),
+                worker.default_buffer_ring_group_id_val,
+                0,
+              );
+              let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
+              if !ops_output.sqe_blueprints.is_empty() {
+                work.atomic_batches.push_back(ops_output.sqe_blueprints);
               }
             }
           }
+
+          // Try to submit the atomic batches for this FD
+          let mut stop_processing_this_fd = false;
+          while let Some(batch) = work.atomic_batches.pop_front() {
+            if batches_processed_this_iteration >= MAX_BATCHES_PER_ITERATION
+              || unsafe { worker.ring.submission_shared().is_full() }
+            {
+              work.atomic_batches.push_front(batch); // Put it back
+              stop_processing_this_fd = true;
+              break;
+            }
+
+            // Now it is safe to pass `worker` mutably.
+            if let Err(returned_batch) =
+              cqe_processor::process_handler_blueprints(worker, fd, batch)
+            {
+              work.atomic_batches.push_front(returned_batch);
+              stop_processing_this_fd = true;
+              break;
+            }
+            batches_processed_this_iteration += 1;
+          }
+
+          // If there's any work left for this FD, put it back into the main work_map.
+          if !work.app_data.is_empty() || !work.atomic_batches.is_empty() {
+            worker.work_map.insert(fd, work);
+          }
+
+          if stop_processing_this_fd {
+            break;
+          }
         }
 
+        // --- PHASE 3: ENSURE READS ---
         profiler.mark_segment_end_and_start_new("ensure_reads");
         let active_fds_for_read = worker.handler_manager.get_active_fds();
         let mut sq = unsafe { worker.ring.submission_shared() };
-
         for fd in active_fds_for_read {
           if worker.internal_op_tracker.has_pending_read_op(fd) {
             continue;
@@ -548,7 +590,8 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         }
         drop(sq);
 
-        profiler.mark_segment_end_and_start_new("submit_and_process");
+        // --- PHASE 4 & 5: SUBMIT AND IDLE ---
+        profiler.mark_segment_end_and_start_new("submit_and_idle");
         let sq_len = unsafe { worker.ring.submission_shared().len() };
         let mut sqes_submitted_to_kernel_this_batch = 0;
         let needs_wait = !work_was_available
@@ -563,29 +606,17 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           } else {
             worker.ring.submitter().submit()
           };
-
           match submitted_count_res {
             Ok(count) => {
               sqes_submitted_to_kernel_this_batch = count;
-              kernel_poll_timeout_duration = if count > 0 || work_was_available {
-                KERNEL_POLL_INITIAL
-              } else {
-                (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION)
-              };
             }
             Err(e)
               if e.kind() == std::io::ErrorKind::TimedOut
-                || e.raw_os_error() == Some(libc::ETIME) =>
-            {
-              if needs_wait {
-                kernel_poll_timeout_duration =
-                  (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
-              }
-            }
+                || e.raw_os_error() == Some(libc::ETIME) => {}
             Err(e)
               if e.raw_os_error() == Some(libc::EBUSY) || e.raw_os_error() == Some(libc::EINTR) =>
             {
-              warn!("UringWorker: submit/submit_with_args returned EBUSY/EINTR");
+              warn!("UringWorker: submit() returned EBUSY/EINTR");
             }
             Err(e) => {
               error!(
@@ -599,36 +630,31 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
         let (cqe_processed_count, newly_generated_work) =
           match cqe_processor::process_all_cqes(worker, false) {
-            Ok((count, work)) => (count, work),
-            Err(_) => break, // Or handle error
+            Ok(result) => result,
+            Err(e) => {
+              error!("UringWorker: cqe_processor returned a fatal error: {}", e);
+              return Err(e);
+            }
           };
 
-        // Immediately add the new work to the work_map for the next loop iteration
         if !newly_generated_work.is_empty() {
-          work_was_available = true; // Signal that there's work for the next idle check
+          work_was_available = true;
           for (fd, blueprints) in newly_generated_work {
             worker
               .work_map
               .entry(fd)
               .or_default()
-              .blueprints
-              .extend(blueprints);
+              .atomic_batches
+              .push_back(blueprints);
           }
         }
 
-        // --- PHASE 5: Idle Strategy ---
-        profiler.mark_segment_end_and_start_new("idle_strategy");
-
-        // THIS IS THE CORRECTED LINE:
         if sqes_submitted_to_kernel_this_batch == 0
           && cqe_processed_count == 0
           && !work_was_available
         {
-          if !needs_wait {
-            // If we didn't wait in the submit phase, our idle strategy kicks in
-            kernel_poll_timeout_duration =
-              (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
-          }
+          kernel_poll_timeout_duration =
+            (kernel_poll_timeout_duration * 2).min(KERNEL_POLL_MAX_DURATION);
         } else {
           kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
         }
@@ -643,9 +669,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           continue;
         }
         if worker.internal_op_tracker.is_empty() && worker.external_op_tracker.is_empty() {
-          info!(
-            "UringWorker: Draining complete. All operations finished. Transitioning to CleaningUp."
-          );
+          info!("UringWorker: Draining complete. Transitioning to CleaningUp.");
           worker.state = WorkerState::CleaningUp;
           continue;
         }

@@ -22,8 +22,8 @@ const SNDZEROCPY_IO_URING_ENABLED: bool = false;
 const TCP_CORK_ENABLED: u32 = 1;
 
 const NUM_DEALERS: usize = 8;
-const MAX_CONCURRENT_REQUESTS: usize = 100000;
-const NUM_MSGS_PER_DEALER: u64 = 500_000;
+const MAX_CONCURRENT_REQUESTS: usize = 1000000;
+const NUM_MSGS_PER_DEALER: u64 = 5_000_000;
 const PAYLOAD_SIZE_BYTES: usize = 1024;
 const ROUTER_ENDPOINT: &'static str = "tcp://127.0.0.1:5559";
 
