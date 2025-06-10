@@ -160,9 +160,13 @@ async fn main() -> Result<(), ZmqError> {
     );
 
     let uring_config = UringConfig {
+        default_recv_multishot: DEALER_IO_URING_ENABLED || ROUTER_IO_URING_ENABLED,
         default_send_zerocopy: SNDZEROCPY_IO_URING_ENABLED,
-        ring_entries: 1024,
-        ..Default::default()
+        ring_entries: 10240,
+        default_recv_buffer_count: 16,
+        default_recv_buffer_size: 65536,
+        default_send_buffer_count: 16,
+        default_send_buffer_size: 65536,
     };
     if let Err(e) = initialize_uring_backend(uring_config) {
         if !matches!(&e, ZmqError::InvalidState(s) if s.contains("already initialized")) {
@@ -233,11 +237,14 @@ async fn main() -> Result<(), ZmqError> {
     }
 
     // --- Await Completion & Report ---
+    println!("Sending");
     let sender_results = join_all(sender_handles).await;
     let total_sent: u64 = sender_results.into_iter().map(|res| res.unwrap().unwrap().messages_sent).sum();
     
+    println!("Sending finished, awaiting receiver");
     let receiver_count = central_receiver_handle.await.unwrap();
 
+    println!("Now awaiting router");
     let router_echoed = router_handle.await.unwrap().unwrap();
     
     let start_ts = first_send_ts.lock().await.unwrap();

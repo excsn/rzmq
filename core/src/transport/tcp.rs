@@ -383,7 +383,6 @@ impl TcpListener {
                         );
                         setup_successful = false;
                       } else {
-
                         let raw_fd = std_stream.into_raw_fd();
 
                         let worker_op_tx =
@@ -959,13 +958,12 @@ impl TcpConnecter {
           let user_data_for_op = self.context.inner().next_handle() as u64;
           let (reply_tx_for_op, reply_rx_for_op) = oneshot();
 
-
           let hwm = self.socket_options.sndhwm.max(1); // TODO Needs bounded mpsc fibre to respect this
           let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::unbounded();
           let new_conn_iface = Arc::new(UringFdConnection::new(
-              raw_fd,
-              mpsc_tx_for_conn.to_async(),
-              self.context.clone(),
+            raw_fd,
+            mpsc_tx_for_conn.to_async(),
+            self.context.clone(),
           ));
           let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
             user_data: user_data_for_op,

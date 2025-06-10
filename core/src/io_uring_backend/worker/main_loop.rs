@@ -17,7 +17,7 @@ use io_uring::{opcode, types};
 use tracing::{debug, error, info, trace, warn};
 
 const KERNEL_POLL_INITIAL: Duration = Duration::from_millis(1);
-const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(512);
+const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(128);
 
 impl UringWorker {
   /// Handles an external UringOpRequest: may build an SQE, or handle the request directly
