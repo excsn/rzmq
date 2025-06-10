@@ -44,6 +44,10 @@ impl HandlerManager {
     }
   }
 
+  pub(crate) fn get_active_fds(&self) -> Vec<RawFd> {
+    self.handlers.keys().copied().collect()
+  }
+
   /// Creates a new handler, adds it, calls `connection_ready`, and returns initial I/O operations.
   pub fn create_and_add_handler<'a>(
     &mut self,
@@ -192,9 +196,5 @@ impl HandlerManager {
     &mut self,
   ) -> impl Iterator<Item = (RawFd, &mut Box<dyn UringConnectionHandler + Send>)> {
     self.handlers.iter_mut().map(|(fd, handler)| (*fd, handler))
-  }
-
-  pub(crate) fn get_active_fds(&self) -> Vec<RawFd> {
-    self.handlers.keys().copied().collect()
   }
 }

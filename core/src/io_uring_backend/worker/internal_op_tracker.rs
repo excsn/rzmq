@@ -123,4 +123,14 @@ impl InternalOpTracker {
       .map(|(user_data, _)| *user_data)
       .collect()
   }
+
+  pub(crate) fn has_pending_read_op(&self, fd_to_check: RawFd) -> bool {
+    self.op_to_details.values().any(|details| {
+      details.fd == fd_to_check
+        && matches!(
+          details.op_type,
+          InternalOpType::RingRead | InternalOpType::RingReadMultishot
+        )
+    })
+  }
 }

@@ -22,9 +22,6 @@ use super::worker::InternalOpTracker;
 // --- Blueprints for SQEs requested by handlers ---
 #[derive(Debug, Clone)]
 pub enum HandlerSqeBlueprint {
-  /// Request a ring-buffered read for the handler's FD.
-  /// The UringWorker will use the default_buffer_ring_group_id.
-  RequestRingRead,
   /// Request to send data. The UringWorker will build a Send SQE.
   RequestSend {
     data: Bytes,
@@ -209,10 +206,6 @@ pub trait UringConnectionHandler: Send {
     worker_interface: &UringWorkerInterface<'_>,
     internal_op_tracker: &mut InternalOpTracker,
   ) -> Option<Result<(HandlerIoOps, bool), ZmqError>>;
-
-  /// Called by `cqe_processor` (specifically `process_handler_blueprints`) after it successfully
-  /// submits a standard (non-multishot) read operation for this handler.
-  fn inform_standard_read_op_submitted(&mut self, op_user_data: UserData);
 
   /// Called by `cqe_processor` (specifically `process_handler_blueprints`) after it successfully
   /// submits an SQE that was initiated by this handler's `MultishotReader` (either a new

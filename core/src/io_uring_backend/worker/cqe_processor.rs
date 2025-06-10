@@ -65,26 +65,6 @@ pub(crate) fn process_handler_blueprints(
           .build();
           Some(Ok((entry, InternalOpType::GenericHandlerOp)))
         }
-        HandlerSqeBlueprint::RequestRingRead => {
-          if let Some(bgid) = default_bgid_for_read_sqe {
-            let read_op_builder = opcode::Read::new(
-              types::Fd(fd_from_handler_iteration),
-              std::ptr::null_mut(),
-              0,
-            )
-            .offset(u64::MAX)
-            .buf_group(bgid);
-
-            let mut entry: squeue::Entry = read_op_builder.build();
-            entry = entry.flags(squeue::Flags::BUFFER_SELECT);
-            Some(Ok((entry, InternalOpType::RingRead)))
-          } else {
-            let err_msg =
-            "RequestRingRead blueprint: No default_buffer_ring_group_id configured/passed for SQE construction."
-              .to_string();
-            Some(Err(err_msg))
-          }
-        }
         HandlerSqeBlueprint::RequestSend {
           data,
           send_op_flags,
@@ -303,17 +283,6 @@ pub(crate) fn process_handler_blueprints(
               let remaining = blueprints.split_off(idx);
               return Err(remaining);
             } else {
-              // After a successful push, inform the handler if it was a standard read.
-              if op_type == InternalOpType::RingRead {
-                if let Some(handler) = handler_manager.get_mut(fd_from_handler_iteration) {
-                  handler.inform_standard_read_op_submitted(user_data);
-                } else {
-                  warn!(
-                    fd = fd_from_handler_iteration,
-                    "Handler not found after submitting RingRead SQE to inform it of the UD."
-                  );
-                }
-              }
               trace!(
                 "CQE Processor: Queued SQE (ud:{}) for FD {} from blueprint: {:?}",
                 user_data,

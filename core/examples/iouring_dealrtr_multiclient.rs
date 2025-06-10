@@ -22,7 +22,7 @@ const SNDZEROCPY_IO_URING_ENABLED: bool = false;
 const TCP_CORK_ENABLED: u32 = 1;
 
 const NUM_DEALERS: usize = 8;
-const MAX_CONCURRENT_REQUESTS: usize = 1000;
+const MAX_CONCURRENT_REQUESTS: usize = 10000;
 const NUM_MSGS_PER_DEALER: u64 = 250_000;
 const PAYLOAD_SIZE_BYTES: usize = 1024;
 const ROUTER_ENDPOINT: &'static str = "tcp://127.0.0.1:5559";
@@ -94,6 +94,7 @@ async fn run_dealer_sender_task(
 
     pending_map.lock().await.insert(request_id, permit);
 
+    // println!("SEND {}", request_id);
     let frames = create_request_frames(request_id, &payload);
     dealer_socket.send_multipart(frames).await?;
   }
@@ -163,7 +164,7 @@ impl MsgExt for Msg {
 #[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::INFO)
+    .with_max_level(tracing::Level::DEBUG)
     .compact()
     .init();
 

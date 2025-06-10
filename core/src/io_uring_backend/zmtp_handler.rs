@@ -78,7 +78,6 @@ pub struct ZmtpUringHandler {
 
   handshake_timeout: Duration,
   handshake_timeout_deadline: Instant,
-  pending_read_op_ud: Option<UserData>,
 
   peer_identity_from_security: Option<Blob>,
   peer_identity_from_ready: Option<Blob>,
@@ -120,7 +119,6 @@ impl ZmtpUringHandler {
       outgoing_multipart_app_messages: VecDeque::new(),
       handshake_timeout: handshake_timeout_duration,
       handshake_timeout_deadline: Instant::now() + handshake_timeout_duration,
-      pending_read_op_ud: None,
       peer_identity_from_security: None,
       peer_identity_from_ready: None,
       final_peer_identity: None,
@@ -162,54 +160,6 @@ impl ZmtpUringHandler {
       cipher.encrypt_zmtp_frame(zmtp_frame_bytes)
     } else {
       Ok(zmtp_frame_bytes)
-    }
-  }
-
-  /// Ensures a standard (single-shot) ring read is requested if conditions are met.
-  fn ensure_standard_read_is_pending(
-    &mut self,
-    ops: &mut HandlerIoOps,
-    interface: &UringWorkerInterface<'_>,
-  ) {
-    if self.multishot_reader.is_some() && self.multishot_reader.as_ref().unwrap().is_active() {
-      // Multishot is active, don't submit a standard read.
-      return;
-    }
-
-    // Check if a standard read is already pending.
-    if self.pending_read_op_ud.is_none()
-      && !matches!(
-        self.phase,
-        ZmtpHandlerPhase::Closed | ZmtpHandlerPhase::Error
-      )
-    {
-      if interface.default_buffer_group_id().is_some() {
-        // The handler requests the read. It no longer sets a flag here.
-        // The worker will assign a UD and the handler will be notified if needed,
-        // but for a simple single-shot read, we just need to know it's complete
-        // via `handle_internal_sqe_completion`.
-        ops
-          .sqe_blueprints
-          .push(HandlerSqeBlueprint::RequestRingRead);
-        trace!(
-          fd = self.fd,
-          "ZmtpUringHandler: Requested standard RingRead."
-        );
-        // We will set `pending_read_op_ud` when the worker confirms the submission,
-        // or more simply, we clear it when the read CQE arrives. Let's start with clearing on
-      } else {
-        error!(
-          fd = self.fd,
-          "ZmtpUringHandler: Critical - Cannot request standard read, no default_bgid configured for worker."
-        );
-        let err = ZmqError::Internal(
-          "Standard read required but not configured in worker (no default_bgid).".into(),
-        );
-
-        let mut temp_ops = std::mem::take(ops);
-        self.transition_to_error(&mut temp_ops, err.clone(), interface);
-        *ops = temp_ops;
-      }
     }
   }
 
@@ -1056,11 +1006,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
         // The actual RequestRingReadMultishot blueprint will be added by prepare_sqes.
       } else {
         tracing::error!("[ZmtpUringHandler FD={}] Multishot configured (use_recv_multishot=true) but no default_bgid available from worker interface! Falling back to standard reads.", self.fd);
-        // Fallback: ensure standard read is requested if multishot setup fails
-        self.ensure_standard_read_is_pending(&mut ops, interface);
       }
-    } else {
-      self.ensure_standard_read_is_pending(&mut ops, interface);
     }
 
     if self.is_server {
@@ -1078,7 +1024,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
       });
       self.phase = ZmtpHandlerPhase::ClientSendGreeting;
     }
-    self.ensure_standard_read_is_pending(&mut ops, interface);
+    
     ops
   }
 
@@ -1090,12 +1036,6 @@ impl UringConnectionHandler for ZmtpUringHandler {
   ) -> HandlerIoOps {
     trace!(fd = self.fd, len = buffer_slice.len(), phase = ?self.phase, "ZmtpUringHandler: process_ring_read_data");
     self.last_activity_time = Instant::now();
-
-    // This data came from a standard read, so clear the pending UD flag.
-    // The current_external_op_ud on the interface IS the UD of the completed read operation.
-    if self.pending_read_op_ud == Some(interface.current_external_op_ud) {
-      self.pending_read_op_ud = None;
-    }
 
     let mut ops = HandlerIoOps::new();
 
@@ -1155,14 +1095,6 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
 
-    if self
-      .multishot_reader
-      .as_ref()
-      .map_or(true, |r| !r.is_active())
-    {
-      self.ensure_standard_read_is_pending(&mut ops, interface);
-    }
-
     ops
   }
 
@@ -1176,16 +1108,6 @@ impl UringConnectionHandler for ZmtpUringHandler {
     trace!(fd = self.fd, cqe_res = cqe_result, phase = ?self.phase, "ZmtpUringHandler: handle_internal_sqe_completion (likely Send ACK)");
     self.last_activity_time = Instant::now();
     let mut ops = HandlerIoOps::new();
-
-    // If the completed operation was our pending standard read, clear the flag.
-    if self.pending_read_op_ud == Some(sqe_user_data) {
-      self.pending_read_op_ud = None;
-      tracing::trace!(
-        fd = self.fd,
-        ud = sqe_user_data,
-        "Standard read operation completed, clearing pending_read_op_ud."
-      );
-    }
 
     if cqe_result < 0 {
       let raw_errno = -cqe_result;
@@ -1346,20 +1268,11 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
 
-    if self
-      .multishot_reader
-      .as_ref()
-      .map_or(true, |r| !r.is_active())
-    {
-      self.ensure_standard_read_is_pending(&mut ops, interface);
-    }
-
     ops
   }
 
   fn prepare_sqes(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
     let mut ops = HandlerIoOps::new();
-    self.ensure_standard_read_is_pending(&mut ops, interface);
 
     if Instant::now() > self.handshake_timeout_deadline
       && !matches!(
@@ -1382,8 +1295,6 @@ impl UringConnectionHandler for ZmtpUringHandler {
           ops.sqe_blueprints.push(blueprint);
         }
       }
-    } else if self.pending_read_op_ud.is_none() {
-      self.ensure_standard_read_is_pending(&mut ops, interface);
     }
 
     if self.phase == ZmtpHandlerPhase::DataPhase {
@@ -1591,13 +1502,6 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
 
-    if self
-      .multishot_reader
-      .as_ref()
-      .map_or(true, |r| !r.is_active())
-    {
-      self.ensure_standard_read_is_pending(&mut ops, interface);
-    }
     ops
   }
 
@@ -1676,18 +1580,6 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
     None // CQE not for an active multishot reader of this handler, or no reader.
-  }
-
-  fn inform_standard_read_op_submitted(&mut self, op_user_data: UserData) {
-    if self.pending_read_op_ud.is_some() {
-      warn!(fd = self.fd, old_ud = ?self.pending_read_op_ud, new_ud = op_user_data, "Informed of new standard read submission while another was already pending. Overwriting.");
-    }
-    self.pending_read_op_ud = Some(op_user_data);
-    tracing::trace!(
-      fd = self.fd,
-      ud = op_user_data,
-      "Standard read operation submitted, tracking pending_read_op_ud."
-    );
   }
 
   fn inform_multishot_reader_op_submitted(

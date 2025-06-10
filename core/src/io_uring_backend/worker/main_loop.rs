@@ -2,7 +2,7 @@
 
 use super::{cqe_processor, ExternalOpContext, UringWorker};
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
-use crate::io_uring_backend::connection_handler::{UringWorkerInterface};
+use crate::io_uring_backend::connection_handler::UringWorkerInterface;
 use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest};
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkItem, WorkerState};
 use crate::io_uring_backend::UserData;
@@ -63,12 +63,7 @@ impl UringWorker {
             error: ZmqError::InvalidState("Buffer ring already initialized".into()),
           }));
         } else {
-          match BufferRingManager::new(
-            &self.ring,
-            num_buffers,
-            bgid,
-            buffer_capacity,
-          ) {
+          match BufferRingManager::new(&self.ring, num_buffers, bgid, buffer_capacity) {
             Ok(bm) => {
               info!(
                 "UringWorker: BufferRingManager initialized with bgid: {}, {} buffers of {} capacity.",
@@ -699,7 +694,6 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
     worker.ring.as_raw_fd()
   );
 
-  // <<< MODIFIED START >>>
   let mut profiler = LoopProfiler::new(Duration::from_millis(10), 10000);
   let mut kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
 
@@ -856,6 +850,69 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             }
           }
         }
+
+        // --- NEW PHASE: Ensure Reads are Pending on All Active Connections ---
+        profiler.mark_segment_end_and_start_new("ensure_reads");
+        let active_fds = worker.handler_manager.get_active_fds();
+        let mut sq = unsafe { worker.ring.submission_shared() };
+
+        for fd in active_fds {
+          // If a read is already in flight for this FD, do nothing.
+          if worker.internal_op_tracker.has_pending_read_op(fd) {
+            continue;
+          }
+
+          // If the submission queue is full, stop trying for this cycle.
+          if sq.is_full() {
+            debug!("UringWorker: SQ full during read submission phase. Will retry next cycle.");
+            break;
+          }
+
+          // If we are here, we need to submit a read for this FD.
+          if let Some(bgid) = worker.default_buffer_ring_group_id_val {
+            let read_op_builder =
+              io_uring::opcode::Read::new(io_uring::types::Fd(fd), std::ptr::null_mut(), 0)
+                .offset(u64::MAX)
+                .buf_group(bgid);
+
+            let entry: io_uring::squeue::Entry = read_op_builder
+              .build()
+              .flags(io_uring::squeue::Flags::BUFFER_SELECT);
+
+            let user_data = worker.internal_op_tracker.new_op_id(
+              fd,
+              super::InternalOpType::RingRead,
+              super::InternalOpPayload::None,
+            );
+
+            let final_entry = entry.user_data(user_data);
+
+            unsafe {
+              if sq.push(&final_entry).is_err() {
+                // This might happen in a race, even with the is_full() check.
+                // We must clean up the tracker state we just created.
+                worker.internal_op_tracker.take_op_details(user_data);
+                warn!(
+                  "UringWorker: SQ push failed for read op on FD {} (race). Will retry next cycle.",
+                  fd
+                );
+                // Stop trying for this cycle if the queue is full.
+                break;
+              } else {
+                trace!(
+                  "UringWorker: Queued new standard read for FD {}. UD: {}",
+                  fd,
+                  user_data
+                );
+              }
+            }
+          } else {
+            // This is a critical configuration error.
+            error!("UringWorker: Cannot submit read for FD {} because no default buffer ring is configured.", fd);
+            // We might want to close the handler here. For now, we just log and continue.
+          }
+        }
+        drop(sq);
 
         // --- PHASE 3: Submit to Kernel and Process Completions ---
         profiler.mark_segment_end_and_start_new("submit_and_process");
