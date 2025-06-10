@@ -18,7 +18,7 @@ The `rzmq` library provides an asynchronous, pure-Rust implementation of ZeroMQ 
 
 **Main Entry Points:**
 
-*   Create a `rzmq::Context` using `Context::new()` or `rzmq::context()`.
+*   Create a `rzmq::Context` using `Context::new()` or `Context::with_capacity()`.
 *   Create `rzmq::Socket` instances from a `Context` using `Context::socket(SocketType)`.
 
 **Pervasive Types:**
@@ -38,15 +38,15 @@ Configuration for the global `io_uring` backend. This is used when calling `rzmq
     *   `ring_entries: u32`
         *   The number of submission queue entries for the `io_uring` instance.
     *   `default_send_zerocopy: bool`
-        *   Global flag to enable or disable the *attempt* to use zero-copy send operations by the `UringWorker`. Individual sockets still need to opt-in via `IO_URING_SNDZEROCOPY` socket option.
+        *   Global flag to enable or disable the *attempt* to use zero-copy send operations by the `UringWorker`. A send buffer pool is allocated if this is true.
     *   `default_recv_multishot: bool`
-        *   Global flag to enable or disable the creation of the default `io_uring` provided buffer ring (group ID 0) at worker startup, primarily for multishot receive operations. Individual sockets still need to opt-in via `IO_URING_RCVMULTISHOT` socket option.
+        *   Global flag to enable or disable the creation of the default `io_uring` provided buffer ring (group ID 0) at worker startup, primarily for multishot receive operations.
     *   `default_recv_buffer_count: usize`
-        *   The number of buffers to provision in the default receive buffer ring (if `default_recv_multishot` is true).
+        *   The number of buffers to provision in the default receive buffer ring.
     *   `default_recv_buffer_size: usize`
         *   The size (in bytes) of each buffer in the default receive buffer ring.
     *   `default_send_buffer_count: usize`
-        *   The number of buffers to provision in the global send buffer pool (if `default_send_zerocopy` is true).
+        *   The number of buffers to provision in the global send buffer pool.
     *   `default_send_buffer_size: usize`
         *   The size (in bytes) of each buffer in the global send buffer pool.
 
@@ -69,7 +69,7 @@ The `Context` is the entry point for creating `rzmq` sockets. It manages shared 
     *   `pub fn new() -> Result<Self, ZmqError>`
         *   Creates a new, independent context with default internal actor mailbox capacities.
     *   `pub fn with_capacity(actor_mailbox_capacity: Option<usize>) -> Result<Self, ZmqError>`
-        *   Creates a new, independent context, allowing specification of the bounded capacity for internal actor command mailboxes. If `None`, `rzmq::runtime::DEFAULT_MAILBOX_CAPACITY` is used. Minimum capacity is 1.
+        *   Creates a new, independent context, allowing specification of the bounded capacity for internal actor command mailboxes. If `None`, `rzmq::runtime::mailbox::DEFAULT_MAILBOX_CAPACITY` is used. Minimum capacity is 1.
 
 *   **Methods**:
     *   `pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError>`
@@ -97,7 +97,7 @@ The public handle for an `rzmq` socket. Provides methods for network operations,
     *   `pub async fn recv(&self) -> Result<Msg, ZmqError>`
         *   Receives a single message part (`Msg`) according to the socket's pattern.
     *   `pub async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError>`
-        *   Sends a sequence of message frames atomically as one logical message. Application is responsible for setting `MsgFlags::MORE` on all but the last frame.
+        *   Sends a sequence of message frames atomically as one logical message. The implementation will automatically set `MsgFlags::MORE` on all but the last frame.
     *   `pub async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError>`
         *   Receives all frames of a complete logical ZMQ message.
     *   `pub async fn set_option<T: ToBytes>(&self, option: i32, value: T) -> Result<(), ZmqError>`
@@ -243,21 +243,11 @@ Represents significant events occurring within a socket or its connections, used
 
 ## 6. Public Functions (Free-standing)
 
-### In `rzmq` (crate root):
-
-*   `pub fn version() -> (i32, i32, i32)`
-    *   Returns the library version as a tuple (major, minor, patch).
-*   `pub fn version_major() -> i32`
-*   `pub fn version_minor() -> i32`
-*   `pub fn version_patch() -> i32`
-*   `pub fn context() -> Result<Context, ZmqError>` (This exists in `rzmq::context::context()` and is re-exported effectively at the crate root via `pub use context::Context;`)
-    *   Creates a new rzmq context. Equivalent to `Context::new()`.
-
 ### In `rzmq::uring` (only if `io-uring` feature is enabled):
 
 *   `pub fn initialize_uring_backend(config: UringConfig) -> Result<(), ZmqError>`
     *   Initializes the global `io_uring` backend with the provided configuration. Must be called once before any `io_uring`-based socket operations if custom configuration is desired, or it will be auto-initialized with defaults.
-*   `pub fn shutdown_uring_backend() -> Result<(), ZmqError>`
+*   `pub async fn shutdown_uring_backend() -> Result<(), ZmqError>`
     *   Shuts down the global `io_uring` backend, joining worker threads and cleaning up resources.
 
 ## 7. Public Type Aliases
@@ -269,19 +259,12 @@ Represents significant events occurring within a socket or its connections, used
 
 ### In `rzmq::socket::events`:
 
-*   `pub type MonitorSender = fibre::mpsc::Sender<SocketEvent>`
+*   `pub type MonitorSender = fibre::mpmc::AsyncSender<SocketEvent>`
     *   The sending end of the channel used for socket monitor events.
-*   `pub type MonitorReceiver = fibre::mpsc::Receiver<SocketEvent>`
+*   `pub type MonitorReceiver = fibre::mpmc::AsyncReceiver<SocketEvent>`
     *   The receiving end of the channel used for socket monitor events.
 
 ## 8. Public Constants
-
-### In `rzmq` (crate root):
-
-*   `pub(crate) const VERSION_MAJOR: i32 = 0` (Actually `pub(crate)`)
-*   `pub(crate) const VERSION_MINOR: i32 = 1` (Actually `pub(crate)`)
-*   `pub(crate) const VERSION_PATCH: i32 = 0` (Actually `pub(crate)`)
-    *   Note: Version constants are marked `pub(crate)` in the code, meaning they are not part of the public API for external users, but the `version()` functions are.
 
 ### In `rzmq::socket::options`:
 
@@ -306,7 +289,7 @@ Constants for socket option integer IDs.
 *   `pub const HEARTBEAT_TTL: i32 = 40`
 *   `pub const HANDSHAKE_IVL: i32 = 41`
 *   `pub const ROUTER_MANDATORY: i32 = 33`
-*   `pub const ZAP_DOMAIN: i32 = 55` (Note: ZAP protocol itself is not implemented)
+*   `pub const ZAP_DOMAIN: i32 = 55`
 *   `pub const PLAIN_SERVER: i32 = 44`
 *   `pub const PLAIN_USERNAME: i32 = 45`
 *   `pub const PLAIN_PASSWORD: i32 = 46`

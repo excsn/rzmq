@@ -168,11 +168,11 @@ Handle for interacting with a socket.
 *   **`pub async fn unbind(&self, endpoint: &str) -> Result<(), ZmqError>`**
     Stops listening on a bound endpoint.
 *   **`pub async fn send(&self, msg: Msg) -> Result<(), ZmqError>`**
-    Sends a message. For multi-part messages where `send` is used iteratively, set `MsgFlags::MORE` on all but the last part.
+    Sends a single message part (`Msg`). For multi-part messages where `send` is used iteratively, set `MsgFlags::MORE` on all but the last part.
 *   **`pub async fn recv(&self) -> Result<Msg, ZmqError>`**
-    Receives a message part. Check `msg.is_more()` for multi-part messages and call `recv()` again if true.
+    Receives a single message part (`Msg`). Check `msg.is_more()` for multi-part messages and call `recv()` again if true.
 *   **`pub async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError>`**
-    Sends a sequence of `Msg` frames as a single logical message. The library handles necessary ZMTP delimiters. The caller should ensure `MsgFlags::MORE` is set correctly on the input `frames` if the *application-level payload itself* is multi-part; the final frame of the application payload should not have `MORE`.
+    Sends a sequence of `Msg` frames as a single logical message. The library automatically handles setting the `MORE` flag on the ZMTP frames that are sent over the wire.
 *   **`pub async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError>`**
     Receives all frames of a complete logical ZeroMQ message.
 *   **`pub async fn set_option<T: ToBytes>(&self, option: i32, value: T) -> Result<(), ZmqError>`**
@@ -283,23 +283,16 @@ Connections are asynchronous. `rzmq` handles retries for TCP connections if `REC
         Ok(())
     }
     ```
-*   **Sending with `send_multipart()`:** (Often preferred for clarity, especially with DEALER/ROUTER)
+*   **Sending with `send_multipart()`:** This is the preferred method for sending a complete logical message. The library handles setting the `MORE` flag on the wire.
     ```rust
     use rzmq::{Msg, MsgFlags};
     async fn send_multipart_atomic_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
-        // For application-level multipart messages, construct the Vec<Msg>
-        // and ensure flags are set correctly for the *application payload*.
-        // The library handles ZMTP-level delimiters (e.g., for DEALER/ROUTER).
-        let mut app_payload_part1 = Msg::from_static(b"Payload Part 1");
-        app_payload_part1.set_flags(MsgFlags::MORE); // More app payload follows
-        let app_payload_part2 = Msg::from_static(b"Payload Part 2"); // Last app payload part
-
-        // Example for DEALER:
-        // socket.send_multipart(vec![app_payload_part1, app_payload_part2]).await?;
-
-        // Example for ROUTER (first frame is identity):
-        // let identity_frame = Msg::from_static(b"destination_peer_id");
-        // socket.send_multipart(vec![identity_frame, app_payload_part1, app_payload_part2]).await?;
+        let frames = vec![
+            Msg::from_static(b"Identity"), // For ROUTER
+            Msg::from_static(b"Payload Part 1"),
+            Msg::from_static(b"Payload Part 2"),
+        ];
+        socket.send_multipart(frames).await?;
         Ok(())
     }
     ```
@@ -329,7 +322,7 @@ Connections are asynchronous. `rzmq` handles retries for TCP connections if `REC
     ```
 
 ### Socket Options
-Fine-tune socket behavior using `socket.set_option_raw(OPTION_ID, byte_slice_value)` or `socket.set_option(OPTION_ID, typed_value)`.
+Fine-tune socket behavior using `socket.set_option_raw(OPTION_ID, byte_slice_value)` or the convenience `socket.set_option(OPTION_ID, typed_value)`.
 Refer to the [API Reference](#8-public-constants) for a list of common option constants (e.g., `rzmq::socket::SNDHWM`).
 
 Example: Setting `SNDTIMEO` (send timeout)
@@ -406,12 +399,12 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
 *   **PLAIN**: Username/password based authentication. Interoperable with other ZeroMQ implementations using PLAIN.
     *   Server: Set `rzmq::socket::PLAIN_SERVER` option to `true` (as `1i32`).
     *   Client: Set `rzmq::socket::PLAIN_USERNAME` and `rzmq::socket::PLAIN_PASSWORD` options.
-*   **Noise_XX** (Experimental, requires `noise_xx` feature): Encrypted and authenticated sessions using the Noise Protocol Framework (XX handshake pattern). This is a modern security mechanism specific to `rzmq` and is not part of the standard ZMTP security mechanisms found in `libzmq` (like CURVE). Therefore, Noise_XX in `rzmq` will only interoperate with other `rzmq` instances also configured for Noise_XX.
+*   **Noise_XX** (requires `noise_xx` feature): Encrypted and authenticated sessions using the Noise Protocol Framework (XX handshake pattern). This is a modern security mechanism specific to `rzmq` and **will not interoperate** with `libzmq`'s `CURVE` security. Use it for `rzmq`-to-`rzmq` communication.
     *   Enable with `rzmq::socket::NOISE_XX_ENABLED` option (`true` as `1i32`).
     *   Set `rzmq::socket::NOISE_XX_STATIC_SECRET_KEY` (32-byte array).
     *   Client must set `rzmq::socket::NOISE_XX_REMOTE_STATIC_PUBLIC_KEY` (server's 32-byte public key).
 
-**Note:** CURVE security and ZAP (ZeroMQ Authentication Protocol) are **not supported** and not planned for implementation.
+**Note:** CURVE security and ZAP (ZeroMQ Authentication Protocol) are **not supported**.
 
 ## Using `io_uring` (Linux Specific)
 
@@ -423,32 +416,32 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
     rzmq = { version = "...", features = ["io-uring"] } # Or git source
     ```
 2.  **Use `#[tokio::main]`**: Your application's `main` function should use the standard `#[tokio::main]` attribute. `rzmq`'s `io_uring` backend integrates with the Tokio runtime it finds.
-3.  **Initialize the `io_uring` Backend**: Before creating any `rzmq::Context`, you must initialize the `io_uring` backend. This is typically done once at the start of your application.
+3.  **Initialize the `io_uring` Backend**: Before creating any `rzmq::Context`, you must initialize the `io_uring` backend. This is a global, one-time setup.
     ```rust
     use rzmq::uring::{initialize_uring_backend, shutdown_uring_backend, UringConfig};
 
     #[tokio::main]
     async fn main() -> Result<(), rzmq::ZmqError> {
-        // Initialize with default configuration
+        // Initialize with default configuration. This can only be done once.
         initialize_uring_backend(UringConfig::default())?;
+        
         // Or with custom configuration:
         // let uring_cfg = UringConfig {
         //     ring_entries: 512,
         //     default_send_zerocopy: true,
-        //     default_send_buffer_count: 32,
         //     /* ... other fields ... */
         //     ..Default::default()
         // };
         // initialize_uring_backend(uring_cfg)?;
 
         let ctx = rzmq::Context::new()?;
-        // Sockets created from this context can now opt-in to use io_uring for TCP sessions.
+        // Sockets created from this context can now opt-in to use io_uring.
         // ... your application logic ...
 
-        ctx.term().await?; // Terminate rzmq context
+        ctx.term().await?;
 
-        // Shutdown the io_uring backend (optional but good practice)
-        shutdown_uring_backend()?;
+        // Shutdown the io_uring backend (optional but good practice).
+        shutdown_uring_backend().await?;
         Ok(())
     }
     ```
@@ -460,11 +453,11 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
     ```
 5.  **`io_uring` Specific Socket Options**: (Optional)
     Once `IO_URING_SESSION_ENABLED` is set, you can further influence behavior with:
-    *   `rzmq::socket::TCP_CORK`: (Boolean `1i32` or `0i32`) Enable/disable TCP corking.
+    *   `rzmq::socket::TCP_CORK`: (Boolean `1i32` or `0i32`) Enable/disable TCP corking for better batching.
     *   `rzmq::socket::IO_URING_SNDZEROCOPY`: (Boolean) Request zero-copy sends. Fulfillment depends on global `UringConfig.default_send_zerocopy` and pool setup.
     *   `rzmq::socket::IO_URING_RCVMULTISHOT`: (Boolean) Request multishot receives. Fulfillment depends on global `UringConfig.default_recv_multishot` and default ring setup.
 
-    Global parameters for zero-copy send pools and the default multishot receive ring (like buffer counts and sizes) are set via `UringConfig` during `initialize_uring_backend()`.
+    Global parameters for zero-copy send pools and the default multishot receive ring are set via `UringConfig` during `initialize_uring_backend()`.
 
 ## Error Handling
 
@@ -475,7 +468,7 @@ The primary error type is `rzmq::ZmqError`. It's an enum covering various error 
     *   `Timeout`: Operation exceeded specified timeout (`SNDTIMEO` or `RCVTIMEO`).
     *   `AddrInUse(String)`: Address already in use during `bind`.
     *   `ConnectionRefused(String)`: Peer actively refused connection.
-    *   `InvalidState(&'static str)`: Operation attempted in an invalid socket state.
+    *   `InvalidState(&'static str)`: Operation attempted in an invalid socket state (e.g., REQ sending twice).
     *   `ResourceLimitReached`: Send/receive buffer high-water mark reached (acts like EAGAIN).
     *   `HostUnreachable(String)`: E.g., for `ROUTER` with `ROUTER_MANDATORY`, if peer identity is unknown.
     *   `InvalidEndpoint(String)`: Malformed endpoint string.
