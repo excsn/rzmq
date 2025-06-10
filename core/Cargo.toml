@@ -1,11 +1,11 @@
 [package]
 name = "rzmq"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "MPL-2.0"
 publish = true
 
-description = "A high performance, fully asynchronous, safe pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, with optional io_uring acceleration on Linux."
+description = "A high performance, fully asynchronous, safe pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, with optional io_uring and tcp cork acceleration on Linux."
 authors = ["Excerion Sun <dev@excsn.com>", "Norm O <normo.pub@gmail.com>"]
 readme = "README.md"
 repository = "https://github.com/excsn/rzmq"
