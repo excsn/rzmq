@@ -1,6 +1,6 @@
 [package]
 name = "rzmq"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 license = "MPL-2.0"
 publish = true
@@ -42,7 +42,7 @@ eventfd = {version = "^0.2", optional = true }
 io-uring = { version = "^0.7", optional = true }
 io_uring_buf_ring = { version = "^0.2", optional = true }
 libc = "0.2"
-socket2 = "^0"
+socket2 = "^0.5"
 
 # --- Utilities ---
 atomic_float = "^1"
