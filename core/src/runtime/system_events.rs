@@ -166,62 +166,75 @@ impl fmt::Debug for SystemEvent {
     match self {
       SystemEvent::ContextTerminating => write!(f, "ContextTerminating"),
       SystemEvent::SocketClosing { socket_id } => f
-          .debug_struct("SocketClosing")
-          .field("socket_id", socket_id)
-          .finish(),
-      SystemEvent::ActorStarted { handle_id, actor_type, parent_id } => f
-          .debug_struct("ActorStarted")
-          .field("handle_id", handle_id)
-          .field("actor_type", actor_type)
-          .field("parent_id", parent_id)
-          .finish(),
-      SystemEvent::ActorStopping { handle_id, actor_type, endpoint_uri, parent_id, error } => f
-          .debug_struct("ActorStopping")
-          .field("handle_id", handle_id)
-          .field("actor_type", actor_type)
-          .field("parent_id", parent_id) 
-          .field("endpoint_uri", endpoint_uri)
-          .field("error", error)
-          .finish(),
+        .debug_struct("SocketClosing")
+        .field("socket_id", socket_id)
+        .finish(),
+      SystemEvent::ActorStarted {
+        handle_id,
+        actor_type,
+        parent_id,
+      } => f
+        .debug_struct("ActorStarted")
+        .field("handle_id", handle_id)
+        .field("actor_type", actor_type)
+        .field("parent_id", parent_id)
+        .finish(),
+      SystemEvent::ActorStopping {
+        handle_id,
+        actor_type,
+        endpoint_uri,
+        parent_id,
+        error,
+      } => f
+        .debug_struct("ActorStopping")
+        .field("handle_id", handle_id)
+        .field("actor_type", actor_type)
+        .field("parent_id", parent_id)
+        .field("endpoint_uri", endpoint_uri)
+        .field("error", error)
+        .finish(),
       SystemEvent::NewConnectionEstablished {
-          parent_core_id,
-          endpoint_uri,
-          target_endpoint_uri,
-          connection_iface, // Will use ISocketConnection's Debug impl
-          interaction_model,
-          managing_actor_task_id,
+        parent_core_id,
+        endpoint_uri,
+        target_endpoint_uri,
+        connection_iface, // Will use ISocketConnection's Debug impl
+        interaction_model,
+        managing_actor_task_id,
       } => f
-          .debug_struct("NewConnectionEstablished")
-          .field("parent_core_id", parent_core_id)
-          .field("endpoint_uri", endpoint_uri)
-          .field("target_endpoint_uri", target_endpoint_uri)
-          .field("connection_iface_is_some", &connection_iface.is_some())
-          .field("interaction_model", interaction_model)
-          .field("managing_actor_task_id", managing_actor_task_id)
-          .finish(),
+        .debug_struct("NewConnectionEstablished")
+        .field("parent_core_id", parent_core_id)
+        .field("endpoint_uri", endpoint_uri)
+        .field("target_endpoint_uri", target_endpoint_uri)
+        .field("connection_iface_is_some", &connection_iface.is_some())
+        .field("interaction_model", interaction_model)
+        .field("managing_actor_task_id", managing_actor_task_id)
+        .finish(),
       SystemEvent::PeerIdentityEstablished {
-          parent_core_id,
-          connection_identifier,
-          peer_identity,
+        parent_core_id,
+        connection_identifier,
+        peer_identity,
       } => f
-          .debug_struct("PeerIdentityEstablished")
-          .field("parent_core_id", parent_core_id)
-          .field("connection_identifier", connection_identifier)
-          .field("peer_identity", peer_identity)
-          .finish(),
-      SystemEvent::ConnectionAttemptFailed { parent_core_id, target_endpoint_uri, error_msg } => f
-          .debug_struct("ConnectionAttemptFailed")
-          .field("parent_core_id", parent_core_id)
-          .field("target_endpoint_uri", target_endpoint_uri)
-          .field("error_msg", error_msg)
-          .finish(),
-      SystemEvent::InprocBindingRequest { /* ... fields ... */ .. } => {
-          // Simplified debug for brevity or implement fully
-          f.debug_struct("InprocBindingRequest").finish_non_exhaustive()
-      }
-      SystemEvent::InprocPipePeerClosed { /* ... fields ... */ .. } => {
-          f.debug_struct("InprocPipePeerClosed").finish_non_exhaustive()
-      }
+        .debug_struct("PeerIdentityEstablished")
+        .field("parent_core_id", parent_core_id)
+        .field("connection_identifier", connection_identifier)
+        .field("peer_identity", peer_identity)
+        .finish(),
+      SystemEvent::ConnectionAttemptFailed {
+        parent_core_id,
+        target_endpoint_uri,
+        error_msg,
+      } => f
+        .debug_struct("ConnectionAttemptFailed")
+        .field("parent_core_id", parent_core_id)
+        .field("target_endpoint_uri", target_endpoint_uri)
+        .field("error_msg", error_msg)
+        .finish(),
+      SystemEvent::InprocBindingRequest { .. } => f
+        .debug_struct("InprocBindingRequest")
+        .finish_non_exhaustive(),
+      SystemEvent::InprocPipePeerClosed { .. } => f
+        .debug_struct("InprocPipePeerClosed")
+        .finish_non_exhaustive(),
     }
   }
 }
