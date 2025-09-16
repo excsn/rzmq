@@ -367,7 +367,7 @@ impl TcpListener {
                           "TcpListener: Applying TCP_CORK to accepted connection FD for IO URing."
                         );
                         let sock_ref = socket2::SockRef::from(&std_stream);
-                        if let Err(e) = sock_ref.set_cork(true) {
+                        if let Err(e) = sock_ref.set_tcp_cork(true) {
                           tracing::error!(handle = accept_loop_handle, fd = std_stream.as_raw_fd(), error = %e, "TcpListener: Failed to set TCP_CORK for IO URing FD. Proceeding without.");
                           // Not making this fatal for the connection, it will proceed without CORK.
                         }
@@ -923,8 +923,7 @@ impl TcpConnecter {
               "TcpConnecter: Applying TCP_CORK to outgoing connection FD before connect for IO URing."
             );
             // Apply to socket2::Socket before connect()
-            if let Err(e) = socket.set_cork(true) {
-              // socket2::Socket has set_cork
+            if let Err(e) = socket.set_tcp_cork(true) {
               tracing::error!(handle = self.handle, error = %e, "TcpConnecter: Failed to set TCP_CORK (socket2) for IO URing FD. Proceeding without.");
               // Optionally, make this fatal:
               // return Err(ZmqError::IoError { kind: e.kind(), message: format!("Failed to set TCP_CORK: {}", e) });
@@ -943,7 +942,7 @@ impl TcpConnecter {
 
           let peer_addr_actual = std_stream.peer_addr().map_err(ZmqError::from)?;
 
-          if let Some(ref mon_tx) = monitor_tx {
+          if let Some(mon_tx) = monitor_tx {
             let _ = mon_tx.try_send(SocketEvent::Connected {
               endpoint: endpoint_uri_original.to_string(),
               peer_addr: format!("tcp://{}", peer_addr_actual),
@@ -1052,7 +1051,7 @@ impl TcpConnecter {
 
         let peer_addr_actual = std_tokio_stream.peer_addr().map_err(ZmqError::from)?;
 
-        if let Some(ref mon_tx) = monitor_tx {
+        if let Some(mon_tx) = monitor_tx {
           let _ = mon_tx.try_send(SocketEvent::Connected {
             endpoint: endpoint_uri_original.to_string(),
             peer_addr: format!("tcp://{}", peer_addr_actual),
@@ -1143,7 +1142,7 @@ impl TcpConnecter {
       }
     }
     tracing::debug!(handle = self.handle, uri = %self.endpoint, ?delay, "Connecter waiting before attempt #{}", next_attempt_num);
-    if let Some(ref tx) = monitor_tx {
+    if let Some(tx) = monitor_tx {
       let _ = tx.try_send(SocketEvent::ConnectRetried {
         endpoint: self.endpoint.clone(),
         interval: delay,
@@ -1198,7 +1197,7 @@ fn apply_socket2_options_pre_connect(
   config: &TcpTransportConfig,
 ) -> Result<(), ZmqError> {
   socket
-    .set_nodelay(config.tcp_nodelay)
+    .set_tcp_nodelay(config.tcp_nodelay)
     .map_err(ZmqError::from)?;
   if config.keepalive_time.is_some()
     || config.keepalive_interval.is_some()
@@ -1228,7 +1227,7 @@ fn apply_tcp_socket_options_to_tokio(
   config: &TcpTransportConfig,
 ) -> Result<(), ZmqError> {
   let socket_ref = SockRef::from(stream);
-  socket_ref.set_nodelay(config.tcp_nodelay)?;
+  socket_ref.set_tcp_nodelay(config.tcp_nodelay)?;
   if config.keepalive_time.is_some()
     || config.keepalive_interval.is_some()
     || config.keepalive_count.is_some()
@@ -1255,7 +1254,7 @@ fn apply_tcp_socket_options_to_std(
   config: &TcpTransportConfig,
 ) -> Result<(), ZmqError> {
   let socket_ref = SockRef::from(stream);
-  socket_ref.set_nodelay(config.tcp_nodelay)?;
+  socket_ref.set_tcp_nodelay(config.tcp_nodelay)?;
   if config.keepalive_time.is_some()
     || config.keepalive_interval.is_some()
     || config.keepalive_count.is_some()

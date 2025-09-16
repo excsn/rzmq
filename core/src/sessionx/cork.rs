@@ -71,7 +71,7 @@ impl TcpCorkInfoX {
   /// * `actor_handle`: The handle of the calling actor, for logging purposes.
   ///
   /// This operation is performed in a blocking Tokio task because `socket2`'s
-  /// `set_cork` is a blocking syscall.
+  /// `set tcp cork` is a blocking syscall.
   pub(crate) async fn apply_cork_state(&mut self, enable: bool, actor_handle: usize) {
     if self.is_corked == enable {
       // Already in the desired state
@@ -91,7 +91,7 @@ impl TcpCorkInfoX {
       // The FromRawFd trait upholds safety if the FD is valid and owned correctly.
       // Here, we create a socket2::Socket temporarily.
       let socket = unsafe { socket2::Socket::from_raw_fd(fd_to_cork) };
-      let result = socket.set_cork(enable);
+      let result = socket.set_tcp_cork(enable);
       // Crucial: Prevent socket2::Socket from closing the FD when it's dropped.
       // The original stream still owns the FD.
       std::mem::forget(socket);
@@ -121,7 +121,7 @@ impl TcpCorkInfoX {
         // If enable=true failed, is_corked remains false.
         // If enable=false failed, is_corked might still be true (undesirable).
         // For robustness, if an attempt to change state fails, reflect that accurately.
-        // However, set_cork is unlikely to fail when disabling if it was previously enabled,
+        // However, setting cork is unlikely to fail when disabling if it was previously enabled,
         // unless the FD became invalid.
         // If we failed to enable, self.is_corked is already false.
         // If we failed to disable, it means self.is_corked was true, and we couldn't change it.

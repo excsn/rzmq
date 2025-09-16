@@ -1,11 +1,11 @@
 [package]
 name = "rzmq"
-version = "0.5.2"
-edition = "2021"
+version = "0.5.3"
+edition = "2024"
 license = "MPL-2.0"
 publish = true
 
-description = "A high performance, fully asynchronous, safe pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, with optional io_uring and tcp cork acceleration on Linux."
+description = "A high performance, fully asynchronous, safe pure-Rust implementation of ZeroMQ (ØMQ) messaging with io_uring and tcp cork acceleration on Linux."
 authors = ["Excerion Sun <dev@excsn.com>", "Norm O <normo.pub@gmail.com>"]
 readme = "README.md"
 repository = "https://github.com/excsn/rzmq"
@@ -28,13 +28,13 @@ bench_external_clients = []
 [dependencies]
 
 # --- Core Async Runtime & Concurrency ---
-fibre = { version = "^0" }
+fibre = { version = "^0.5" }
 async-trait = "^0.1.88"
 async-recursion = "^1.0"
 tokio = { version = "^1", features = ["fs", "rt", "rt-multi-thread", "macros", "sync", "net", "time", "io-util"] }
 tokio-util = { version = "^0.7", features = ["codec"] }
 futures = "^0.3"
-parking_lot = "^0"
+parking_lot = "^0.12"
 
 # --- I/O & Buffers ---
 bytes = "^1.4"
@@ -42,7 +42,7 @@ eventfd = {version = "^0.2", optional = true }
 io-uring = { version = "^0.7", optional = true }
 io_uring_buf_ring = { version = "^0.2", optional = true }
 libc = "0.2"
-socket2 = "^0.5"
+socket2 = { version = "0.6", features = ["all"] }
 
 # --- Utilities ---
 atomic_float = "^1"
