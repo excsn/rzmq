@@ -13,7 +13,7 @@ const COMPACT_SEND_RECV_MESSAGES: bool = true;
 async fn main() -> Result<(), ZmqError> {
   // Initialize tracing (optional, but good for seeing rzmq logs)
   if std::env::var("RUST_LOG").is_err() {
-    std::env::set_var("RUST_LOG", "info,rzmq=debug");
+    unsafe { std::env::set_var("RUST_LOG", "info,rzmq=debug"); }
   }
 
   tracing_subscriber::fmt()
