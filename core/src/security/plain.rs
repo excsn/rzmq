@@ -13,9 +13,7 @@ enum PlainState {
   ClientExpectWelcome, // Client waiting for WELCOME from server
   // Server states
   ServerExpectHello, // Server waiting for HELLO from client
-  // <<< MODIFIED START [Simplified server state for non-ZAP flow] >>>
   ServerSendWelcome, // Server -> Client: WELCOME confirming PLAIN (after HELLO or ZAP)
-  // <<< MODIFIED END >>>
   // End states
   Ready, // Handshake successful
   Error, // Handshake failed
@@ -31,7 +29,7 @@ pub struct PlainMechanism {
   username: Option<Vec<u8>>,
   password: Option<Vec<u8>>,
   // Optional ZAP metadata received (placeholder for future ZAP impl)
-  _zap_metadata: Option<Metadata>, // <<< MODIFIED [Renamed to avoid unused warning for now] >>>
+  _zap_metadata: Option<Metadata>,
   error_reason: Option<String>,
 }
 
@@ -59,7 +57,6 @@ impl PlainMechanism {
     }
   }
 
-  // <<< ADDED [Method for client to set its credentials] >>>
   /// Called by the client-side engine to set credentials before handshake starts.
   pub fn set_client_credentials(&mut self, username: Option<Vec<u8>>, password: Option<Vec<u8>>) {
     if !self.is_server {
@@ -69,7 +66,6 @@ impl PlainMechanism {
       tracing::warn!("set_client_credentials called on a server-side PLAIN mechanism. Ignoring.");
     }
   }
-  // <<< ADDED END >>>
 
   /// Parses the HELLO command body (client -> server).
   /// Body format: <username-len(1)><username><password-len(1)><password>
@@ -244,9 +240,6 @@ impl Mechanism for PlainMechanism {
       | PlainState::ClientExpectWelcome
       | PlainState::ServerExpectHello
       | PlainState::ServerSendWelcome => MechanismStatus::Handshaking,
-      // <<< MODIFIED START [Removed ServerAuthenticating from direct mapping for now] >>>
-      // PlainState::ServerAuthenticating => MechanismStatus::Authenticating,
-      // <<< MODIFIED END >>>
       PlainState::Ready => MechanismStatus::Ready,
       PlainState::Error => MechanismStatus::Error,
     }

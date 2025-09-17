@@ -26,7 +26,6 @@ const NUM_PUSHERS: usize = 2;
 const NUM_PULLERS: usize = 2;
 const FINAL_TERM_TIMEOUT: Duration = Duration::from_secs(5); // Timeout for ctx.term() itself
 
-// --- Setup function remains the same ---
 async fn wait_for_event(
   monitor_rx: &MonitorReceiver,
   check_event: impl Fn(&SocketEvent) -> bool,

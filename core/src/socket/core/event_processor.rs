@@ -142,14 +142,14 @@ pub(crate) async fn process_system_event(
     SystemEvent::ConnectionAttemptFailed {
       parent_core_id,
       target_endpoint_uri,
-      error_msg,
+      error,
     } => {
       if parent_core_id == core_handle {
         command_processor::handle_connect_failed_event(
           core_arc,
           socket_logic_strong.clone(),
           target_endpoint_uri,
-          ZmqError::Internal(error_msg),
+          error,
         )
         .await;
       }

@@ -28,11 +28,9 @@ use crate::sessionx::types::{HandshakeSubPhaseX, ZmtpHandshakeProgressX};
 pub(crate) async fn advance_handshake_step_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
 ) -> Result<ZmtpHandshakeProgressX, ZmqError> {
-  // <<< MODIFIED [Use a fixed per-operation timeout for handshake steps] >>>
   // The overall handshake timeout (handler.config.handshake_timeout)
   // will be enforced by SessionConnectionActorX.
   let operation_timeout = Duration::from_secs(15); // Default for individual send/recv during handshake
-                                                   // <<< MODIFIED END >>>
 
   match handler.handshake_state.sub_phase {
     HandshakeSubPhaseX::GreetingExchange => exchange_greetings_impl(handler, operation_timeout).await,
@@ -206,11 +204,11 @@ async fn perform_security_handshake_step_impl<S: ZmtpStdStream>(
   }
 
   if let Some(token_to_send_vec) = handler.security_mechanism.produce_token()? {
-    // <<< MODIFIED [Get length before move] >>>
     let token_len = token_to_send_vec.len();
     let command_msg = Msg::from_vec(token_to_send_vec);
-    // <<< MODIFIED END >>>
+
     send_handshake_command_frame_impl(handler, command_msg, operation_timeout).await?;
+    
     tracing::trace!(
       sca_handle = handler.actor_handle,
       mechanism = handler.security_mechanism.name(),

@@ -1,5 +1,3 @@
-// core/src/transport/inproc.rs
-
 #![cfg(feature = "inproc")]
 
 use crate::context::Context;
@@ -47,10 +45,8 @@ pub(crate) async fn connect_inproc(
         error_msg: err_msg,
       };
 
-      // <<< MODIFIED [Get monitor_tx from core_arc.core_state] >>>
       let monitor_tx_opt = core_arc.core_state.read().get_monitor_sender_clone();
       if let Some(monitor) = monitor_tx_opt {
-        // <<< MODIFIED END >>>
         let _ = monitor.send(event).await;
       }
       let _ = reply_tx_user.send(Err(zmq_err));
@@ -82,7 +78,7 @@ pub(crate) async fn connect_inproc(
       let event_failed = SystemEvent::ConnectionAttemptFailed {
         parent_core_id: connector_core_handle,
         target_endpoint_uri: format!("inproc://{}", name),
-        error_msg: err.to_string(),
+        error: err,
       };
       let _ = core_arc.context.event_bus().publish(event_failed);
       return;
@@ -146,10 +142,9 @@ pub(crate) async fn connect_inproc(
     format!("inproc://{}", name),
     core_arc.context.clone(),
     tx_connector_to_binder.clone(),
-    connector_monitor_tx.clone(), // Pass it here
+    connector_monitor_tx.clone(),
     connector_socket_options,
   ));
-  // <<< MODIFIED END >>>
 
   let endpoint_info = EndpointInfo {
     mailbox: core_arc.command_sender(),
@@ -372,9 +367,7 @@ pub(crate) async fn disconnect_inproc(
     tracing::warn!(connector_core_handle = connector_core_handle, %endpoint_uri, "Inproc disconnect: Local pipe state was already removed or inconsistent.");
   }
 
-  // <<< MODIFIED [Use the already cloned monitor_tx_for_event] >>>
   if let Some(monitor) = monitor_tx_for_event {
-    // <<< MODIFIED END >>>
     let event = SocketEvent::Disconnected {
       endpoint: endpoint_uri.to_string(),
     };

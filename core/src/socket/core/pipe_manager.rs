@@ -23,13 +23,10 @@ use tokio::time::timeout;
 pub(crate) async fn run_pipe_reader_task(
   context: RzmqContext,
   core_handle: usize,
-  // core_command_mailbox is no longer needed as we call ISocket directly
-  // core_command_mailbox: MailboxSender,
-  socket_logic_strong: Arc<dyn ISocket>, // This is the direct reference
+  socket_logic_strong: Arc<dyn ISocket>,
   pipe_read_id: usize,
   pipe_receiver: AsyncReceiver<Msg>,
 ) {
-  // <<< MODIFIED END >>>
   let pipe_reader_task_handle_id = context.inner().next_handle();
   let pipe_reader_actor_type = ActorType::PipeReader; // This ActorType might be removed soon
 
@@ -57,7 +54,6 @@ pub(crate) async fn run_pipe_reader_task(
 
     match pipe_receiver.recv().await {
       Ok(msg) => {
-        // <<< MODIFIED [Call ISocket::handle_pipe_event directly] >>>
         let cmd_for_isocket = Command::PipeMessageReceived {
           pipe_id: pipe_read_id,
           msg,
@@ -78,7 +74,6 @@ pub(crate) async fn run_pipe_reader_task(
           }
           break;
         }
-        // <<< MODIFIED END >>>
       }
       Err(_) => {
         // RecvError implies channel is closed and empty
@@ -88,7 +83,7 @@ pub(crate) async fn run_pipe_reader_task(
           pipe_read_id = pipe_read_id,
           "PipeReaderTask: Data pipe closed by peer. Notifying ISocket."
         );
-        // <<< MODIFIED [Call ISocket::handle_pipe_event directly for closed pipe] >>>
+        
         let cmd_closed_for_isocket = Command::PipeClosedByPeer {
           pipe_id: pipe_read_id,
         };
@@ -105,7 +100,7 @@ pub(crate) async fn run_pipe_reader_task(
             final_error_for_stopping = Some(e);
           }
         }
-        // <<< MODIFIED END >>>
+        
         break;
       }
     }
@@ -509,7 +504,7 @@ pub(crate) async fn process_inproc_binding_request_event(
 
     let inproc_endpoint_entry_handle_id = core_arc.context.inner().next_handle();
 
-    // <<< MODIFIED START [InprocConnection for binder side] >>>
+    // InprocConnection for binder side
     let binder_side_inproc_iface =
       Arc::new(crate::socket::connection_iface::InprocConnection::new(
         inproc_endpoint_entry_handle_id, // connection_id for this EndpointInfo
@@ -521,7 +516,6 @@ pub(crate) async fn process_inproc_binding_request_event(
         core_arc.core_state.read().get_monitor_sender_clone(), // Binder's monitor
         core_arc.core_state.read().options.clone(),      // Binder's socket options
       ));
-    // <<< MODIFIED END >>>
 
     let endpoint_info_for_binder = EndpointInfo {
       mailbox: core_arc.command_sender(),
@@ -535,7 +529,6 @@ pub(crate) async fn process_inproc_binding_request_event(
       handle_id: inproc_endpoint_entry_handle_id,
       target_endpoint_uri: Some(connector_uri.clone()),
       is_outbound_connection: false,
-      // <<< MODIFIED [Use the specific binder-side interface] >>>
       connection_iface: binder_side_inproc_iface,
     };
 
@@ -591,7 +584,6 @@ pub(crate) async fn handle_inproc_pipe_peer_closed_event(
     "SocketCore (binder) handling InprocPipePeerClosed event."
   );
 
-  // <<< MODIFIED START [Corrected logic to find binder's read pipe] >>>
   let mut binder_read_pipe_id_to_cleanup: Option<usize> = None;
   let mut endpoint_uri_of_closed_conn: Option<String> = None;
 
@@ -610,7 +602,6 @@ pub(crate) async fn handle_inproc_pipe_peer_closed_event(
       }
     }
   }
-  // <<< MODIFIED END >>>
 
   if let Some(read_id_to_clean) = binder_read_pipe_id_to_cleanup {
     tracing::debug!(

@@ -1,5 +1,3 @@
-// core/src/io_uring_backend/signaling_op_sender.rs
-
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::ops::UringOpRequest;
@@ -110,4 +108,3 @@ impl std::fmt::Debug for SignalingOpSender {
       .finish()
   }
 }
-// <<< MODIFIED END >>>

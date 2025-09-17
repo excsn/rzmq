@@ -99,7 +99,6 @@ impl ISocket for RepSocket {
     self.send_multipart(vec![msg]).await
   }
 
-  // <<< MODIFIED START [Correct implementation of recv() using the orchestrator] >>>
   async fn recv(&self) -> Result<Msg, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
@@ -129,7 +128,6 @@ impl ISocket for RepSocket {
       .recv_message(rcvtimeo_opt, transform_fn)
       .await
   }
-  // <<< MODIFIED END >>>
 
   async fn send_multipart(&self, payload_frames: Vec<Msg>) -> Result<(), ZmqError> {
     if !self.core.is_running().await {
@@ -201,7 +199,6 @@ impl ISocket for RepSocket {
     }
   }
 
-  // <<< MODIFIED START [Correct implementation of recv_multipart using the orchestrator] >>>
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
@@ -230,7 +227,6 @@ impl ISocket for RepSocket {
       .recv_logical_message(rcvtimeo_opt, transform_fn)
       .await
   }
-  // <<< MODIFIED END >>>
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
     Err(ZmqError::UnsupportedOption(option))

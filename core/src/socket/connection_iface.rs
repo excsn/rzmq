@@ -82,7 +82,7 @@ pub(crate) struct SessionConnection {
   connection_id: usize,
   pipe_to_session_tx: AsyncSender<Vec<Msg>>,
   socket_options: Arc<SocketOptions>,
-  // Added context field to generate unique UserData for operations.
+  // context field to generate unique UserData for operations.
   // This is necessary if UringFdConnection needs a similar capability and we want to keep new() signatures consistent
   // or if SessionConnection itself might later interact with systems needing unique IDs.
   // For now, primarily for UringFdConnection pattern.
@@ -91,7 +91,6 @@ pub(crate) struct SessionConnection {
   context: Context,
 }
 
-// Added Debug impl for SessionConnection manually as Context was added which makes auto-derive complex
 impl fmt::Debug for SessionConnection {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("SessionConnection")
@@ -281,7 +280,7 @@ impl ISocketConnection for UringFdConnection {
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
-    // This logic remains the same. Closing is an async request to the worker.
+    // Closing is an async request to the worker.
     let (reply_tx, reply_rx) = oneshot();
     let unique_user_data = self.context.inner().next_handle() as u64;
     let req = UringOpRequest::ShutdownConnectionHandler {

@@ -615,8 +615,8 @@ pub(crate) async fn respawn_connecter_actor(
     Ok(Endpoint::Inproc(_)) => {
       tracing::warn!(handle = core_handle, %target_uri, "Inproc connections are not respawned via Connecter actor mechanism.");
     }
-    Err(e) => {
-      tracing::error!(handle = core_handle, %target_uri, error = %e, "Failed to parse endpoint for respawning connecter.");
+    Err(err) => {
+      tracing::error!(handle = core_handle, %target_uri, error = %err, "Failed to parse endpoint for respawning connecter.");
       // Optionally publish ConnectionAttemptFailed here if this was a reconnect attempt.
       let _ = core_arc
         .context
@@ -624,7 +624,7 @@ pub(crate) async fn respawn_connecter_actor(
         .publish(SystemEvent::ConnectionAttemptFailed {
           parent_core_id: core_handle,
           target_endpoint_uri: target_uri,
-          error_msg: e.to_string(),
+          error: err,
         });
     }
     _ => {

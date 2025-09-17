@@ -38,7 +38,7 @@ async fn main() -> Result<(), ZmqError> {
   // --- Server (REP) Setup ---
   let server_socket = ctx.socket(SocketType::Rep)?;
   println!("[Server] Setting LINGER option...");
-  server_socket.set_option(LINGER, 0i32).await?; // <<< MODIFIED [Set LINGER option to 0 for quick close] >>>
+  server_socket.set_option(LINGER, 0i32).await?; // Set LINGER option to 0 for quick close
   println!("[Server] Setting PLAIN_SERVER option to true...");
   server_socket.set_option(PLAIN_SERVER, true).await?; // Enable PLAIN server role
   println!("[Server] Binding to {}...", bind_addr);
@@ -48,7 +48,7 @@ async fn main() -> Result<(), ZmqError> {
   // --- Client (REQ) Setup ---
   let client_socket = ctx.socket(SocketType::Req)?;
   println!("[Client] Setting LINGER option...");
-  client_socket.set_option(LINGER, 0i32).await?; // <<< MODIFIED [Set LINGER option to 0 for quick close] >>>
+  client_socket.set_option(LINGER, 0i32).await?; // Set LINGER option to 0 for quick close
   println!("[Client] Setting PLAIN_USERNAME to '{}'...", username);
   client_socket
     .set_option(PLAIN_USERNAME, username)

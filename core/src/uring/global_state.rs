@@ -70,7 +70,6 @@ pub(crate) fn get_uring_upstream_processor_join_handle_mutex() -> &'static Mutex
   URING_UPSTREAM_PROCESSOR_JOIN_HANDLE.get_or_init(Default::default)
 }
 
-// Getter for the FD map remains the same, as its structure within OnceCell didn't change to Mutex<Option<...>>
 #[doc(hidden)]
 #[cfg(feature = "io-uring")]
 pub(crate) fn get_uring_fd_to_socket_core_mailbox_map_oncecell(
@@ -78,7 +77,6 @@ pub(crate) fn get_uring_fd_to_socket_core_mailbox_map_oncecell(
   &URING_FD_TO_SOCKET_CORE_MAILBOX_MAP // This one we still init directly in uring.rs
 }
 
-// --- ensure_global_uring_systems_started (no change to its logic, it calls uring::initialize_uring_backend) ---
 pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
   if !URING_BACKEND_INITIALIZED.load(std::sync::atomic::Ordering::SeqCst) {
     info!("GlobalUringState: io_uring backend not yet initialized by user. Initializing with default configuration.");
@@ -89,7 +87,7 @@ pub(crate) fn ensure_global_uring_systems_started() -> Result<(), ZmqError> {
   Ok(())
 }
 
-// --- Helper: get_global_uring_worker_op_tx (Modified) ---
+// --- Helper: get_global_uring_worker_op_tx ---
 pub(crate) fn get_global_uring_worker_op_tx() -> Result<SignalingOpSender, ZmqError> {
   let guard = get_uring_worker_op_tx_mutex().lock();
   guard.as_ref().cloned().ok_or_else(|| {

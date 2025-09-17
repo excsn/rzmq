@@ -1,8 +1,7 @@
 use crate::error::ZmqError;
-use crate::message::Msg; // MsgFlags needed for recv_multipart
+use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::{CoreState, SocketCore};
-// <<< MODIFIED [PullSocket continues to use FairQueue<Msg> directly] >>>
 use crate::socket::patterns::fair_queue::FairQueue;
 use crate::socket::ISocket;
 
@@ -254,10 +253,9 @@ impl ISocket for PullSocket {
   }
 }
 
-// <<< ADDED [Helper for recv_multipart to call recv() logic internally, similar to ReqSocket] >>>
+// Helper for recv_multipart to call recv() logic internally, similar to ReqSocket
 impl PullSocket {
   /// Internal helper for recv_multipart to get single frames with timeout.
-  /// This is essentially the same logic as the public recv() method.
   async fn recv_message_internal_for_multipart(&self, rcvtimeo_opt: Option<Duration>) -> Result<Msg, ZmqError> {
     // This duplicates the logic of the public recv() method.
     if !self.core.is_running().await {

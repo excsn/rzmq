@@ -4,9 +4,8 @@ pub(crate) mod null;
 pub(crate) mod plain;
 pub mod zap;
 
-pub(crate) use cipher::{IDataCipher, PassThroughDataCipher};
+pub(crate) use cipher::IDataCipher;
 pub(crate) use mechanism::{Mechanism, MechanismStatus};
-pub(crate) use zap::ZapClient;
 pub(crate) use {null::NullMechanism, plain::PlainMechanism};
 
 use crate::message::Metadata;
@@ -18,7 +17,7 @@ mod noise_xx;
 #[cfg(feature = "noise_xx")]
 pub use noise_xx::NoiseXxMechanism;
 
-// <<< ADDED START [Mechanism Initializer Type and specific initializers] >>>
+// Mechanism Initializer Type and specific initializers
 type MechanismInitializerFn = fn(
   is_server: bool,
   local_config: &ZmtpEngineConfig,

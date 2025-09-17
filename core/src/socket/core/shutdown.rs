@@ -345,7 +345,6 @@ async fn close_active_connections(
     let iface_clone = conn_iface.clone();
     let id_clone = *conn_id; // This is the EndpointInfo.handle_id
     let uri_clone = conn_uri.clone();
-    // <<< REMOVED core_arc_clone_for_fut, not needed directly in this fut if we collect IDs >>>
 
     close_futs.push(async move {
       let close_result = iface_clone.close_connection().await;

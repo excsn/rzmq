@@ -1,15 +1,10 @@
-// src/transport/endpoint.rs
-
 use crate::error::ZmqError;
-use std::{
-  net::SocketAddr,
-  path::{Path, PathBuf},
-};
+use std::path::PathBuf;
 
 /// Represents a parsed and validated endpoint address.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Endpoint {
-  Tcp(std::net::SocketAddr, String), // Store original string for maps/disconnect
+  Tcp(String, String), // Store address part (e.g., "my-host:5555") and original URI
   #[cfg(feature = "ipc")]
   Ipc(PathBuf, String), // Store validated PathBuf and original string
   #[cfg(feature = "inproc")]
@@ -28,14 +23,14 @@ pub(crate) fn parse_endpoint(endpoint_str: &str) -> Result<Endpoint, ZmqError> {
     // Match on the scheme
     match scheme {
       "tcp" => {
-        // Parse TCP address
-        address_part
-          .parse::<SocketAddr>()
-          .map(|addr| Endpoint::Tcp(addr, endpoint_str.to_string()))
-          .map_err(|_| {
-            tracing::debug!("Failed to parse TCP address: {}", address_part);
-            invalid_endpoint_err()
-          })
+        if address_part.is_empty() {
+          Err(invalid_endpoint_err())
+        } else {
+          Ok(Endpoint::Tcp(
+            address_part.to_string(),
+            endpoint_str.to_string(),
+          ))
+        }
       }
 
       #[cfg(feature = "ipc")]

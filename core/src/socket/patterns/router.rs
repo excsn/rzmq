@@ -1,7 +1,6 @@
 use crate::message::Blob;
 use std::collections::HashMap;
-// use tokio::sync::RwLock; // Remove
-use parking_lot::RwLock; // Add
+use parking_lot::RwLock;
 use tracing;
 
 #[derive(Debug, Default)]
@@ -20,7 +19,7 @@ impl RouterMap {
     let mut id_to_uri_guard = self.identity_to_uri.write(); // Sync write lock
     let mut pipe_to_id_guard = self.read_pipe_to_identity.write(); // Sync write lock
 
-    // Logic remains the same, guards are dropped at the end of the scope
+    // guards are dropped at the end of the scope
     if let Some(old_uri) = id_to_uri_guard.insert(identity.clone(), endpoint_uri.clone()) {
       if old_uri != endpoint_uri {
         tracing::warn!(

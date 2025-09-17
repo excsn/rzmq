@@ -122,8 +122,8 @@ pub enum SystemEvent {
     parent_core_id: usize,
     /// The target endpoint URI that the connection attempt was made to.
     target_endpoint_uri: String,
-    /// A string representation of the error that caused the connection failure.
-    error_msg: String,
+    /// The structured error that caused the connection failure.
+    error: ZmqError,
   },
 
   /// Published by an `inproc` connector's `SocketCore` to request a connection
@@ -222,12 +222,12 @@ impl fmt::Debug for SystemEvent {
       SystemEvent::ConnectionAttemptFailed {
         parent_core_id,
         target_endpoint_uri,
-        error_msg,
+        error,
       } => f
         .debug_struct("ConnectionAttemptFailed")
         .field("parent_core_id", parent_core_id)
         .field("target_endpoint_uri", target_endpoint_uri)
-        .field("error_msg", error_msg)
+        .field("error", error)
         .finish(),
       SystemEvent::InprocBindingRequest { .. } => f
         .debug_struct("InprocBindingRequest")

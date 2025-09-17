@@ -71,6 +71,10 @@ pub enum ZmqError {
   #[error("Endpoint resolution failed: {0}")]
   EndpointResolutionFailed(String),
 
+  /// DNS resolution for a given hostname failed.
+  #[error("DNS resolution failed: {0}")]
+  DnsResolutionFailed(String),
+
   // --- Socket Option Errors ---
   /// An invalid socket option ID was provided to `set_option` or `get_option`.
   /// Corresponds to POSIX `EINVAL` for option errors.

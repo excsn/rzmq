@@ -1,7 +1,6 @@
 #![cfg(feature = "ipc")]
 
 use crate::context::Context;
-// Use the specific helper for IPC engines, which uses ZmtpEngineCoreStd<UnixStream>
 use crate::error::ZmqError;
 use crate::runtime::{
   mailbox, system_events::ConnectionInteractionModel, ActorDropGuard, ActorType, Command,
@@ -23,7 +22,7 @@ use std::time::Duration;
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 use tokio::sync::{broadcast, Semaphore};
 use tokio::task::{Id as TaskId, JoinHandle};
-use tokio::time::sleep; // timeout for connect attempt
+use tokio::time::sleep;
 
 // --- IpcListener Actor ---
 pub(crate) struct IpcListener {
@@ -278,7 +277,6 @@ impl IpcListener {
               let mut setup_successful = true;
 
               // IPC doesn't have an io_uring path like TCP. It always uses an actor.
-              // <<< MODIFIED START [Replace old SessionBase/Engine with SCA] >>>
               let sca_handle_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
               let actor_conf = ActorConfigX {
                 context: context_clone.clone(),
@@ -310,9 +308,8 @@ impl IpcListener {
               });
               managing_actor_task_id_for_event = Some(sca_task_handle.id());
               // connection_iface_for_event is None, SocketCore creates it
-              // <<< MODIFIED END >>>
 
-              // Common event publishing logic (same as in TcpListener)
+              // Common event publishing logic
               if setup_successful {
                 // setup_successful is true unless an error occurred above
                 if let Some(inter_model) = interaction_model_for_event {
@@ -381,7 +378,6 @@ impl IpcListener {
 }
 
 impl Drop for IpcListener {
-  // ... (Drop implementation remains the same)
   fn drop(&mut self) {
     tracing::debug!(listener_handle = self.handle, path = ?self.path, "Dropping IpcListener, cleaning up IPC socket file");
     if let Some(listener_join_handle) = self.listener_handle.take() {
@@ -591,7 +587,7 @@ impl IpcConnecter {
           let _ = self.context.event_bus().publish(SystemEvent::ConnectionAttemptFailed {
             parent_core_id: self.parent_socket_id,
             target_endpoint_uri: endpoint_uri_original.clone(),
-            error_msg: err.to_string(),
+            error: err.clone(),
           });
         }
         actor_drop_guard.set_error(err);

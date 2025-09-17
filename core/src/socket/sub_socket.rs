@@ -2,17 +2,16 @@ use super::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
+use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::options::{SUBSCRIBE, UNSUBSCRIBE};
 use crate::socket::patterns::SubscriptionTrie;
-use crate::socket::ISocket;
-use crate::{delegate_to_core, Blob};
+use crate::{Blob, delegate_to_core};
 
 use async_trait::async_trait;
 use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::HashMap;
-// <<< REMOVED [VecDeque for current_recv_buffer no longer needed in SubSocket itself] >>>
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,14 +25,13 @@ pub(crate) struct SubSocket {
 
 impl SubSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    // <<< MODIFIED [Initialize generic orchestrator with core_handle and Vec<Msg> as QItem] >>>
-    let orchestrator = IncomingMessageOrchestrator::new(core.handle, core.core_state.read().options.rcvhwm);
+    let orchestrator =
+      IncomingMessageOrchestrator::new(core.handle, core.core_state.read().options.rcvhwm);
     Self {
       core,
       subscriptions: SubscriptionTrie::new(),
       incoming_orchestrator: orchestrator,
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
-      // <<< REMOVED [current_recv_buffer initialization] >>>
     }
   }
 
@@ -84,7 +82,14 @@ impl SubSocket {
 
   async fn send_subscription_command_to_all(&self, is_subscribe: bool, topic: &[u8]) {
     let msg = Self::construct_subscription_message(is_subscribe, topic);
-    let peer_uris: Vec<String> = { self.pipe_read_to_endpoint_uri.read().values().cloned().collect() };
+    let peer_uris: Vec<String> = {
+      self
+        .pipe_read_to_endpoint_uri
+        .read()
+        .values()
+        .cloned()
+        .collect()
+    };
 
     if peer_uris.is_empty() {
       tracing::trace!(
@@ -134,10 +139,11 @@ impl ISocket for SubSocket {
   }
 
   async fn send(&self, _msg: Msg) -> Result<(), ZmqError> {
-    Err(ZmqError::InvalidState("SUB sockets cannot send data messages"))
+    Err(ZmqError::InvalidState(
+      "SUB sockets cannot send data messages",
+    ))
   }
 
-  // <<< MODIFIED START [SubSocket::recv() uses orchestrator.recv_message()] >>>
   async fn recv(&self) -> Result<Msg, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
@@ -151,7 +157,6 @@ impl ISocket for SubSocket {
       .recv_message(rcvtimeo_opt, transform_fn)
       .await
   }
-  // <<< MODIFIED END >>>
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     match option {
@@ -161,10 +166,11 @@ impl ISocket for SubSocket {
   }
 
   async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
-    Err(ZmqError::InvalidState("SUB sockets cannot send data messages"))
+    Err(ZmqError::InvalidState(
+      "SUB sockets cannot send data messages",
+    ))
   }
 
-  // <<< MODIFIED START [SubSocket::recv_multipart() uses orchestrator.recv_logical_message()] >>>
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
     if !self.core.is_running().await {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
@@ -213,11 +219,13 @@ impl ISocket for SubSocket {
     Ok(false)
   }
 
-  // <<< MODIFIED START [handle_pipe_event uses new orchestrator methods for QItem=Vec<Msg>] >>>
   async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
-        if let Some(raw_zmtp_message_vec) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
+        if let Some(raw_zmtp_message_vec) = self
+          .incoming_orchestrator
+          .accumulate_pipe_frame(pipe_read_id, msg)?
+        {
           // raw_zmtp_message_vec is, e.g., [topic_frame_M, data_frame_NM] from a PUB.
           let topic_data = raw_zmtp_message_vec
             .get(0)
@@ -239,9 +247,13 @@ impl ISocket for SubSocket {
     }
     Ok(())
   }
-  // <<< MODIFIED END >>>
 
-  async fn pipe_attached(&self, pipe_read_id: usize, _pipe_write_id: usize, _peer_identity: Option<&[u8]>) {
+  async fn pipe_attached(
+    &self,
+    pipe_read_id: usize,
+    _pipe_write_id: usize,
+    _peer_identity: Option<&[u8]>,
+  ) {
     let endpoint_uri_option = self
       .core_state_read()
       .pipe_read_id_to_endpoint_uri
@@ -285,13 +297,20 @@ impl ISocket for SubSocket {
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
-    tracing::debug!(handle = self.core.handle, pipe_read_id, "SUB detaching pipe");
+    tracing::debug!(
+      handle = self.core.handle,
+      pipe_read_id,
+      "SUB detaching pipe"
+    );
 
     let removed_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id);
     if removed_uri.is_some() {
       tracing::trace!(handle = self.core.handle, pipe_read_id, uri = %removed_uri.unwrap(), "SUB removed endpoint_uri mapping for detached pipe");
     }
 
-    self.incoming_orchestrator.clear_pipe_state(pipe_read_id).await;
+    self
+      .incoming_orchestrator
+      .clear_pipe_state(pipe_read_id)
+      .await;
   }
 }
