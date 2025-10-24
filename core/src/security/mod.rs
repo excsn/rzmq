@@ -11,8 +11,14 @@ pub(crate) use {null::NullMechanism, plain::PlainMechanism};
 use crate::message::Metadata;
 use crate::{error::ZmqError, protocol::zmtp::ZmtpGreeting, socket::ZmtpEngineConfig};
 
+#[cfg(feature = "curve")]
+mod curve;
+
 #[cfg(feature = "noise_xx")]
 mod noise_xx;
+
+#[cfg(feature = "curve")]
+pub(crate) use curve::CurveMechanism;
 
 #[cfg(feature = "noise_xx")]
 pub use noise_xx::NoiseXxMechanism;

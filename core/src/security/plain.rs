@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::{Metadata, ZmqError};
+use crate::{security::mechanism::ProcessTokenAction, Metadata, ZmqError};
 
 use super::{cipher::PassThroughDataCipher, IDataCipher, Mechanism, MechanismStatus};
 
@@ -122,7 +122,7 @@ impl Mechanism for PlainMechanism {
     Self::NAME
   }
 
-  fn process_token(&mut self, token: &[u8]) -> Result<(), ZmqError> {
+  fn process_token(&mut self, token: &[u8]) -> Result<ProcessTokenAction, ZmqError> {
     if token.is_empty() {
       self.set_error_internal("Received empty security token".into());
       return Err(ZmqError::SecurityError("Empty token".into()));
@@ -145,10 +145,13 @@ impl Mechanism for PlainMechanism {
               Ok((username, password)) => {
                 self.username = Some(username);
                 self.password = Some(password);
-                // Simplified: Directly move to SendWelcome, bypassing ZAP.
+                
+                // Directly move to SendWelcome, bypassing ZAP.
                 tracing::debug!("PLAIN Server: Auto-accepting HELLO (ZAP bypassed for now).");
                 self.state = PlainState::ServerSendWelcome;
-                Ok(())
+
+                // INSTRUCTION TO CALLER: I have a response ready for you.
+                Ok(ProcessTokenAction::ProduceAndSend)
               }
               Err(e) => {
                 self.set_error_internal(format!("Failed to parse HELLO: {}", e));
@@ -176,7 +179,9 @@ impl Mechanism for PlainMechanism {
           if command_name == Self::CMD_WELCOME {
             tracing::debug!(mechanism = Self::NAME, "Client received WELCOME");
             self.state = PlainState::Ready;
-            Ok(())
+
+            // INSTRUCTION TO CALLER: We are done.
+            Ok(ProcessTokenAction::HandshakeComplete)
           } else if command_name == Self::CMD_ERROR {
             let reason = String::from_utf8_lossy(body).to_string();
             self.set_error_internal(format!("Received ERROR from server: {}", reason));

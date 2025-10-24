@@ -3,6 +3,7 @@
 #![allow(dead_code, unused_variables)]
 
 use super::ZmtpProtocolHandlerX;
+use crate::security::mechanism::ProcessTokenAction;
 use crate::transport::ZmtpStdStream;
 use crate::error::ZmqError;
 use crate::message::Msg;
@@ -189,67 +190,114 @@ async fn perform_security_handshake_step_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
   operation_timeout: Duration,
 ) -> Result<ZmtpHandshakeProgressX, ZmqError> {
-  let peer_greeting = handler
-    .pending_peer_greeting
-    .as_ref()
-    .ok_or_else(|| ZmqError::Internal("No peer g".into()))?;
+  // 1. One-time setup: Negotiate and initialize the mechanism on the first entry.
   if handler.security_mechanism.name() == NullMechanism::NAME {
-    handler.security_mechanism =
-      negotiate_security_mechanism(handler.is_server, &handler.config, peer_greeting, handler.actor_handle)?;
+    let peer_greeting = handler.pending_peer_greeting.as_ref().ok_or_else(|| {
+      ZmqError::Internal("Handshake entered security phase without a peer greeting".to_string())
+    })?;
+    handler.security_mechanism = negotiate_security_mechanism(
+      handler.is_server,
+      &handler.config,
+      peer_greeting,
+      handler.actor_handle,
+    )?;
     tracing::debug!(
       sca_handle = handler.actor_handle,
       mechanism = handler.security_mechanism.name(),
-      "Sec mech negotiated."
+      "Security mechanism negotiated."
     );
   }
 
-  if let Some(token_to_send_vec) = handler.security_mechanism.produce_token()? {
-    let token_len = token_to_send_vec.len();
-    let command_msg = Msg::from_vec(token_to_send_vec);
-
-    send_handshake_command_frame_impl(handler, command_msg, operation_timeout).await?;
+  // 2. Check for mechanism completion first. If it's done, transition to the next phase.
+  if handler.security_mechanism.is_complete() {
+    let mechanism_to_finalize =
+        std::mem::replace(&mut handler.security_mechanism, Box::new(NullMechanism));
+    let (cipher, id_opt) = mechanism_to_finalize.into_data_cipher_parts()?;
+    handler.data_cipher = Some(cipher);
+    // Transition to the next handshake sub-phase, DO NOT exit yet.
+    handler.handshake_state.sub_phase = HandshakeSubPhaseX::ReadyExchange;
     
-    tracing::trace!(
-      sca_handle = handler.actor_handle,
-      mechanism = handler.security_mechanism.name(),
-      token_size = token_len,
-      "Sent security token."
-    );
-  }
-
-  if !handler.security_mechanism.is_complete() && !handler.security_mechanism.is_error() {
-    let received_msg = read_handshake_command_frame_impl(handler, operation_timeout).await?;
-    let token_data = received_msg.data().unwrap_or(&[]);
-    tracing::trace!(
-      sca_handle = handler.actor_handle,
-      mechanism = handler.security_mechanism.name(),
-      token_size = token_data.len(),
-      "Recvd security token."
-    );
-    if let Err(e) = handler.security_mechanism.process_token(token_data) {
-      handler
-        .security_mechanism
-        .set_error(format!("Token process err: {}", e));
+    // Return progress, but let the actor loop call advance_handshake() again
+    // to process the ReadyExchange phase.
+    if let Some(identity) = id_opt {
+        return Ok(ZmtpHandshakeProgressX::IdentityReady(identity.into()));
+    } else {
+        return Ok(ZmtpHandshakeProgressX::InProgress);
     }
   }
 
-  if handler.security_mechanism.is_complete() {
-    let mech_box = std::mem::replace(&mut handler.security_mechanism, Box::new(NullMechanism));
-    let (cipher, id_opt) = mech_box.into_data_cipher_parts()?;
-    handler.data_cipher = Some(cipher);
-    handler.handshake_state.sub_phase = HandshakeSubPhaseX::ReadyExchange;
-    return Ok(id_opt.map_or(ZmtpHandshakeProgressX::InProgress, |v| {
-      ZmtpHandshakeProgressX::IdentityReady(v.into())
-    }));
-  } else if handler.security_mechanism.is_error() {
+  if handler.security_mechanism.is_error() {
     return Err(ZmqError::SecurityError(
       handler
         .security_mechanism
         .error_reason()
-        .unwrap_or("Unknown sec err")
+        .unwrap_or("Unknown security error")
         .to_string(),
     ));
   }
+
+  // 3. GENERIC DRIVER LOGIC (for mechanisms that are not yet complete)
+
+  // ACTION A: Check if it's our turn to send a token.
+  if let Some(token_to_send) = handler.security_mechanism.produce_token()? {
+    tracing::debug!(
+      sca_handle = handler.actor_handle,
+      token_len = token_to_send.len(),
+      "Handshake: Producing and sending token."
+    );
+    let command_msg = Msg::from_vec(token_to_send);
+    send_handshake_command_frame_impl(handler, command_msg, operation_timeout).await?;
+    return Ok(ZmtpHandshakeProgressX::InProgress);
+  }
+
+  // ACTION B: If not our turn, we must be waiting for the peer.
+  tracing::trace!(sca_handle = handler.actor_handle, "Handshake: Waiting to read token from peer.");
+  let received_msg = read_handshake_command_frame_impl(handler, operation_timeout).await?;
+
+  let token_data = received_msg.data().unwrap_or(&[]);
+  tracing::debug!(
+    sca_handle = handler.actor_handle,
+    token_len = token_data.len(),
+    "Handshake: Read and processing token."
+  );
+
+  // Process the token and get the next action.
+  let action = handler.security_mechanism.process_token(token_data)?;
+
+  match action {
+    ProcessTokenAction::ContinueWaiting => {
+      // Nothing to do, just wait for the next event/message.
+    }
+    ProcessTokenAction::ProduceAndSend => {
+      // The mechanism told us it has a reply ready. Send it immediately.
+      if let Some(token_to_send) = handler.security_mechanism.produce_token()? {
+        tracing::debug!(
+          sca_handle = handler.actor_handle,
+          token_len = token_to_send.len(),
+          "Handshake: Immediately producing and sending reply token."
+        );
+        let command_msg = Msg::from_vec(token_to_send);
+        send_handshake_command_frame_impl(handler, command_msg, operation_timeout).await?;
+      } else {
+        return Err(ZmqError::Internal(
+          "Mechanism requested ProduceAndSend but produced no token.".to_string(),
+        ));
+      }
+    }
+    ProcessTokenAction::HandshakeComplete => {
+      // The mechanism is telling us it's done. Now we can do the same as the is_complete() check above.
+      let mechanism_to_finalize =
+          std::mem::replace(&mut handler.security_mechanism, Box::new(NullMechanism));
+      let (cipher, id_opt) = mechanism_to_finalize.into_data_cipher_parts()?;
+      handler.data_cipher = Some(cipher);
+      handler.handshake_state.sub_phase = HandshakeSubPhaseX::ReadyExchange;
+      if let Some(identity) = id_opt {
+        return Ok(ZmtpHandshakeProgressX::IdentityReady(identity.into()));
+      }
+    }
+  }
+
+  // After performing the action, return. The actor loop will call again.
   Ok(ZmtpHandshakeProgressX::InProgress)
 }
 

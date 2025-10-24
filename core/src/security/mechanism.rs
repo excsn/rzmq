@@ -12,6 +12,16 @@ pub enum MechanismStatus {
   Error,          // Handshake failed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessTokenAction {
+  /// No immediate action is required. The handler should wait for the next event.
+  ContinueWaiting,
+  /// The mechanism now has a token ready to send immediately.
+  ProduceAndSend,
+  /// The handshake is now complete.
+  HandshakeComplete,
+}
+
 /// Trait for security mechanisms (NULL, PLAIN, etc.).
 /// Drives the security handshake state machine.
 pub trait Mechanism: Send + Sync + fmt::Debug + 'static {
@@ -22,8 +32,8 @@ pub trait Mechanism: Send + Sync + fmt::Debug + 'static {
 
   /// Processes an incoming ZMTP security token (part of handshake).
   /// Updates the internal state machine.
-  /// Returns Ok(()) on success, Err(ZmqError::SecurityError) on failure.
-  fn process_token(&mut self, token: &[u8]) -> Result<(), ZmqError>;
+  /// Returns Ok(ProcessTokenAction) on success, Err(ZmqError::SecurityError) on failure.
+  fn process_token(&mut self, token: &[u8]) -> Result<ProcessTokenAction, ZmqError>;
 
   /// Produces the next ZMTP security token to be sent, based on current state.
   /// Returns None if no token needs to be sent currently (e.g., waiting for peer).
@@ -76,4 +86,5 @@ pub trait Mechanism: Send + Sync + fmt::Debug + 'static {
   /// For simplicity, let's have it always return a Result. Non-encrypting mechanisms
   /// would return a pass-through cipher.
   fn into_data_cipher_parts(self: Box<Self>) -> Result<(Box<dyn IDataCipher>, Option<Vec<u8>>), ZmqError>;
+  
 }

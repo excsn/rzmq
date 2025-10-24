@@ -196,9 +196,9 @@ pub(crate) struct ZmtpEngineConfig {
   // TCP Corking
   pub use_cork: bool,
   #[cfg(feature = "noise_xx")]
-  pub use_noise_xx: bool, // Derived from noise_xx_options.enabled
+  pub use_noise_xx: bool,
   #[cfg(feature = "noise_xx")]
-  pub noise_xx_local_sk_bytes_for_engine: Option<[u8; 32]>, // Renamed for clarity
+  pub noise_xx_local_sk_bytes_for_engine: Option<[u8; 32]>,
   #[cfg(feature = "noise_xx")]
   pub noise_xx_remote_pk_bytes_for_engine: Option<[u8; 32]>,
   pub use_plain: bool,

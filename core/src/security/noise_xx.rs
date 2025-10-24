@@ -1,6 +1,7 @@
 #![cfg(feature = "noise_xx")]
 
 use crate::error::ZmqError;
+use crate::security::mechanism::ProcessTokenAction;
 use crate::security::{Mechanism, MechanismStatus, Metadata};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use snow::error::{Prerequisite, StateProblem};
@@ -339,7 +340,7 @@ impl NoiseXxMechanism {
   }
 }
 
-#[async_trait::async_trait] // If any methods become async, though these are CPU-bound
+#[async_trait::async_trait]
 impl Mechanism for NoiseXxMechanism {
   fn name(&self) -> &'static str {
     Self::NAME
@@ -424,7 +425,7 @@ impl Mechanism for NoiseXxMechanism {
     }
   }
 
-  fn process_token(&mut self, token: &[u8]) -> Result<(), ZmqError> {
+  fn process_token(&mut self, token: &[u8]) -> Result<ProcessTokenAction, ZmqError> {
     if self.current_status == MechanismStatus::Error || self.current_status == MechanismStatus::Ready {
       return Err(ZmqError::InvalidState(
         "NOISE_XX: Processing token in Error/Ready state".into(),
@@ -455,7 +456,7 @@ impl Mechanism for NoiseXxMechanism {
         self.is_server_role
       );
       self.transition_to_final_state()?; // Sets self.current_status to Ready or Error
-      self.pending_outgoing_handshake_msg = None;
+      Ok(ProcessTokenAction::HandshakeComplete)
     } else if handshake_state.is_my_turn() {
       // It's now our turn to write. Prepare the message.
       let mut msg_buf = vec![0u8; 1024];
@@ -467,23 +468,15 @@ impl Mechanism for NoiseXxMechanism {
         len
       );
       self.pending_outgoing_handshake_msg = Some(msg_buf);
-
-      // Client (Initiator) specific:
-      // If this write_message *would have been* the initiator's last (s,ss),
-      // its snow::HandshakeState is now finished. However, we DO NOT transition to Ready here.
-      // The transition to Ready (including PK verification) will happen when this pending message
-      // is actually *produced* by produce_token().
-      if !self.is_server_role && handshake_state.is_handshake_finished() {
-        tracing::debug!("NOISE_XX process_token (Initiator): snow::HandshakeState finished after preparing final message. Mechanism status remains Handshaking. Verification will happen in produce_token().");
-      }
+      Ok(ProcessTokenAction::ProduceAndSend)
     } else {
       tracing::trace!(
         "NOISE_XX process_token (is_server={}): Processed token, awaiting peer's next. No pending message generated.",
         self.is_server_role
       );
       self.pending_outgoing_handshake_msg = None;
+      Ok(ProcessTokenAction::ContinueWaiting)
     }
-    Ok(())
   }
 
   fn status(&self) -> MechanismStatus {

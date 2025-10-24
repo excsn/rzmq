@@ -1,15 +1,16 @@
-// core/src/sessionx/protocol_handler/mod.rs
-
 #![allow(dead_code, unused_variables, unused_mut)]
+
+mod data_io;
+mod handshake;
+mod heartbeat;
 
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::protocol::zmtp::greeting::ZmtpGreeting; // Needed for pending_peer_greeting
+use crate::protocol::zmtp::greeting::ZmtpGreeting;
 use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
 use crate::security::{IDataCipher, Mechanism, NullMechanism};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::transport::ZmtpStdStream;
-use crate::Blob;
 
 use bytes::BytesMut;
 use std::fmt;
@@ -17,12 +18,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
-// Sub-modules for focused logic
-mod data_io;
-mod handshake;
-mod heartbeat; // This will define ZmtpHeartbeatStateX if we move it
 
 use self::heartbeat::ZmtpHeartbeatStateX;
+#[cfg(target_os = "linux")]
 use super::cork::{try_create_cork_info, TcpCorkInfoX};
 use super::types::{HandshakeSubPhaseX, ZmtpHandshakeProgressX};
 use heartbeat::ZmtpHandshakeStateX;
@@ -43,7 +41,7 @@ pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
   pub(crate) data_cipher: Option<Box<dyn IDataCipher>>,
   pub(crate) zmtp_manual_parser: ZmtpManualParser,
 
-  pub(crate) heartbeat_state: ZmtpHeartbeatStateX, // Now from self::heartbeat
+  pub(crate) heartbeat_state: ZmtpHeartbeatStateX,
 
   #[cfg(target_os = "linux")]
   pub(crate) cork_info: Option<TcpCorkInfoX>,

@@ -1,4 +1,4 @@
-use crate::{Metadata, ZmqError};
+use crate::{security::mechanism::ProcessTokenAction, Metadata, ZmqError};
 
 use super::{cipher::PassThroughDataCipher, IDataCipher, Mechanism, MechanismStatus};
 
@@ -15,8 +15,9 @@ impl Mechanism for NullMechanism {
     Self::NAME
   }
 
-  fn process_token(&mut self, _token: &[u8]) -> Result<(), ZmqError> {
-    Ok(())
+  fn process_token(&mut self, _token: &[u8]) -> Result<ProcessTokenAction, ZmqError> {
+    // NULL mechanism does nothing with tokens and is always ready.
+    Ok(ProcessTokenAction::HandshakeComplete)
   }
   fn produce_token(&mut self) -> Result<Option<Vec<u8>>, ZmqError> {
     Ok(None)
