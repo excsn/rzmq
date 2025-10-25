@@ -6,18 +6,18 @@ use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, HandlerUpstreamEvent, ProtocolHandlerFactory,
   UringConnectionHandler, UringWorkerInterface, UserData, WorkerIoConfig,
 };
-use crate::io_uring_backend::ops::{ProtocolConfig, HANDLER_INTERNAL_SEND_OP_UD};
+use crate::io_uring_backend::ops::{HANDLER_INTERNAL_SEND_OP_UD, ProtocolConfig};
 use crate::io_uring_backend::worker::MultishotReader;
 use crate::message::{Msg, MsgFlags};
 use crate::protocol::zmtp::{
   command::{ZmtpCommand, ZmtpReady},
-  greeting::{ZmtpGreeting, GREETING_LENGTH, MECHANISM_LENGTH},
+  greeting::{GREETING_LENGTH, MECHANISM_LENGTH, ZmtpGreeting},
   manual_parser::ZmtpManualParser,
 };
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
 use crate::security::{
-  negotiate_security_mechanism, IDataCipher, Mechanism, NullMechanism, PlainMechanism,
+  IDataCipher, Mechanism, NullMechanism, PlainMechanism, negotiate_security_mechanism,
 };
 use crate::socket::options::ZmtpEngineConfig;
 use crate::{Blob, ZmqError};
@@ -599,7 +599,10 @@ impl ZmtpUringHandler {
                 originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
               });
             } else {
-              debug!("[ZmtpHandler FD={}] Server finished security ({}), now in {:?} phase (from SecurityExchange transition). Waiting for client's ZMTP READY.", self.fd, mechanism_name_for_log_on_completion, self.phase);
+              debug!(
+                "[ZmtpHandler FD={}] Server finished security ({}), now in {:?} phase (from SecurityExchange transition). Waiting for client's ZMTP READY.",
+                self.fd, mechanism_name_for_log_on_completion, self.phase
+              );
             }
             progress_this_iteration = true;
           }
@@ -1005,7 +1008,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
         );
         // The actual RequestRingReadMultishot blueprint will be added by prepare_sqes.
       } else {
-        tracing::error!("[ZmtpUringHandler FD={}] Multishot configured (use_recv_multishot=true) but no default_bgid available from worker interface! Falling back to standard reads.", self.fd);
+        tracing::error!(
+          "[ZmtpUringHandler FD={}] Multishot configured (use_recv_multishot=true) but no default_bgid available from worker interface! Falling back to standard reads.",
+          self.fd
+        );
       }
     }
 
@@ -1024,7 +1030,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
       });
       self.phase = ZmtpHandlerPhase::ClientSendGreeting;
     }
-    
+
     ops
   }
 
@@ -1205,7 +1211,8 @@ impl UringConnectionHandler for ZmtpUringHandler {
               /* error handling, potentially re-queue with UD or handle error */
               error!(
                 fd = self.fd,
-                "Failed to encode/encrypt queued multipart message: {}. Message dropped from queue.", e
+                "Failed to encode/encrypt queued multipart message: {}. Message dropped from queue.",
+                e
               );
               // Re-queue the original parts along with their UserData on failure
               self
@@ -1593,7 +1600,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
         if let Some(target_ud) = target_op_data_if_cancel {
           reader.mark_cancellation_submitted(op_user_data, target_ud);
         } else {
-          tracing::warn!("[ZmtpHandler FD={}] inform_multishot_reader_op_submitted called for cancel_op but target_op_data_if_cancel is None.", self.fd);
+          tracing::warn!(
+            "[ZmtpHandler FD={}] inform_multishot_reader_op_submitted called for cancel_op but target_op_data_if_cancel is None.",
+            self.fd
+          );
         }
       } else {
         reader.mark_operation_submitted(op_user_data);
@@ -1684,9 +1694,23 @@ impl ZmtpConfigSecurityExt for ZmtpEngineConfig {
       if can_propose_noise {
         return NoiseXxMechanism::NAME_BYTES;
       } else {
-        warn!("NoiseXX configured (use_noise_xx=true) but required keys missing for current role ('{}') to propose; falling back.", if is_handler_server_role {"server"} else {"client"});
+        warn!(
+          "NoiseXX configured (use_noise_xx=true) but required keys missing for current role ('{}') to propose; falling back.",
+          if is_handler_server_role {
+            "server"
+          } else {
+            "client"
+          }
+        );
       }
     }
+
+    #[cfg(feature = "curve")]
+    if self.use_curve {
+      // CURVE has higher priority than PLAIN
+      return crate::security::CurveMechanism::NAME_BYTES;
+    }
+
     if self.use_plain {
       return PlainMechanism::NAME_BYTES;
     }

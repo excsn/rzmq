@@ -1,8 +1,8 @@
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::{security::mechanism::ProcessTokenAction, Metadata, ZmqError};
+use crate::{security::{framer::{ISecureFramer, NullFramer}, mechanism::ProcessTokenAction}, Metadata, ZmqError};
 
-use super::{cipher::PassThroughDataCipher, IDataCipher, Mechanism, MechanismStatus};
+use super::{IDataCipher, Mechanism, MechanismStatus, cipher::PassThroughDataCipher};
 
 /// State for the PLAIN security mechanism handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +81,9 @@ impl PlainMechanism {
     let user_len = cursor.get_u8() as usize;
     if cursor.remaining() < user_len + 1 {
       // Check space for username and password length byte
-      return Err(ZmqError::SecurityError("Invalid PLAIN HELLO username length".into()));
+      return Err(ZmqError::SecurityError(
+        "Invalid PLAIN HELLO username length".into(),
+      ));
     }
     let mut username = vec![0u8; user_len];
     cursor.copy_to_slice(&mut username);
@@ -89,7 +91,9 @@ impl PlainMechanism {
     // Read password
     let pass_len = cursor.get_u8() as usize;
     if cursor.remaining() < pass_len {
-      return Err(ZmqError::SecurityError("Invalid PLAIN HELLO password length".into()));
+      return Err(ZmqError::SecurityError(
+        "Invalid PLAIN HELLO password length".into(),
+      ));
     }
     let mut password = vec![0u8; pass_len];
     cursor.copy_to_slice(&mut password);
@@ -145,7 +149,7 @@ impl Mechanism for PlainMechanism {
               Ok((username, password)) => {
                 self.username = Some(username);
                 self.password = Some(password);
-                
+
                 // Directly move to SendWelcome, bypassing ZAP.
                 tracing::debug!("PLAIN Server: Auto-accepting HELLO (ZAP bypassed for now).");
                 self.state = PlainState::ServerSendWelcome;
@@ -159,7 +163,10 @@ impl Mechanism for PlainMechanism {
               }
             }
           } else {
-            self.set_error_internal(format!("Expected HELLO, got {}", String::from_utf8_lossy(command_name)));
+            self.set_error_internal(format!(
+              "Expected HELLO, got {}",
+              String::from_utf8_lossy(command_name)
+            ));
             Err(ZmqError::SecurityError("Unexpected command".into()))
           }
         }
@@ -169,7 +176,9 @@ impl Mechanism for PlainMechanism {
             self.state,
             String::from_utf8_lossy(command_name)
           ));
-          Err(ZmqError::SecurityError("Unexpected command in server state".into()))
+          Err(ZmqError::SecurityError(
+            "Unexpected command in server state".into(),
+          ))
         }
       }
     } else {
@@ -191,7 +200,9 @@ impl Mechanism for PlainMechanism {
               "Expected WELCOME or ERROR, got {}",
               String::from_utf8_lossy(command_name)
             ));
-            Err(ZmqError::SecurityError("Unexpected command from server".into()))
+            Err(ZmqError::SecurityError(
+              "Unexpected command from server".into(),
+            ))
           }
         }
         _ => {
@@ -200,7 +211,9 @@ impl Mechanism for PlainMechanism {
             self.state,
             String::from_utf8_lossy(command_name)
           ));
-          Err(ZmqError::SecurityError("Unexpected command in client state".into()))
+          Err(ZmqError::SecurityError(
+            "Unexpected command in client state".into(),
+          ))
         }
       }
     }
@@ -291,11 +304,13 @@ impl Mechanism for PlainMechanism {
     Ok(())
   }
 
-  fn into_data_cipher_parts(self: Box<Self>) -> Result<(Box<dyn IDataCipher>, Option<Vec<u8>>), ZmqError> {
+  fn into_framer(self: Box<Self>) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     if self.status() != MechanismStatus::Ready {
-      return Err(ZmqError::InvalidState("PLAIN handshake not complete.".into()));
+      return Err(ZmqError::InvalidState(
+        "PLAIN handshake not complete.".into(),
+      ));
     }
-    // For PLAIN, the peer identity is typically the authenticated username.
-    Ok((Box::new(PassThroughDataCipher::default()), self.username.clone()))
+    // For PLAIN, the framer is a passthrough (NullFramer) and the identity is the username.
+    Ok((Box::new(NullFramer::new()), self.username.clone()))
   }
 }

@@ -8,7 +8,8 @@ use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::protocol::zmtp::greeting::ZmtpGreeting;
 use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
-use crate::security::{IDataCipher, Mechanism, NullMechanism};
+use crate::security::framer::{ISecureFramer, NullFramer};
+use crate::security::{Mechanism, NullMechanism};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::transport::ZmtpStdStream;
 
@@ -18,10 +19,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
-
 use self::heartbeat::ZmtpHeartbeatStateX;
 #[cfg(target_os = "linux")]
-use super::cork::{try_create_cork_info, TcpCorkInfoX};
+use super::cork::{TcpCorkInfoX, try_create_cork_info};
 use super::types::{HandshakeSubPhaseX, ZmtpHandshakeProgressX};
 use heartbeat::ZmtpHandshakeStateX;
 
@@ -32,14 +32,12 @@ pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
   pub(crate) stream: Option<S>,
 
   pub(crate) network_read_buffer: BytesMut,
-  pub(crate) plaintext_feed_buffer: BytesMut,
 
   pub(crate) handshake_state: ZmtpHandshakeStateX,
   pub(crate) security_mechanism: Box<dyn Mechanism>,
   pub(crate) pending_peer_greeting: Option<ZmtpGreeting>,
-
-  pub(crate) data_cipher: Option<Box<dyn IDataCipher>>,
-  pub(crate) zmtp_manual_parser: ZmtpManualParser,
+  pub(crate) zmtp_manual_parser: ZmtpManualParser, // For the handshake phase
+  pub(crate) framer: Box<dyn ISecureFramer>, // For the data phase
 
   pub(crate) heartbeat_state: ZmtpHeartbeatStateX,
 
@@ -60,23 +58,25 @@ impl<S: ZmtpStdStream + fmt::Debug> fmt::Debug for ZmtpProtocolHandlerX<S> {
       .field("is_server", &self.is_server)
       .field("stream_is_some", &self.stream.is_some());
     debug_struct
-      .field("network_read_buffer_len", &self.network_read_buffer.len())
-      .field(
-        "plaintext_feed_buffer_len",
-        &self.plaintext_feed_buffer.len(),
-      );
+      .field("network_read_buffer_len", &self.network_read_buffer.len());
+
+    // REMOVED old fields, ADDED framer (can't debug the trait object itself easily)
+    debug_struct.field("framer_active", &"true"); 
+    
     debug_struct
       .field("handshake_state", &self.handshake_state)
       .field("security_mechanism_name", &self.security_mechanism.name())
       .field("pending_peer_greeting", &self.pending_peer_greeting);
-    debug_struct.field("data_cipher_is_some", &self.data_cipher.is_some());
-    debug_struct
-      .field("zmtp_manual_parser", &self.zmtp_manual_parser)
-      .field("heartbeat_state", &self.heartbeat_state);
+
+    debug_struct.field("heartbeat_state", &self.heartbeat_state);
+      
     #[cfg(target_os = "linux")]
     debug_struct.field("cork_info", &self.cork_info);
     #[cfg(not(target_os = "linux"))]
-    debug_struct.field("cork_info", &"None (Non-Linux)"); // Or just self.cork_info if it's Option<()>
+    debug_struct.field("cork_info", &"None (Non-Linux)");
+
+    debug_struct.field("zmtp_manual_parser", &self.zmtp_manual_parser);
+
     debug_struct.finish_non_exhaustive()
   }
 }
@@ -111,12 +111,11 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
       is_server,
       stream: Some(stream),
       network_read_buffer: BytesMut::with_capacity(8192 * 2),
-      plaintext_feed_buffer: BytesMut::with_capacity(8192 * 2),
       handshake_state: ZmtpHandshakeStateX::new(),
       security_mechanism: Box::new(NullMechanism),
       pending_peer_greeting: None,
-      data_cipher: None,
       zmtp_manual_parser: ZmtpManualParser::new(),
+      framer: Box::new(NullFramer::new()),
       heartbeat_state: ZmtpHeartbeatStateX::new(
         heartbeat_ivl_from_config,
         effective_timeout_corrected,
@@ -166,7 +165,7 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
   pub(crate) async fn write_data_msgs(&mut self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
     data_io::write_data_msgs_impl(self, msgs).await
   }
-  
+
   /// Processes an incoming ZMTP command frame received during the data phase,
   /// primarily for handling PING/PONG.
   ///

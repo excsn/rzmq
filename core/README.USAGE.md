@@ -45,7 +45,7 @@ Understanding these core concepts is key to effectively using `rzmq`:
 *   **Socket Options**: Sockets can be configured with various options (e.g., high-water marks, timeouts, identity) using `Socket::set_option_raw()` or the convenience `Socket::set_option()` for types implementing `ToBytes`.
 *   **Monitoring**: `rzmq` provides a mechanism to monitor socket events (like connection establishment, disconnections, etc.) through a channel obtained via `Socket::monitor()`.
 *   **Graceful Shutdown**: It's crucial to call `Context::term().await` to ensure all sockets are properly closed, pending messages are handled according to `LINGER` options, and background tasks are terminated cleanly.
-*   **Security**: `rzmq` supports NULL (no security), PLAIN (username/password), and its own Noise_XX mechanism for encrypted and authenticated communication. CURVE and ZAP are not supported.
+*   **Security**: `rzmq` supports multiple security mechanisms, including NULL (no security), PLAIN (username/password), CURVE (for interoperable encryption with libzmq), and a custom Noise_XX implementation for `rzmq`-to-`rzmq` communication. ZAP is not yet supported.
 
 ## Quick Start
 
@@ -396,15 +396,18 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
 `rzmq` supports the following security mechanisms:
 
 *   **NULL**: No security (default). Interoperable with other ZeroMQ implementations using NULL.
-*   **PLAIN**: Username/password based authentication. Interoperable with other ZeroMQ implementations using PLAIN.
+*   **PLAIN** (requires `plain` feature): Username/password based authentication. Interoperable with other ZeroMQ implementations using PLAIN.
     *   Server: Set `rzmq::socket::PLAIN_SERVER` option to `true` (as `1i32`).
     *   Client: Set `rzmq::socket::PLAIN_USERNAME` and `rzmq::socket::PLAIN_PASSWORD` options.
+*   **CURVE** (requires `curve` feature): Encrypted and authenticated sessions based on the official CurveZMQ security protocol. This mechanism provides strong security and is designed to be **interoperable** with `libzmq`'s CURVE implementation.
+    *   Server: Set `rzmq::socket::CURVE_SERVER` option to `true` (as `1i32`) and provide its secret key via `rzmq::socket::CURVE_SECRET_KEY`.
+    *   Client: Provide its own secret key via `rzmq::socket::CURVE_SECRET_KEY` and the server's public key via `rzmq::socket::CURVE_SERVER_KEY`.
 *   **Noise_XX** (requires `noise_xx` feature): Encrypted and authenticated sessions using the Noise Protocol Framework (XX handshake pattern). This is a modern security mechanism specific to `rzmq` and **will not interoperate** with `libzmq`'s `CURVE` security. Use it for `rzmq`-to-`rzmq` communication.
     *   Enable with `rzmq::socket::NOISE_XX_ENABLED` option (`true` as `1i32`).
     *   Set `rzmq::socket::NOISE_XX_STATIC_SECRET_KEY` (32-byte array).
     *   Client must set `rzmq::socket::NOISE_XX_REMOTE_STATIC_PUBLIC_KEY` (server's 32-byte public key).
 
-**Note:** CURVE security and ZAP (ZeroMQ Authentication Protocol) are **not supported**.
+**Note:** ZAP (ZeroMQ Authentication Protocol) is **not yet fully supported**.
 
 ## Using `io_uring` (Linux Specific)
 

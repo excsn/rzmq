@@ -1,7 +1,7 @@
 [package]
 name = "rzmq_cli"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 license = "MPL-2.0"
 
 description = "Command Line Utility for RZMQ, an asynchronous, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, with optional io_uring acceleration on Linux."

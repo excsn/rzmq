@@ -1,5 +1,5 @@
 use super::{IDataCipher, ZmqError};
-use crate::message::Metadata;
+use crate::{message::Metadata, security::framer::ISecureFramer};
 use std::fmt;
 
 // Define MechanismStatus enum properly here
@@ -80,11 +80,11 @@ pub trait Mechanism: Send + Sync + fmt::Debug + 'static {
   fn process_zap_reply(&mut self, reply_frames: &[Vec<u8>]) -> Result<(), ZmqError>;
 
   /// Called after handshake is Ready. If this mechanism provides data-phase encryption,
-  /// it consumes itself and returns an IDataCipher and the established peer identity.
+  /// it consumes itself and returns an ISecureFramer and the established peer identity.
   /// If it's a non-encrypting mechanism (like NULL), it can return an error or a
   /// specific indicator that no cipher is needed (engine then uses raw stream).
   /// For simplicity, let's have it always return a Result. Non-encrypting mechanisms
   /// would return a pass-through cipher.
-  fn into_data_cipher_parts(self: Box<Self>) -> Result<(Box<dyn IDataCipher>, Option<Vec<u8>>), ZmqError>;
+fn into_framer(self: Box<Self>) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError>;
   
 }

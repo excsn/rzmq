@@ -1,6 +1,6 @@
 [package]
 name = "rzmq"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 license = "MPL-2.0"
 publish = true
@@ -49,10 +49,12 @@ socket2 = { version = "0.6", features = ["all"] }
 atomic_float = "^1"
 bitflags = "^2.4"
 dashmap = "^5.5"
+hex = "0.4.3"
 linked-hash-map = "^0.5.6"
 once_cell = "^1"
 rand = "^0.9"
 tracing = "^0.1"
+zeroize = "1.8.2"
 
 # --- Error Handling ---
 thiserror = "^2.0"
@@ -129,6 +131,10 @@ required-features = ["io-uring"]
 [[test]]
 name = "inproc_minimal"
 required-features = ["inproc"]
+
+[[test]]
+name = "curve"
+required-features = ["curve"]
 
 [[test]]
 name = "noise_xx"

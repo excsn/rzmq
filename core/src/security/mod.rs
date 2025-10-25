@@ -1,4 +1,5 @@
 mod cipher;
+pub(crate) mod framer;
 pub mod mechanism;
 pub(crate) mod null;
 pub(crate) mod plain;
@@ -21,7 +22,7 @@ mod noise_xx;
 pub(crate) use curve::CurveMechanism;
 
 #[cfg(feature = "noise_xx")]
-pub use noise_xx::NoiseXxMechanism;
+pub(crate) use noise_xx::NoiseXxMechanism;
 
 // Mechanism Initializer Type and specific initializers
 type MechanismInitializerFn = fn(
@@ -67,16 +68,37 @@ fn initialize_plain(
   Ok(Box::new(plain_mech))
 }
 
+#[cfg(feature = "curve")]
+fn initialize_curve(
+  is_server: bool,
+  local_config: &ZmtpEngineConfig,
+  _engine_handle_for_log: usize,
+) -> Result<Box<dyn Mechanism>, ZmqError> {
+  use crate::security::curve::handshake::CurveHandshake;
+  let handshake = CurveHandshake::new(is_server, local_config)?;
+  Ok(Box::new(CurveMechanism {
+    handshake,
+    status: MechanismStatus::Handshaking,
+    error_reason: None,
+  }))
+}
+
 #[cfg(feature = "noise_xx")]
 fn initialize_noise_xx(
   is_server: bool,
   local_config: &ZmtpEngineConfig,
   _engine_handle_for_log: usize,
 ) -> Result<Box<dyn Mechanism>, ZmqError> {
-  let local_sk_bytes_arr: [u8; 32] = local_config
-    .noise_xx_local_sk_bytes_for_engine
-    .ok_or_else(|| ZmqError::SecurityError("NOISE_XX: Local static secret key not configured.".into()))?;
-  let remote_pk_config_opt_ref: Option<[u8; 32]> = local_config.noise_xx_remote_pk_bytes_for_engine.as_ref().copied();
+  let local_sk_bytes_arr: [u8; 32] =
+    local_config
+      .noise_xx_local_sk_bytes_for_engine
+      .ok_or_else(|| {
+        ZmqError::SecurityError("NOISE_XX: Local static secret key not configured.".into())
+      })?;
+  let remote_pk_config_opt_ref: Option<[u8; 32]> = local_config
+    .noise_xx_remote_pk_bytes_for_engine
+    .as_ref()
+    .copied();
 
   Ok(Box::from(NoiseXxMechanism::new(
     is_server,
@@ -91,19 +113,8 @@ const KNOWN_MECHANISMS: &[KnownMechanismDescriptor] = &[
     name_str: NullMechanism::NAME,
     initializer: initialize_null,
     is_locally_enabled: |cfg| {
-      // NULL is only "enabled" if no stronger mechanism is configured.
-      let plain_enabled = cfg.use_plain;
-      let noise_enabled = {
-        #[cfg(feature = "noise_xx")]
-        {
-          cfg.use_noise_xx
-        }
-        #[cfg(not(feature = "noise_xx"))]
-        {
-          false
-        }
-      };
-      !plain_enabled && !noise_enabled
+      // NULL is enabled if no other security mechanisms are.
+      !cfg.security_enabled
     },
   },
   KnownMechanismDescriptor {
@@ -111,6 +122,13 @@ const KNOWN_MECHANISMS: &[KnownMechanismDescriptor] = &[
     name_str: PlainMechanism::NAME,
     initializer: initialize_plain,
     is_locally_enabled: |cfg| cfg.use_plain,
+  },
+  #[cfg(feature = "curve")]
+  KnownMechanismDescriptor {
+    name_static_bytes: CurveMechanism::NAME_BYTES,
+    name_str: CurveMechanism::NAME,
+    initializer: initialize_curve,
+    is_locally_enabled: |cfg| cfg.use_curve,
   },
   #[cfg(feature = "noise_xx")]
   KnownMechanismDescriptor {

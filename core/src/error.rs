@@ -108,6 +108,8 @@ pub enum ZmqError {
   /// A generic error related to security mechanism processing during ZMTP handshake or data transfer.
   #[error("Security error: {0}")]
   SecurityError(String),
+  #[error("Invalid Curve25519 key provided")]
+  InvalidCurveKey,
 
   // --- Security Errors (more specific security issues) ---
   /// Authentication with the peer failed (e.g., ZAP failure, incorrect PLAIN credentials).
@@ -165,6 +167,24 @@ impl From<io::Error> for ZmqError {
       kind: e.kind(),         // Store theErrorKind.
       message: e.to_string(), // Store the String representation of the error.
     }
+  }
+}
+
+#[cfg(feature = "curve")]
+impl From<dryoc::Error> for ZmqError {
+  fn from(e: dryoc::Error) -> Self {
+    // We can map specific dryoc errors later if needed.
+    // For now, a general security error is sufficient.
+    ZmqError::SecurityError(e.to_string())
+  }
+}
+
+impl From<core::array::TryFromSliceError> for ZmqError {
+  fn from(e: core::array::TryFromSliceError) -> Self {
+    ZmqError::ProtocolViolation(format!(
+      "Failed to parse message component due to incorrect length: {}",
+      e
+    ))
   }
 }
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cli", "core", "macros"]
+members = ["cli", "core"]
 
 [workspace.dependencies]
 x25519-dalek = { package = "xs_x25519-dalek", version = "^2.0", features = ["static_secrets"] }

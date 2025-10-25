@@ -1,6 +1,6 @@
-use crate::{security::mechanism::ProcessTokenAction, Metadata, ZmqError};
+use crate::{security::{framer::{ISecureFramer, NullFramer}, mechanism::ProcessTokenAction}, Metadata, ZmqError};
 
-use super::{cipher::PassThroughDataCipher, IDataCipher, Mechanism, MechanismStatus};
+use super::{IDataCipher, Mechanism, MechanismStatus, cipher::PassThroughDataCipher};
 
 #[derive(Debug)]
 pub struct NullMechanism;
@@ -51,7 +51,8 @@ impl Mechanism for NullMechanism {
     Ok(())
   }
 
-  fn into_data_cipher_parts(self: Box<Self>) -> Result<(Box<dyn IDataCipher>, Option<Vec<u8>>), ZmqError> {
-    Ok((Box::new(PassThroughDataCipher::default()), None))
+  fn into_framer(self: Box<Self>) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
+    // For PLAIN, the second tuple element would be self.username.clone()
+    Ok((Box::new(NullFramer::new()), None))
   }
 }

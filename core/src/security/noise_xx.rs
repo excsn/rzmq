@@ -1,72 +1,19 @@
 #![cfg(feature = "noise_xx")]
 
+use super::cipher::IDataCipher;
 use crate::error::ZmqError;
+use crate::security::framer::{ISecureFramer, LengthPrefixedFramer};
 use crate::security::mechanism::ProcessTokenAction;
 use crate::security::{Mechanism, MechanismStatus, Metadata};
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use snow::error::{Prerequisite, StateProblem};
-// Use your existing types
 use snow::params::NoiseParams;
 use snow::{Error as SnowError, TransportState};
 
-use super::cipher::IDataCipher;
-
-// Helper to convert SnowError to ZmqError
-impl From<SnowError> for ZmqError {
-  fn from(e: SnowError) -> Self {
-    tracing::warn!("Snow protocol error occurred: {}", e); // Log the Display form of SnowError
-    match e {
-      SnowError::Pattern(problem) => {
-        // Example: Map specific pattern problems if needed, or use a generic message
-        ZmqError::SecurityError(format!("Noise pattern configuration error: {:?}", problem))
-      }
-      SnowError::Init(stage) => ZmqError::SecurityError(format!("Noise initialization error at stage: {:?}", stage)),
-      SnowError::Prereq(prereq) => match prereq {
-        Prerequisite::LocalPrivateKey => {
-          ZmqError::SecurityError("Noise prerequisite error: Local private key missing or invalid.".into())
-        }
-        Prerequisite::RemotePublicKey => ZmqError::SecurityError(
-          "Noise prerequisite error: Remote public key missing or invalid for current operation.".into(),
-        ),
-      },
-      SnowError::State(problem) => match problem {
-        StateProblem::MissingKeyMaterial => {
-          ZmqError::SecurityError("Noise state error: Missing required key material for operation.".into())
-        }
-        StateProblem::HandshakeNotFinished => {
-          ZmqError::InvalidState("Noise state error: Handshake is not yet finished for requested operation.".into())
-        }
-        StateProblem::HandshakeAlreadyFinished => {
-          ZmqError::InvalidState("Noise state error: Handshake is already finished.".into())
-        }
-        // Map other StateProblem variants as needed to more specific ZmqErrors or generic SecurityError
-        _ => ZmqError::SecurityError(format!("Noise state machine error: {:?}", problem)),
-      },
-      SnowError::Input => {
-        // This often relates to message sizes or invalid input to read/write_message
-        ZmqError::SecurityError("Noise input error: Invalid message format or size for current state.".into())
-      }
-      SnowError::Dh => ZmqError::SecurityError("Noise Diffie-Hellman operation failed.".into()),
-      SnowError::Decrypt => {
-        // This is critical, means message authentication (tag verification) or decryption failed.
-        ZmqError::SecurityError("Noise decrypt/authentication failed (e.g., bad MAC or ciphertext).".into())
-      }
-      #[cfg(feature = "hfs")] // If you enable hfs feature in snow
-      SnowError::Kem => ZmqError::SecurityError("Noise Key Encapsulation Mechanism (KEM) failed.".into()),
-      _ => {
-        // This arm catches any future variants added to snow::Error
-        // or any existing variants not explicitly matched above (if any).
-        tracing::error!("Unhandled snow::Error variant: {}", e);
-        ZmqError::SecurityError(format!("Unhandled or new Noise protocol error: {}", e))
-      }
-    }
-  }
-}
-
-// Custom Debug for NoiseXxMechanism because snow::HandshakeState is not Debug
 pub struct NoiseXxMechanism {
   is_server_role: bool,
-  state: Option<snow::HandshakeState>, // Store the HandshakeState directly
+  state: Option<snow::HandshakeState>,
 
   // This will be populated once the handshake is complete and state transitions.
   // The NoiseStream will use this TransportState.
@@ -90,7 +37,11 @@ impl std::fmt::Debug for NoiseXxMechanism {
       .field("is_server_role", &self.is_server_role)
       .field(
         "state_is_handshake_finished",
-        &self.state.as_ref().map(|s| s.is_handshake_finished()).unwrap_or(false),
+        &self
+          .state
+          .as_ref()
+          .map(|s| s.is_handshake_finished())
+          .unwrap_or(false),
       )
       .field("transport_state_is_some", &self.transport_state.is_some())
       .field(
@@ -101,7 +52,10 @@ impl std::fmt::Debug for NoiseXxMechanism {
       .field("error_reason_str", &self.error_reason_str)
       .field(
         "pending_outgoing_handshake_msg_len",
-        &self.pending_outgoing_handshake_msg.as_ref().map(|v| v.len()),
+        &self
+          .pending_outgoing_handshake_msg
+          .as_ref()
+          .map(|v| v.len()),
       )
       .finish()
   }
@@ -179,7 +133,8 @@ impl NoiseXxMechanism {
       Some(pk_bytes_slice) => pk_bytes_slice.to_vec(),
       None => {
         let err_msg =
-          "NOISE_XX handshake purportedly finished but no remote static key material was obtained.".to_string();
+          "NOISE_XX handshake purportedly finished but no remote static key material was obtained."
+            .to_string();
         tracing::error!("{}", err_msg);
         self.current_status = MechanismStatus::Error;
         self.error_reason_str = Some(err_msg);
@@ -202,7 +157,8 @@ impl NoiseXxMechanism {
             handshake_derived_peer_pk.as_slice()
           );
           self.current_status = MechanismStatus::Error;
-          self.error_reason_str = Some("NOISE_XX: Server public key mismatch. Connection rejected.".into());
+          self.error_reason_str =
+            Some("NOISE_XX: Server public key mismatch. Connection rejected.".into());
           return Err(SnowError::Decrypt);
         }
         tracing::debug!(
@@ -235,21 +191,20 @@ impl NoiseXxMechanism {
       if let Some(expected_server_pk_array) = self.configured_remote_static_pk_bytes {
         // Compare the public key derived from the handshake with the one configured for the server.
         if handshake_derived_peer_pk.as_slice() != expected_server_pk_array.as_slice() {
-          // --- EXPANDED SECTION ---
           tracing::error!(
             mechanism = Self::NAME,
             role = "Client",
             "Server public key validation FAILED during NOISE_XX handshake.
                         Expected PK (configured via socket option): {:?}, 
                         Actual PK received from peer during handshake: {:?}",
-            expected_server_pk_array.as_slice(), // Log as slice for consistent formatting
+            expected_server_pk_array.as_slice(),
             handshake_derived_peer_pk.as_slice()
           );
-          // --- END EXPANDED SECTION ---
           self.current_status = MechanismStatus::Error;
-          self.error_reason_str = Some("NOISE_XX: Server public key mismatch. Connection rejected.".into());
+          self.error_reason_str =
+            Some("NOISE_XX: Server public key mismatch. Connection rejected.".into());
+
           // SnowError::Decrypt is often used to signal an authentication/integrity failure.
-          // SnowError::Identity from snow crate is not a variant.
           // Another option could be a custom error or mapping to a more specific ZmqError later.
           return Err(SnowError::Decrypt);
         }
@@ -323,20 +278,24 @@ impl NoiseXxMechanism {
 
   /// Consumes the NoiseXxMechanism (if handshake is complete and successful)
   /// and returns an IDataCipher for the data phase, along with the peer's identity.
-  pub fn into_data_cipher_parts(mut self) -> Result<(Box<dyn IDataCipher>, Option<Vec<u8>>), ZmqError> {
+  pub fn into_data_cipher(mut self) -> Result<(Box<dyn IDataCipher>, Option<Vec<u8>>), ZmqError> {
     if self.current_status != MechanismStatus::Ready {
       return Err(ZmqError::InvalidState(
         "Noise handshake not complete, cannot create data cipher.".into(),
       ));
     }
-    let ts = self
-      .transport_state
-      .take()
-      .ok_or_else(|| ZmqError::Internal("NoiseXxMechanism is Ready but TransportState is missing.".into()))?;
+    let ts = self.transport_state.take().ok_or_else(|| {
+      ZmqError::Internal("NoiseXxMechanism is Ready but TransportState is missing.".into())
+    })?;
 
     let peer_id = self.verified_peer_static_pk.clone(); // Clone before self is fully consumed by Box::new
 
-    Ok((Box::new(NoiseDataCipher { transport_state: ts }), peer_id))
+    Ok((
+      Box::new(NoiseDataCipher {
+        transport_state: ts,
+      }),
+      peer_id,
+    ))
   }
 }
 
@@ -376,7 +335,9 @@ impl Mechanism for NoiseXxMechanism {
 
     // If no pending message, check if we should generate a new one.
     // Do not proceed if already Ready or in Error.
-    if self.current_status == MechanismStatus::Ready || self.current_status == MechanismStatus::Error {
+    if self.current_status == MechanismStatus::Ready
+      || self.current_status == MechanismStatus::Error
+    {
       return Ok(None);
     }
 
@@ -389,10 +350,11 @@ impl Mechanism for NoiseXxMechanism {
       }
     }
 
-    let handshake_state = self
-      .state
-      .as_mut()
-      .ok_or_else(|| ZmqError::InvalidState("Noise HandshakeState missing when trying to produce new token.".into()))?;
+    let handshake_state = self.state.as_mut().ok_or_else(|| {
+      ZmqError::InvalidState(
+        "Noise HandshakeState missing when trying to produce new token.".into(),
+      )
+    })?;
 
     if handshake_state.is_my_turn() {
       let mut msg_buf = vec![0u8; 1024];
@@ -420,13 +382,17 @@ impl Mechanism for NoiseXxMechanism {
       }
       Ok(Some(msg_buf))
     } else {
-      tracing::trace!("NOISE_XX produce_token: Not my turn and no pending message. Waiting for peer.");
+      tracing::trace!(
+        "NOISE_XX produce_token: Not my turn and no pending message. Waiting for peer."
+      );
       Ok(None) // Not our turn to send.
     }
   }
 
   fn process_token(&mut self, token: &[u8]) -> Result<ProcessTokenAction, ZmqError> {
-    if self.current_status == MechanismStatus::Error || self.current_status == MechanismStatus::Ready {
+    if self.current_status == MechanismStatus::Error
+      || self.current_status == MechanismStatus::Ready
+    {
       return Err(ZmqError::InvalidState(
         "NOISE_XX: Processing token in Error/Ready state".into(),
       ));
@@ -441,10 +407,9 @@ impl Mechanism for NoiseXxMechanism {
       token.len()
     );
 
-    let handshake_state = self
-      .state
-      .as_mut()
-      .ok_or_else(|| ZmqError::InvalidState("Noise HandshakeState missing before process_token".into()))?;
+    let handshake_state = self.state.as_mut().ok_or_else(|| {
+      ZmqError::InvalidState("Noise HandshakeState missing before process_token".into())
+    })?;
 
     let mut read_payload_buf = vec![0u8; 1024];
     let _payload_len = handshake_state.read_message(token, &mut read_payload_buf)?;
@@ -517,139 +482,127 @@ impl Mechanism for NoiseXxMechanism {
     self
   }
 
-  fn into_data_cipher_parts(mut self: Box<Self>) -> Result<(Box<dyn IDataCipher>, Option<Vec<u8>>), ZmqError> {
+  fn into_framer(
+    mut self: Box<Self>,
+  ) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     if self.current_status != MechanismStatus::Ready {
       return Err(ZmqError::InvalidState(
-        "Noise handshake not complete, cannot create data cipher.".into(),
+        "Noise handshake not complete, cannot create framer.".into(),
       ));
     }
-    let ts = self
-      .transport_state
-      .take()
-      .ok_or_else(|| ZmqError::Internal("NoiseXxMechanism is Ready but TransportState is missing.".into()))?;
 
-    // Peer identity should have been verified and stored in self.verified_peer_static_pk
-    // by transition_to_final_state() before current_status became Ready.
-    let peer_id = self.verified_peer_static_pk.clone();
+    // The into_data_cipher method consumes the mechanism to produce the cipher.
+    // We can call it here to get the parts.
+    let (cipher, peer_id) = self.into_data_cipher()?;
 
-    Ok((Box::new(NoiseDataCipher { transport_state: ts }), peer_id))
+    // Wrap the pure cipher in the framer.
+    let framer = Box::new(LengthPrefixedFramer::new(cipher));
+
+    Ok((framer, peer_id))
   }
 }
 
-// New struct specific for Noise data phase crypto
 #[derive(Debug)] // TransportState isn't Debug, so manual or selective Debug
 struct NoiseDataCipher {
   transport_state: TransportState,
 }
 
 impl IDataCipher for NoiseDataCipher {
-  fn encrypt_zmtp_frame(&mut self, plaintext_zmtp_frame: Bytes) -> Result<Bytes, ZmqError> {
-    const MAX_NOISE_PAYLOAD_LEN: usize = 65535 - 16; // Max data before tag
+  fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ZmqError> {
     const NOISE_TAG_LEN: usize = 16;
-    const NOISE_LEN_PREFIX_LEN: usize = 2;
-
-    if plaintext_zmtp_frame.len() > (u16::MAX as usize - NOISE_TAG_LEN) {
-      // Max ZMTP frame size
+    if plaintext.len() > (u16::MAX as usize - NOISE_TAG_LEN) {
       return Err(ZmqError::InvalidMessage(
-        "ZMTP frame too large for Noise message.".into(),
+        "Payload too large for Noise frame.".into(),
       ));
     }
 
-    // Buffer for [2-byte len_prefix][ciphertext][16-byte tag]
-    // The ciphertext will be the same length as plaintext_zmtp_frame for ChaChaPoly.
-    let ciphertext_len = plaintext_zmtp_frame.len();
-    let payload_with_tag_len = ciphertext_len + NOISE_TAG_LEN; // This is the length that goes into the prefix
+    let mut output_buffer = vec![0u8; plaintext.len() + NOISE_TAG_LEN];
 
-    let mut output_buffer = BytesMut::with_capacity(NOISE_LEN_PREFIX_LEN + payload_with_tag_len);
-    output_buffer.put_u16(payload_with_tag_len as u16); // Write length prefix (BIG ENDIAN default for put_u16)
+    let bytes_written = self
+      .transport_state
+      .write_message(plaintext, &mut output_buffer)?;
 
-    // Prepare a buffer for snow to write ciphertext + tag into
-    // This buffer does not include the prefix space.
-    let mut snow_output_buf = vec![0u8; payload_with_tag_len];
-
-    tracing::trace!(
-      plaintext_len = plaintext_zmtp_frame.len(),
-      snow_output_buffer_capacity = snow_output_buf.len(),
-      "NoiseDataCipher::encrypt: Calling snow's write_message."
-    );
-
-    // snow.write_message writes ciphertext + tag into snow_output_buf
-    let bytes_written_by_snow = self.transport_state.write_message(
-      &plaintext_zmtp_frame, // This is the "payload" for the Noise message
-      &mut snow_output_buf,  // snow writes ciphertext+tag here
-    )?;
-
-    // bytes_written_by_snow should be equal to payload_with_tag_len
-    if bytes_written_by_snow != payload_with_tag_len {
-      tracing::error!(
-        expected_snow_write = payload_with_tag_len,
-        actual_snow_write = bytes_written_by_snow,
-        "Mismatch in expected bytes written by snow."
-      );
-      return Err(ZmqError::EncryptionError("Snow write_message length mismatch".into()));
-    }
-
-    output_buffer.put_slice(&snow_output_buf[..bytes_written_by_snow]); // Append ciphertext+tag
-
-    tracing::trace!(
-        total_noise_msg_len = output_buffer.len(), // Should be 2 + payload_with_tag_len
-        prefix_val = payload_with_tag_len,
-        actual_len_prefix_bytes = ?output_buffer.get(..2),
-        "NoiseDataCipher::encrypt: Encryption successful."
-    );
-
-    Ok(output_buffer.freeze())
+    output_buffer.truncate(bytes_written);
+    Ok(output_buffer)
   }
 
-  fn decrypt_wire_data_to_zmtp_frame(&mut self, encrypted_wire_data: &mut BytesMut) -> Result<Option<Bytes>, ZmqError> {
-    const NOISE_LEN_PREFIX_LEN: usize = 2;
-    const MIN_NOISE_MSG_PAYLOAD_WITH_TAG: usize = 16; // Smallest possible encrypted payload is just the tag
-
-    if encrypted_wire_data.len() < NOISE_LEN_PREFIX_LEN {
-      return Ok(None); // Not enough data for length prefix
+  fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, ZmqError> {
+    const MIN_NOISE_MSG_LEN: usize = 16; // Smallest possible is just the tag
+    if ciphertext.len() < MIN_NOISE_MSG_LEN {
+      return Err(ZmqError::ProtocolViolation(
+        "Noise message too short for tag.".into(),
+      ));
     }
 
-    // Peek at the 2-byte big-endian length prefix.
-    let length_bytes: [u8; 2] = encrypted_wire_data[0..NOISE_LEN_PREFIX_LEN].try_into().unwrap();
-    let encrypted_payload_len_with_tag = u16::from_be_bytes(length_bytes) as usize;
+    let max_plaintext_len = ciphertext.len() - MIN_NOISE_MSG_LEN;
+    let mut decrypted_buffer = vec![0u8; max_plaintext_len];
 
-    if encrypted_payload_len_with_tag == 0 {
-      // A zero-length noise message is valid (e.g. for rekeying or empty transport data)
-      // but doesn't contain a ZMTP frame. We should consume it and signal no ZMTP frame.
-      tracing::trace!("Decrypted zero-length noise message, consuming.");
-      encrypted_wire_data.advance(NOISE_LEN_PREFIX_LEN); // Consume the length prefix
-      return Ok(None); // No ZMTP frame produced from an empty Noise payload
+    let len_decrypted = self
+      .transport_state
+      .read_message(ciphertext, &mut decrypted_buffer)?;
+
+    decrypted_buffer.truncate(len_decrypted);
+    Ok(decrypted_buffer)
+  }
+}
+
+// Helper to convert SnowError to ZmqError
+impl From<SnowError> for ZmqError {
+  fn from(e: SnowError) -> Self {
+    tracing::warn!("Snow protocol error occurred: {}", e); // Log the Display form of SnowError
+    match e {
+      SnowError::Pattern(problem) => {
+        // Example: Map specific pattern problems if needed, or use a generic message
+        ZmqError::SecurityError(format!("Noise pattern configuration error: {:?}", problem))
+      }
+      SnowError::Init(stage) => {
+        ZmqError::SecurityError(format!("Noise initialization error at stage: {:?}", stage))
+      }
+      SnowError::Prereq(prereq) => match prereq {
+        Prerequisite::LocalPrivateKey => ZmqError::SecurityError(
+          "Noise prerequisite error: Local private key missing or invalid.".into(),
+        ),
+        Prerequisite::RemotePublicKey => ZmqError::SecurityError(
+          "Noise prerequisite error: Remote public key missing or invalid for current operation."
+            .into(),
+        ),
+      },
+      SnowError::State(problem) => match problem {
+        StateProblem::MissingKeyMaterial => ZmqError::SecurityError(
+          "Noise state error: Missing required key material for operation.".into(),
+        ),
+        StateProblem::HandshakeNotFinished => ZmqError::InvalidState(
+          "Noise state error: Handshake is not yet finished for requested operation.".into(),
+        ),
+        StateProblem::HandshakeAlreadyFinished => {
+          ZmqError::InvalidState("Noise state error: Handshake is already finished.".into())
+        }
+        // Map other StateProblem variants as needed to more specific ZmqErrors or generic SecurityError
+        _ => ZmqError::SecurityError(format!("Noise state machine error: {:?}", problem)),
+      },
+      SnowError::Input => {
+        // This often relates to message sizes or invalid input to read/write_message
+        ZmqError::SecurityError(
+          "Noise input error: Invalid message format or size for current state.".into(),
+        )
+      }
+      SnowError::Dh => ZmqError::SecurityError("Noise Diffie-Hellman operation failed.".into()),
+      SnowError::Decrypt => {
+        // This is critical, means message authentication (tag verification) or decryption failed.
+        ZmqError::SecurityError(
+          "Noise decrypt/authentication failed (e.g., bad MAC or ciphertext).".into(),
+        )
+      }
+      #[cfg(feature = "hfs")] // If you enable hfs feature in snow
+      SnowError::Kem => {
+        ZmqError::SecurityError("Noise Key Encapsulation Mechanism (KEM) failed.".into())
+      }
+      _ => {
+        // This arm catches any future variants added to snow::Error
+        // or any existing variants not explicitly matched above (if any).
+        tracing::error!("Unhandled snow::Error variant: {}", e);
+        ZmqError::SecurityError(format!("Unhandled or new Noise protocol error: {}", e))
+      }
     }
-
-    let total_noise_message_len = NOISE_LEN_PREFIX_LEN + encrypted_payload_len_with_tag;
-
-    if encrypted_wire_data.len() < total_noise_message_len {
-      return Ok(None); // Not enough data for the full Noise message
-    }
-
-    // We have a full Noise message. Consume it.
-    // `split_to` consumes from `encrypted_wire_data`.
-    let noise_message_bytes_frozen = encrypted_wire_data.split_to(total_noise_message_len).freeze();
-    let encrypted_payload_with_tag_slice = &noise_message_bytes_frozen[NOISE_LEN_PREFIX_LEN..];
-
-    if encrypted_payload_len_with_tag < MIN_NOISE_MSG_PAYLOAD_WITH_TAG {
-      tracing::error!(
-        actual_len = encrypted_payload_len_with_tag,
-        min_len = MIN_NOISE_MSG_PAYLOAD_WITH_TAG,
-        "Noise message payload too short to contain a tag."
-      );
-      return Err(ZmqError::ProtocolViolation("Noise message too short for tag.".into()));
-    }
-    let max_plaintext_len = encrypted_payload_len_with_tag - MIN_NOISE_MSG_PAYLOAD_WITH_TAG;
-    // If encrypted_payload_len_with_tag IS 16, max_plaintext_len is 0. A 0-len plaintext is valid.
-    let mut decrypted_zmtp_frame_buf = vec![0u8; max_plaintext_len];
-
-    let len_decrypted = self.transport_state.read_message(
-      encrypted_payload_with_tag_slice, // This is ciphertext + tag
-      &mut decrypted_zmtp_frame_buf,
-    )?; // SnowError converted to ZmqError
-
-    decrypted_zmtp_frame_buf.truncate(len_decrypted);
-    Ok(Some(Bytes::from(decrypted_zmtp_frame_buf)))
   }
 }

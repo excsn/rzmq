@@ -3,7 +3,7 @@
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 [![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
 
-`rzmq` is an asynchronous, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, built on top of the [Tokio](https://tokio.rs/) runtime. It aims to provide a familiar ZeroMQ-style API within the Rust async ecosystem, **striving for wire-level interoperability with `libzmq` and other ZeroMQ implementations for core patterns and ZMTP 3.1 using NULL or PLAIN security.**
+`rzmq` is an asynchronous, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, built on top of the [Tokio](https://tokio.rs/) runtime. It aims to provide a familiar ZeroMQ-style API within the Rust async ecosystem, **striving for wire-level interoperability with `libzmq` and other ZeroMQ implementations for core patterns and ZMTP 3.1 using NULL, PLAIN, and CURVE security.**
 
 **A key design goal and demonstrated capability of `rzmq` is achieving exceptional performance on Linux.** Leveraging its advanced `io_uring` backend, **`rzmq` has shown superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a compelling choice for performance-critical distributed applications on Linux.
 
@@ -12,15 +12,15 @@
 **Please Note:** `rzmq` is currently in **Beta**. While core functionality and significant performance advantages (on Linux with `io_uring`) are in place, users should be aware of the following:
 
 *   **API Stability:** The public API is stabilizing but may still see minor refinements before a 1.0 release.
-*   **Feature Scope:** While major ZeroMQ patterns and options are supported, **full feature parity with all of `libzmq`'s extensive options and advanced behaviors (such as ZAP or CURVE security) is a non-goal.** The focus is on core ZMTP 3.1 compliance, popular patterns, and specific security mechanisms (NULL, PLAIN, and its own Noise_XX offering).
-*   **Interoperability:** `rzmq` aims for wire-level interoperability with `libzmq` and other standard ZMTP 3.1 implementations for supported socket patterns using the **NULL or PLAIN** security mechanisms. The **Noise_XX** mechanism implemented in `rzmq` is specific to this library and will not interoperate with `libzmq`'s CURVE or other security layers.
+*   **Feature Scope:** While major ZeroMQ patterns and options are supported, **full feature parity with all of `libzmq`'s extensive options and advanced behaviors (such as ZAP) is a non-goal.** The focus is on core ZMTP 3.1 compliance, popular patterns, and supported security mechanisms (NULL, PLAIN, CURVE, and its own Noise_XX offering).
+*   **Interoperability:** `rzmq` aims for wire-level interoperability with `libzmq` and other standard ZMTP 3.1 implementations for supported socket patterns using the **NULL, PLAIN, and CURVE** security mechanisms. The **Noise_XX** mechanism is specific to `rzmq` and will not interoperate with other `libzmq` security layers.
 *   **Testing Environment:**
     *   Core functionality has primarily been tested on **macOS (ARM & x86)** and **Linux (Kernel version 6.x)**.
     *   The high-performance `io_uring` backend is Linux-specific and has been developed and tested primarily against **Linux Kernel 6.x**. Functionality on older kernels supporting `io_uring` (e.g., 5.6+) may vary, especially for advanced features.
     *   Windows and other operating systems are **not currently supported or tested**.
 *   **Performance Generalization:** While leading performance is demonstrated in specific benchmarks, comprehensive benchmarking across all diverse workloads and hardware configurations is ongoing.
 *   **Robustness & Edge Cases:** The library has been tested for common use cases on the aforementioned platforms, but some edge cases or extreme conditions might not be as hardened as the mature `libzmq`.
-*   **Security Mechanisms:** NULL and PLAIN security mechanisms are functional. **Noise_XX is also provided as a modern, robust alternative specific to `rzmq`. CURVE security and the ZAP (ZeroMQ Authentication Protocol) are not supported and are not planned for implementation.**
+*   **Security Mechanisms:** NULL, PLAIN, and CURVE security mechanisms are functional and designed for interoperability with `libzmq`. **Noise_XX is also provided as a modern, robust alternative for `rzmq`-to-`rzmq` communication.** The ZAP (ZeroMQ Authentication Protocol) is not supported.
 
 We encourage testing, feedback, and contributions to help mature the library towards a stable 1.0 release.
 
@@ -72,7 +72,8 @@ Supports a range of common socket options for fine-tuning behavior, including:
 *   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE` (for SUB), `ROUTING_ID` (for DEALER/ROUTER identity), `ROUTER_MANDATORY`
 *   Keepalives: ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
 *   Security:
-    *   `PLAIN_SERVER`, `PLAIN_USERNAME`, `PLAIN_PASSWORD`
+    *   `PLAIN_SERVER`, `PLAIN_USERNAME`, `PLAIN_PASSWORD` (requires `plain` feature)
+    *   `CURVE_SERVER`, `CURVE_SECRET_KEY`, `CURVE_SERVER_KEY` (requires `curve` feature)
     *   `NOISE_XX_ENABLED`, `NOISE_XX_STATIC_SECRET_KEY`, `NOISE_XX_REMOTE_STATIC_PUBLIC_KEY` (requires `noise_xx` feature)
 *   Performance/Platform-Specific (`io-uring` feature, Linux-only):
     *   `IO_URING_SESSION_ENABLED` (to enable io_uring for a socket's connections)
@@ -110,6 +111,8 @@ tokio = { version = "1", features = ["full"] } # "full" feature recommended for 
 
 *   `ipc`: Enables the `ipc://` transport (Unix-like systems only).
 *   `inproc`: Enables the `inproc://` transport.
+*   `plain`: Enables the PLAIN security mechanism.
+*   `curve`: Enables the CURVE security mechanism.
 *   `noise_xx`: (Experimental) Enables the Noise_XX security mechanism (specific to `rzmq`).
 *   `io-uring`: (Linux-only) Enables the `io_uring` backend for TCP transport and related optimizations.
 
@@ -181,8 +184,7 @@ async fn main() -> Result<(), ZmqError> {
 
 *   **Limited ZMQ Option Parity:** Many `libzmq` options are not implemented (e.g., various buffer size controls, `ZMQ_IMMEDIATE`, detailed multicast options). **Full parity with all `libzmq` options is a non-goal.**
 *   **Unsupported Standard Security Mechanisms:**
-    *   **CURVE encryption (from `libzmq`) is not supported and not planned for implementation.** `rzmq` offers Noise_XX as its primary modern, robust authenticated encryption mechanism.
-    *   **ZAP (ZeroMQ Authentication Protocol) is not supported and not planned for implementation.** Authentication needs are addressed by the supported mechanisms (PLAIN, Noise_XX).
+    *   **ZAP (ZeroMQ Authentication Protocol) is not yet supported.** Authentication needs are currently addressed directly by the supported mechanisms (PLAIN, CURVE, Noise_XX).
 *   **`zmq_poll` Equivalent:** No direct high-level equivalent. Tokio's `select!` macro or task management should be used for concurrent operations on multiple sockets.
 *   **`zmq_proxy` Equivalent:** No built-in high-level proxy function.
 *   **Advanced Pattern Options:** Behavior for some advanced options (e.g., certain `ZMQ_ROUTER_*` flags, `SUB` forwarding) needs full verification and implementation if deemed in scope.

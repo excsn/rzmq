@@ -1,3 +1,4 @@
+use crate::Command;
 use crate::context::Context as RzmqContext;
 use crate::error::ZmqError;
 use crate::error::ZmqResult;
@@ -5,9 +6,8 @@ use crate::message::Msg;
 use crate::runtime::ActorDropGuard;
 use crate::runtime::ActorType;
 use crate::socket::core::state::{EndpointInfo, EndpointType};
-use crate::socket::core::{command_processor, SocketCore};
+use crate::socket::core::{SocketCore, command_processor};
 use crate::socket::{ISocket, SocketEvent};
-use crate::Command;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
 #[cfg(feature = "inproc")]
@@ -83,7 +83,7 @@ pub(crate) async fn run_pipe_reader_task(
           pipe_read_id = pipe_read_id,
           "PipeReaderTask: Data pipe closed by peer. Notifying ISocket."
         );
-        
+
         let cmd_closed_for_isocket = Command::PipeClosedByPeer {
           pipe_id: pipe_read_id,
         };
@@ -100,7 +100,7 @@ pub(crate) async fn run_pipe_reader_task(
             final_error_for_stopping = Some(e);
           }
         }
-        
+
         break;
       }
     }
@@ -205,11 +205,21 @@ pub(crate) async fn cleanup_stopped_child_resources(
     }
 
     // Send monitor event for the disconnection/closure.
-    let monitor_event = match ep_info.endpoint_type {
-      EndpointType::Session => SocketEvent::Disconnected {
+    let monitor_event = match (ep_info.endpoint_type, error_opt) {
+      // A session terminated with a security-related error, which indicates a handshake failure.
+      (EndpointType::Session, Some(e @ &ZmqError::SecurityError(_)))
+      | (EndpointType::Session, Some(e @ &ZmqError::AuthenticationFailure(_))) => {
+        SocketEvent::HandshakeFailed {
+          endpoint: ep_info.endpoint_uri.clone(),
+          error_msg: e.to_string(),
+        }
+      }
+      // A session terminated for any other reason (cleanly or non-security error).
+      (EndpointType::Session, _) => SocketEvent::Disconnected {
         endpoint: ep_info.endpoint_uri.clone(),
       },
-      EndpointType::Listener => SocketEvent::Closed {
+      // A listener has terminated.
+      (EndpointType::Listener, _) => SocketEvent::Closed {
         endpoint: ep_info.endpoint_uri.clone(),
       },
     };
@@ -416,7 +426,12 @@ pub(crate) async fn cleanup_session_state_by_pipe(
         core_s_write.send_monitor_event(event);
       }
     } else {
-      tracing::warn!(handle=core_handle, pipe_read_id, "cleanup_session_state_by_pipe: EndpointInfo for URI '{}' not found during write, though pipe_read_id mapping existed.", uri_key);
+      tracing::warn!(
+        handle = core_handle,
+        pipe_read_id,
+        "cleanup_session_state_by_pipe: EndpointInfo for URI '{}' not found during write, though pipe_read_id mapping existed.",
+        uri_key
+      );
     }
   } else {
     tracing::warn!(
@@ -454,8 +469,8 @@ pub(crate) async fn process_inproc_binding_request_event(
   reply_tx_to_connector: oneshot::Sender<ZmqResult<()>>,
 ) -> Result<(), ZmqError> {
   use crate::socket::{
-    core::state::{EndpointInfo, EndpointType},
     SocketEvent,
+    core::state::{EndpointInfo, EndpointType},
   };
 
   let binder_core_handle = core_arc.handle;

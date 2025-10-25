@@ -28,6 +28,23 @@ The `rzmq` library provides an asynchronous, pure-Rust implementation of ZeroMQ 
 *   `rzmq::Msg`: The type used for sending and receiving message data.
 *   `rzmq::SocketType`: Enum used to specify the messaging pattern when creating a socket.
 
+### 1.1. Security Model
+
+`rzmq` provides a pluggable security layer that operates transparently over TCP connections. When security is enabled on a socket, the library automatically performs a cryptographic handshake upon connection establishment before any application messages are sent or received.
+
+*   **Mechanisms**: The library supports several standard ZeroMQ security mechanisms:
+    *   **`NULL`**: The default behavior. No security is applied, and messages are sent in plaintext.
+    *   **`PLAIN`**: A simple username/password authentication scheme. (Requires the `plain` feature).
+    *   **`CURVE`**: A robust public-key encryption mechanism providing strong security. (Requires the `curve` feature).
+    *   **`NOISE_XX`**: A modern and secure handshake protocol based on the Noise Protocol Framework. (Requires the `noise_xx` feature).
+
+*   **Configuration**: Security is configured on a per-socket basis using `Socket::set_option`.
+    *   To act as a server (e.g., a `REP`, `ROUTER`, or `PULL` socket that binds), you must enable the server role for the chosen mechanism (e.g., by setting `PLAIN_SERVER` or `CURVE_SERVER` to `true`) and provide its secret key.
+    *   To act as a client, you provide the client's own keys and, for authentication, the public key of the server you intend to connect to (e.g., `CURVE_SERVER_KEY`).
+
+*   **Lifecycle and Monitoring**: The success or failure of the security handshake can be observed using the socket monitoring feature.
+    *   Upon successful completion of the handshake, a `SocketEvent::HandshakeSucceeded` event is emitted. Only after this event can application data be securely exchanged.
+    *   If the handshake fails for any reason (e.g., key mismatch, authentication failure), a `SocketEvent::HandshakeFailed` event is emitted, and the connection is terminated.
 ## 2. Configuration
 
 ### `rzmq::uring::UringConfig` Struct
@@ -290,9 +307,12 @@ Constants for socket option integer IDs.
 *   `pub const HANDSHAKE_IVL: i32 = 41`
 *   `pub const ROUTER_MANDATORY: i32 = 33`
 *   `pub const ZAP_DOMAIN: i32 = 55`
-*   `pub const PLAIN_SERVER: i32 = 44`
-*   `pub const PLAIN_USERNAME: i32 = 45`
-*   `pub const PLAIN_PASSWORD: i32 = 46`
+*   `pub const PLAIN_SERVER: i32 = 44` (Requires `plain` feature)
+*   `pub const PLAIN_USERNAME: i32 = 45` (Requires `plain` feature)
+*   `pub const PLAIN_PASSWORD: i32 = 46` (Requires `plain` feature)
+*   `pub const CURVE_SERVER: i32 = 47` (Requires `curve` feature)
+*   `pub const CURVE_SECRET_KEY: i32 = 49` (Requires `curve` feature)
+*   `pub const CURVE_SERVER_KEY: i32 = 48` (Requires `curve` feature)
 *   `pub const NOISE_XX_ENABLED: i32 = 1202` (Requires `noise_xx` feature)
 *   `pub const NOISE_XX_STATIC_SECRET_KEY: i32 = 1200` (Requires `noise_xx` feature)
 *   `pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201` (Requires `noise_xx` feature)

@@ -35,8 +35,13 @@ pub const PLAIN_PASSWORD: i32 = 46;
 pub const NOISE_XX_ENABLED: i32 = 1202; // Boolean (0 or 1)
 pub const NOISE_XX_STATIC_SECRET_KEY: i32 = 1200; // Expects 32-byte secret key
 pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201; // Client uses this for server's PK, expects 32-byte public key
-                                                         // Optional: For server, a list of allowed client public keys (if not using ZAP for this)
-                                                         // pub const NOISE_XX_ALLOWED_PEERS: i32 = 1203; // Would take a list of PKs
+// Optional: For server, a list of allowed client public keys (if not using ZAP for this)
+// pub const NOISE_XX_ALLOWED_PEERS: i32 = 1203; // Would take a list of PKs
+
+// Security/CURVE
+pub const CURVE_SERVER: i32 = 47; // Matches libzmq's ZMQ_CURVE_SERVER
+pub const CURVE_SECRET_KEY: i32 = 49; // Matches libzmq's ZMQ_CURVE_SECRETKEY
+pub const CURVE_SERVER_KEY: i32 = 48; // Matches libzmq's ZMQ_CURVE_SERVERKEY
 
 pub const MAX_CONNECTIONS: i32 = 1000;
 
@@ -96,6 +101,8 @@ pub(crate) struct SocketOptions {
   pub io_uring: IOURingSocketOptions,
   pub zap_domain: Option<String>, // ZAP Domain
   pub plain_options: PlainMechanismSocketOptions,
+  #[cfg(feature = "curve")]
+  pub curve_options: CurveMechanismSocketOptions,
   #[cfg(feature = "noise_xx")]
   pub noise_xx_options: NoiseXxSocketOptions,
 }
@@ -130,6 +137,8 @@ impl Default for SocketOptions {
       plain_options: Default::default(),
       #[cfg(feature = "noise_xx")]
       noise_xx_options: NoiseXxSocketOptions::default(),
+      #[cfg(feature = "curve")]
+      curve_options: CurveMechanismSocketOptions::default(),
     }
   }
 }
@@ -149,6 +158,15 @@ impl Default for IOURingSocketOptions {
       recv_multishot: false,
     }
   }
+}
+
+#[cfg(feature = "curve")]
+#[derive(Debug, Clone, Default)]
+pub struct CurveMechanismSocketOptions {
+  pub enabled: bool,
+  pub server_role: bool, // True if the socket is acting as a CURVE server
+  pub secret_key: Option<[u8; 32]>,
+  pub server_public_key: Option<[u8; 32]>, // For clients connecting to a server
 }
 
 #[cfg(feature = "noise_xx")]
@@ -185,6 +203,7 @@ pub(crate) struct ZmtpEngineConfig {
   pub routing_id: Option<Blob>,
   /// Socket type name to include in READY command
   pub socket_type_name: String,
+  pub security_enabled: bool,
   pub heartbeat_ivl: Option<Duration>,
   pub heartbeat_timeout: Option<Duration>,
   pub handshake_timeout: Option<Duration>,
@@ -201,6 +220,12 @@ pub(crate) struct ZmtpEngineConfig {
   pub noise_xx_local_sk_bytes_for_engine: Option<[u8; 32]>,
   #[cfg(feature = "noise_xx")]
   pub noise_xx_remote_pk_bytes_for_engine: Option<[u8; 32]>,
+  #[cfg(feature = "curve")]
+  pub use_curve: bool,
+  #[cfg(feature = "curve")]
+  pub curve_local_secret_key: Option<[u8; 32]>,
+  #[cfg(feature = "curve")]
+  pub curve_remote_public_key: Option<[u8; 32]>,
   pub use_plain: bool,
   pub plain_username_for_engine: Option<String>,
   pub plain_password_for_engine: Option<String>,
@@ -208,9 +233,25 @@ pub(crate) struct ZmtpEngineConfig {
 
 impl From<&SocketOptions> for ZmtpEngineConfig {
   fn from(options: &SocketOptions) -> Self {
+    // Determine if any security mechanism is active.
+    let security_enabled = options.plain_options.enabled
+    || {
+        #[cfg(feature = "noise_xx")]
+        { options.noise_xx_options.enabled }
+        #[cfg(not(feature = "noise_xx"))]
+        { false }
+    }
+    || {
+        #[cfg(feature = "curve")]
+        { options.curve_options.enabled }
+        #[cfg(not(feature = "curve"))]
+        { false }
+    };
+
     ZmtpEngineConfig {
       routing_id: options.routing_id.clone(),
       socket_type_name: options.socket_type_name.clone(),
+      security_enabled,
       heartbeat_ivl: options.heartbeat_ivl,
       heartbeat_timeout: options.heartbeat_timeout,
       handshake_timeout: options.handshake_ivl,
@@ -225,6 +266,12 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       noise_xx_local_sk_bytes_for_engine: options.noise_xx_options.static_secret_key_bytes,
       #[cfg(feature = "noise_xx")]
       noise_xx_remote_pk_bytes_for_engine: options.noise_xx_options.remote_static_public_key_bytes,
+      #[cfg(feature = "curve")]
+      use_curve: options.curve_options.enabled,
+      #[cfg(feature = "curve")]
+      curve_local_secret_key: options.curve_options.secret_key,
+      #[cfg(feature = "curve")]
+      curve_remote_public_key: options.curve_options.server_public_key,
       use_plain: options.plain_options.enabled,
       plain_username_for_engine: options.plain_options.username.clone(),
       plain_password_for_engine: options.plain_options.password.clone(),
@@ -235,7 +282,9 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
 // --- Helper functions for parsing option values ---
 /// Parses a byte slice representing an integer option (like HWM, linger).
 pub(crate) fn parse_i32_option(value: &[u8]) -> Result<i32, ZmqError> {
-  let arr: [u8; 4] = value.try_into().map_err(|_| ZmqError::InvalidOptionValue(0))?; // Use generic error for now
+  let arr: [u8; 4] = value
+    .try_into()
+    .map_err(|_| ZmqError::InvalidOptionValue(0))?; // Use generic error for now
 
   Ok(i32::from_ne_bytes(arr)) // Assuming native endianness for socket options based on ZMQ C API usage
 }
@@ -271,7 +320,10 @@ pub(crate) fn parse_secs_duration_option(value: &[u8]) -> Result<Option<Duration
 /// Parses a byte slice representing a timeout or linger value in milliseconds.
 /// ZMQ uses -1 for infinite, 0 for immediate/no-wait, >0 for duration.
 /// Maps to Option<Duration>: None=-1, Some(ZERO)=0, Some(>0)=millis.
-pub(crate) fn parse_timeout_option(value: &[u8], option_id: i32) -> Result<Option<Duration>, ZmqError> {
+pub(crate) fn parse_timeout_option(
+  value: &[u8],
+  option_id: i32,
+) -> Result<Option<Duration>, ZmqError> {
   let val = parse_i32_option(value).map_err(|_| ZmqError::InvalidOptionValue(option_id))?;
   match val {
     -1 => Ok(None),                                     // Infinite timeout
@@ -321,7 +373,10 @@ pub(crate) fn parse_blob_option(value: &[u8]) -> Result<Blob, ZmqError> {
 
 /// Parses heartbeat interval/timeout values in milliseconds.
 /// ZMQ uses 0 to disable. Negative is invalid.
-pub(crate) fn parse_heartbeat_option(value: &[u8], option_id: i32) -> Result<Option<Duration>, ZmqError> {
+pub(crate) fn parse_heartbeat_option(
+  value: &[u8],
+  option_id: i32,
+) -> Result<Option<Duration>, ZmqError> {
   let val = parse_i32_option(value).map_err(|_| ZmqError::InvalidOptionValue(option_id))?;
   match val {
     0 => Ok(None),                                      // 0 disables heartbeat
@@ -330,7 +385,10 @@ pub(crate) fn parse_heartbeat_option(value: &[u8], option_id: i32) -> Result<Opt
   }
 }
 
-pub(crate) fn parse_handshake_option(value: &[u8], option_id: i32) -> Result<Option<Duration>, ZmqError> {
+pub(crate) fn parse_handshake_option(
+  value: &[u8],
+  option_id: i32,
+) -> Result<Option<Duration>, ZmqError> {
   let val = parse_i32_option(value).map_err(|_| ZmqError::InvalidOptionValue(option_id))?;
   match val {
     0 => Ok(None),
@@ -358,10 +416,13 @@ pub(crate) fn parse_reconnect_ivl_max_option(value: &[u8]) -> Result<Option<Dura
   }
 }
 
-pub(crate) fn parse_max_connections_option(value: &[u8], option_id: i32) -> Result<Option<usize>, ZmqError> {
+pub(crate) fn parse_max_connections_option(
+  value: &[u8],
+  option_id: i32,
+) -> Result<Option<usize>, ZmqError> {
   let val = parse_i32_option(value).map_err(|_| ZmqError::InvalidOptionValue(option_id))?;
   match val {
-    -1 => Ok(None),                                    // ZMQ often uses -1 for "no limit" or "system default"
+    -1 => Ok(None), // ZMQ often uses -1 for "no limit" or "system default"
     0 => Err(ZmqError::InvalidOptionValue(option_id)), // 0 is invalid for max connections
     1.. => Ok(Some(val as usize)),
     _ => Err(ZmqError::InvalidOptionValue(option_id)),
@@ -378,7 +439,10 @@ pub(crate) fn parse_max_connections_option(value: &[u8], option_id: i32) -> Resu
 /// # Returns
 /// `Ok([u8; N])` if the value has the correct length.
 /// `Err(ZmqError::InvalidOptionValue)` if the value's length does not match `N`.
-pub(crate) fn parse_key_option<const N: usize>(value: &[u8], option_id: i32) -> Result<[u8; N], ZmqError> {
+pub(crate) fn parse_key_option<const N: usize>(
+  value: &[u8],
+  option_id: i32,
+) -> Result<[u8; N], ZmqError> {
   value.try_into().map_err(|_e| {
     // The error from try_into (TryFromSliceError) doesn't carry much info itself,
     // so we create our own ZmqError.
@@ -407,7 +471,11 @@ pub(crate) fn apply_core_option_value(
   option_id: i32,
   value: &[u8],
 ) -> Result<(), ZmqError> {
-  tracing::debug!(option_id, value_len = value.len(), "Applying core socket option");
+  tracing::debug!(
+    option_id,
+    value_len = value.len(),
+    "Applying core socket option"
+  );
   match option_id {
         SNDHWM => options.sndhwm = parse_i32_option(value)?.max(0) as usize,
         RCVHWM => options.rcvhwm = parse_i32_option(value)?.max(0) as usize,
@@ -438,6 +506,22 @@ pub(crate) fn apply_core_option_value(
         PLAIN_PASSWORD => {
             options.plain_options.password = Some(parse_string_option(value, option_id)?);
             options.plain_options.enabled = true;
+        }
+        
+        #[cfg(feature = "curve")]
+        CURVE_SERVER => {
+          options.curve_options.server_role = parse_bool_option(value)?;
+          options.curve_options.enabled = true; // Setting any CURVE option enables it
+        }
+        #[cfg(feature = "curve")]
+        CURVE_SECRET_KEY => {
+          options.curve_options.secret_key = Some(parse_key_option::<32>(value, option_id)?);
+          options.curve_options.enabled = true;
+        }
+        #[cfg(feature = "curve")]
+        CURVE_SERVER_KEY => {
+          options.curve_options.server_public_key = Some(parse_key_option::<32>(value, option_id)?);
+          options.curve_options.enabled = true;
         }
 
         #[cfg(feature = "noise_xx")]
