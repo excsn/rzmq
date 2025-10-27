@@ -1,8 +1,6 @@
-// core/src/socket/patterns/load_balancer.rs
-
 use parking_lot::Mutex;
 use std::{collections::VecDeque, sync::Arc};
-use tokio::sync::Notify; // Notify remains tokio::sync
+use tokio::sync::Notify;
 
 /// Distributes access to available connections in a round-robin fashion.
 #[derive(Debug, Default)]

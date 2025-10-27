@@ -1,5 +1,3 @@
-// core/src/io_uring_backend/worker/external_op_tracker.rs
-
 #![cfg(feature = "io-uring")]
 
 use fibre::oneshot;
@@ -7,7 +5,7 @@ use fibre::oneshot;
 use crate::io_uring_backend::ops::{ProtocolConfig, UringOpCompletion, UserData};
 use crate::ZmqError;
 use std::collections::HashMap;
-use std::os::unix::io::RawFd; // For the Result in OneShotSender
+use std::os::unix::io::RawFd;
 
 #[derive(Debug, Default)]
 pub(crate) struct MultipartSendState {

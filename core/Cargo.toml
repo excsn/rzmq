@@ -14,7 +14,7 @@ keywords = ["zeromq", "messaging", "async", "network", "io_uring"]
 categories = ["asynchronous", "network-programming", "concurrency"]
 
 [features]
-full = ["default", "ipc", "inproc", "noise_xx", "curve"]
+full = ["default", "ipc", "inproc", "plain", "noise_xx", "curve"]
 full-linux = ["full", "io-uring"]
 default = ["ipc", "inproc"]
 
@@ -23,6 +23,7 @@ noise_xx = ["dep:snow", "dep:x25519-dalek"]
 curve = ["dep:dryoc"]
 ipc = []
 inproc = []
+plain = []
 
 bench_external_clients = []
 

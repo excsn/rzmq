@@ -1,7 +1,3 @@
-// core/src/sessionx/protocol_handler/handshake.rs
-
-#![allow(dead_code, unused_variables)]
-
 use super::ZmtpProtocolHandlerX;
 use crate::Blob;
 use crate::MsgFlags;
@@ -15,14 +11,14 @@ use crate::security::NoiseXxMechanism;
 #[cfg(feature = "plain")]
 use crate::security::PlainMechanism;
 use crate::security::mechanism::ProcessTokenAction;
-use crate::security::{NullMechanism, PlainMechanism, negotiate_security_mechanism};
+use crate::security::{NullMechanism, negotiate_security_mechanism};
 use crate::transport::ZmtpStdStream;
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_util::codec::Encoder; // Added Instant
+use tokio_util::codec::Encoder;
 
 use crate::sessionx::types::{HandshakeSubPhaseX, ZmtpHandshakeProgressX};
 
@@ -227,15 +223,15 @@ fn determine_own_greeting_mechanism_impl<S: ZmtpStdStream>(
 
   #[cfg(feature = "curve")]
   if handler.config.use_curve {
-    // CURVE has higher priority than PLAIN
     return crate::security::CurveMechanism::NAME_BYTES;
   }
 
+  #[cfg(feature = "plain")]
   if handler.config.use_plain {
-    PlainMechanism::NAME_BYTES
-  } else {
-    NullMechanism::NAME_BYTES
+    return PlainMechanism::NAME_BYTES;
   }
+
+  return NullMechanism::NAME_BYTES;
 }
 
 async fn perform_security_handshake_step_impl<S: ZmtpStdStream>(

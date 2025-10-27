@@ -1,15 +1,14 @@
-// core/src/io_uring_backend/worker/sqe_builder.rs
-
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest, UserData};
 use crate::ZmqError;
-use io_uring::{opcode, squeue, types};
+use super::socket_addr_to_sockaddr_storage;
+
 use std::mem;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 
-use super::socket_addr_to_sockaddr_storage;
+use io_uring::{opcode, squeue, types};
 
 /// Builds an SQE for an external UringOpRequest if it maps to a direct kernel call.
 ///

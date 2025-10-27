@@ -1,15 +1,13 @@
-// src/socket/types.rs
-
-use crate::error::ZmqError; // For Result types in API methods.
-use crate::message::Msg; // For send/recv methods.
-use crate::runtime::Command; // For UserMonitor command payload.
-use crate::runtime::MailboxSender; // For storing the SocketCore's command sender.
-use crate::socket::events::{MonitorReceiver, DEFAULT_MONITOR_CAPACITY}; // For socket monitoring.
-use crate::socket::ISocket; // The internal trait implemented by specific socket patterns.
-use std::fmt;
-use std::sync::Arc;
+use crate::error::ZmqError;
+use crate::message::Msg;
+use crate::runtime::Command;
+use crate::runtime::MailboxSender;
+use crate::socket::ISocket;
+use crate::socket::events::{DEFAULT_MONITOR_CAPACITY, MonitorReceiver};
 use fibre::mpmc::bounded_async;
 use fibre::oneshot;
+use std::fmt;
+use std::sync::Arc;
 
 /// Represents the type of a ZeroMQ socket, defining its messaging pattern and behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -184,22 +182,27 @@ impl Socket {
     let (reply_tx, reply_rx) = oneshot::oneshot();
 
     // Create a UserMonitor command to send to the SocketCore.
-    let cmd = Command::UserMonitor { monitor_tx, reply_tx };
+    let cmd = Command::UserMonitor {
+      monitor_tx,
+      reply_tx,
+    };
 
     // Send the command to the SocketCore's command mailbox.
     self
-      .core_command_sender // Use the stored command sender for this socket's core.
+      .core_command_sender
       .send(cmd)
       .await
-      .map_err(|_send_error| ZmqError::Internal("Mailbox send error during monitor setup".into()))?;
+      .map_err(|_send_error| {
+        ZmqError::Internal("Mailbox send error during monitor setup".into())
+      })?;
 
     // Wait for the SocketCore to acknowledge that the monitor has been set up.
     // The `??` propagates the `RecvError` from `reply_rx.await` and then the `Result<(), ZmqError>` inside.
-    reply_rx.recv()
-      .await
-      .map_err(|_recv_error| ZmqError::Internal("Reply channel error during monitor setup".into()))??;
+    reply_rx.recv().await.map_err(|_recv_error| {
+      ZmqError::Internal("Reply channel error during monitor setup".into())
+    })??;
 
-    Ok(monitor_rx) // Return the receiver end of the monitor channel to the user.
+    Ok(monitor_rx)
   }
 
   /// Creates a monitoring channel with a default capacity (`DEFAULT_MONITOR_CAPACITY`).
@@ -211,13 +214,7 @@ impl Socket {
 
 impl fmt::Debug for Socket {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    // Provide a basic Debug representation.
-    // Avoid trying to debug the `dyn ISocket` directly as it can be complex.
-    // Information like the socket's handle ID or type could be added if
-    // `ISocket` provides accessors for them without needing to lock `SocketCore` state.
-    f.debug_struct("Socket")
-      // Example: .field("core_handle", &self.inner.core().handle) // If core().handle is accessible and cheap
-      .finish_non_exhaustive() // Indicates that more fields might be added in the future.
+    f.debug_struct("Socket").finish_non_exhaustive()
   }
 }
 

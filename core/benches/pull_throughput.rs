@@ -181,7 +181,6 @@ fn setup_push_pull_bench(
 }
 
 // --- Async Benchmark Logic ---
-// Corrected signature: Future is now 'static because we copy config values.
 fn benchmark_logic(
   ctx: BenchContext,
   state: BenchState,

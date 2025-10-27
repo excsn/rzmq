@@ -1,5 +1,3 @@
-// core/src/io_uring_backend/ops.rs
-
 #![cfg(feature = "io-uring")]
 
 use crate::message::Msg;

@@ -1,12 +1,10 @@
-// core/src/socket/core/state.rs
-
-use crate::runtime::MailboxSender; // Command, SystemEvent not directly used in structs but for context
+use crate::runtime::MailboxSender;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
 use crate::socket::types::SocketType;
 use crate::socket::SocketEvent;
-use crate::Msg; // For AsyncSender<Msg>
+use crate::Msg;
 
 use fibre::mpmc::AsyncSender;
 use std::collections::{HashMap, HashSet};

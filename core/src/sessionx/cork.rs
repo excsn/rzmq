@@ -1,8 +1,5 @@
-// core/src/sessionx/cork.rs
+#![cfg(target_os = "linux")]
 
-#![allow(dead_code)] // Allow dead code for now
-
-#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 /// State specific to TCP_CORK management on Linux.
@@ -10,17 +7,13 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 /// implements `AsRawFd` and the `use_cork` option is enabled.
 #[derive(Debug)]
 pub(crate) struct TcpCorkInfoX {
-  #[cfg(target_os = "linux")]
   fd: RawFd,
-  #[cfg(target_os = "linux")]
   is_corked: bool,
   /// Tracks if the *next* send operation is for the first frame of a new logical ZMQ message.
   /// This is important for deciding when to enable TCP_CORK.
-  #[cfg(target_os = "linux")]
   expecting_first_frame_of_new_zmq_message: bool,
 }
 
-#[cfg(target_os = "linux")]
 impl TcpCorkInfoX {
   /// Creates a new `TcpCorkInfoX` if the stream provides a raw file descriptor.
   /// Returns `None` if `fd` cannot be obtained (which shouldn't happen if `S: AsRawFd`).
@@ -140,20 +133,8 @@ impl TcpCorkInfoX {
   }
 }
 
-/// Fallback for non-Linux platforms or when `S` is not `AsRawFd`.
-/// The `ZmtpProtocolHandlerX` can hold an `Option<TcpCorkInfoX>`,
-/// which will be `None` in these cases.
-/// Alternatively, to always have the field, `TcpCorkInfoX` could be an enum:
-/// enum TcpCorkInfoX {
-///   Linux { fd: RawFd, ... },
-///   Unsupported,
-/// }
-/// For simplicity, we'll rely on `Option<TcpCorkInfoX>` in `ZmtpProtocolHandlerX`.
-/// This file then only really defines the Linux-specific struct and its methods.
-
 // Helper function that might be used by ZmtpProtocolHandlerX to initialize its cork_info field.
 // This is defined outside the struct so it can be called conditionally.
-#[cfg(target_os = "linux")]
 pub(crate) fn try_create_cork_info<S: AsRawFd>(
   stream_option: Option<&S>,
   use_cork_config: bool,
@@ -162,34 +143,4 @@ pub(crate) fn try_create_cork_info<S: AsRawFd>(
     return None;
   }
   stream_option.and_then(TcpCorkInfoX::new)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn try_create_cork_info<S>(_stream_option: Option<&S>, _use_cork_config: bool) -> Option<TcpCorkInfoX> {
-  // On non-Linux, TcpCorkInfoX itself is not defined with fields,
-  // or we simply always return None for the Option<TcpCorkInfoX> field.
-  // To make this compile, we need a definition for TcpCorkInfoX on non-Linux.
-  None
-}
-
-// If TcpCorkInfoX is intended to be a field in ZmtpProtocolHandlerX regardless of platform,
-// we need a non-Linux definition.
-#[cfg(not(target_os = "linux"))]
-impl TcpCorkInfoX {
-  // Provide minimal methods or make them no-ops for non-Linux if the struct exists.
-  // If ZmtpProtocolHandlerX has Option<TcpCorkInfoX>, these aren't strictly needed
-  // as it would be None.
-
-  // This new constructor is for the non-Linux case IF TcpCorkInfoX is not an Option.
-  // However, with Option<TcpCorkInfoX>, this `new` isn't needed for the non-Linux path.
-  // pub(crate) fn new<S>(_stream: &S) -> Option<Self> { None }
-
-  pub(crate) fn is_corked(&self) -> bool {
-    false
-  }
-  pub(crate) fn is_expecting_first_frame(&self) -> bool {
-    true
-  } // Default that doesn't affect logic
-  pub(crate) fn set_expecting_first_frame(&mut self, _expecting: bool) {}
-  pub(crate) async fn apply_cork_state(&mut self, _enable: bool, _actor_handle: usize) {}
 }

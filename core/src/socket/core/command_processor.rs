@@ -1,20 +1,21 @@
-// core/src/socket/core/command_processor.rs
-
-use crate::context::Context as RzmqContext;
 use crate::error::ZmqError;
-use crate::runtime::{ActorType, Command, MailboxSender, SystemEvent};
+#[cfg(feature = "io-uring")]
+use crate::runtime::ActorType;
+use crate::runtime::{Command, MailboxSender, SystemEvent};
+use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
+#[cfg(feature = "io-uring")]
+use crate::socket::core::pipe_manager;
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
-use crate::socket::core::{pipe_manager, shutdown, SocketCore}; // For calling other helpers
+use crate::socket::core::{SocketCore, shutdown};
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::socket::options::{self, *};
-use crate::socket::ISocket;
-use crate::transport::endpoint::{parse_endpoint, Endpoint};
+use crate::transport::endpoint::{Endpoint, parse_endpoint};
 #[cfg(feature = "inproc")]
-use crate::transport::inproc; // For inproc bind/connect directly
+use crate::transport::inproc;
 #[cfg(feature = "ipc")]
 use crate::transport::ipc::{IpcConnecter, IpcListener};
-use crate::transport::tcp::{TcpConnecter, TcpListener}; // For TCP bind/connect
+use crate::transport::tcp::{TcpConnecter, TcpListener};
 
 use fibre::oneshot;
 use std::sync::Arc;

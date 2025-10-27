@@ -1,5 +1,3 @@
-// core/src/sessionx/protocol_handler/heartbeat.rs
-
 #![allow(dead_code, unused_variables)]
 
 use super::ZmtpProtocolHandlerX;
@@ -14,11 +12,6 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub(crate) struct ZmtpHandshakeStateX {
   pub sub_phase: super::HandshakeSubPhaseX,
-  // Potential future additions:
-  // pub greeting_sent: bool,
-  // pub peer_greeting_received: bool,
-  // pub own_ready_sent: bool,
-  // pub peer_ready_received: bool,
 }
 
 impl ZmtpHandshakeStateX {

@@ -1,5 +1,3 @@
-// core/src/uring.rs
-
 #![cfg(feature = "io-uring")]
 
 pub mod global_state;

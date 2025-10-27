@@ -1,5 +1,3 @@
-// src/runtime/mailbox.rs
-
 //! Type aliases for actor communication channels.
 
 use crate::runtime::command::Command;

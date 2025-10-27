@@ -26,7 +26,8 @@ pub const HANDSHAKE_IVL: i32 = 41; // ZMQ_HANDSHAKE_IVL
 pub const ROUTER_MANDATORY: i32 = 33;
 
 // Security Options
-pub const ZAP_DOMAIN: i32 = 55;
+/// Not used currently
+pub const ZAP_DOMAIN: i32 = 55; //TODO  will remove if 100% sure ZAP won't be impl
 pub const PLAIN_SERVER: i32 = 44;
 pub const PLAIN_USERNAME: i32 = 45;
 pub const PLAIN_PASSWORD: i32 = 46;

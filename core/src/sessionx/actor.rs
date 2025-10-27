@@ -1,5 +1,3 @@
-// core/src/sessionx/actor.rs
-
 #![allow(dead_code, unused_variables, unused_mut)]
 
 use crate::error::ZmqError;

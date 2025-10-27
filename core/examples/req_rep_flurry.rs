@@ -59,7 +59,7 @@ async fn run_req_client(ctx: Context) -> Result<(), ZmqError> {
   Ok(())
 }
 
-#[tokio::main] // Or #[tokio::main]
+#[tokio::main]
 async fn main() -> Result<(), ZmqError> {
   tracing_subscriber::fmt()
     .with_max_level(tracing::Level::INFO) // Use INFO for examples
@@ -79,26 +79,26 @@ async fn main() -> Result<(), ZmqError> {
   sleep(Duration::from_millis(200)).await;
 
   let client_ctx = ctx.clone();
-  let client_handle = tokio::spawn(async move {
+  let client_handle_1 = tokio::spawn(async move {
     if let Err(e) = run_req_client(client_ctx).await {
       eprintln!("[REQ] Error: {}", e);
     }
   });
   let client_ctx = ctx.clone();
-  let client_handle = tokio::spawn(async move {
+  let client_handle_2 = tokio::spawn(async move {
     if let Err(e) = run_req_client(client_ctx).await {
       eprintln!("[REQ] Error: {}", e);
     }
   });
   let client_ctx = ctx.clone();
-  let client_handle = tokio::spawn(async move {
+  let client_handle_3 = tokio::spawn(async move {
     if let Err(e) = run_req_client(client_ctx).await {
       eprintln!("[REQ] Error: {}", e);
     }
   });
 
   // Wait for tasks to complete
-  let _ = tokio::try_join!(server_handle, client_handle);
+  let _ = tokio::try_join!(server_handle, client_handle_1, client_handle_2, client_handle_3);
 
   println!("[Main] Terminating context...");
   ctx.term().await?;

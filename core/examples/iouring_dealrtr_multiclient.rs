@@ -1,5 +1,3 @@
-// core/examples/iouring_dealrtr_multiclient.rs
-
 use bytes::Bytes;
 use futures::future::join_all;
 use futures::{stream::FuturesUnordered, StreamExt};

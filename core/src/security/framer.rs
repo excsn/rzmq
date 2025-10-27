@@ -14,8 +14,6 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
   fn write_msg_multipart(&mut self, msgs: Vec<Msg>) -> Result<Bytes, ZmqError>;
 }
 
-// core/src/security/framer.rs
-
 pub(crate) struct NullFramer {
   parser: ZmtpManualParser,
 }
@@ -42,8 +40,6 @@ impl ISecureFramer for NullFramer {
     Ok(buffer.freeze())
   }
 }
-
-// core/src/security/framer.rs
 
 pub(crate) struct LengthPrefixedFramer {
   cipher: Box<dyn IDataCipher>,

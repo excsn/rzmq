@@ -113,11 +113,11 @@ fn setup_pub_sub_bench(
     pub_socket
       .set_option(SNDHWM, BENCH_HWM)
       .await
-      .map_err(|e| e.to_string())?; // Corrected here
-    let pub_monitor = pub_socket.monitor_default().await.map_err(|e| e.to_string())?; // Corrected here
+      .map_err(|e| e.to_string())?;
+    let pub_monitor = pub_socket.monitor_default().await.map_err(|e| e.to_string())?;
     let port = NEXT_BENCH_PORT.fetch_add(1, AtomicOrdering::Relaxed);
     let bind_addr = format!("{}:{}", BIND_ADDR_BASE, port);
-    pub_socket.bind(&bind_addr).await.map_err(|e| e.to_string())?; // Corrected here
+    pub_socket.bind(&bind_addr).await.map_err(|e| e.to_string())?;
     wait_for_event(&pub_monitor, |e| {
       matches!(e, SocketEvent::Listening { endpoint: ep } if ep == &bind_addr)
     }).await?;
@@ -131,9 +131,9 @@ fn setup_pub_sub_bench(
       sub_socket
         .set_option(RCVHWM, BENCH_HWM)
         .await
-        .map_err(|e| e.to_string())?; // Corrected here
-      sub_socket.set_option(SUBSCRIBE, b"").await.map_err(|e| e.to_string())?; // Corrected here
-      sub_socket.connect(&bind_addr).await.map_err(|e| e.to_string())?; // Corrected here
+        .map_err(|e| e.to_string())?;
+      sub_socket.set_option(SUBSCRIBE, b"").await.map_err(|e| e.to_string())?;
+      sub_socket.connect(&bind_addr).await.map_err(|e| e.to_string())?;
       sub_sockets.push(sub_socket);
     }
     

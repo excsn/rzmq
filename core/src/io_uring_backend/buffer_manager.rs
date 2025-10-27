@@ -1,5 +1,3 @@
-// core/src/io_uring_backend/buffer_manager.rs
-
 #![cfg(feature = "io-uring")]
 
 use crate::ZmqError;
@@ -17,14 +15,17 @@ impl fmt::Debug for BufferRingManager {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("BufferRingManager")
       .field("bgid", &self.buf_ring_instance.buffer_group())
-      // If `ring_entries` was stored in BufferRingManager upon creation:
-      // .field("ring_entries", &self.stored_ring_entries_count)
       .finish_non_exhaustive()
   }
 }
 
 impl BufferRingManager {
-  pub fn new(ring: &IoUring, ring_entries: u16, bgid: u16, buffer_capacity: usize) -> Result<Self, ZmqError> {
+  pub fn new(
+    ring: &IoUring,
+    ring_entries: u16,
+    bgid: u16,
+    buffer_capacity: usize,
+  ) -> Result<Self, ZmqError> {
     tracing::info!(
       "Initializing BufferRingManager with bgid: {}, requested_entries: {}, capacity_per_buffer: {}",
       bgid,
@@ -48,7 +49,10 @@ impl BufferRingManager {
       }
       Err(e) => {
         tracing::error!("Failed to build and register IoUringBufRing: {:?}", e);
-        Err(ZmqError::Internal(format!("BufferRingManager build failed: {:?}", e)))
+        Err(ZmqError::Internal(format!(
+          "BufferRingManager build failed: {:?}",
+          e
+        )))
       }
     }
   }
@@ -65,6 +69,11 @@ impl BufferRingManager {
     self
       .buf_ring_instance
       .get_buf(buffer_id, available_len)
-      .ok_or_else(|| ZmqError::Internal(format!("Failed to borrow buffer ID {} from ring", buffer_id)))
+      .ok_or_else(|| {
+        ZmqError::Internal(format!(
+          "Failed to borrow buffer ID {} from ring",
+          buffer_id
+        ))
+      })
   }
 }

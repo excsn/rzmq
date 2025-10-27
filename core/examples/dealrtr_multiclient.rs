@@ -162,10 +162,9 @@ async fn run_dealer_sender_task(
 }
 
 // ====================================================================
-// CORRECTED DEALER CENTRAL RECEIVER TASK
+// DEALER CENTRAL RECEIVER TASK
 // ====================================================================
 
-// NEW: Type alias for the future to solve the mismatched types error
 type RecvFuture<'a> =
   Pin<Box<dyn Future<Output = (usize, Result<Vec<Msg>, ZmqError>)> + Send + 'a>>;
 

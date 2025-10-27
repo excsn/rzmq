@@ -1,8 +1,3 @@
-// src/socket/mod.rs
-
-// Declare sub-modules within the `socket` module.
-// Each sub-module handles a specific aspect of socket functionality.
-
 /// Contains the `SocketCore` actor implementation and related internal types.
 pub(crate) mod core;
 /// Defines `SocketEvent` for monitoring and related channel types.

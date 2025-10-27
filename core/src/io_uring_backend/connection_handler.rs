@@ -1,5 +1,3 @@
-// core/src/io_uring_backend/connection_handler.rs
-
 #![cfg(feature = "io-uring")]
 
 use crate::message::Msg;
@@ -12,7 +10,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use fibre::mpmc::Sender as UpstreamEventSender;
 
-// UserData re-export from ops.rs
 pub use crate::io_uring_backend::ops::UserData;
 
 use super::buffer_manager::BufferRingManager;

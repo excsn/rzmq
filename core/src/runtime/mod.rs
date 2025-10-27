@@ -1,5 +1,3 @@
-// src/runtime/mod.rs
-
 //! Core asynchronous primitives: Commands, Mailboxes, Pipes.
 
 pub mod actor_drop_guard;

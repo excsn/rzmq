@@ -1,11 +1,8 @@
-// src/lib.rs
-
 //! rzmq - A pure-Rust asynchronous ZeroMQ implementation using Tokio.
 //!
 //! This library aims to provide a compatible API with ZeroMQ patterns
 //! while leveraging Rust's safety and Tokio's asynchronous capabilities.
 
-// Declare modules that make up the library.
 // These modules encapsulate different aspects of the ZMQ implementation.
 
 /// Defines the `Context`, which is the entry point for creating sockets.
@@ -40,11 +37,11 @@ pub mod uring;
 // from the crate root (e.g., `rzmq::ZmqError`, `rzmq::Socket`).
 pub use context::Context;
 pub use error::ZmqError;
-pub use message::{Blob, Metadata, Msg, MsgFlags}; // Core message components.
+pub use message::{Blob, Metadata, Msg, MsgFlags};
 pub use runtime::Command;
-pub(crate) use runtime::{MailboxReceiver, MailboxSender}; // The main entry point for creating sockets.
+pub(crate) use runtime::{MailboxReceiver, MailboxSender};
 
-pub(crate) use socket::core::CoreState; // CoreState is internal to socket implementation.
+pub(crate) use socket::core::CoreState;
 
 // Socket and SocketType are fundamental for users.
 pub use socket::types::{Socket, SocketType};

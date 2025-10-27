@@ -3,20 +3,17 @@ use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::core::SocketCore;
 use crate::socket::options::ROUTER_MANDATORY;
 use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
 use crate::socket::patterns::{RouterMap, WritePipeCoordinator};
 use crate::socket::ISocket;
 
 use dashmap::DashMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use parking_lot::RwLockReadGuard as ParkingLotRwLockReadGuard;
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit};
 
 use super::core::command_processor::update_core_option;
@@ -29,12 +26,6 @@ struct ActiveFragmentedSend {
   _permit: OwnedSemaphorePermit,
 }
 
-#[derive(Debug, Default)]
-struct RouterRecvBuffer {
-  identity: Option<Blob>,
-  payload_frames: VecDeque<Msg>,
-}
-
 #[derive(Debug)]
 pub(crate) struct RouterSocket {
   core: Arc<SocketCore>,
@@ -43,7 +34,6 @@ pub(crate) struct RouterSocket {
   pipe_to_identity_shared_map: Arc<DashMap<usize, Blob>>,
   current_send_target: TokioMutex<Option<ActiveFragmentedSend>>,
   pipe_send_coordinator: Arc<WritePipeCoordinator>,
-  current_recv_buffer: TokioMutex<RouterRecvBuffer>,
 }
 
 impl RouterSocket {
@@ -58,11 +48,8 @@ impl RouterSocket {
       pipe_to_identity_shared_map: Arc::new(DashMap::new()),
       current_send_target: TokioMutex::new(None),
       pipe_send_coordinator: Arc::new(WritePipeCoordinator::new()),
-      current_recv_buffer: TokioMutex::new(RouterRecvBuffer::default()),
     }
   }
-
-  // Removed core_state_read() helper, direct use core.core_state.read() in scopes
 
   fn pipe_id_to_placeholder_identity(pipe_read_id: usize) -> Blob {
     Blob::from_bytes(Bytes::from(format!("pipe:{}", pipe_read_id)))
@@ -171,7 +158,7 @@ impl ISocket for RouterSocket {
       )
     };
 
-    let mut current_send_target_guard = self.current_send_target.lock().await;
+    let current_send_target_guard = self.current_send_target.lock().await;
 
     if let Some(active_info) = &*current_send_target_guard {
       let target_uri_for_payload = active_info.target_endpoint_uri.clone();
@@ -264,7 +251,7 @@ impl ISocket for RouterSocket {
       };
 
       let (conn_iface_opt, conn_id_opt) = {
-        let core_s_read_guard = self.core.core_state.read(); // Guard active
+        let core_s_read_guard = self.core.core_state.read();
         let result = core_s_read_guard
           .endpoints
           .get(&target_endpoint_uri)
@@ -274,7 +261,6 @@ impl ISocket for RouterSocket {
               Some(ep_info.handle_id),
             )
           });
-        // Guard dropped when core_s_read_guard goes out of scope here
         result
       };
 
@@ -419,17 +405,15 @@ impl ISocket for RouterSocket {
     };
 
     let conn_info = {
-      let core_s_read = self.core.core_state.read(); // Guard active
+      let core_s_read = self.core.core_state.read();
       let result = core_s_read
         .endpoints
         .get(&target_endpoint_uri)
         .map(|ep_info| (ep_info.connection_iface.clone(), ep_info.handle_id));
-      // Guard dropped when core_s_read goes out of scope here
       result
     };
 
     let (conn_iface, conn_id) = match conn_info {
-      // Use the extracted values
       Some((iface, id)) => (iface, id),
       None => {
         // Peer connection disappeared after URI lookup but before getting EndpointInfo

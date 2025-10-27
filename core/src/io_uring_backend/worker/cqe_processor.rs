@@ -1,5 +1,3 @@
-// core/src/io_uring_backend/worker/cqe_processor.rs
-
 #![cfg(feature = "io-uring")]
 
 use super::internal_op_tracker::{InternalOpDetails, InternalOpPayload, InternalOpType};

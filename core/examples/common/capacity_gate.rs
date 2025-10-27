@@ -2,18 +2,18 @@ use futures_intrusive::sync::{GenericSemaphoreReleaser, Semaphore};
 use parking_lot::RawMutex;
 use std::{future::Future, sync::Arc};
 
-// New struct for the owned permit. It holds an Arc to the gate,
+// struct for the owned permit. It holds an Arc to the gate,
 // making it 'static.
 #[derive(Debug)]
 pub(crate) struct OwnedPermitGuard {
-    gate: Arc<CapacityGate>,
+  gate: Arc<CapacityGate>,
 }
 
 // When the owned guard is dropped, it releases the permit.
 impl Drop for OwnedPermitGuard {
-    fn drop(&mut self) {
-        self.gate.release();
-    }
+  fn drop(&mut self) {
+    self.gate.release();
+  }
 }
 
 #[derive(Debug)]
@@ -37,7 +37,7 @@ impl CapacityGate {
     self.semaphore.acquire(1)
   }
 
-  /// NEW METHOD: Acquires an owned permit.
+  /// Acquires an owned permit.
   /// The returned future and the resulting guard are 'static.
   pub fn acquire_owned(self: Arc<Self>) -> impl Future<Output = OwnedPermitGuard> {
     async move {

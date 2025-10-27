@@ -1,16 +1,13 @@
-// core/src/socket/core/shutdown.rs
-
 use crate::error::ZmqError;
 use crate::runtime::{ActorType, Command, SystemEvent};
 use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::core::state::{CoreState, EndpointType, ShutdownCoordinator, ShutdownPhase}; // Import from state.rs
-use crate::socket::core::{command_processor, pipe_manager, SocketCore}; // pipe_manager for cleanup_stopped_child_resources
+use crate::socket::core::state::{CoreState, EndpointType, ShutdownCoordinator, ShutdownPhase};
+use crate::socket::core::{command_processor, pipe_manager, SocketCore};
 use crate::socket::ISocket;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-// JoinHandle not directly used here, but by callers that store it in EndpointInfo for Listeners
 
 // --- ShutdownCoordinator Methods ---
 impl ShutdownCoordinator {

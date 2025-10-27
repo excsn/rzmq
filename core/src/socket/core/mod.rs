@@ -1,12 +1,9 @@
-// core/src/socket/core/mod.rs
-
-// Declare the sub-modules within the `core` (SocketCore actor) module
 pub(crate) mod command_loop;
 pub(crate) mod command_processor;
 pub(crate) mod event_processor;
 pub(crate) mod pipe_manager;
 pub(crate) mod shutdown;
-pub(crate) mod state; // Contains CoreState, EndpointInfo, ShutdownCoordinator definitions
+pub(crate) mod state;
 
 use crate::context::Context;
 use crate::error::ZmqError;
@@ -24,9 +21,8 @@ use std::sync::Arc;
 // when synchronous access within async blocks is frequent.
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
-// Bring in necessary structs from sub-modules
 pub(crate) use state::CoreState;
-use state::ShutdownCoordinator; // For SocketCore fields
+use state::ShutdownCoordinator;
 
 #[derive(Debug)]
 pub struct SocketCore {

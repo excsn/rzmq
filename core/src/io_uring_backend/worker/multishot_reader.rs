@@ -1,5 +1,3 @@
-// core/src/io_uring_backend/worker/multishot_reader.rs
-
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;

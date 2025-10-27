@@ -1,5 +1,3 @@
-// core/src/io_uring_backend/worker/handler_manager.rs
-
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::{
@@ -8,7 +6,7 @@ use crate::io_uring_backend::{
     HandlerIoOps, ProtocolHandlerFactory, UringConnectionHandler, UringWorkerInterface, WorkerIoConfig,
   },
   ops::ProtocolConfig,
-  UserData, // Import the ProtocolConfig enum
+  UserData,
 };
 
 use std::collections::HashMap;
