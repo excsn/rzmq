@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["cli", "core"]
+members = ["cli", "core", "interop"]
 
 [workspace.dependencies]
 x25519-dalek = { package = "xs_x25519-dalek", version = "^2.0", features = ["static_secrets"] }
+tracing = "^0.1"
+tracing-subscriber = { version = "^0.3", features = ["env-filter"] }

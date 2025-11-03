@@ -1,0 +1,17 @@
+[package]
+name = "rzmq_interop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+full = []
+
+[dependencies]
+rzmq = { path = "../core" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+
+[dev-dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

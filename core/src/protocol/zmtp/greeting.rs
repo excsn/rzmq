@@ -2,12 +2,13 @@ use crate::error::ZmqError;
 use bytes::{BufMut, BytesMut};
 use std::convert::TryInto;
 
-pub const GREETING_PREFIX: &[u8; 10] = &[0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x7F];
+pub const GREETING_PREFIX: &[u8; 10] =
+  &[0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x7F];
 pub const GREETING_VERSION_MAJOR: u8 = 3;
 pub const GREETING_VERSION_MINOR: u8 = 0; // We send 3.0, but accept 3.x (specifically 3.1 from peers often)
 pub const GREETING_VERSION_MAJOR_BYTE: u8 = 0x03; // Actual byte value for ZMTP 3.x major
 pub const GREETING_VERSION_MINOR_BYTE: u8 = 0x00; // Actual byte value for ZMTP x.0 (e.g., 3.0)
-                                                  // Or 0x01 for ZMTP x.1 if rzmq aims for 3.1
+// Or 0x01 for ZMTP x.1 if rzmq aims for 3.1
 
 pub const GREETING_LENGTH: usize = 64;
 pub const MECHANISM_OFFSET: usize = GREETING_PREFIX.len() + 2; // Starts after prefix(10) + version(1)
@@ -38,7 +39,7 @@ impl ZmtpGreeting {
     buffer.put_u8(GREETING_VERSION_MINOR_BYTE); // Send 0x00 for minor version (for ZMTP 3.0)
     buffer.put_slice(mechanism);
     buffer.put_u8(as_server as u8); // 0x00 for client, 0x01 for server
-                                    // Padding (31 bytes)
+    // Padding (31 bytes)
 
     // Total Length (64) - Signature (10) - MajorV (1) - MinorV (1) - Mech (20) - AsServer (1) = Padding (31)
     let current_len = GREETING_PREFIX.len() + 2 + MECHANISM_LENGTH + 1;
@@ -61,25 +62,32 @@ impl ZmtpGreeting {
     let data = buffer.split_to(GREETING_LENGTH); // Consume the 64 bytes
 
     // 1. Validate Signature Prefix
-    if &data[0..GREETING_PREFIX.len()] != GREETING_PREFIX {
-      // Check only the first 10 bytes
+    if data[0] != 0xFF || data[9] != 0x7F {
+      // Check only the fixed start and end bytes
       tracing::error!(
-        "Invalid ZMTP greeting prefix received. Expected: {:?}, Got: {:?}",
-        GREETING_PREFIX,
-        &data[0..GREETING_PREFIX.len()]
+        "Invalid ZMTP greeting signature markers. Expected start=255 and end=127. Got start={}, end={}",
+        data[0],
+        data[9]
       );
-      // For debugging, print the full received greeting if it fails here
-      tracing::debug!("Full received greeting data (64 bytes): {:?}", &data[..]);
-      return Err(ZmqError::ProtocolViolation("Invalid greeting prefix".into()));
+      tracing::debug!(
+        "Full received greeting prefix (10 bytes): {:?}",
+        &data[..10]
+      );
+      return Err(ZmqError::ProtocolViolation(
+        "Invalid greeting signature markers".into(),
+      ));
     }
 
     for i in 0..PADDING_LENGTH {
       if data[PADDING_OFFSET + i] != 0x00 {
         tracing::error!(
-                "Invalid ZMTP greeting: Non-zero byte found in reserved padding area at offset {}. Expected 0x00, Got: {:#04x}",
-                PADDING_OFFSET + i, data[PADDING_OFFSET + i]
-            );
-        return Err(ZmqError::ProtocolViolation("Non-zero byte in greeting padding".into()));
+          "Invalid ZMTP greeting: Non-zero byte found in reserved padding area at offset {}. Expected 0x00, Got: {:#04x}",
+          PADDING_OFFSET + i,
+          data[PADDING_OFFSET + i]
+        );
+        return Err(ZmqError::ProtocolViolation(
+          "Non-zero byte in greeting padding".into(),
+        ));
       }
     }
 
@@ -122,7 +130,11 @@ impl ZmtpGreeting {
 
   /// Helper to get mechanism name as &str (trimming nulls).
   pub fn mechanism_name(&self) -> &str {
-    let first_null = self.mechanism.iter().position(|&b| b == 0).unwrap_or(MECHANISM_LENGTH);
+    let first_null = self
+      .mechanism
+      .iter()
+      .position(|&b| b == 0)
+      .unwrap_or(MECHANISM_LENGTH);
     std::str::from_utf8(&self.mechanism[..first_null]).unwrap_or("<invalid_utf8>")
   }
 }
