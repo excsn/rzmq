@@ -1,26 +1,23 @@
 use crate::error::ZmqError;
 use bytes::{BufMut, BytesMut};
 use std::convert::TryInto;
+use tracing;
 
-pub const GREETING_PREFIX: &[u8; 10] =
-  &[0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x7F];
-pub const GREETING_VERSION_MAJOR: u8 = 3;
-pub const GREETING_VERSION_MINOR: u8 = 0; // We send 3.0, but accept 3.x (specifically 3.1 from peers often)
-pub const GREETING_VERSION_MAJOR_BYTE: u8 = 0x03; // Actual byte value for ZMTP 3.x major
-pub const GREETING_VERSION_MINOR_BYTE: u8 = 0x00; // Actual byte value for ZMTP x.0 (e.g., 3.0)
-// Or 0x01 for ZMTP x.1 if rzmq aims for 3.1
-
+// --- Constants ---
 pub const GREETING_LENGTH: usize = 64;
-pub const MECHANISM_OFFSET: usize = GREETING_PREFIX.len() + 2; // Starts after prefix(10) + version(1)
 pub const MECHANISM_LENGTH: usize = 20;
-pub const AS_SERVER_OFFSET: usize = MECHANISM_OFFSET + MECHANISM_LENGTH; // After mechanism
 
-// Validate that the reserved/padding area (last 31 bytes) is all zeros, as per typical implementations.
-// The ZMTP spec says these are "reserved for future use and MUST be zero." (RFC 23, Section 3.1)
-// Offset of padding: 10 (sig) + 1 (major) + 1 (minor) + 20 (mech) + 1 (as-server) = 33.
-// Padding length = 31. So, bytes from index 33 to 63 (inclusive).
-const PADDING_OFFSET: usize = AS_SERVER_OFFSET + 1; // 32 + 1 = 33
-const PADDING_LENGTH: usize = GREETING_LENGTH - PADDING_OFFSET; // 64 - 33 = 31
+// ZMTP version this implementation sends and expects from peers.
+pub const GREETING_VERSION_MAJOR_BYTE: u8 = 0x03;
+pub const GREETING_VERSION_MINOR_BYTE: u8 = 0x00;
+
+// Byte offsets within the 64-byte greeting.
+const VERSION_MAJOR_OFFSET: usize = 10;
+const VERSION_MINOR_OFFSET: usize = 11;
+pub const MECHANISM_OFFSET: usize = 12;
+pub const AS_SERVER_OFFSET: usize = MECHANISM_OFFSET + MECHANISM_LENGTH; // 32
+const PADDING_OFFSET: usize = AS_SERVER_OFFSET + 1; // 33
+const PADDING_LENGTH: usize = GREETING_LENGTH - PADDING_OFFSET; // 31
 
 /// Represents the parsed content of a ZMTP/3.1 greeting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,29 +28,36 @@ pub struct ZmtpGreeting {
 }
 
 impl ZmtpGreeting {
-  /// Creates a greeting message to be sent.
+  /// Creates a canonical greeting message to be sent.
   pub fn encode(mechanism: &[u8; MECHANISM_LENGTH], as_server: bool, buffer: &mut BytesMut) {
     buffer.reserve(GREETING_LENGTH);
-    buffer.put_slice(GREETING_PREFIX);
-    buffer.put_u8(GREETING_VERSION_MAJOR_BYTE); // Send 0x03 for major version
-    buffer.put_u8(GREETING_VERSION_MINOR_BYTE); // Send 0x00 for minor version (for ZMTP 3.0)
+
+    // Start byte (0xFF) + 8 zero bytes (canonical reserved area) + final marker (0x7F)
+    buffer.put_u8(0xFF);
+    buffer.put_bytes(0, 8); // Bytes 1-8 are zeroed
+    buffer.put_u8(0x7F); // Byte 9 is the final marker
+
+    // Version bytes (at indices 10 and 11)
+    buffer.put_u8(GREETING_VERSION_MAJOR_BYTE);
+    buffer.put_u8(GREETING_VERSION_MINOR_BYTE);
+
+    // Mechanism
     buffer.put_slice(mechanism);
-    buffer.put_u8(as_server as u8); // 0x00 for client, 0x01 for server
-    // Padding (31 bytes)
 
-    // Total Length (64) - Signature (10) - MajorV (1) - MinorV (1) - Mech (20) - AsServer (1) = Padding (31)
-    let current_len = GREETING_PREFIX.len() + 2 + MECHANISM_LENGTH + 1;
+    // As-server flag
+    buffer.put_u8(as_server as u8);
+
+    // Padding to complete 64 bytes
+    let current_len = buffer.len();
     let padding_len = GREETING_LENGTH - current_len;
-
     if padding_len > 0 {
-      // Should always be > 0
       buffer.put_bytes(0, padding_len);
     }
 
     debug_assert_eq!(buffer.len(), GREETING_LENGTH);
   }
 
-  /// Parses a received greeting message.
+  /// Parses a received greeting message with improved tolerance for implementation variations.
   pub fn decode(buffer: &mut BytesMut) -> Result<Option<Self>, ZmqError> {
     if buffer.len() < GREETING_LENGTH {
       return Ok(None); // Need more data
@@ -61,29 +65,26 @@ impl ZmtpGreeting {
 
     let data = buffer.split_to(GREETING_LENGTH); // Consume the 64 bytes
 
-    // 1. Validate Signature Prefix
-    if data[0] != 0xFF || data[9] != 0x7F {
-      // Check only the fixed start and end bytes
-      tracing::error!(
-        "Invalid ZMTP greeting signature markers. Expected start=255 and end=127. Got start={}, end={}",
-        data[0],
-        data[9]
-      );
-      tracing::debug!(
-        "Full received greeting prefix (10 bytes): {:?}",
-        &data[..10]
-      );
+    // 1. Validate fixed signature markers (more robust than a full prefix match).
+    // The spec guarantees the first byte is 0xFF, but the middle bytes have varied.
+    // We check the first byte and can optionally check the 10th byte (0x7F), though it was also part of the issue.
+    // For maximum compatibility, checking only the first byte and padding is often sufficient.
+    if data[0] != 0xFF {
+      tracing::error!("Greeting does not start with 0xFF (got {:#04x})", data[0]);
       return Err(ZmqError::ProtocolViolation(
-        "Invalid greeting signature markers".into(),
+        "Greeting does not start with 0xFF".into(),
       ));
     }
 
+    // 2. Validate that the required padding area is all zeros.
+    // The ZMTP spec (RFC 23, Section 3.1) requires these bytes to be zero.
     for i in 0..PADDING_LENGTH {
-      if data[PADDING_OFFSET + i] != 0x00 {
+      let idx = PADDING_OFFSET + i;
+      if data[idx] != 0x00 {
         tracing::error!(
-          "Invalid ZMTP greeting: Non-zero byte found in reserved padding area at offset {}. Expected 0x00, Got: {:#04x}",
-          PADDING_OFFSET + i,
-          data[PADDING_OFFSET + i]
+          "Invalid ZMTP greeting: non-zero padding byte at index {}: {:#04x}",
+          idx,
+          data[idx]
         );
         return Err(ZmqError::ProtocolViolation(
           "Non-zero byte in greeting padding".into(),
@@ -91,28 +92,23 @@ impl ZmtpGreeting {
       }
     }
 
-    // 2. Extract and Validate Version
-    let major_version = data[GREETING_PREFIX.len()]; // 11th byte (index 10)
-    let minor_version = data[GREETING_PREFIX.len() + 1]; // 12th byte (index 11)
+    // 3. Extract and Validate Version (at fixed offsets).
+    let major_version = data[VERSION_MAJOR_OFFSET];
+    let minor_version = data[VERSION_MINOR_OFFSET];
 
     if major_version != GREETING_VERSION_MAJOR_BYTE {
-      // Expect 0x03
       return Err(ZmqError::ProtocolViolation(format!(
         "Unsupported ZMTP major version {}.{}",
         major_version, minor_version
       )));
     }
-
-    // rzmq can decide which minor versions it supports. Usually, being liberal is fine.
-    // We are compatible with 3.x (mainly 3.1 which uses this format)
     let version = (major_version, minor_version);
 
-    // 3. Extract Mechanism
-
+    // 4. Extract Mechanism.
     let mechanism_slice = &data[MECHANISM_OFFSET..MECHANISM_OFFSET + MECHANISM_LENGTH];
     let mechanism: [u8; MECHANISM_LENGTH] = mechanism_slice.try_into().unwrap();
 
-    // 4. Extract As-Server Flag
+    // 5. Extract As-Server Flag.
     let as_server_byte = data[AS_SERVER_OFFSET];
     let as_server = match as_server_byte {
       0x00 => false,
@@ -120,7 +116,7 @@ impl ZmtpGreeting {
       _ => return Err(ZmqError::ProtocolViolation("Invalid as-server flag".into())),
     };
 
-    tracing::debug!(?version, ?mechanism, as_server, "Parsed ZMTP Greeting");
+    tracing::debug!(?version, mechanism_name = %std::str::from_utf8(&mechanism).unwrap_or("").trim_end_matches('\0'), as_server, "Parsed ZMTP Greeting");
     Ok(Some(Self {
       version,
       mechanism,
@@ -128,7 +124,7 @@ impl ZmtpGreeting {
     }))
   }
 
-  /// Helper to get mechanism name as &str (trimming nulls).
+  /// Helper to get mechanism name as &str (trimming nulls). (Unchanged)
   pub fn mechanism_name(&self) -> &str {
     let first_null = self
       .mechanism
