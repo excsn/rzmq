@@ -371,10 +371,10 @@ async fn perform_ready_exchange_step_impl<S: ZmtpStdStream>(
     );
 
     let socket_type = &handler.config.socket_type_name;
-    // This is the key logic from libzmq: REQ and DEALER sockets
+    // This is the key logic from libzmq: REQ, DEALER, and ROUTER sockets
     // include the Identity property to identify themselves to peers like ROUTER.
     // ROUTER and REP sockets MUST NOT include an Identity.
-    if socket_type == "REQ" || socket_type == "DEALER" {
+    if socket_type == "REQ" || socket_type == "DEALER" || socket_type == "ROUTER" {
       // If an identity is set, use it. Otherwise, send an empty one.
       let identity = handler.config.routing_id.as_ref().map_or_else(
         || Vec::new(), // Default to empty Vec<u8> if None

@@ -1,7 +1,8 @@
 use crate::{
   message::Blob,
   socket::patterns::router::strategies::{
-    DealerPeerStrategy, DefaultRouterStrategy, ReqPeerStrategy, RouterSendStrategy,
+    DealerPeerStrategy, DefaultRouterStrategy, ReqPeerStrategy, RouterPeerStrategy,
+    RouterSendStrategy,
   },
 };
 use parking_lot::RwLock;
@@ -140,6 +141,7 @@ impl RouterMap {
     let strategy: Arc<dyn RouterSendStrategy> = match peer_socket_type {
       Some("REQ") => Arc::new(ReqPeerStrategy),
       Some("DEALER") => Arc::new(DealerPeerStrategy),
+      Some("ROUTER") => Arc::new(RouterPeerStrategy),
       _ => Arc::new(DefaultRouterStrategy),
     };
 
@@ -221,6 +223,22 @@ pub(crate) mod strategies {
     ) -> Vec<Msg> {
       // DEALER peers expect: [payload...]
       // Both identity and delimiter are discarded.
+      payload_frames
+    }
+  }
+
+  #[derive(Debug)]
+  pub(crate) struct RouterPeerStrategy;
+
+  impl RouterSendStrategy for RouterPeerStrategy {
+    fn prepare_wire_frames(
+      &self,
+      destination_identity_msg: Msg,
+      payload_frames: Vec<Msg>,
+    ) -> Vec<Msg> {
+      // When a ROUTER sends to another ROUTER peer, it strips the peer's
+      // identity (the destination_identity_msg) for routing and sends
+      // only the remaining payload frames over the wire.
       payload_frames
     }
   }

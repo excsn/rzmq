@@ -60,6 +60,11 @@ impl RouterSocket {
     pipe_read_id: usize,
     mut raw_zmtp_message: Vec<Msg>,
   ) -> Result<(Blob, Vec<Msg>), ZmqError> {
+    // The application should receive [sender_identity, payload...].
+    // The 'payload' is the entire message received from the peer, after stripping
+    // a single leading delimiter IF the peer is a REQ or DEALER.
+
+    // First, determine the sender's identity from our internal map.
     let identity_blob = self
       .pipe_to_identity_shared_map
       .get(&pipe_read_id)
@@ -68,26 +73,46 @@ impl RouterSocket {
         tracing::warn!(
           handle = self.core.handle,
           pipe_id = pipe_read_id,
-          "Router: Identity for pipe {} not found in shared map, using placeholder for incoming message processing.",
-          pipe_read_id
+          "Router: Identity for pipe not found, using placeholder for incoming message."
         );
         Self::pipe_id_to_placeholder_identity(pipe_read_id)
       });
 
-    if !raw_zmtp_message.is_empty() && raw_zmtp_message[0].size() == 0 {
-      tracing::trace!(
-        handle = self.core.handle,
-        pipe_id = pipe_read_id,
-        "Router: Stripped empty ZMTP delimiter from incoming message."
-      );
-      raw_zmtp_message.remove(0);
-    } else {
-      tracing::debug!(
-        handle = self.core.handle,
-        pipe_id = pipe_read_id,
-        "Router: Incoming ZMTP message from pipe did not start with an empty delimiter."
-      );
+    // Now, determine if we need to strip a delimiter based on the peer's socket type.
+    let peer_socket_type = {
+      let core_s = self.core.core_state.read();
+      core_s
+        .pipe_read_id_to_endpoint_uri
+        .get(&pipe_read_id)
+        .and_then(|uri| core_s.endpoints.get(uri))
+        .and_then(|ep_info| ep_info.peer_socket_type.clone())
+    };
+
+    match peer_socket_type.as_deref() {
+      Some("REQ") | Some("DEALER") => {
+        if !raw_zmtp_message.is_empty() && raw_zmtp_message[0].size() == 0 {
+          // Correctly strip the delimiter from REQ/DEALER peers.
+          raw_zmtp_message.remove(0);
+        } else {
+          tracing::warn!(
+            handle = self.core.handle,
+            pipe_id = pipe_read_id,
+            "ROUTER: Expected empty delimiter from REQ/DEALER peer, but not found."
+          );
+        }
+      }
+      Some("ROUTER") => {
+        // Do nothing. The entire message is the payload from a ROUTER peer.
+      }
+      _ => {
+        // Default/Unknown: For backward compatibility or peers that don't announce type,
+        // we can try to guess. The old behavior was to strip a delimiter if present.
+        if !raw_zmtp_message.is_empty() && raw_zmtp_message[0].size() == 0 {
+          raw_zmtp_message.remove(0);
+        }
+      }
     }
+
     Ok((identity_blob, raw_zmtp_message))
   }
 
@@ -248,7 +273,7 @@ impl ISocket for RouterSocket {
             Ok(())
           };
         }
-      }; 
+      };
 
       let (conn_iface_opt, conn_id_opt) = {
         let core_s_read_guard = self.core.core_state.read();
@@ -354,21 +379,9 @@ impl ISocket for RouterSocket {
         "ROUTER send_multipart requires at least an identity frame.".into(),
       ));
     }
-    if frames.len() < 2 && !(frames.len() == 1 && frames[0].data().map_or(false, |d| d.is_empty()))
-    {
-      if frames.len() == 1 {
-        if frames[0].is_more() {
-          return Err(ZmqError::InvalidMessage(
-            "ROUTER send_multipart: Single identity frame must not have MORE flag if no payload."
-              .into(),
-          ));
-        }
-      } else {
-        return Err(ZmqError::InvalidMessage("ROUTER send_multipart requires at least identity and one payload frame, or just an identity frame for an empty message.".into()));
-      }
-    }
 
-    let mut destination_identity_msg = frames.remove(0);
+    // The first frame is the destination identity.
+    let destination_identity_msg = frames.remove(0);
     let destination_id_blob =
       Blob::from_bytes(destination_identity_msg.data_bytes().unwrap_or_default());
 
@@ -386,6 +399,8 @@ impl ISocket for RouterSocket {
       )
     };
 
+    // 1. Find the peer's info (URI and strategy) using the identity.
+    // This is an async call but uses internal, non-Tokio locks.
     let peer_info = match self
       .router_map_for_send
       .get_peer_info_for_identity(&destination_id_blob)
@@ -393,40 +408,46 @@ impl ISocket for RouterSocket {
     {
       Some(info) => info,
       None => {
+        // Peer not found.
         return if router_mandatory_opt {
-          Err(ZmqError::HostUnreachable(
-            "Peer connection for identity disappeared".into(),
-          ))
+          Err(ZmqError::HostUnreachable(format!(
+            "Peer with identity {:?} not found (ROUTER_MANDATORY)",
+            destination_id_blob
+          )))
         } else {
+          // Silently drop the message.
           Ok(())
         };
       }
     };
 
-    let target_endpoint_uri = peer_info.uri;
-    let send_strategy = peer_info.strategy;
-
-    let conn_info = {
+    // 2. Look up the connection interface and ID using the URI from PeerInfo.
+    // This is done in a tightly scoped lock.
+    let (conn_iface_opt, conn_id_opt) = {
       let core_s_read = self.core.core_state.read();
-      let result = core_s_read
+      core_s_read
         .endpoints
-        .get(&target_endpoint_uri)
-        .map(|ep_info| (ep_info.connection_iface.clone(), ep_info.handle_id));
-      result
+        .get(&peer_info.uri)
+        .map_or((None, None), |ep_info| {
+          (
+            Some(ep_info.connection_iface.clone()),
+            Some(ep_info.handle_id),
+          )
+        })
     };
 
-    let (conn_iface, conn_id) = match conn_info {
-      Some((iface, id)) => (iface, id),
-      None => {
-        // Peer connection disappeared after URI lookup but before getting EndpointInfo
-        // No RwLockReadGuard held here for this async call
+    let (conn_iface, conn_id) = match (conn_iface_opt, conn_id_opt) {
+      (Some(iface), Some(id)) => (iface, id),
+      _ => {
+        // The peer was in RouterMap but its EndpointInfo is gone. This is a stale entry.
+        // We should clean up the RouterMap and then decide what to do.
         self
           .router_map_for_send
           .remove_peer_by_identity(&destination_id_blob)
           .await;
         return if router_mandatory_opt {
           Err(ZmqError::HostUnreachable(
-            "Peer connection for identity disappeared".into(),
+            "Peer connection for identity disappeared before send".into(),
           ))
         } else {
           Ok(())
@@ -434,20 +455,15 @@ impl ISocket for RouterSocket {
       }
     };
 
-    {
-      let guard = self.current_send_target.lock().await;
-      if let Some(active_info) = &*guard {
-        if active_info.target_endpoint_uri == target_endpoint_uri {
-          tracing::debug!(handle = self.core.handle, uri = %target_endpoint_uri, "ROUTER send_multipart to same target as active fragmented send. Permit system will serialize.");
-        }
-      }
-    }
+    // All locks are released before we hit the first .await below.
 
+    // 3. Acquire a send permit for this specific connection.
     let _permit = self
       .pipe_send_coordinator
       .acquire_send_permit(conn_id, timeout_opt)
       .await
       .map_err(|e| {
+        // If acquiring the permit fails, decide whether to error or drop.
         if router_mandatory_opt {
           e
         } else {
@@ -455,13 +471,18 @@ impl ISocket for RouterSocket {
         }
       })?;
 
-    let mut zmtp_wire_frames = send_strategy.prepare_wire_frames(destination_identity_msg, frames);
+    // 4. Prepare the final wire frames using the peer-specific strategy.
+    let mut zmtp_wire_frames =
+      peer_info
+        .strategy
+        .prepare_wire_frames(destination_identity_msg, frames);
 
     // Final flag setting on the last frame
     if let Some(last_frame) = zmtp_wire_frames.last_mut() {
       last_frame.set_flags(last_frame.flags() & !MsgFlags::MORE);
     }
 
+    // 5. Send the message.
     match conn_iface.send_multipart(zmtp_wire_frames).await {
       Ok(()) => Ok(()),
       Err(e) => {
@@ -472,6 +493,7 @@ impl ISocket for RouterSocket {
             e
           })
         } else {
+          // Silently drop on error if not mandatory.
           Ok(())
         }
       }
