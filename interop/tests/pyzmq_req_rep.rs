@@ -33,7 +33,7 @@ async fn test_req_rep_with_pyzmq() -> Result<()> {
   // Call the logging setup function from our common module.
   common::setup_logging();
 
-  let endpoint = "tcp://127.0.0.1:5571";
+  let endpoint = "tcp://127.0.0.1:65243";
 
   // 1. Start Python Server
   tracing::info!("Spawning python3 process...");

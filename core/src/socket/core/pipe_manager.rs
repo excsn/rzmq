@@ -544,6 +544,7 @@ pub(crate) async fn process_inproc_binding_request_event(
       handle_id: inproc_endpoint_entry_handle_id,
       target_endpoint_uri: Some(connector_uri.clone()),
       is_outbound_connection: false,
+      peer_socket_type: None,
       connection_iface: binder_side_inproc_iface,
     };
 

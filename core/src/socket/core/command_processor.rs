@@ -400,6 +400,7 @@ async fn handle_user_bind(
                   handle_id: child_actor_handle,
                   target_endpoint_uri: None,
                   is_outbound_connection: false,
+                  peer_socket_type: None,
                   // Listeners don't have a single ISocketConnection; they manage multiple.
                   // We need a dummy or specialized ISocketConnection here if the field is mandatory.
                   connection_iface: Arc::new(crate::socket::connection_iface::DummyConnection),
@@ -452,6 +453,7 @@ async fn handle_user_bind(
                   handle_id: child_actor_handle,
                   target_endpoint_uri: None,
                   is_outbound_connection: false,
+                  peer_socket_type: None,
                   connection_iface: Arc::new(crate::socket::connection_iface::DummyConnection),
                 },
               );

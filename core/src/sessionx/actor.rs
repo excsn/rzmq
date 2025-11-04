@@ -435,6 +435,7 @@ where
 
       // Determine final peer identity: one from handshake (security or READY) takes precedence.
       let final_peer_identity = self.pending_peer_identity_from_handshake.take();
+      let peer_socket_type = self.zmtp_handler.handshake_state.peer_socket_type.clone();
 
       if let Some(routing_id) = self
         .core_pipe_manager
@@ -445,6 +446,7 @@ where
           parent_core_id: self.parent_socket_id,
           connection_identifier: routing_id,
           peer_identity: final_peer_identity,
+          peer_socket_type,
         };
         if self
           .actor_config

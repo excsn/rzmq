@@ -1,16 +1,16 @@
+use crate::Msg;
 use crate::error::ZmqError;
 use crate::runtime::system_events::ConnectionInteractionModel;
 use crate::runtime::{Command, SystemEvent};
 use crate::sessionx::ScaConnectionIface;
+use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 #[cfg(feature = "io-uring")]
 use crate::socket::connection_iface::UringFdConnection;
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
-use crate::socket::core::{command_processor, pipe_manager, shutdown, SocketCore};
-use crate::socket::ISocket;
+use crate::socket::core::{SocketCore, command_processor, pipe_manager, shutdown};
 #[cfg(feature = "io-uring")]
 use crate::uring;
-use crate::Msg;
 
 use std::sync::Arc;
 use tokio::task::Id as TaskId;
@@ -117,6 +117,7 @@ pub(crate) async fn process_system_event(
       parent_core_id,
       connection_identifier,
       peer_identity,
+      peer_socket_type,
     } => {
       if parent_core_id == core_handle {
         if current_shutdown_phase == ShutdownPhase::Running {
@@ -126,6 +127,30 @@ pub(crate) async fn process_system_event(
             identity = ?peer_identity,
             "SocketCore processing PeerIdentityEstablished event."
           );
+
+          {
+            // Scoped write lock
+            let mut core_s_write = core_arc.core_state.write();
+            // First, clone the URI from the mapping. This releases any borrow on core_s_write related to the lookup.
+            let uri_opt = core_s_write
+              .pipe_read_id_to_endpoint_uri
+              .get(&connection_identifier)
+              .cloned();
+
+            if let Some(uri) = uri_opt {
+              // Now, perform the mutable lookup using the cloned URI.
+              if let Some(ep_info) = core_s_write.endpoints.get_mut(&uri) {
+                tracing::debug!(
+                    handle = core_handle,
+                    pipe_id = connection_identifier,
+                    peer_type = ?peer_socket_type,
+                    "Updating peer socket type in EndpointInfo."
+                );
+                ep_info.peer_socket_type = peer_socket_type;
+              }
+            }
+          }
+
           socket_logic_strong
             .update_peer_identity(connection_identifier, peer_identity)
             .await;
@@ -327,6 +352,7 @@ async fn handle_new_connection_established(
         handle_id: sca_handle_id, // This is the SCA's own handle
         target_endpoint_uri: Some(target_endpoint_uri_from_event),
         is_outbound_connection: is_outbound_this_core_initiated,
+        peer_socket_type: None,
         connection_iface: sca_iface,
       };
 

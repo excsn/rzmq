@@ -12,12 +12,14 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub(crate) struct ZmtpHandshakeStateX {
   pub sub_phase: super::HandshakeSubPhaseX,
+  pub(crate) peer_socket_type: Option<String>,
 }
 
 impl ZmtpHandshakeStateX {
   pub(crate) fn new() -> Self {
     Self {
       sub_phase: super::HandshakeSubPhaseX::GreetingExchange,
+      peer_socket_type: None,
     }
   }
 }

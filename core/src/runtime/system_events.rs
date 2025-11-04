@@ -112,6 +112,8 @@ pub enum SystemEvent {
     /// This comes from `ZmtpEngineConfig::routing_id` of the peer, sent in its READY command,
     /// or potentially from a security mechanism.
     peer_identity: Option<Blob>,
+    /// The `Socket-Type` name string provided by the peer in its READY command.
+    peer_socket_type: Option<String>,
   },
 
   /// Published by a Connecter task when a connection attempt fails definitively
@@ -213,11 +215,13 @@ impl fmt::Debug for SystemEvent {
         parent_core_id,
         connection_identifier,
         peer_identity,
+        peer_socket_type,
       } => f
         .debug_struct("PeerIdentityEstablished")
         .field("parent_core_id", parent_core_id)
         .field("connection_identifier", connection_identifier)
         .field("peer_identity", peer_identity)
+        .field("peer_socket_type", peer_socket_type) 
         .finish(),
       SystemEvent::ConnectionAttemptFailed {
         parent_core_id,

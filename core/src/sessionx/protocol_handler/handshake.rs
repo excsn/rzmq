@@ -120,7 +120,8 @@ async fn send_handshake_command_frame_impl<S: ZmtpStdStream>(
   command_msg.set_flags(MsgFlags::COMMAND);
   let mut temp_zmtp_encoder = ZmtpCodec::new();
   let mut encoded_command_buffer = BytesMut::new();
-  temp_zmtp_encoder.encode(command_msg, &mut encoded_command_buffer)?;
+  temp_zmtp_encoder.encode(command_msg.clone(), &mut encoded_command_buffer)?;
+
   let stream = handler
     .stream
     .as_mut()
@@ -362,27 +363,65 @@ async fn perform_ready_exchange_step_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
   operation_timeout: Duration,
 ) -> Result<ZmtpHandshakeProgressX, ZmqError> {
-  let mut final_peer_id_from_ready: Option<Blob> = None;
-  if !handler.is_server {
+  let build_properties = |handler: &ZmtpProtocolHandlerX<S>| -> HashMap<String, Vec<u8>> {
     let mut props = HashMap::new();
     props.insert(
       "Socket-Type".to_string(),
       handler.config.socket_type_name.as_bytes().to_vec(),
     );
-    if let Some(id) = &handler.config.routing_id {
-      if !id.is_empty() && id.len() <= 255 {
-        props.insert("Identity".to_string(), id.to_vec());
+
+    let socket_type = &handler.config.socket_type_name;
+    // This is the key logic from libzmq: REQ and DEALER sockets
+    // include the Identity property to identify themselves to peers like ROUTER.
+    // ROUTER and REP sockets MUST NOT include an Identity.
+    if socket_type == "REQ" || socket_type == "DEALER" {
+      // If an identity is set, use it. Otherwise, send an empty one.
+      let identity = handler.config.routing_id.as_ref().map_or_else(
+        || Vec::new(), // Default to empty Vec<u8> if None
+        |blob| blob.to_vec(),
+      );
+      // Only include if length is valid (though empty is valid).
+      if identity.len() <= 255 {
+        props.insert("Identity".to_string(), identity);
       }
     }
+    props
+  };
+
+  let mut final_peer_id_from_ready: Option<Blob> = None;
+  if !handler.is_server {
+    // Client-side READY send
+    let props = build_properties(handler);
     send_handshake_command_frame_impl(handler, ZmtpReady::create_msg(props), operation_timeout)
       .await?;
     tracing::debug!(sca_handle = handler.actor_handle, "Client sent READY.");
   }
+
+  // Both sides receive the peer's READY
   let recv_ready_msg = read_handshake_command_frame_impl(handler, operation_timeout).await?;
   let peer_ready_data = match ZmtpCommand::parse(&recv_ready_msg) {
     Some(ZmtpCommand::Ready(data)) => data,
     _ => return Err(ZmqError::ProtocolViolation("Expected READY".into())),
   };
+
+  let peer_socket_type_str = peer_ready_data
+    .properties
+    .get("Socket-Type")
+    .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+
+  if let Some(ref peer_type) = peer_socket_type_str {
+    tracing::debug!(
+        sca_handle = handler.actor_handle,
+        %peer_type,
+        "Peer announced its Socket-Type in READY command."
+    );
+    handler.handshake_state.peer_socket_type = Some(peer_type.clone());
+  } else {
+    tracing::warn!(
+      sca_handle = handler.actor_handle,
+      "Peer did not announce Socket-Type in READY command. Assuming legacy or non-compliant peer."
+    );
+  }
   tracing::debug!(sca_handle = handler.actor_handle, "Recvd peer READY.");
   if let Some(id_v) = peer_ready_data.properties.get("Identity") {
     if !id_v.is_empty() && id_v.len() <= 255 {
@@ -391,11 +430,8 @@ async fn perform_ready_exchange_step_impl<S: ZmtpStdStream>(
   }
 
   if handler.is_server {
-    let mut props = HashMap::new();
-    props.insert(
-      "Socket-Type".to_string(),
-      handler.config.socket_type_name.as_bytes().to_vec(),
-    );
+    // Server-side READY send
+    let props = build_properties(handler);
     send_handshake_command_frame_impl(handler, ZmtpReady::create_msg(props), operation_timeout)
       .await?;
     tracing::debug!(sca_handle = handler.actor_handle, "Server sent READY.");

@@ -2,12 +2,12 @@ use crate::delegate_to_core;
 use crate::error::ZmqError;
 use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
+use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::SocketCore;
 use crate::socket::options::ROUTER_MANDATORY;
 use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
 use crate::socket::patterns::{RouterMap, WritePipeCoordinator};
-use crate::socket::ISocket;
 
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -234,10 +234,10 @@ impl ISocket for RouterSocket {
 
       let target_endpoint_uri = match self
         .router_map_for_send
-        .get_uri_for_identity(&destination_id)
+        .get_peer_info_for_identity(&destination_id)
         .await
       {
-        Some(uri) => uri,
+        Some(info) => info.uri,
         None => {
           return if router_mandatory_opt {
             Err(ZmqError::HostUnreachable(format!(
@@ -248,7 +248,7 @@ impl ISocket for RouterSocket {
             Ok(())
           };
         }
-      };
+      }; 
 
       let (conn_iface_opt, conn_id_opt) = {
         let core_s_read_guard = self.core.core_state.read();
@@ -386,23 +386,25 @@ impl ISocket for RouterSocket {
       )
     };
 
-    let target_endpoint_uri = match self
+    let peer_info = match self
       .router_map_for_send
-      .get_uri_for_identity(&destination_id_blob)
+      .get_peer_info_for_identity(&destination_id_blob)
       .await
     {
-      Some(uri) => uri,
+      Some(info) => info,
       None => {
         return if router_mandatory_opt {
-          Err(ZmqError::HostUnreachable(format!(
-            "Peer {:?} not found (ROUTER_MANDATORY)",
-            destination_id_blob
-          )))
+          Err(ZmqError::HostUnreachable(
+            "Peer connection for identity disappeared".into(),
+          ))
         } else {
           Ok(())
         };
       }
     };
+
+    let target_endpoint_uri = peer_info.uri;
+    let send_strategy = peer_info.strategy;
 
     let conn_info = {
       let core_s_read = self.core.core_state.read();
@@ -453,26 +455,11 @@ impl ISocket for RouterSocket {
         }
       })?;
 
-    let mut zmtp_wire_frames: Vec<Msg> = Vec::with_capacity(frames.len() + 2);
-    destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
-    zmtp_wire_frames.push(destination_identity_msg);
+    let mut zmtp_wire_frames = send_strategy.prepare_wire_frames(destination_identity_msg, frames);
 
-    let mut delimiter_frame = Msg::new();
-    if !frames.is_empty() {
-      delimiter_frame.set_flags(MsgFlags::MORE);
-    } else {
-      delimiter_frame.set_flags(delimiter_frame.flags() & !MsgFlags::MORE);
-    }
-    zmtp_wire_frames.push(delimiter_frame);
-
-    let num_payload_frames = frames.len();
-    for (i, mut frame) in frames.into_iter().enumerate() {
-      if i < num_payload_frames - 1 {
-        frame.set_flags(frame.flags() | MsgFlags::MORE);
-      } else {
-        frame.set_flags(frame.flags() & !MsgFlags::MORE);
-      }
-      zmtp_wire_frames.push(frame);
+    // Final flag setting on the last frame
+    if let Some(last_frame) = zmtp_wire_frames.last_mut() {
+      last_frame.set_flags(last_frame.flags() & !MsgFlags::MORE);
     }
 
     match conn_iface.send_multipart(zmtp_wire_frames).await {
@@ -525,14 +512,13 @@ impl ISocket for RouterSocket {
   }
 
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
-    
     match command {
       Command::Stop => {
         self.incoming_orchestrator.close().await;
       }
       _ => return Ok(false),
     }
-    
+
     Ok(true)
   }
 
@@ -614,14 +600,22 @@ impl ISocket for RouterSocket {
   }
 
   async fn update_peer_identity(&self, pipe_read_id: usize, new_identity_opt: Option<Blob>) {
-    let endpoint_uri_opt = {
-      self
-        .core
-        .core_state
-        .read()
+    let (endpoint_uri_opt, peer_socket_type_opt) = {
+      let core_s_read = self.core.core_state.read();
+      let uri_opt = core_s_read
         .pipe_read_id_to_endpoint_uri
         .get(&pipe_read_id)
-        .cloned()
+        .cloned();
+
+      let type_opt = if let Some(ref uri) = uri_opt {
+        core_s_read
+          .endpoints
+          .get(uri)
+          .and_then(|ep_info| ep_info.peer_socket_type.clone())
+      } else {
+        None
+      };
+      (uri_opt, type_opt)
     };
 
     if let Some(endpoint_uri) = endpoint_uri_opt {
@@ -636,7 +630,12 @@ impl ISocket for RouterSocket {
 
       self
         .router_map_for_send
-        .update_peer_identity(pipe_read_id, new_identity.clone(), &endpoint_uri)
+        .update_peer_identity(
+          pipe_read_id,
+          new_identity.clone(),
+          &endpoint_uri,
+          peer_socket_type_opt.as_deref(),
+        )
         .await;
       self
         .pipe_to_identity_shared_map

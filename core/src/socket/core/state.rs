@@ -38,6 +38,7 @@ pub(crate) struct EndpointInfo {
   pub target_endpoint_uri: Option<String>,
   /// True if this endpoint represents an outbound connection initiated by this SocketCore.
   pub is_outbound_connection: bool,
+  pub peer_socket_type: Option<String>,
   /// The unified interface for sending messages and closing the connection.
   pub connection_iface: Arc<dyn ISocketConnection>,
 }

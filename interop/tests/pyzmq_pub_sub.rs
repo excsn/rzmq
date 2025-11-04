@@ -20,7 +20,7 @@ impl Drop for ChildProcessGuard {
 #[tokio::test]
 async fn test_pub_sub_with_pyzmq() -> Result<()> {
   common::setup_logging();
-  let endpoint = "tcp://127.0.0.1:5573"; // New port
+  let endpoint = "tcp://127.0.0.1:65241";
 
   let mut cmd = Command::new("python3")
     .arg("python_scripts/pub_server.py")

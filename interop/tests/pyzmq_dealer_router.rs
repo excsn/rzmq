@@ -19,7 +19,7 @@ impl Drop for ChildProcessGuard {
 #[tokio::test]
 async fn test_dealer_router_with_pyzmq() -> Result<()> {
   common::setup_logging();
-  let endpoint = "tcp://127.0.0.1:5574"; // New port
+  let endpoint = "tcp://127.0.0.1:65240";
 
   let mut cmd = Command::new("python3")
     .arg("python_scripts/router_server.py")

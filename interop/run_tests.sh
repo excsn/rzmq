@@ -37,7 +37,7 @@ fi
 # The "$@" passes along any arguments you provide to this script (e.g., -- --nocapture)
 # to cargo test.
 echo "Executing cargo test for package 'rzmq_interop'..."
-RUST_LOG=info cargo test -p rzmq_interop -- "$@"
+RUST_LOG=trace cargo test -p rzmq_interop -- "$@"
 
 echo ""
 echo "--- Interop tests completed. ---"

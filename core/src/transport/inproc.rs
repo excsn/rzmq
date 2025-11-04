@@ -158,6 +158,7 @@ pub(crate) async fn connect_inproc(
     handle_id: inproc_endpoint_entry_handle_id,
     target_endpoint_uri: Some(connector_uri_str.clone()),
     is_outbound_connection: true,
+    peer_socket_type: None,
     connection_iface: inproc_conn_iface,
   };
   {
