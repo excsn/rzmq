@@ -218,12 +218,24 @@ pub(crate) mod strategies {
   impl RouterSendStrategy for DealerPeerStrategy {
     fn prepare_wire_frames(
       &self,
-      _destination_identity_msg: Msg,
+      mut destination_identity_msg: Msg,
       payload_frames: Vec<Msg>,
     ) -> Vec<Msg> {
-      // DEALER peers expect: [payload...]
-      // Both identity and delimiter are discarded.
-      payload_frames
+      // A ROUTER must send [identity, delimiter, payload...] to a DEALER.
+      // The DEALER socket will then strip the identity and delimiter before giving
+      // the payload to the application.
+      let mut zmtp_wire_frames = Vec::with_capacity(2 + payload_frames.len());
+
+      destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
+      zmtp_wire_frames.push(destination_identity_msg);
+
+      let mut delimiter = Msg::new();
+      if !payload_frames.is_empty() {
+        delimiter.set_flags(MsgFlags::MORE);
+      }
+      zmtp_wire_frames.push(delimiter);
+      zmtp_wire_frames.extend(payload_frames);
+      zmtp_wire_frames
     }
   }
 
