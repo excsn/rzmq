@@ -167,6 +167,11 @@ where
       tokio::select! {
         biased;
 
+        // --- ARM 0: Shutdown Step ---
+         _ = async {}, if self.current_phase == ConnectionPhaseX::ShuttingDownStream => {
+            self.perform_graceful_shutdown().await;
+        }
+
         // --- ARM 1: Control Commands (AttachPipes, Stop) ---
         maybe_cmd = self.command_mailbox_receiver.recv(), if !matches!(self.current_phase, ConnectionPhaseX::Terminating) => {
           match maybe_cmd {
@@ -262,11 +267,6 @@ where
               self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await; // Or Internal error
             }
           }
-        }
-
-        // --- ARM 9: Shutdown Step ---
-         _ = async {}, if self.current_phase == ConnectionPhaseX::ShuttingDownStream => {
-            self.perform_graceful_shutdown().await;
         }
       }
     }
