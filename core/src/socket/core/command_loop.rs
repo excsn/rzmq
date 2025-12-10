@@ -109,34 +109,34 @@ pub(crate) async fn run_command_loop(
         // --- 2. User Command Processing ---
         // Only process commands if not fully finished.
         cmd_result = command_receiver.recv(), if current_shutdown_phase != ShutdownPhase::Finished => {
-            match cmd_result {
-                Ok(command) => {
-                    // Delegate to command_processor module
-                    if let Err(e) = command_processor::process_socket_command(
-                        core_arc.clone(),
-                        &socket_logic_strong,
-                        command,
-                    ).await {
-                        tracing::error!(handle = core_handle, "Fatal error processing command: {}. Initiating shutdown.", e);
-                        final_error_for_actorstop = Some(e);
-                        let coord = core_arc.shutdown_coordinator.lock().await;
-                        if coord.state == ShutdownPhase::Running {
-                            drop(coord);
-                            shutdown::initiate_core_shutdown(core_arc.clone(), &socket_logic_strong, true).await;
-                        }
-                    }
+          match cmd_result {
+            Ok(command) => {
+              // Delegate to command_processor module
+              if let Err(e) = command_processor::process_socket_command(
+                core_arc.clone(),
+                &socket_logic_strong,
+                command,
+              ).await {
+                tracing::error!(handle = core_handle, "Fatal error processing command: {}. Initiating shutdown.", e);
+                final_error_for_actorstop = Some(e);
+                let coord = core_arc.shutdown_coordinator.lock().await;
+                if coord.state == ShutdownPhase::Running {
+                  drop(coord);
+                  shutdown::initiate_core_shutdown(core_arc.clone(), &socket_logic_strong, true).await;
                 }
-                Err(_) => { // Command mailbox closed
-                    tracing::info!(handle = core_handle, "SocketCore command mailbox closed. Initiating shutdown.");
-                    final_error_for_actorstop = Some(ZmqError::Internal("SocketCore: Command mailbox closed".into()));
-                    let coord = core_arc.shutdown_coordinator.lock().await;
-                    if coord.state == ShutdownPhase::Running {
-                        drop(coord);
-                        shutdown::initiate_core_shutdown(core_arc.clone(), &socket_logic_strong, true).await;
-                    }
-                    // Loop will break due to ShutdownPhase::Finished or next error check
-                }
+              }
             }
+            Err(_) => { // Command mailbox closed
+              tracing::info!(handle = core_handle, "SocketCore command mailbox closed. Initiating shutdown.");
+              final_error_for_actorstop = Some(ZmqError::Internal("SocketCore: Command mailbox closed".into()));
+              let coord = core_arc.shutdown_coordinator.lock().await;
+              if coord.state == ShutdownPhase::Running {
+                drop(coord);
+                shutdown::initiate_core_shutdown(core_arc.clone(), &socket_logic_strong, true).await;
+              }
+              // Loop will break due to ShutdownPhase::Finished or next error check
+            }
+          }
         }
 
         // --- 3. Maintenance (Linger & Reconnects) ---

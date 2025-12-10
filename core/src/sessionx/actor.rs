@@ -3,9 +3,10 @@
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};
-use crate::socket::options::ZmtpEngineConfig;
+use crate::sessionx::regulator::SessionRegulator;
 use crate::socket::ISocket;
-use crate::throttle::{types::AdaptiveThrottleConfig, AdaptiveThrottle};
+use crate::socket::options::ZmtpEngineConfig;
+use crate::throttle::{AdaptiveThrottle, types::AdaptiveThrottleConfig};
 use crate::transport::ZmtpStdStream;
 use crate::{Blob, MailboxReceiver};
 
@@ -14,8 +15,9 @@ use std::fmt::Debug;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd; // For AsRawFd bound if S needs it for cork_info init
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
-use tokio::task::{yield_now, JoinHandle};
+use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
 use super::pipe_manager::CorePipeManagerX;
@@ -44,6 +46,7 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
 
   handshake_deadline: Option<TokioInstant>,
   socket_logic: Arc<dyn ISocket>,
+  session_regulator: SessionRegulator,
 }
 
 // Add AsRawFd bound here if ZmtpProtocolHandlerX::new needs it for cork setup.
@@ -104,6 +107,7 @@ where
       ping_check_timer,
       handshake_deadline,
       socket_logic,
+      session_regulator: SessionRegulator::new(Duration::from_secs(1)),
     };
 
     let task_handle = tokio::spawn(actor.run_loop());
@@ -127,7 +131,7 @@ where
     );
 
     let adaptive_throttle = {
-      let mut config = AdaptiveThrottleConfig::default();  //TODO Need to make this adjustable per socket
+      let mut config = AdaptiveThrottleConfig::default(); //TODO Need to make this adjustable per socket
       config.credit_per_message = 5;
       config.healthy_balance_width = 1024000;
       config.max_imbalance = 6553600;
@@ -525,9 +529,13 @@ where
 
   async fn set_fatal_error(&mut self, error: ZmqError) {
     tracing::error!(sca_handle = self.handle, uri = %self.actor_config.connected_endpoint_uri, err = %error, "SCA fatal error.");
+    // Enforce minimum lifespan to prevent rapid churn/log spam
+    self.session_regulator.enforce_min_lifespan().await;
+
     if self.error_for_drop_guard.is_none() {
       self.error_for_drop_guard = Some(error);
     }
+    
     self.transition_to_shutdown_stream(None).await; // Error is already set
   }
 
