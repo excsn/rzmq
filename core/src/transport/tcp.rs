@@ -118,7 +118,7 @@ impl TcpListener {
 
     let s = socket2::Socket::new(domain, socket2::Type::STREAM, None).map_err(ZmqError::from)?;
     s.set_reuse_address(true).map_err(ZmqError::from)?;
-    
+
     if domain == socket2::Domain::IPV6 {
       s.set_only_v6(false).map_err(ZmqError::from)?; //TODO: Probably make this configurable with options
     }
@@ -619,6 +619,7 @@ pub(crate) struct TcpConnecter {
   context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
   context: Context,
   parent_socket_id: usize,
+  initial_attempts: u32,
 }
 
 impl fmt::Debug for TcpConnecter {
@@ -645,6 +646,7 @@ impl TcpConnecter {
     monitor_tx: Option<MonitorSender>,
     context: Context,
     parent_socket_id: usize,
+    initial_attempts: u32,
   ) -> JoinHandle<()> {
     let transport_config = TcpTransportConfig {
       tcp_nodelay: options.tcp_nodelay,
@@ -661,6 +663,7 @@ impl TcpConnecter {
       context_handle_source,
       context: context.clone(),
       parent_socket_id,
+      initial_attempts,
     };
     let task_join_handle =
       tokio::spawn(connecter_actor.run_connect_loop(monitor_tx, parent_socket_id));
@@ -680,7 +683,7 @@ impl TcpConnecter {
       Some(parent_socket_id),
     );
 
-    tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Long-Lived TCP Connecter actor started.");
+    tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, attempt_start = self.initial_attempts, "Long-Lived TCP Connecter actor started.");
 
     if !endpoint_uri_clone.starts_with("tcp://") {
       let err = ZmqError::InvalidEndpoint(endpoint_uri_clone.clone());
@@ -704,23 +707,31 @@ impl TcpConnecter {
       == Some(Duration::ZERO)
       && (self.socket_options.reconnect_ivl_max == Some(Duration::ZERO)
         || self.socket_options.reconnect_ivl_max.is_none());
-    let mut current_retry_delay = if self.socket_options.reconnect_ivl == Some(Duration::ZERO)
-      && self
-        .socket_options
-        .reconnect_ivl_max
-        .map_or(false, |d| d > Duration::ZERO)
-    {
-      self.socket_options.reconnect_ivl_max.unwrap()
-    } else {
-      initial_reconnect_ivl
-    };
+
+    // Initialize backoff state based on inherited attempts
     let reconnect_ivl_max_opt = self.socket_options.reconnect_ivl_max;
-    let mut attempt_count = 0;
+    let mut current_retry_delay = initial_reconnect_ivl;
+
+    // Fast-forward delay calculation to current attempt count if we are inheriting state
+    if initial_reconnect_ivl > Duration::ZERO {
+      if let Some(max_d) = reconnect_ivl_max_opt.filter(|d| *d > Duration::ZERO) {
+        // Cap exponent to prevent overflow if initial_attempts is huge
+        let iterations = self.initial_attempts.min(31);
+        for _ in 0..iterations {
+          current_retry_delay = (current_retry_delay * 2).min(max_d);
+        }
+      }
+    }
+
+    let mut attempt_count = self.initial_attempts;
     let mut system_event_rx = self.context.event_bus().subscribe();
     let mut last_connect_attempt_error: Option<ZmqError> = None;
 
     'connecter_life_loop: loop {
-      if attempt_count > 0 {
+      // Wait condition: Only wait if this is a retry *within* this actor's life.
+      // If attempt_count == initial_attempts, it means SocketCore just spawned us
+      // after waiting the appropriate delay, so we should try immediately.
+      if attempt_count > self.initial_attempts {
         if no_retry_after_first_connect_fail {
           tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: Retries disabled. Stopping after first failure.");
           break 'connecter_life_loop;
@@ -730,7 +741,7 @@ impl TcpConnecter {
             &mut system_event_rx,
             current_retry_delay,
             &monitor_tx,
-            attempt_count + 1,
+            attempt_count as usize + 1,
           )
           .await
         {
@@ -801,7 +812,7 @@ impl TcpConnecter {
             parent_core_id: self.parent_socket_id,
             endpoint_uri: actual_peer_uri,
             target_endpoint_uri: endpoint_uri_clone.clone(),
-            connection_iface: connection_iface_opt, // Pass the Option
+            connection_iface: connection_iface_opt,
             interaction_model,
             managing_actor_task_id,
           };
@@ -820,18 +831,25 @@ impl TcpConnecter {
         }
         Err(attempt_failure_error) => {
           last_connect_attempt_error = Some(attempt_failure_error.clone());
+
           tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %attempt_failure_error, "Connecter: TCP connect attempt #{} failed.", attempt_count);
+
           if is_fatal_connect_error(&attempt_failure_error)
             || matches!(&attempt_failure_error, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus error"))
           {
             tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %attempt_failure_error, "Connecter: Fatal error. Stopping.");
             break 'connecter_life_loop;
           }
+
+          // If we fail on the very first attempt (freshly spawned) AND retries are disabled, stop.
           if no_retry_after_first_connect_fail && attempt_count == 1 {
             tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: No retry, stopping after first fail.");
             break 'connecter_life_loop;
           }
-          if attempt_count == 1 {
+
+          // Emit ConnectDelayed only once per actor lifecycle/retry-sequence to avoid log spam.
+          // Check if it matches initial_attempts + 1.
+          if attempt_count == self.initial_attempts + 1 {
             if let Some(ref mon_tx) = monitor_tx {
               let _ = mon_tx.try_send(SocketEvent::ConnectDelayed {
                 endpoint: endpoint_uri_clone.clone(),
@@ -1165,18 +1183,27 @@ pub(crate) fn is_fatal_connect_error(e: &ZmqError) -> bool {
     ZmqError::IoError { kind, .. } => {
       matches!(
         kind,
+        // Physical configuration issues are fatal
         io::ErrorKind::AddrNotAvailable
           | io::ErrorKind::AddrInUse
           | io::ErrorKind::InvalidInput
-          | io::ErrorKind::PermissionDenied
-          | io::ErrorKind::ConnectionRefused
+          | io::ErrorKind::PermissionDenied // ConnectionRefused is transient (server down), NOT fatal.
       )
     }
-    ZmqError::InvalidEndpoint(_)
-    | ZmqError::UnsupportedTransport(_)
-    | ZmqError::SecurityError(_)
+    // Structural issues are fatal
+    ZmqError::InvalidEndpoint(_) | ZmqError::UnsupportedTransport(_) => true,
+
+    // DNS might be transient, but often indicates misconfig.
+    // ZMQ usually retries DNS, but let's stick to fatal if name doesn't resolve to avoid infinite loops on typos.
+    ZmqError::DnsResolutionFailed(_) => true,
+
+    // Protocol/Security errors during handshake should trigger backoff retry, not permanent death.
+    // This allows recovery if credentials/keys are fixed on the server side.
+    ZmqError::SecurityError(_)
     | ZmqError::AuthenticationFailure(_)
-    | ZmqError::DnsResolutionFailed(_) => true,
+    | ZmqError::ProtocolViolation(_) => false,
+
+    // All others (Timeout, ConnectionClosed, etc.) are transient
     _ => false,
   }
 }

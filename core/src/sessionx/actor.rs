@@ -93,6 +93,18 @@ where
 
     let system_event_receiver = actor_config.context.event_bus().subscribe();
 
+    // We enforce a minimum 1s lifespan if the configured receive timeout is short,
+    // to prevent rapid crash-loops from flooding logs.
+    let rcv_timeout = engine_config
+      .rcvtimeo
+      .unwrap_or(std::time::Duration::from_secs(30));
+    let regulator_min_lifespan = if rcv_timeout < std::time::Duration::from_millis(1000) {
+      std::time::Duration::from_millis(1000)
+    } else {
+      // Even if rcvtimeo is long, a crash-on-connect should still be throttled.
+      std::time::Duration::from_millis(1000)
+    };
+
     let actor = Self {
       handle,
       current_phase: ConnectionPhaseX::HandshakeInProgress, // Start handshake immediately
@@ -107,7 +119,7 @@ where
       ping_check_timer,
       handshake_deadline,
       socket_logic,
-      session_regulator: SessionRegulator::new(Duration::from_secs(1)),
+      session_regulator: SessionRegulator::new(regulator_min_lifespan),
     };
 
     let task_handle = tokio::spawn(actor.run_loop());
@@ -529,14 +541,22 @@ where
 
   async fn set_fatal_error(&mut self, error: ZmqError) {
     tracing::error!(sca_handle = self.handle, uri = %self.actor_config.connected_endpoint_uri, err = %error, "SCA fatal error.");
-    // Enforce minimum lifespan to prevent rapid churn/log spam
-    self.session_regulator.enforce_min_lifespan().await;
 
     if self.error_for_drop_guard.is_none() {
       self.error_for_drop_guard = Some(error);
     }
-    
-    self.transition_to_shutdown_stream(None).await; // Error is already set
+
+    // 1. Explicitly shutdown and drop the stream NOW to free the OS File Descriptor.
+    // We do this before the regulator sleep to prevent FD exhaustion attacks.
+    // We ignore errors here as we are already handling a fatal error.
+    let _ = self.zmtp_handler.initiate_stream_shutdown().await;
+
+    // 2. Mark state as shutting down so the main loop exits correctly after the sleep.
+    self.transition_to_shutdown_stream(None).await;
+
+    // 3. Enforce minimum lifespan. The actor stays alive (consuming RAM) but not OS handles.
+    // This prevents rapid crash-loops from burning CPU.
+    self.session_regulator.enforce_min_lifespan().await;
   }
 
   async fn transition_to_shutdown_stream(&mut self, accompanying_error: Option<ZmqError>) {

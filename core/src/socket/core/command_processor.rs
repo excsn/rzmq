@@ -577,6 +577,13 @@ pub(crate) async fn respawn_connecter_actor(
       let core_s_read = core_arc.core_state.read();
       let options_clone = core_s_read.options.clone();
       let monitor_tx_clone = core_s_read.get_monitor_sender_clone();
+      
+      let current_attempts = core_s_read
+        .reconnect_states
+        .get(&target_uri)
+        .map(|s| s.current_attempts)
+        .unwrap_or(0);
+
       let handle_source_clone = context_clone.inner().next_handle.clone();
       drop(core_s_read);
 
@@ -591,6 +598,7 @@ pub(crate) async fn respawn_connecter_actor(
         monitor_tx_clone,
         context_clone,
         parent_socket_id,
+        current_attempts,
       );
       // No need to store EndpointInfo for Connecter here; it's short-lived and reports via events.
     }
@@ -639,7 +647,7 @@ pub(crate) async fn respawn_connecter_actor(
 /// Handles the ConnectionAttemptFailed system event.
 pub(crate) async fn handle_connect_failed_event(
   core_arc: Arc<SocketCore>,
-  socket_logic: Arc<dyn ISocket + 'static>,
+  _socket_logic: Arc<dyn ISocket + 'static>, // Logic argument no longer used directly here
   target_uri: String,
   error: ZmqError,
 ) {
@@ -656,18 +664,38 @@ pub(crate) async fn handle_connect_failed_event(
   // Check if reconnect is configured and error is not fatal
   let should_reconnect = {
     let core_s_read = core_arc.core_state.read();
-    core_s_read.options.reconnect_ivl.map_or(false, |d| d != Duration::ZERO) && // reconnect_ivl > 0
-        !crate::transport::tcp::is_fatal_connect_error(&error) // Use specific helper
+    core_s_read
+      .options
+      .reconnect_ivl
+      .map_or(false, |d| d != Duration::ZERO)
+      && !crate::transport::tcp::is_fatal_connect_error(&error)
   };
 
   if should_reconnect {
-    tracing::info!(handle = core_handle, uri = %target_uri, "Connection failed, will attempt to respawn connecter (reconnect).");
-    // The Connecter actor itself manages the delays (ConnectDelayed, ConnectRetried events).
-    // Here, we just ensure a new Connecter task is spawned if the previous one failed definitively.
-    // The Connecter's own loop implements the retry delays.
-    // If ConnectionAttemptFailed means the Connecter actor *itself* has stopped, then we respawn.
-    // This implies ConnectionAttemptFailed is usually published by a Connecter just before it stops.
-    respawn_connecter_actor(core_arc, socket_logic, target_uri).await;
+    let mut state = core_arc.core_state.write();
+    let options = state.options.clone();
+
+    // Default to 100ms if not set, consistent with ZMQ defaults
+    let base = options
+      .reconnect_ivl
+      .unwrap_or(std::time::Duration::from_millis(100));
+    let max = options
+      .reconnect_ivl_max
+      .unwrap_or(std::time::Duration::from_secs(60));
+
+    let recon_state = state
+      .reconnect_states
+      .entry(target_uri.clone())
+      .or_default();
+    let delay = recon_state.on_connection_failure(base, max);
+
+    tracing::info!(
+      handle = core_handle,
+      uri = %target_uri,
+      attempt = recon_state.current_attempts,
+      next_attempt_in = ?delay,
+      "Connection failed. Scheduling reconnect via passive backoff."
+    );
   } else {
     tracing::info!(handle = core_handle, uri = %target_uri, "Connection failed, reconnect not enabled or error is fatal.");
   }
