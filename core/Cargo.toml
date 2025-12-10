@@ -1,6 +1,6 @@
 [package]
 name = "rzmq"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2024"
 license = "MPL-2.0"
 publish = true
@@ -68,7 +68,7 @@ dryoc = { version = "^0.7", optional = true }
 [dev-dependencies]
 # For benchmarks
 anyhow = "^1"
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 bench_matrix = { version = "^0" }
 serial_test = "^3"
 # For integration tests

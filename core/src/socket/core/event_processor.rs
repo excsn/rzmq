@@ -148,6 +148,12 @@ pub(crate) async fn process_system_event(
                 );
                 ep_info.peer_socket_type = peer_socket_type;
               }
+              
+              // 2. Reset reconnect backoff state on successful handshake
+              if let Some(recon_state) = core_s_write.reconnect_states.get_mut(&uri) {
+                recon_state.on_connection_success();
+                tracing::trace!(handle = core_handle, uri = %uri, "Reset reconnect backoff state after success.");
+              }
             }
           }
 

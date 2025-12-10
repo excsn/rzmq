@@ -38,8 +38,8 @@ pub(crate) async fn run_command_loop(
   );
 
   // Linger check interval
-  let mut linger_check_interval: Interval = interval(Duration::from_millis(100)); // Adjusted interval
-  linger_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+  let mut maintenance_interval: Interval = interval(Duration::from_millis(100)); // Adjusted interval
+  maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
   let mut final_error_for_actorstop: Option<ZmqError> = None;
 
@@ -139,37 +139,64 @@ pub(crate) async fn run_command_loop(
             }
         }
 
-        // --- 3. Linger Check (Timer) ---
-        // Only tick if in Lingering phase.
-        _ = linger_check_interval.tick(), if current_shutdown_phase == ShutdownPhase::Lingering => {
+        // --- 3. Maintenance (Linger & Reconnects) ---
+        _ = maintenance_interval.tick() => {
+          // A. Reconnection Logic (Only if Running)
+          if current_shutdown_phase == ShutdownPhase::Running {
+            let mut uris_to_retry = Vec::new();
+            let now = std::time::Instant::now();
+            
+            {
+              let mut state = core_arc.core_state.write();
+              for (uri, recon_state) in state.reconnect_states.iter_mut() {
+                if recon_state.is_due(now) {
+                  uris_to_retry.push(uri.clone());
+                  // Mark as processed so we don't respawn it again next tick.
+                  // The attempt count is preserved. It will be reset only on connection success.
+                  recon_state.next_attempt_at = None; 
+                }
+              }
+            }
+
+            for uri in uris_to_retry {
+              tracing::debug!(handle=core_handle, uri=%uri, "Backoff timer expired. Respawning connecter.");
+              crate::socket::core::command_processor::respawn_connecter_actor(
+                core_arc.clone(),
+                socket_logic_strong.clone(),
+                uri
+              ).await;
+            }
+          }
+
+          // B. Linger Logic (Only if Lingering)
+          if current_shutdown_phase == ShutdownPhase::Lingering {
             // Delegate to shutdown module
             if let Err(e) = shutdown::check_and_advance_linger(
-                core_arc.clone(),
-                &socket_logic_strong,
+              core_arc.clone(),
+              &socket_logic_strong,
             ).await {
-                tracing::error!(handle = core_handle, "Error during linger check: {}. Forcing cleanup.", e);
-                final_error_for_actorstop = final_error_for_actorstop.clone().or(Some(e));
-                // Force advance to cleaning phase if linger check itself errors badly
-                let mut coord = core_arc.shutdown_coordinator.lock().await;
-                if coord.state == ShutdownPhase::Lingering { // Re-check state
-                    {
-                        // Pass a mutable CoreState guard
-                        let mut core_state_write_guard = core_arc.core_state.write();
-                        shutdown::advance_to_cleaning_phase(&mut coord, core_handle, &mut core_state_write_guard);
-                    }
-                    // Drop guards before async call
-                    #[cfg(feature = "inproc")]
-                    let pipes_to_clean_val = coord.inproc_connections_to_cleanup.clone();
-                    #[cfg(not(feature = "inproc"))]
-                    let pipes_to_clean_val = Vec::new(); // Dummy for non-inproc
-                    drop(coord);
-
-                    shutdown::perform_final_pipe_cleanup(core_arc.clone(), &socket_logic_strong, pipes_to_clean_val).await;
-
-                } else {
-                    drop(coord); // Still need to drop if not advancing
+              tracing::error!(handle = core_handle, "Error during linger check: {}. Forcing cleanup.", e);
+              final_error_for_actorstop = final_error_for_actorstop.clone().or(Some(e));
+              
+              // Force advance to cleaning phase if linger check itself errors badly
+              let mut coord = core_arc.shutdown_coordinator.lock().await;
+              if coord.state == ShutdownPhase::Lingering {
+                {
+                  let mut core_state_write_guard = core_arc.core_state.write();
+                  shutdown::advance_to_cleaning_phase(&mut coord, core_handle, &mut core_state_write_guard);
                 }
+                #[cfg(feature = "inproc")]
+                let pipes_to_clean_val = coord.inproc_connections_to_cleanup.clone();
+                #[cfg(not(feature = "inproc"))]
+                let pipes_to_clean_val = Vec::new(); 
+                drop(coord);
+
+                shutdown::perform_final_pipe_cleanup(core_arc.clone(), &socket_logic_strong, pipes_to_clean_val).await;
+              } else {
+                drop(coord);
+              }
             }
+          }
         }
       } // end tokio::select!
     } // end loop

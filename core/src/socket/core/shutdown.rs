@@ -430,17 +430,30 @@ pub(crate) async fn handle_actor_stopping_event(
       );
       // Only reconnect if the cleanup indicated it was an outbound session that failed.
       if should_consider_reconnect {
-          if let Some(uri) = endpoint_uri_opt {
-              // We need to drop the lock before calling the async reconnect function
-              let target_uri_to_reconnect = uri.to_string();
-              drop(coordinator); // Release lock
-              command_processor::respawn_connecter_actor(
-                  core_arc.clone(),
-                  socket_logic_strong.clone(),
-                  target_uri_to_reconnect,
-              )
-              .await;
-          }
+        if let Some(uri_str) = endpoint_uri_opt {
+          let target_uri = uri_str.to_string();
+
+          // Calculate delay and update state
+          let mut state = core_arc.core_state.write();
+          let options = state.options.clone();
+          
+          // Default to 100ms if not set, consistent with ZMQ defaults
+          let base = options.reconnect_ivl.unwrap_or(std::time::Duration::from_millis(100));
+          let max = options.reconnect_ivl_max.unwrap_or(std::time::Duration::from_secs(60));
+
+          let recon_state = state.reconnect_states.entry(target_uri.clone()).or_default();
+          let delay = recon_state.on_connection_failure(base, max);
+
+          tracing::info!(
+            handle = core_handle,
+            uri = %target_uri,
+            attempt = recon_state.current_attempts,
+            next_attempt_in = ?delay,
+            "Session stopped. Scheduled for reconnect via passive backoff."
+          );
+          
+          // Note: We do NOT spawn a task here. The main command_loop will pick this up.
+        }
       }
     }
     ShutdownPhase::StoppingChildren => {

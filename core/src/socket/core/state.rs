@@ -1,10 +1,10 @@
+use crate::Msg;
 use crate::runtime::MailboxSender;
+use crate::socket::SocketEvent;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
 use crate::socket::types::SocketType;
-use crate::socket::SocketEvent;
-use crate::Msg;
 
 use fibre::mpmc::AsyncSender;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +51,60 @@ pub(crate) enum EndpointType {
            // Consider adding Connecter if we store pending connect attempts in endpoints map with a JoinHandle
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReconnectState {
+  pub current_attempts: u32,
+  pub next_attempt_at: Option<Instant>,
+}
+
+impl Default for ReconnectState {
+  fn default() -> Self {
+    Self {
+      current_attempts: 0,
+      next_attempt_at: None,
+    }
+  }
+}
+
+impl ReconnectState {
+  /// Resets state when a connection is successfully established
+  pub fn on_connection_success(&mut self) {
+    self.current_attempts = 0;
+    self.next_attempt_at = None;
+  }
+
+  /// Calculates the delay for the next attempt and updates state
+  pub fn on_connection_failure(
+    &mut self,
+    base_ivl: std::time::Duration,
+    max_ivl: std::time::Duration,
+  ) -> std::time::Duration {
+    // 1. Calculate Backoff: base * 2 ^ attempts
+    // Cap power at 31 to prevent u32 overflow
+    let multiplier = 2u32.saturating_pow(self.current_attempts.min(31));
+    let mut delay = base_ivl.saturating_mul(multiplier);
+
+    // 2. Cap at max interval
+    if max_ivl > std::time::Duration::ZERO {
+      delay = delay.min(max_ivl);
+    }
+
+    // 3. Update state
+    self.current_attempts = self.current_attempts.saturating_add(1);
+    self.next_attempt_at = Some(Instant::now() + delay);
+
+    delay
+  }
+
+  /// Checks if a retry is due
+  pub fn is_due(&self, now: Instant) -> bool {
+    match self.next_attempt_at {
+      Some(time) => now >= time,
+      None => false,
+    }
+  }
+}
+
 /// Holds the mutable state for a `SocketCore` actor.
 #[derive(Debug)]
 pub(crate) struct CoreState {
@@ -63,6 +117,10 @@ pub(crate) struct CoreState {
   pub pipe_reader_task_handles: HashMap<usize, JoinHandle<()>>,
   // Main map of active endpoints, keyed by resolved endpoint_uri
   pub endpoints: HashMap<String, EndpointInfo>,
+
+  // --- Reconnection State ---
+  /// Maps Target URI -> ReconnectState
+  pub(crate) reconnect_states: HashMap<String, ReconnectState>,
 
   // --- Mappings for ISocket interaction and event routing ---
   /// Maps a pipe_read_id (actual for sessions, or synthetic for uring FDs) to the endpoint_uri.
@@ -89,6 +147,7 @@ impl CoreState {
       pipes_tx: HashMap::new(),
       pipe_reader_task_handles: HashMap::new(),
       endpoints: HashMap::new(),
+      reconnect_states: HashMap::new(),
       pipe_read_id_to_endpoint_uri: HashMap::new(),
       #[cfg(feature = "io-uring")]
       uring_fd_to_endpoint_uri: HashMap::new(),
@@ -139,7 +198,10 @@ impl CoreState {
       );
     }
 
-    let map_removed = self.pipe_read_id_to_endpoint_uri.remove(&pipe_read_id).is_some();
+    let map_removed = self
+      .pipe_read_id_to_endpoint_uri
+      .remove(&pipe_read_id)
+      .is_some();
     if map_removed {
       tracing::trace!(
         core_handle = self.handle,
