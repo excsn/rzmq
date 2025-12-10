@@ -16,7 +16,7 @@ use std::fmt::Debug;
 use std::os::fd::AsRawFd; // For AsRawFd bound if S needs it for cork_info init
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{OwnedSemaphorePermit, broadcast};
 use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
@@ -47,6 +47,7 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   handshake_deadline: Option<TokioInstant>,
   socket_logic: Arc<dyn ISocket>,
   session_regulator: SessionRegulator,
+  _connection_permit: Option<OwnedSemaphorePermit>,
 }
 
 // Add AsRawFd bound here if ZmtpProtocolHandlerX::new needs it for cork setup.
@@ -66,6 +67,7 @@ where
     engine_config: Arc<ZmtpEngineConfig>,
     command_mailbox_receiver: MailboxReceiver,
     socket_logic: Arc<dyn ISocket>,
+    connection_permit: Option<OwnedSemaphorePermit>,
   ) -> JoinHandle<()> {
     // Returns JoinHandle for the SCA task
 
@@ -120,6 +122,7 @@ where
       handshake_deadline,
       socket_logic,
       session_regulator: SessionRegulator::new(regulator_min_lifespan),
+      _connection_permit: connection_permit,
     };
 
     let task_handle = tokio::spawn(actor.run_loop());

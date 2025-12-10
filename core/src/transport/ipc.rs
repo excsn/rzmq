@@ -3,8 +3,9 @@
 use crate::context::Context;
 use crate::error::ZmqError;
 use crate::runtime::{
-  mailbox, system_events::ConnectionInteractionModel, ActorDropGuard, ActorType, Command,
-  MailboxReceiver as GenericMailboxReceiver, MailboxSender as GenericMailboxSender, SystemEvent,
+  ActorDropGuard, ActorType, Command, MailboxReceiver as GenericMailboxReceiver,
+  MailboxSender as GenericMailboxSender, SystemEvent, mailbox,
+  system_events::ConnectionInteractionModel,
 };
 use crate::sessionx::actor::SessionConnectionActorX;
 use crate::sessionx::states::ActorConfigX;
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::{Semaphore, broadcast};
 use tokio::task::{Id as TaskId, JoinHandle};
 use tokio::time::sleep;
 
@@ -42,7 +43,10 @@ impl fmt::Debug for IpcListener {
       .field("handle", &self.handle)
       .field("endpoint", &self.endpoint)
       .field("path", &self.path)
-      .field("mailbox_receiver_is_closed", &self.mailbox_receiver.is_closed())
+      .field(
+        "mailbox_receiver_is_closed",
+        &self.mailbox_receiver.is_closed(),
+      )
       .field("listener_handle_is_some", &self.listener_handle.is_some())
       .field("context_present", &true) // Avoid printing full context
       .field("parent_socket_id", &self.parent_socket_id)
@@ -67,14 +71,17 @@ impl IpcListener {
     let (tx, rx) = mailbox(capacity);
 
     match std::fs::remove_file(&path) {
-      Ok(_) => tracing::debug!(listener_handle = handle, path = ?path, "Removed existing IPC socket file."),
+      Ok(_) => {
+        tracing::debug!(listener_handle = handle, path = ?path, "Removed existing IPC socket file.")
+      }
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
       Err(e) => {
         tracing::warn!(listener_handle = handle, path = ?path, error = %e, "Failed to remove existing IPC socket file.")
       }
     }
 
-    let listener = TokioUnixListener::bind(&path).map_err(|e| ZmqError::from_io_endpoint(e, &endpoint_uri))?;
+    let listener =
+      TokioUnixListener::bind(&path).map_err(|e| ZmqError::from_io_endpoint(e, &endpoint_uri))?;
     let resolved_uri = endpoint_uri.clone();
     tracing::info!(listener_handle = handle, path = ?path, uri = %resolved_uri, "IPC Listener bound successfully");
 
@@ -270,14 +277,15 @@ impl IpcListener {
             let socket_logic = socket_logic.clone();
 
             async move {
-              let _permit_scoped_for_task = _permit_guard;
+              let max_connection_permit = _permit_guard;
               // Variables for the common event publishing logic
               let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
               let mut managing_actor_task_id_for_event: Option<TaskId> = None;
               let mut setup_successful = true;
 
               // IPC doesn't have an io_uring path like TCP. It always uses an actor.
-              let sca_handle_id = handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              let sca_handle_id =
+                handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
               let actor_conf = ActorConfigX {
                 context: context_clone.clone(),
                 monitor_tx: monitor_tx_clone,
@@ -300,6 +308,7 @@ impl IpcListener {
                 engine_conf,
                 command_receiver_for_sca,
                 socket_logic.clone(),
+                Some(max_connection_permit),
               );
 
               interaction_model_for_event = Some(ConnectionInteractionModel::ViaSca {
@@ -322,7 +331,10 @@ impl IpcListener {
                     managing_actor_task_id: managing_actor_task_id_for_event,
                   };
                   if context_clone.event_bus().publish(event).is_err() {
-                    tracing::error!("Failed to publish NewConnection(SCA/IPC) for {}", actual_connected_uri);
+                    tracing::error!(
+                      "Failed to publish NewConnection(SCA/IPC) for {}",
+                      actual_connected_uri
+                    );
                     // Abort spawned SCA if publish fails
                     // Managing_actor_task_id_for_event holds the TaskId of SCA
                     // Direct abort via TaskId isn't straightforward, SCA should handle lack of AttachPipes.
@@ -351,7 +363,11 @@ impl IpcListener {
         }
         Err(e) => {
           drop(permit);
-          tracing::error!("Error accepting IPC connection (listener {}): {}", endpoint_uri, e);
+          tracing::error!(
+            "Error accepting IPC connection (listener {}): {}",
+            endpoint_uri,
+            e
+          );
           if let Some(ref tx) = monitor_tx {
             let _ = tx.try_send(SocketEvent::AcceptFailed {
               endpoint: endpoint_uri.clone(),
@@ -387,7 +403,9 @@ impl Drop for IpcListener {
       }
     }
     match std::fs::remove_file(&self.path) {
-      Ok(_) => tracing::debug!(listener_handle = self.handle, path = ?self.path, "Removed IPC socket file."),
+      Ok(_) => {
+        tracing::debug!(listener_handle = self.handle, path = ?self.path, "Removed IPC socket file.")
+      }
       Err(e) if e.kind() == io::ErrorKind::NotFound => {
         tracing::trace!(listener_handle = self.handle, path = ?self.path, "IPC socket file not found during drop.")
       }
@@ -446,11 +464,16 @@ impl IpcConnecter {
       parent_socket_id,
       socket_logic,
     };
-    let task_join_handle = tokio::spawn(connecter_actor.run_connect_attempt(monitor_tx, parent_socket_id));
+    let task_join_handle =
+      tokio::spawn(connecter_actor.run_connect_attempt(monitor_tx, parent_socket_id));
     task_join_handle
   }
 
-  async fn run_connect_attempt(self, monitor_tx: Option<MonitorSender>, _parent_socket_id_unused: usize) {
+  async fn run_connect_attempt(
+    self,
+    monitor_tx: Option<MonitorSender>,
+    _parent_socket_id_unused: usize,
+  ) {
     let connecter_handle = self.handle;
     let endpoint_uri_original = self.endpoint_uri.clone(); // User's target URI
 
@@ -465,7 +488,11 @@ impl IpcConnecter {
 
     // Variables to hold the outcome of the connection attempt
     let mut connection_outcome: Result<
-      (ConnectionInteractionModel, Option<TaskId>, String /* actual_uri */),
+      (
+        ConnectionInteractionModel,
+        Option<TaskId>,
+        String, /* actual_uri */
+      ),
       ZmqError,
     >;
 
@@ -481,75 +508,76 @@ impl IpcConnecter {
     let connect_future = UnixStream::connect(&self.path);
 
     tokio::select! {
-        biased;
-        _ = async { // Early abort if context/socket is closing
-            loop {
-                match system_event_rx.recv().await {
-                    Ok(SystemEvent::ContextTerminating) => break,
-                    Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => break,
-                    Ok(_) => continue,
-                    Err(_) => break, // Channel closed or lagged
-                }
-            }
-        } => {
-            connection_outcome = Err(ZmqError::Internal("IPC Connect aborted by system event.".into()));
+      biased;
+      _ = async { // Early abort if context/socket is closing
+        loop {
+          match system_event_rx.recv().await {
+            Ok(SystemEvent::ContextTerminating) => break,
+            Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => break,
+            Ok(_) => continue,
+            Err(_) => break, // Channel closed or lagged
+          }
         }
-        connect_result = tokio::time::timeout(connect_timeout, connect_future) => {
-            match connect_result {
-                Ok(Ok(unix_stream)) => { // Successfully connected within timeout
-                    #[cfg(unix)]
-                    let peer_id_str = format!("ipc-fd-{}", unix_stream.as_raw_fd());
-                    #[cfg(not(unix))] // Fallback if AsRawFd is not available/not unix
-                    let peer_id_str = format!("ipc-conn-{}", self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+      } => {
+          connection_outcome = Err(ZmqError::Internal("IPC Connect aborted by system event.".into()));
+      }
+      connect_result = tokio::time::timeout(connect_timeout, connect_future) => {
+        match connect_result {
+          Ok(Ok(unix_stream)) => { // Successfully connected within timeout
+            #[cfg(unix)]
+            let peer_id_str = format!("ipc-fd-{}", unix_stream.as_raw_fd());
+            #[cfg(not(unix))] // Fallback if AsRawFd is not available/not unix
+            let peer_id_str = format!("ipc-conn-{}", self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
 
-                    let actual_connected_uri = format!("ipc://{}", peer_id_str);
-                    tracing::info!(handle = connecter_handle, uri = %endpoint_uri_original, actual = %actual_connected_uri, "IPC Connect successful");
+            let actual_connected_uri = format!("ipc://{}", peer_id_str);
+            tracing::info!(handle = connecter_handle, uri = %endpoint_uri_original, actual = %actual_connected_uri, "IPC Connect successful");
 
-                    if let Some(ref tx) = monitor_tx {
-                    let _ = tx.try_send(SocketEvent::Connected {
-                        endpoint: endpoint_uri_original.clone(),
-                        peer_addr: actual_connected_uri.clone(),
-                    });
-                    }
-
-                    // Spawn SessionConnectionActorX
-                    let sca_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let actor_conf = ActorConfigX {
-                        context: self.context.clone(),
-                        monitor_tx: monitor_tx.clone(), // Pass along the monitor
-                        logical_target_endpoint_uri: endpoint_uri_original.clone(),
-                        connected_endpoint_uri: actual_connected_uri.clone(),
-                        is_server_role: false, // Outgoing connection is client role
-                    };
-                    let engine_conf = Arc::new(ZmtpEngineConfig::from(&*self.context_options));
-
-                    let (command_sender_for_sca, command_receiver_for_sca) =
-                        mailbox(self.context.inner().get_actor_mailbox_capacity());
-
-                    let sca_task_handle = SessionConnectionActorX::create_and_spawn(
-                        sca_handle_id,
-                        self.parent_socket_id,
-                        unix_stream, // Stream moved here
-                        actor_conf,
-                        engine_conf,
-                        command_receiver_for_sca,
-                        self.socket_logic.clone(),
-                    );
-
-                    let interaction_model = ConnectionInteractionModel::ViaSca {
-                        sca_mailbox: command_sender_for_sca,
-                        sca_handle_id,
-                    };
-                    connection_outcome = Ok((interaction_model, Some(sca_task_handle.id()), actual_connected_uri));
-                }
-                Ok(Err(e)) => { // Connect failed (not timeout related to tokio::time::timeout itself)
-                    connection_outcome = Err(ZmqError::from_io_endpoint(e, &endpoint_uri_original));
-                }
-                Err(_timeout_elapsed) => { // Timeout from tokio::time::timeout
-                    connection_outcome = Err(ZmqError::Timeout);
-                }
+            if let Some(ref tx) = monitor_tx {
+            let _ = tx.try_send(SocketEvent::Connected {
+              endpoint: endpoint_uri_original.clone(),
+              peer_addr: actual_connected_uri.clone(),
+            });
             }
+
+            // Spawn SessionConnectionActorX
+            let sca_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let actor_conf = ActorConfigX {
+              context: self.context.clone(),
+              monitor_tx: monitor_tx.clone(), // Pass along the monitor
+              logical_target_endpoint_uri: endpoint_uri_original.clone(),
+              connected_endpoint_uri: actual_connected_uri.clone(),
+              is_server_role: false, // Outgoing connection is client role
+            };
+            let engine_conf = Arc::new(ZmtpEngineConfig::from(&*self.context_options));
+
+            let (command_sender_for_sca, command_receiver_for_sca) =
+                mailbox(self.context.inner().get_actor_mailbox_capacity());
+
+            let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+              sca_handle_id,
+              self.parent_socket_id,
+              unix_stream, // Stream moved here
+              actor_conf,
+              engine_conf,
+              command_receiver_for_sca,
+              self.socket_logic.clone(),
+              None,
+            );
+
+            let interaction_model = ConnectionInteractionModel::ViaSca {
+              sca_mailbox: command_sender_for_sca,
+              sca_handle_id,
+            };
+            connection_outcome = Ok((interaction_model, Some(sca_task_handle.id()), actual_connected_uri));
+          }
+          Ok(Err(e)) => { // Connect failed (not timeout related to tokio::time::timeout itself)
+            connection_outcome = Err(ZmqError::from_io_endpoint(e, &endpoint_uri_original));
+          }
+          Err(_timeout_elapsed) => { // Timeout from tokio::time::timeout
+            connection_outcome = Err(ZmqError::Timeout);
+          }
         }
+      }
     }
 
     // Process the connection_outcome
@@ -568,7 +596,9 @@ impl IpcConnecter {
             "IPC Connecter: Failed to publish NewConnectionEstablished for {}.",
             endpoint_uri_original
           );
-          actor_drop_guard.set_error(ZmqError::Internal("IPC Failed to publish NewConnection".into()));
+          actor_drop_guard.set_error(ZmqError::Internal(
+            "IPC Failed to publish NewConnection".into(),
+          ));
           // TODO: Abort SCA if spawned and publish failed. SCA should self-terminate if AttachPipes not received.
         } else {
           actor_drop_guard.waive(); // Successful connection and event publish
@@ -584,11 +614,14 @@ impl IpcConnecter {
         }
         // Only publish ConnectionAttemptFailed if it wasn't an internal abort
         if !matches!(&err, ZmqError::Internal(s) if s.contains("aborted by system event")) {
-          let _ = self.context.event_bus().publish(SystemEvent::ConnectionAttemptFailed {
-            parent_core_id: self.parent_socket_id,
-            target_endpoint_uri: endpoint_uri_original.clone(),
-            error: err.clone(),
-          });
+          let _ = self
+            .context
+            .event_bus()
+            .publish(SystemEvent::ConnectionAttemptFailed {
+              parent_core_id: self.parent_socket_id,
+              target_endpoint_uri: endpoint_uri_original.clone(),
+              error: err.clone(),
+            });
         }
         actor_drop_guard.set_error(err);
       }
@@ -599,5 +632,8 @@ impl IpcConnecter {
 }
 
 fn is_fatal_ipc_accept_error(e: &io::Error) -> bool {
-  matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe)
+  matches!(
+    e.kind(),
+    io::ErrorKind::InvalidInput | io::ErrorKind::BrokenPipe
+  )
 }

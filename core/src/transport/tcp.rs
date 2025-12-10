@@ -345,7 +345,7 @@ impl TcpListener {
             let socket_logic = socket_logic.clone();
 
             async move {
-              let _permit_scoped_for_task = _permit_guard;
+              let max_connection_permit = _permit_guard; 
 
               let mut connection_iface_for_event: Option<Arc<dyn ISocketConnection>> = None;
               let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
@@ -520,6 +520,7 @@ impl TcpListener {
                     engine_conf,
                     command_receiver_for_sca,
                     socket_logic,
+                    Some(max_connection_permit),
                   );
 
                   interaction_model_for_event = Some(ConnectionInteractionModel::ViaSca {
@@ -1081,6 +1082,7 @@ impl TcpConnecter {
             engine_conf,
             command_receiver_for_sca,
             self.socket_logic.clone(),
+            None,
           );
 
           let interaction_model = ConnectionInteractionModel::ViaSca {
