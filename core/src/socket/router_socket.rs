@@ -275,7 +275,7 @@ impl ISocket for RouterSocket {
         }
       };
 
-      let (conn_iface_opt, conn_id_opt) = {
+      let (conn_iface_opt, pipe_read_id_opt) = {
         let core_s_read_guard = self.core.core_state.read();
         let result = core_s_read_guard
           .endpoints
@@ -283,13 +283,13 @@ impl ISocket for RouterSocket {
           .map_or((None, None), |ep_info| {
             (
               Some(ep_info.connection_iface.clone()),
-              Some(ep_info.handle_id),
+              ep_info.pipe_ids.map(|(_, read_id)| read_id),
             )
           });
         result
       };
 
-      let (conn_iface, conn_id) = match (conn_iface_opt, conn_id_opt) {
+      let (conn_iface, pipe_read_id) = match (conn_iface_opt, pipe_read_id_opt) {
         (Some(iface), Some(id)) => (iface, id),
         _ => {
           self
@@ -308,7 +308,7 @@ impl ISocket for RouterSocket {
 
       let permit = self
         .pipe_send_coordinator
-        .acquire_send_permit(conn_id, timeout_opt)
+        .acquire_send_permit(pipe_read_id, timeout_opt)
         .await?;
 
       let mut set_target_guard = self.current_send_target.lock().await;
@@ -421,9 +421,9 @@ impl ISocket for RouterSocket {
       }
     };
 
-    // 2. Look up the connection interface and ID using the URI from PeerInfo.
+    // 2. Look up the connection interface and pipe_read_id using the URI from PeerInfo.
     // This is done in a tightly scoped lock.
-    let (conn_iface_opt, conn_id_opt) = {
+    let (conn_iface_opt, pipe_read_id_opt) = {
       let core_s_read = self.core.core_state.read();
       core_s_read
         .endpoints
@@ -431,12 +431,12 @@ impl ISocket for RouterSocket {
         .map_or((None, None), |ep_info| {
           (
             Some(ep_info.connection_iface.clone()),
-            Some(ep_info.handle_id),
+            ep_info.pipe_ids.map(|(_, read_id)| read_id),
           )
         })
     };
 
-    let (conn_iface, conn_id) = match (conn_iface_opt, conn_id_opt) {
+    let (conn_iface, pipe_read_id) = match (conn_iface_opt, pipe_read_id_opt) {
       (Some(iface), Some(id)) => (iface, id),
       _ => {
         // The peer was in RouterMap but its EndpointInfo is gone. This is a stale entry.
@@ -457,10 +457,10 @@ impl ISocket for RouterSocket {
 
     // All locks are released before we hit the first .await below.
 
-    // 3. Acquire a send permit for this specific connection.
+    // 3. Acquire a send permit for this specific pipe.
     let _permit = self
       .pipe_send_coordinator
-      .acquire_send_permit(conn_id, timeout_opt)
+      .acquire_send_permit(pipe_read_id, timeout_opt)
       .await
       .map_err(|e| {
         // If acquiring the permit fails, decide whether to error or drop.
@@ -611,7 +611,7 @@ impl ISocket for RouterSocket {
       self
         .pipe_to_identity_shared_map
         .insert(pipe_read_id, identity_to_use);
-      self.pipe_send_coordinator.add_pipe(connection_id).await;
+      self.pipe_send_coordinator.add_pipe(pipe_read_id).await;
     } else {
       tracing::warn!(
         handle = self.core.handle,
@@ -697,8 +697,9 @@ impl ISocket for RouterSocket {
       .await;
     self.pipe_to_identity_shared_map.remove(&pipe_read_id);
 
-    if let Some(conn_id) = connection_id_opt {
-      self.pipe_send_coordinator.remove_pipe(conn_id).await;
+    self.pipe_send_coordinator.remove_pipe(pipe_read_id).await;
+
+    if connection_id_opt.is_some() {
 
       let mut active_frag_guard = self.current_send_target.lock().await;
       if let Some(active_info) = &*active_frag_guard {
