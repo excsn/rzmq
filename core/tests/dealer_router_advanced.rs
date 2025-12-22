@@ -514,3 +514,84 @@ async fn test_dealer_router_multi_part_router_to_dealer() -> Result<(), ZmqError
   println!("Test test_dealer_router_multi_part_router_to_dealer finished.");
   Ok(())
 }
+
+// --- Test: Remaining peers work after one disconnects ---
+#[tokio::test]
+#[serial]
+async fn test_router_routing_after_peer_disconnect() -> Result<(), ZmqError> {
+  println!("Starting test_router_routing_after_peer_disconnect...");
+  let ctx = common::test_context();
+  let router = ctx.socket(SocketType::Router)?;
+  let endpoint = "tcp://127.0.0.1:5655";
+
+  println!("Binding ROUTER to {}...", endpoint);
+  router.bind(endpoint).await?;
+  tokio::time::sleep(Duration::from_millis(50)).await;
+
+  // Connect 3 dealers
+  let dealer1 = ctx.socket(SocketType::Dealer)?;
+  let dealer2 = ctx.socket(SocketType::Dealer)?;
+  let dealer3 = ctx.socket(SocketType::Dealer)?;
+
+  for (i, dealer) in [&dealer1, &dealer2, &dealer3].iter().enumerate() {
+    println!("Connecting dealer {}...", i + 1);
+    dealer.connect(endpoint).await?;
+  }
+  tokio::time::sleep(Duration::from_millis(100)).await;
+
+  // Each dealer sends so router learns identities
+  let mut identities = Vec::new();
+  for (i, dealer) in [&dealer1, &dealer2, &dealer3].iter().enumerate() {
+    dealer
+      .send(Msg::from_vec(format!("Hello from {}", i + 1).into_bytes()))
+      .await?;
+    let id_frame = common::recv_timeout(&router, LONG_TIMEOUT).await?;
+    let _payload = common::recv_timeout(&router, SHORT_TIMEOUT).await?;
+    identities.push(id_frame.data().unwrap().to_vec());
+    println!("Router learned dealer {} identity", i + 1);
+  }
+
+  // Verify router can reply to all 3
+  for (i, (dealer, identity)) in [&dealer1, &dealer2, &dealer3]
+    .iter()
+    .zip(identities.iter())
+    .enumerate()
+  {
+    let mut id_msg = Msg::from_vec(identity.clone());
+    id_msg.set_flags(MsgFlags::MORE);
+    router.send(id_msg).await?;
+    router.send(Msg::from_static(b"ping")).await?;
+    let reply = common::recv_timeout(dealer, LONG_TIMEOUT).await?;
+    assert_eq!(reply.data().unwrap(), b"ping");
+    println!("Dealer {} received ping", i + 1);
+  }
+
+  // Disconnect dealer 2
+  println!("Disconnecting dealer 2...");
+  drop(dealer2);
+  tokio::time::sleep(Duration::from_millis(100)).await;
+
+  // Remaining dealers should still work
+  println!("Sending to dealer 1...");
+  let mut id_msg1 = Msg::from_vec(identities[0].clone());
+  id_msg1.set_flags(MsgFlags::MORE);
+  router.send(id_msg1).await?;
+  router.send(Msg::from_static(b"after disconnect")).await?;
+  let reply1 = common::recv_timeout(&dealer1, LONG_TIMEOUT).await?;
+  assert_eq!(reply1.data().unwrap(), b"after disconnect");
+  println!("Dealer 1 OK");
+
+  println!("Sending to dealer 3...");
+  let mut id_msg3 = Msg::from_vec(identities[2].clone());
+  id_msg3.set_flags(MsgFlags::MORE);
+  router.send(id_msg3).await?;
+  router.send(Msg::from_static(b"after disconnect")).await?;
+  let reply3 = common::recv_timeout(&dealer3, LONG_TIMEOUT).await?;
+  assert_eq!(reply3.data().unwrap(), b"after disconnect");
+  println!("Dealer 3 OK");
+
+  println!("Terminating context...");
+  ctx.term().await?;
+  println!("Test finished.");
+  Ok(())
+}
