@@ -134,9 +134,13 @@ name = "inproc_minimal"
 required-features = ["inproc"]
 
 [[test]]
-name = "curve"
+name = "security_curve"
 required-features = ["curve"]
 
 [[test]]
-name = "noise_xx"
+name = "security_noise_xx"
 required-features = ["noise_xx"]
+
+[[test]]
+name = "security_plain"
+required-features = ["plain"]

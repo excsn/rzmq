@@ -58,24 +58,37 @@ impl SubSocket {
       .map(|ep_info| ep_info.connection_iface.clone())
   }
 
+  async fn send_subscription_command_via_iface(
+    &self,
+    conn_iface: &Arc<dyn ISocketConnection>,
+    endpoint_uri: &str,
+    msg: Msg,
+  ) -> Result<(), ZmqError> {
+    match conn_iface.send_message(msg).await {
+      Ok(()) => {
+        tracing::trace!(handle = self.core.handle, uri = %endpoint_uri, "Sent subscription command to URI");
+        Ok(())
+      }
+      Err(e) => {
+        tracing::warn!(
+          handle = self.core.handle, uri = %endpoint_uri, error = %e,
+          "Failed to send subscription command to URI"
+        );
+        Err(e)
+      }
+    }
+  }
+
   async fn send_subscription_command_to_uri(&self, endpoint_uri: String, msg: &Msg) {
     let conn_iface_opt = self.get_endpoint(&endpoint_uri);
     if let Some(conn_iface) = conn_iface_opt {
-      match conn_iface.send_message(msg.clone()).await {
-        Ok(()) => {
-          tracing::trace!(handle = self.core.handle, uri = %endpoint_uri, "Sent subscription command to URI");
-        }
-        Err(e) => {
-          tracing::warn!(
-              handle = self.core.handle, uri = %endpoint_uri, error = %e,
-              "Failed to send subscription command to URI (will be cleaned up if fatal)"
-          );
-        }
-      }
+      let _ = self
+        .send_subscription_command_via_iface(&conn_iface, &endpoint_uri, msg.clone())
+        .await;
     } else {
       tracing::warn!(
-          handle = self.core.handle, uri = %endpoint_uri,
-          "SUB: No ISocketConnection found for URI during subscription command send. Peer might have detached."
+        handle = self.core.handle, uri = %endpoint_uri,
+        "SUB: No ISocketConnection found for URI during subscription command send. Peer might have detached."
       );
     }
   }
@@ -270,18 +283,36 @@ impl ISocket for SubSocket {
       let current_topics = self.subscriptions.get_all_topics().await;
       if !current_topics.is_empty() {
         tracing::debug!(handle = self.core.handle, uri = %endpoint_uri, num_topics = current_topics.len(), "Sending existing subscriptions to newly attached peer.");
-        for topic in current_topics {
-          let sub_msg = Self::construct_subscription_message(true, &topic);
-          self
-            .send_subscription_command_to_uri(endpoint_uri.clone(), &sub_msg)
-            .await;
+
+        if let Some(conn_iface) = self.get_endpoint(&endpoint_uri) {
+          for topic in current_topics {
+            let sub_msg = Self::construct_subscription_message(true, &topic);
+            if self
+              .send_subscription_command_via_iface(&conn_iface, &endpoint_uri, sub_msg)
+              .await
+              .is_err()
+            {
+              tracing::warn!(
+                handle = self.core.handle,
+                uri = %endpoint_uri,
+                "Aborting subscription sync due to send error."
+              );
+              break;
+            }
+          }
+        } else {
+          tracing::warn!(
+            handle = self.core.handle,
+            uri = %endpoint_uri,
+            "SUB pipe_attached: Connection interface not found for URI. Skipping subscription sync."
+          );
         }
       }
     } else {
       tracing::warn!(
         handle = self.core.handle,
         pipe_read_id,
-        "SUB pipe_attached: Could not find endpoint_uri. Cannot update map or send initial subscriptions."
+        "SUB pipe_attached: Could not find endpoint_uri for pipe_read_id. Cannot update map or send initial subscriptions."
       );
     }
   }

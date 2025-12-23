@@ -1,6 +1,12 @@
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::{security::{framer::{ISecureFramer, NullFramer}, mechanism::ProcessTokenAction}, Metadata, ZmqError};
+use crate::{
+  Metadata, ZmqError,
+  security::{
+    framer::{ISecureFramer, NullFramer},
+    mechanism::ProcessTokenAction,
+  },
+};
 
 use super::{IDataCipher, Mechanism, MechanismStatus, cipher::PassThroughDataCipher};
 
@@ -28,6 +34,9 @@ pub struct PlainMechanism {
   // Store credentials (client uses its own, server stores received from client)
   username: Option<Vec<u8>>,
   password: Option<Vec<u8>>,
+  // Server: credentials expected from client
+  expected_username: Option<Vec<u8>>,
+  expected_password: Option<Vec<u8>>,
   // Optional ZAP metadata received (placeholder for future ZAP impl)
   _zap_metadata: Option<Metadata>,
   error_reason: Option<String>,
@@ -52,6 +61,8 @@ impl PlainMechanism {
       },
       username: None,
       password: None,
+      expected_username: None,
+      expected_password: None,
       _zap_metadata: None,
       error_reason: None,
     }
@@ -64,6 +75,17 @@ impl PlainMechanism {
       self.password = password;
     } else {
       tracing::warn!("set_client_credentials called on a server-side PLAIN mechanism. Ignoring.");
+    }
+  }
+
+  pub fn set_server_expected_credentials(
+    &mut self,
+    username: Option<Vec<u8>>,
+    password: Option<Vec<u8>>,
+  ) {
+    if self.is_server {
+      self.expected_username = username;
+      self.expected_password = password;
     }
   }
 
@@ -147,15 +169,28 @@ impl Mechanism for PlainMechanism {
             tracing::debug!(mechanism = Self::NAME, "Server received HELLO");
             match Self::parse_hello_body(body) {
               Ok((username, password)) => {
-                self.username = Some(username);
-                self.password = Some(password);
+                // Verify credentials before accepting
+                let is_valid = self
+                  .expected_username
+                  .as_ref()
+                  .map_or(false, |u| u == &username)
+                  && self
+                    .expected_password
+                    .as_ref()
+                    .map_or(false, |p| p == &password);
 
-                // Directly move to SendWelcome, bypassing ZAP.
-                tracing::debug!("PLAIN Server: Auto-accepting HELLO (ZAP bypassed for now).");
-                self.state = PlainState::ServerSendWelcome;
-
-                // INSTRUCTION TO CALLER: I have a response ready for you.
-                Ok(ProcessTokenAction::ProduceAndSend)
+                if is_valid {
+                  self.username = Some(username);
+                  self.password = Some(password);
+                  tracing::debug!("PLAIN Server: Credentials verified. Accepting connection.");
+                  self.state = PlainState::ServerSendWelcome;
+                  Ok(ProcessTokenAction::ProduceAndSend)
+                } else {
+                  let msg = "Invalid username or password";
+                  tracing::warn!("PLAIN Server: Authentication failed. {}", msg);
+                  self.set_error_internal(msg.into());
+                  Err(ZmqError::AuthenticationFailure(msg.into()))
+                }
               }
               Err(e) => {
                 self.set_error_internal(format!("Failed to parse HELLO: {}", e));

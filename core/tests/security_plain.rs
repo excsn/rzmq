@@ -1,7 +1,8 @@
 mod common;
 
 use rzmq::{
-  socket::{SocketEvent, LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME}, Socket, SocketType, ZmqError,
+  Socket, SocketType, ZmqError,
+  socket::{LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME, SocketEvent},
 };
 use serial_test::serial; // Add necessary rzmq imports
 use std::time::Duration;
@@ -13,15 +14,21 @@ async fn setup_server(
   ctx: &rzmq::Context,
   bind_addr: &str,
   enable_plain: bool,
-  // Add other mechanism configs if needed for mixed tests
+  expected_username: Option<&str>,
+  expected_password: Option<&str>,
 ) -> Result<Socket, ZmqError> {
   let server = ctx.socket(SocketType::Rep)?;
   if enable_plain {
-    server.set_option(PLAIN_SERVER, true).await?; // Enable PLAIN server role
+    server.set_option(PLAIN_SERVER, true).await?;
+    // Apply expected credentials
+    if let Some(user) = expected_username {
+      server.set_option(PLAIN_USERNAME, user).await?;
+    }
+    if let Some(pass) = expected_password {
+      server.set_option(PLAIN_PASSWORD, pass).await?;
+    }
   }
-  // Add other security mechanism options here if testing mixed configs
-  // e.g., server.set_option(rzmq::NOISE_XX_ENABLED, false).await?;
-  server.set_option(LINGER, 0).await?; // Ensure quick close for tests
+  server.set_option(LINGER, 0).await?;
   server.bind(bind_addr).await?;
   Ok(server)
 }
@@ -39,8 +46,12 @@ async fn setup_client(
     let user_to_set = username.unwrap_or("");
     let pass_to_set = password.unwrap_or("");
 
-    client.set_option_raw(PLAIN_USERNAME, user_to_set.as_bytes()).await?;
-    client.set_option_raw(PLAIN_PASSWORD, pass_to_set.as_bytes()).await?;
+    client
+      .set_option_raw(PLAIN_USERNAME, user_to_set.as_bytes())
+      .await?;
+    client
+      .set_option_raw(PLAIN_PASSWORD, pass_to_set.as_bytes())
+      .await?;
     // Setting either PLAIN_USERNAME or PLAIN_PASSWORD makes client_socket.options.plain_options.enabled = true
   }
   // Add other security mechanism options here
@@ -57,7 +68,9 @@ async fn test_plain_successful_handshake() {
   let ctx = common::test_context();
   let addr = "tcp://127.0.0.1:15501";
 
-  let server_socket = setup_server(&ctx, addr, true).await.expect("Server setup failed");
+  let server_socket = setup_server(&ctx, addr, true, Some("user"), Some("pass"))
+    .await
+    .expect("Server setup failed");
   let (client_socket, client_monitor) = setup_client(&ctx, addr, true, Some("user"), Some("pass"))
     .await
     .expect("Client setup failed");
@@ -79,7 +92,10 @@ async fn test_plain_successful_handshake() {
     .send(rzmq::Msg::from_static(b"hello"))
     .await
     .expect("Client failed to send request");
-  let reply = client_socket.recv().await.expect("Client failed to recv reply");
+  let reply = client_socket
+    .recv()
+    .await
+    .expect("Client failed to recv reply");
   assert_eq!(reply.data().unwrap(), b"world");
 
   // Check monitor events for handshake success on client
@@ -115,7 +131,107 @@ async fn test_plain_successful_handshake() {
   ctx.term().await.unwrap();
 }
 
-// Test 2: PLAIN Client connecting to NULL Server (should fail)
+// Test 2: PLAIN Client with NO credentials vs Configured Server (Should FAIL)
+#[tokio::test]
+#[serial]
+async fn test_plain_client_no_credentials() {
+  let ctx = common::test_context();
+  let addr = "tcp://127.0.0.1:15504";
+
+  // Server expects specific credentials (admin/secret) to verify rejection
+  let server_socket = setup_server(&ctx, addr, true, Some("admin"), Some("secret")).await.expect("Server setup failed");
+  // Ensure server processes events
+  tokio::spawn(async move {
+      let _ = server_socket.recv().await;
+  });
+
+  // Client configured with None (defaults to empty strings)
+  let (client_socket, client_monitor) = setup_client(&ctx, addr, true, None, None).await.expect("Client setup failed");
+
+  // Attempt to send (should trigger handshake)
+  let _ = client_socket.send(rzmq::Msg::from_static(b"empty_req")).await;
+  
+  // We expect the handshake to FAIL because empty != admin/secret
+  let mut failure_observed = false;
+  let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+  loop {
+    if tokio::time::Instant::now() > deadline { break; }
+    match timeout(Duration::from_millis(200), client_monitor.recv()).await {
+      Ok(Ok(event)) => {
+        if matches!(event, SocketEvent::HandshakeFailed { .. } | SocketEvent::Disconnected { .. }) {
+            failure_observed = true;
+            break;
+        }
+      }
+      Ok(Ok(_)) => {}, // Ignore other events
+      _ => {}
+    }
+  }
+
+  assert!(
+    failure_observed,
+    "Client with no credentials should have been rejected by server expecting 'admin'."
+  );
+  
+  client_socket.close().await.unwrap();
+  ctx.term().await.unwrap();
+}
+
+// Test 3: PLAIN Client connecting to PLAIN Server Wrong Credentials (should fail)
+
+#[tokio::test]
+async fn test_plain_security_enforcement() -> Result<(), ZmqError> {
+  println!("--- Starting test_plain_security_enforcement ---");
+  let ctx = common::test_context();
+  let endpoint = "tcp://127.0.0.1:5998";
+
+  // --- 1. Configure Server (Expects: admin / secret) ---
+  let server = ctx.socket(SocketType::Rep)?;
+  server.set_option(PLAIN_SERVER, true).await?;
+  server.set_option(PLAIN_USERNAME, "admin").await?;
+  server.set_option(PLAIN_PASSWORD, "secret").await?;
+  server.bind(endpoint).await?;
+
+  // --- 2. Configure Client (Sends: hacker / wrongpass) ---
+  let client = ctx.socket(SocketType::Req)?;
+  client.set_option(PLAIN_USERNAME, "hacker").await?;
+  client.set_option(PLAIN_PASSWORD, "wrongpass").await?;
+
+  let mut monitor = client.monitor_default().await?;
+  client.connect(endpoint).await?;
+
+  // --- 3. Expect Failure ---
+  let result = common::wait_for_monitor_event(
+    &monitor,
+    Duration::from_secs(2),
+    Duration::from_millis(50),
+    |e| {
+      matches!(
+        e,
+        SocketEvent::HandshakeFailed { .. } | SocketEvent::Disconnected { .. }
+      )
+    },
+  )
+  .await;
+
+  match result {
+    Ok(_) => {
+      println!("Success: Connection correctly rejected.");
+      Ok(())
+    }
+    Err(_) => {
+      // If we timed out waiting for failure, check if we accidentally succeeded
+      // This part is manual because wait_for_monitor_event filters.
+      // But effectively, if we didn't get Failed, and the bug exists, we likely got Succeeded silently (filtered out).
+      // We can assert failure here.
+      panic!(
+        "Regression: PLAIN auth did not report failure for bad credentials. (Server likely accepted connection)."
+      );
+    }
+  }
+}
+
+// Test 4: PLAIN Client connecting to NULL Server (should fail)
 
 #[tokio::test]
 #[serial]
@@ -123,7 +239,9 @@ async fn test_plain_client_to_null_server_fails() {
   let ctx = common::test_context();
   let addr = "tcp://127.0.0.1:15502";
 
-  let server_socket = setup_server(&ctx, addr, false).await.expect("Server setup failed");
+  let server_socket = setup_server(&ctx, addr, false, None, None)
+    .await
+    .expect("Server setup failed");
   let server_task = tokio::spawn(async move {
     // Ensure server is running
     let _ = server_socket.recv().await; // It will likely never receive
@@ -142,7 +260,10 @@ async fn test_plain_client_to_null_server_fails() {
       match timeout(Duration::from_millis(500), client_monitor.recv()).await {
         // Increased timeout slightly
         Ok(Ok(event)) => {
-          tracing::info!("[Test Monitor - PLAIN Client to NULL Server] Event: {:?}", event);
+          tracing::info!(
+            "[Test Monitor - PLAIN Client to NULL Server] Event: {:?}",
+            event
+          );
           match event {
             SocketEvent::HandshakeFailed { .. }
             | SocketEvent::ConnectFailed { .. }
@@ -185,7 +306,7 @@ async fn test_plain_client_to_null_server_fails() {
   ctx.term().await.unwrap();
 }
 
-// Test 3: NULL Client connecting to PLAIN Server (should fail)
+// Test 5: NULL Client connecting to PLAIN Server (should fail)
 
 #[tokio::test]
 #[serial]
@@ -194,7 +315,9 @@ async fn test_null_client_to_plain_server_fails() {
   let addr = "tcp://127.0.0.1:15503";
 
   // Server with PLAIN enabled
-  let server_socket = setup_server(&ctx, addr, true).await.expect("Server setup failed");
+  let server_socket = setup_server(&ctx, addr, true, Some("u"), Some("p"))
+    .await
+    .expect("Server setup failed");
   let _server_task: JoinHandle<()> = tokio::spawn(async move {
     // Keep server running
     // Server might receive a connection attempt that fails handshake,
@@ -227,8 +350,8 @@ async fn test_null_client_to_plain_server_fails() {
 
     if send_res.is_ok() {
       println!("OK (client task)"); // This may or may not print depending on how fast handshake fails
-                                    // Attempt to recv. This should now be interrupted by socket.close() from ctx.term()
-                                    // or fail due to peer detachment if handshake failure propagates error to recv.
+      // Attempt to recv. This should now be interrupted by socket.close() from ctx.term()
+      // or fail due to peer detachment if handshake failure propagates error to recv.
       let recv_res = client_socket.recv().await;
       println!("Client task recv result: {:?}", recv_res);
       if recv_res.is_ok() {
@@ -239,14 +362,20 @@ async fn test_null_client_to_plain_server_fails() {
       } else {
         // Check for specific errors indicating termination or peer loss
         match recv_res.as_ref().err().unwrap() {
-          ZmqError::ConnectionClosed | ZmqError::HostUnreachable(_) | ZmqError::SecurityError(_) | ZmqError::ResourceLimitReached => {
+          ZmqError::ConnectionClosed
+          | ZmqError::HostUnreachable(_)
+          | ZmqError::SecurityError(_)
+          | ZmqError::ResourceLimitReached => {
             println!(
               "Client task recv() failed as expected: {:?}",
               recv_res.as_ref().err().unwrap()
             );
           }
           e => {
-            println!("NOOKSEND (client task) - recv failed with unexpected error: {}", e);
+            println!(
+              "NOOKSEND (client task) - recv failed with unexpected error: {}",
+              e
+            );
             return Err(e.clone()); // Propagate other errors
           }
         }
@@ -259,7 +388,9 @@ async fn test_null_client_to_plain_server_fails() {
       // If send_res itself is an error, that's a valid failure path for handshake fail.
       // Ensure it's a relevant error.
       match send_res.as_ref().err().unwrap() {
-        ZmqError::SecurityError(_) | ZmqError::HostUnreachable(_) | ZmqError::ResourceLimitReached => {
+        ZmqError::SecurityError(_)
+        | ZmqError::HostUnreachable(_)
+        | ZmqError::ResourceLimitReached => {
           println!("Client task send() failed as expected due to handshake issue.");
         }
         e => return Err(e.clone()), // Propagate other errors
@@ -329,7 +460,9 @@ async fn test_null_client_to_plain_server_fails() {
   println!("Main test: Waiting for client_task to join...");
   match timeout(Duration::from_secs(2), client_task).await {
     Ok(Ok(Ok(()))) => {
-      println!("Main test: Client task completed successfully (meaning it handled send/recv failure correctly).")
+      println!(
+        "Main test: Client task completed successfully (meaning it handled send/recv failure correctly)."
+      )
     }
     Ok(Ok(Err(e))) => panic!("Main test: Client task failed with ZmqError: {}", e),
     Ok(Err(e)) => panic!("Main test: Client task panicked: {:?}", e),
@@ -338,59 +471,4 @@ async fn test_null_client_to_plain_server_fails() {
 
   // _server_task.abort(); // Not strictly needed if ctx.term() shuts down server socket too, but good for explicit cleanup
   println!("Test test_null_client_to_plain_server_fails finished.");
-}
-
-// Test 4: PLAIN Client with no credentials (should still "succeed" ZMTP handshake for now)
-
-#[tokio::test]
-#[serial]
-async fn test_plain_client_no_credentials() {
-  let ctx = common::test_context();
-  let addr = "tcp://127.0.0.1:15504";
-
-  let server_socket = setup_server(&ctx, addr, true).await.expect("Server setup failed");
-
-  let (client_socket, client_monitor) = setup_client(&ctx, addr, true, None, None) // enable_plain=true, but no creds
-    .await
-    .expect("Client setup failed");
-
-  let mut handshake_succeeded = false;
-
-  tokio::spawn(async move {
-    let req = server_socket.recv().await.expect("Server failed to recv");
-    assert_eq!(req.data().unwrap(), b"empty_req");
-    server_socket
-      .send(rzmq::Msg::from_static(b"empty_reply"))
-      .await
-      .expect("Server failed to send reply");
-  });
-
-  client_socket
-    .send(rzmq::Msg::from_static(b"empty_req"))
-    .await
-    .expect("Client failed to send request");
-  let reply = client_socket.recv().await.expect("Client failed to recv reply");
-  assert_eq!(reply.data().unwrap(), b"empty_reply");
-
-  loop {
-    match timeout(Duration::from_millis(200), client_monitor.recv()).await {
-      Ok(Ok(SocketEvent::HandshakeSucceeded { endpoint })) => {
-        if endpoint.contains("15504") {
-          handshake_succeeded = true;
-          break;
-        }
-      }
-      Ok(Ok(event)) => {
-        tracing::debug!("Client (no creds) monitor: {:?}", event);
-      }
-      Ok(Err(_)) | Err(_) => break,
-    }
-  }
-  assert!(
-    handshake_succeeded,
-    "Client (no creds) did not receive HandshakeSucceeded for PLAIN"
-  );
-
-  client_socket.close().await.unwrap();
-  ctx.term().await.unwrap();
 }

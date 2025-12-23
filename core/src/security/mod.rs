@@ -49,22 +49,28 @@ fn initialize_null(
 fn initialize_plain(
   is_server: bool,
   local_config: &ZmtpEngineConfig,
-  _engine_handle_for_log: usize, // May use for logging inside if needed
+  _engine_handle_for_log: usize,
 ) -> Result<Box<dyn Mechanism>, ZmqError> {
+  // Always extract expected/local credentials
+  let user_bytes = local_config
+    .plain_username_for_engine
+    .as_ref()
+    .map(|s| s.as_bytes().to_vec());
+  let pass_bytes = local_config
+    .plain_password_for_engine
+    .as_ref()
+    .map(|s| s.as_bytes().to_vec());
+
   let mut plain_mech = PlainMechanism::new(is_server);
-  if !is_server {
-    // Client role
-    // Credentials might be None, PlainMechanism::set_client_credentials handles Option
-    let user_bytes = local_config
-      .plain_username_for_engine
-      .as_ref()
-      .map(|s| s.as_bytes().to_vec());
-    let pass_bytes = local_config
-      .plain_password_for_engine
-      .as_ref()
-      .map(|s| s.as_bytes().to_vec());
+  
+  if is_server {
+    // For server, these are the EXPECTED credentials
+    plain_mech.set_server_expected_credentials(user_bytes, pass_bytes);
+  } else {
+    // For client, these are the OUTGOING credentials
     plain_mech.set_client_credentials(user_bytes, pass_bytes);
   }
+  
   Ok(Box::new(plain_mech))
 }
 
