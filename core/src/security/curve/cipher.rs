@@ -14,8 +14,9 @@ use dryoc::types::{ByteArray, MutByteArray, MutBytes, StackByteArray};
 /// to encrypt or decrypt.
 #[derive(Debug)]
 pub(crate) struct CurveDataCipher {
-  // Pre-computed shared key derived from the handshake.
-  precomputed_key: [u8; 32],
+  // Separate keys for RX (decode) and TX (encode)
+  encode_key: [u8; 32],
+  decode_key: [u8; 32],
 
   // Nonces for data-phase messages.
   send_nonce_counter: u64,
@@ -25,10 +26,11 @@ pub(crate) struct CurveDataCipher {
 impl CurveDataCipher {
   const NONCE_PREFIX: &'static [u8; 16] = b"CurveZMQ-Encrypt";
 
-  /// Creates a new cipher instance with the shared key from the handshake.
-  pub(crate) fn new(precomputed_key: [u8; 32]) -> Self {
+  /// Creates a new cipher instance with distinct keys for encoding and decoding.
+  pub(crate) fn new(encode_key: [u8; 32], decode_key: [u8; 32]) -> Self {
     Self {
-      precomputed_key,
+      encode_key,
+      decode_key,
       send_nonce_counter: 1,
       recv_nonce_counter: 1,
     }
@@ -56,7 +58,7 @@ impl IDataCipher for CurveDataCipher {
       mac.as_mut_array(),
       plaintext,
       nonce.as_array(),
-      &self.precomputed_key,
+      &self.encode_key, // Use the encode key
     );
 
     self.send_nonce_counter += 1;
@@ -92,7 +94,7 @@ impl IDataCipher for CurveDataCipher {
       mac.as_array(),
       ciphertext_only_slice,
       nonce.as_array(),
-      &self.precomputed_key,
+      &self.decode_key, // Use the decode key
     )
     .map_err(|e| ZmqError::AuthenticationFailure(e.to_string()))?;
 

@@ -104,17 +104,18 @@ impl CurveHandshake {
   fn key_prefix(key: &[u8]) -> String {
     hex::encode(&key[..4])
   }
-  
+
   /// Consumes the completed handshake state to produce the data-phase cipher.
   pub(crate) fn into_data_cipher(self) -> Result<Box<dyn IDataCipher>, ZmqError> {
-    if self.phase != CurveHandshakePhase::Complete {
-      return Err(ZmqError::InvalidState("Handshake not complete"));
-    }
-    let secret = self
-      .precomputed_key
-      .ok_or(ZmqError::InvalidState("Shared secret not derived"))?;
-    tracing::debug!(precomputed_key_prefix = %Self::key_prefix(&secret), "Finalizing handshake, creating data cipher.");
-    Ok(Box::new(CurveDataCipher::new(secret)))
+    // Derive the distinct RX and TX keys using the existing helper.
+    // Note: into_session_keys consumes `self`, so we call it directly.
+    let (rx, tx) = self.into_session_keys()?;
+
+    tracing::debug!("Finalizing handshake, derived distinct RX/TX session keys.");
+
+    // Initialize the cipher with the specific keys.
+    // encode_key = tx, decode_key = rx
+    Ok(Box::new(CurveDataCipher::new(tx, rx)))
   }
 
   /// Consumes the completed handshake state to produce the directional session keys.
@@ -123,41 +124,34 @@ impl CurveHandshake {
       return Err(ZmqError::InvalidState("Handshake not complete"));
     }
 
-    let client_pk = self
+    let remote_pk = self
       .remote_static_public_key
       .as_ref()
-      .ok_or_else(|| ZmqError::InvalidState("Handshake complete but client PK missing"))?;
-    let server_pk = self.local_static_keypair.public_key.as_array();
+      .ok_or_else(|| ZmqError::InvalidState("Handshake complete but remote PK missing"))?
+      .as_array();
+    let local_pk = self.local_static_keypair.public_key.as_array();
+    let local_sk = self.local_static_keypair.secret_key.as_array();
 
     let (mut rx, mut tx) = ([0u8; 32], [0u8; 32]);
 
     if self.is_server {
-      // We are the server, so we calculate the server's session keys.
-      // Our RX key is for messages from the client.
-      // Our TX key is for messages to the client.
+      // We are Server. Local is Server, Remote is Client.
       dryoc::classic::crypto_kx::crypto_kx_server_session_keys(
-        &mut rx,
-        &mut tx,
-        server_pk,
-        self.local_static_keypair.secret_key.as_array(),
-        client_pk.as_array(),
+        &mut rx, &mut tx, local_pk,  // Server PK (Primary)
+        local_sk,  // Server SK
+        remote_pk, // Client PK (Peer)
       )?;
     } else {
-      // We are the client.
+      // We are Client. Local is Client, Remote is Server.
       dryoc::classic::crypto_kx::crypto_kx_client_session_keys(
-        &mut rx,
-        &mut tx,
-        self.local_static_keypair.public_key.as_array(),
-        self.local_static_keypair.secret_key.as_array(),
-        server_pk,
+        &mut rx, &mut tx, local_pk,  // Client PK (Primary)
+        local_sk,  // Client SK
+        remote_pk, // Server PK (Peer)
       )?;
     }
 
     Ok((rx, tx))
   }
-  //
-  // All build_* and process_* methods from here down are corrected.
-  //
 
   pub(crate) fn build_client_hello(&self) -> Result<Vec<u8>, ZmqError> {
     tracing::debug!(
@@ -213,7 +207,6 @@ impl CurveHandshake {
     let mut nonce = Nonce::new_byte_array();
     nonce.as_mut_slice()[..8].copy_from_slice(Self::COOKIE_NONCE_PREFIX);
 
-    // **FIXED**: Using crypto_box_detached_afternm, which is in your imports
     crypto_box_detached_afternm(
       &mut cookie_ciphertext,
       cookie_mac.as_mut_array(),
@@ -312,7 +305,6 @@ impl CurveHandshake {
     let mut mac = Mac::new_byte_array();
     let mut encrypted_metadata = vec![0u8; metadata_bytes.len()];
 
-    // PROPOSED FIX: Use the correct temporary 'initiate_key' for encryption.
     crypto_box_detached_afternm(
       &mut encrypted_metadata,
       mac.as_mut_array(),
