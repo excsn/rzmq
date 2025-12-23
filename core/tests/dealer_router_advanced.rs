@@ -1,6 +1,6 @@
 use common::wait_for_monitor_event;
-use rzmq::socket::options::ROUTER_MANDATORY;
 use rzmq::socket::SocketEvent;
+use rzmq::socket::options::ROUTER_MANDATORY;
 use rzmq::{Msg, MsgFlags, SocketType, ZmqError};
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
@@ -136,12 +136,18 @@ async fn test_dealer_router_multiple_dealers() -> Result<(), ZmqError> {
       }
       Err(ZmqError::Timeout) => {
         println!("Dealer {} correctly timed out.", i);
-        assert_ne!(i, target_dealer_index, "Target dealer should not have timed out");
+        assert_ne!(
+          i, target_dealer_index,
+          "Target dealer should not have timed out"
+        );
       }
       Err(e) => return Err(e), // Propagate other errors
     }
   }
-  assert_eq!(received_reply_count, 1, "Exactly one dealer should receive the reply");
+  assert_eq!(
+    received_reply_count, 1,
+    "Exactly one dealer should receive the reply"
+  );
   println!("Verified targeted reply.");
 
   println!("Terminating context...");
@@ -172,7 +178,10 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_false() -> Result<
   dealer.send(Msg::from_static(b"Ping")).await?;
   let ping_id = common::recv_timeout(&router, LONG_TIMEOUT).await?;
   let _ping_payload = common::recv_timeout(&router, SHORT_TIMEOUT).await?;
-  println!("ROUTER received initial ping from ID: {:?}", ping_id.data().unwrap());
+  println!(
+    "ROUTER received initial ping from ID: {:?}",
+    ping_id.data().unwrap()
+  );
 
   // ROUTER attempts to send to an unknown identity
   let unknown_id_data = b"NoSuchDealer";
@@ -246,7 +255,9 @@ async fn test_dealer_router_router_sends_to_unknown_mandatory_true() -> Result<(
   tokio::time::sleep(Duration::from_millis(50)).await;
 
   println!("Setting ROUTER_MANDATORY=true...");
-  router.set_option_raw(ROUTER_MANDATORY, &(1i32).to_ne_bytes()).await?; // Set to true
+  router
+    .set_option_raw(ROUTER_MANDATORY, &(1i32).to_ne_bytes())
+    .await?; // Set to true
 
   println!("Connecting DEALER to {}...", endpoint);
   dealer.connect(endpoint).await?;
@@ -326,18 +337,25 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
     dealer.connect(endpoint).await?;
 
     println!("ROUTER waiting for Accepted/Handshake event...");
-    let connected_event = wait_for_monitor_event(&monitor_rx, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
-      matches!(e, SocketEvent::HandshakeSucceeded { .. })
-    })
-    .await
-    .map_err(|e| ZmqError::Internal(format!("Connect event wait failed: {}", e)))?;
+    let connected_event =
+      wait_for_monitor_event(&monitor_rx, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+        matches!(e, SocketEvent::HandshakeSucceeded { .. })
+      })
+      .await
+      .map_err(|e| ZmqError::Internal(format!("Connect event wait failed: {}", e)))?;
     // Store the endpoint URI reported by the router
     match connected_event {
-      SocketEvent::Accepted { endpoint: _, peer_addr } => dealer_endpoint_uri = format!("tcp://{}", peer_addr), // Should be tcp://<peer_ip>:<peer_port>
+      SocketEvent::Accepted {
+        endpoint: _,
+        peer_addr,
+      } => dealer_endpoint_uri = format!("tcp://{}", peer_addr), // Should be tcp://<peer_ip>:<peer_port>
       SocketEvent::HandshakeSucceeded { endpoint: ep } => dealer_endpoint_uri = ep,
       _ => unreachable!(),
     }
-    println!("ROUTER received connection event for: {}", dealer_endpoint_uri);
+    println!(
+      "ROUTER received connection event for: {}",
+      dealer_endpoint_uri
+    );
 
     // Dealer sends a message so Router learns its identity
     println!("DEALER sending initial message...");
@@ -357,7 +375,10 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
     // Dealer socket is dropped here
   } // dealer dropped
 
-  println!("ROUTER waiting for Disconnected event for {}...", dealer_endpoint_uri);
+  println!(
+    "ROUTER waiting for Disconnected event for {}...",
+    dealer_endpoint_uri
+  );
   wait_for_monitor_event(
     &monitor_rx,
     MONITOR_EVENT_TIMEOUT,
@@ -431,7 +452,10 @@ async fn test_dealer_router_multi_part_dealer_to_router() -> Result<(), ZmqError
 
   // Verify Identity frame
   assert!(id_frame.is_more(), "Identity frame missing MORE flag");
-  assert!(!id_frame.data().unwrap().is_empty(), "Identity frame is empty");
+  assert!(
+    !id_frame.data().unwrap().is_empty(),
+    "Identity frame is empty"
+  );
   let _dealer_id = id_frame.data().unwrap(); // Can optionally store/print ID
 
   // Verify Payload frames
@@ -441,7 +465,10 @@ async fn test_dealer_router_multi_part_dealer_to_router() -> Result<(), ZmqError
   assert!(p2_frame.is_more(), "Part 2 frame missing MORE flag");
   assert_eq!(p2_frame.data().unwrap(), b"Part2");
 
-  assert!(!p3_frame.is_more(), "Part 3 frame should not have MORE flag");
+  assert!(
+    !p3_frame.is_more(),
+    "Part 3 frame should not have MORE flag"
+  );
   assert_eq!(p3_frame.data().unwrap(), b"Part3");
 
   println!("ROUTER correctly received all parts with correct flags.");
@@ -472,7 +499,9 @@ async fn test_dealer_router_multi_part_router_to_dealer() -> Result<(), ZmqError
 
   // Dealer sends request so router knows its identity
   println!("DEALER sending request...");
-  dealer.send(Msg::from_static(b"Request for multi-part")).await?;
+  dealer
+    .send(Msg::from_static(b"Request for multi-part"))
+    .await?;
 
   // Router receives request
   println!("ROUTER receiving request...");
@@ -504,7 +533,10 @@ async fn test_dealer_router_multi_part_router_to_dealer() -> Result<(), ZmqError
   assert!(rec_rep1.is_more(), "Reply Part 1 missing MORE flag");
   assert_eq!(rec_rep1.data().unwrap(), b"ReplyPart1");
 
-  assert!(!rec_rep2.is_more(), "Reply Part 2 should not have MORE flag");
+  assert!(
+    !rec_rep2.is_more(),
+    "Reply Part 2 should not have MORE flag"
+  );
   assert_eq!(rec_rep2.data().unwrap(), b"ReplyPart2");
 
   println!("DEALER correctly received all reply parts with correct flags.");
@@ -593,5 +625,135 @@ async fn test_router_routing_after_peer_disconnect() -> Result<(), ZmqError> {
   println!("Terminating context...");
   ctx.term().await?;
   println!("Test finished.");
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_dealer_routing_after_peer_disconnect() -> Result<(), ZmqError> {
+  // Setup context
+  let ctx = common::test_context();
+
+  // Define endpoints
+  let endpoint1 = "tcp://127.0.0.1:5670";
+  let endpoint2 = "tcp://127.0.0.1:5671";
+
+  // Create two Router sockets (Peers)
+  let router1 = ctx.socket(SocketType::Router)?;
+  let router2 = ctx.socket(SocketType::Router)?;
+
+  router1.bind(endpoint1).await?;
+  router2.bind(endpoint2).await?;
+
+  // Give bind a moment
+  tokio::time::sleep(Duration::from_millis(50)).await;
+
+  // Create Dealer socket
+  let dealer = ctx.socket(SocketType::Dealer)?;
+  dealer.connect(endpoint1).await?;
+  dealer.connect(endpoint2).await?;
+
+  // Give connect a moment
+  tokio::time::sleep(Duration::from_millis(100)).await;
+
+  // Helper to drain messages from routers to verify receipt
+  // Returns true if message received, false if timeout
+  async fn try_recv(router: &rzmq::Socket) -> bool {
+    match tokio::time::timeout(Duration::from_millis(100), router.recv_multipart()).await {
+      Ok(Ok(_)) => true,
+      _ => false,
+    }
+  }
+
+  // 1. Verify initial connectivity to both
+  println!("Verifying initial connectivity...");
+  let mut r1_acked = false;
+  let mut r2_acked = false;
+
+  // Send enough messages to cycle through load balancer
+  for i in 0..10 {
+    if r1_acked && r2_acked {
+      break;
+    }
+    let msg = format!("ping {}", i);
+    dealer.send(Msg::from_vec(msg.into_bytes())).await?;
+
+    if !r1_acked && try_recv(&router1).await {
+      r1_acked = true;
+    }
+    if !r2_acked && try_recv(&router2).await {
+      r2_acked = true;
+    }
+  }
+
+  assert!(r1_acked, "Dealer failed to reach Router 1 initially");
+  assert!(r2_acked, "Dealer failed to reach Router 2 initially");
+  println!("Initial connectivity OK.");
+
+  // 2. Disconnect Router 1
+  println!("Closing Router 1...");
+  router1.close().await?; // Explicitly close to stop the actor and release the port
+  
+  // Allow time for Dealer to detect disconnection
+  tokio::time::sleep(Duration::from_millis(200)).await;
+
+  // 3. Verify Dealer can still send to Router 2
+  println!("Verifying connectivity to Router 2 after Router 1 drop...");
+  let mut r2_still_acked = false;
+  for i in 0..10 {
+    dealer
+      .send(Msg::from_vec(format!("ping2-{}", i).into_bytes()))
+      .await?;
+    if try_recv(&router2).await {
+      r2_still_acked = true;
+      break;
+    }
+  }
+  assert!(
+    r2_still_acked,
+    "Dealer failed to reach Router 2 after Router 1 disconnect"
+  );
+  println!("Router 2 connectivity OK.");
+
+  // 4. Restart Router 1
+  println!("Restarting Router 1...");
+  let router1_new = ctx.socket(SocketType::Router)?;
+
+  // Retry bind to handle potential OS/cleanup delays
+  let mut bind_attempts = 0;
+  loop {
+    match router1_new.bind(endpoint1).await {
+      Ok(_) => break,
+      Err(ZmqError::AddrInUse(_)) if bind_attempts < 10 => {
+        bind_attempts += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+      }
+      Err(e) => return Err(e),
+    }
+  }
+
+  // Allow time for reconnect (backoff might apply, so give it a bit more time)
+  // Default backoff starts at 100ms.
+  tokio::time::sleep(Duration::from_millis(500)).await;
+
+  // 5. Verify Dealer reconnects and sends to Router 1
+  println!("Verifying connectivity to restarted Router 1...");
+  let mut r1_new_acked = false;
+  for i in 0..20 {
+    // More attempts in case of load balancing bias or backoff
+    dealer
+      .send(Msg::from_vec(format!("ping3-{}", i).into_bytes()))
+      .await?;
+    if try_recv(&router1_new).await {
+      r1_new_acked = true;
+      break;
+    }
+    // Also drain Router 2 to keep Dealer's LB cycling
+    try_recv(&router2).await;
+  }
+
+  assert!(r1_new_acked, "Dealer failed to reach restarted Router 1");
+  println!("Restarted Router 1 connectivity OK.");
+
+  ctx.term().await?;
   Ok(())
 }
