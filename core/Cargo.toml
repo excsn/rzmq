@@ -5,7 +5,7 @@ edition = "2024"
 license = "MPL-2.0"
 publish = true
 
-description = "A high performance, fully asynchronous, safe pure-Rust implementation of ZeroMQ (ØMQ) messaging with io_uring and TCP Cork acceleration on Linux."
+description = "High performance, fully asynchronous, safe pure-Rust implementation of ZeroMQ (ØMQ) messaging with io_uring and TCP Cork acceleration on Linux."
 authors = ["Excerion Sun <dev@excsn.com>", "Norm O <normo.pub@gmail.com>"]
 readme = "README.md"
 repository = "https://github.com/excsn/rzmq"
