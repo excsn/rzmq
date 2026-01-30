@@ -16,6 +16,7 @@ use crate::protocol::zmtp::{
 };
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
+use crate::security::framer::{ISecureFramer, NullFramer};
 use crate::security::{
   IDataCipher, Mechanism, NullMechanism, PlainMechanism, negotiate_security_mechanism,
 };
@@ -29,6 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use dryoc::types::Bytes as DryocBytes;
 use tokio_util::codec::Encoder;
 use tracing::{debug, error, info, trace, warn};
 
@@ -61,11 +63,8 @@ pub struct ZmtpUringHandler {
   greeting_buffer: BytesMut,
   network_read_accumulator: BytesMut,
 
-  plaintext_zmtp_frame_accumulator: BytesMut,
-
   security_mechanism: Option<Box<dyn Mechanism>>,
-  data_cipher: Option<Box<dyn IDataCipher>>,
-  zmtp_parser: ZmtpManualParser,
+  framer: Box<dyn ISecureFramer>,
 
   last_activity_time: Instant,
   last_ping_sent_time: Option<Instant>,
@@ -106,10 +105,8 @@ impl ZmtpUringHandler {
       phase: ZmtpHandlerPhase::Initial,
       greeting_buffer: BytesMut::with_capacity(GREETING_LENGTH),
       network_read_accumulator: BytesMut::with_capacity(8192 * 2),
-      plaintext_zmtp_frame_accumulator: BytesMut::with_capacity(8192 * 2),
       security_mechanism: None,
-      data_cipher: None,
-      zmtp_parser: ZmtpManualParser::new(),
+      framer: Box::new(NullFramer::new()),
       last_activity_time: Instant::now(),
       last_ping_sent_time: None,
       waiting_for_pong: false,
@@ -124,42 +121,6 @@ impl ZmtpUringHandler {
       final_peer_identity: None,
       last_sent_was_ping: false,
       multishot_reader: None,
-    }
-  }
-
-  fn zmtp_encode_msg_to_bytes(msg: &Msg) -> Result<Bytes, ZmqError> {
-    let mut temp_codec = crate::protocol::zmtp::ZmtpCodec::new();
-    let mut dst_buffer = BytesMut::new();
-    temp_codec.encode(msg.clone(), &mut dst_buffer)?;
-    Ok(dst_buffer.freeze())
-  }
-
-  /// Encodes a Vec<Msg> (representing ZMTP frames) into a Vec<Bytes> (wire frames).
-  /// Applies encryption if a data_cipher is active.
-  fn zmtp_encode_and_encrypt_frames(
-    &mut self,
-    zmtp_frames: Vec<Msg>,
-  ) -> Result<Vec<Bytes>, ZmqError> {
-    let mut wire_frames = Vec::with_capacity(zmtp_frames.len());
-    for frame in zmtp_frames {
-      // ZMTP encode individual frame (already has its flags)
-      let zmtp_encoded_bytes = Self::zmtp_encode_msg_to_bytes(&frame)?;
-      // Encrypt if needed
-      let wire_frame_bytes =
-        Self::apply_encryption_if_needed(self.data_cipher.as_mut(), zmtp_encoded_bytes)?;
-      wire_frames.push(wire_frame_bytes);
-    }
-    Ok(wire_frames)
-  }
-
-  fn apply_encryption_if_needed(
-    data_cipher_opt: Option<&mut Box<dyn IDataCipher>>,
-    zmtp_frame_bytes: Bytes,
-  ) -> Result<Bytes, ZmqError> {
-    if let Some(cipher) = data_cipher_opt {
-      cipher.encrypt_zmtp_frame(zmtp_frame_bytes)
-    } else {
-      Ok(zmtp_frame_bytes)
     }
   }
 
@@ -270,7 +231,9 @@ impl ZmtpUringHandler {
       // This helps decide if we should loop again or if we're stuck.
       let initial_greeting_len_outer = self.greeting_buffer.len();
       let initial_network_acc_len_outer = self.network_read_accumulator.len();
-      let initial_plaintext_acc_len_outer = self.plaintext_zmtp_frame_accumulator.len();
+
+      // Removed: plaintext_zmtp_frame_accumulator length check (buffer removed)
+
       let mut progress_this_iteration = false;
 
       // Handshake timeout check
@@ -447,8 +410,11 @@ impl ZmtpUringHandler {
                   token_to_send_vec.len()
                 );
                 let token_msg = Msg::from_vec(token_to_send_vec).with_flags(MsgFlags::COMMAND);
+                // Use framer to encode/encrypt
+                let wire_data = self.framer.write_msg_multipart(vec![token_msg])?;
+
                 ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-                  data: Self::zmtp_encode_msg_to_bytes(&token_msg)?,
+                  data: wire_data,
                   send_op_flags: 0, // Security tokens are ZMTP command frames, usually single.
                   originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
                 });
@@ -457,11 +423,9 @@ impl ZmtpUringHandler {
               }
 
               // If there's data from the peer, try to process it.
+              // We use self.framer.try_read_msg to get the token message
               if !self.network_read_accumulator.is_empty() {
-                match self
-                  .zmtp_parser
-                  .decode_from_buffer(&mut self.network_read_accumulator)
-                {
+                match self.framer.try_read_msg(&mut self.network_read_accumulator) {
                   Ok(Some(token_msg_from_peer)) => {
                     debug!(
                       fd = self.fd,
@@ -490,9 +454,12 @@ impl ZmtpUringHandler {
                         );
                         let response_token_msg =
                           Msg::from_vec(response_token_vec).with_flags(MsgFlags::COMMAND);
+                        let wire_data =
+                          self.framer.write_msg_multipart(vec![response_token_msg])?;
+
                         ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-                          data: Self::zmtp_encode_msg_to_bytes(&response_token_msg)?,
-                          send_op_flags: 0, // Security tokens are ZMTP command frames, usually single.
+                          data: wire_data,
+                          send_op_flags: 0,
                           originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
                         });
                         // progress_this_iteration and token_action_this_iteration are likely already true
@@ -569,15 +536,25 @@ impl ZmtpUringHandler {
               fd = self.fd,
               "SecurityExchange: Executing transition post-completion."
             );
-            self.peer_identity_from_security = peer_id_from_sec_mech_on_completion;
 
             let taken_mechanism = self.security_mechanism.take().expect(
               "INTERNAL ERROR: security_mechanism was Some but now None before take for transition",
             );
 
-            let (cipher, _final_peer_id_from_sec_mech) =
-              taken_mechanism.into_data_cipher_parts()?;
-            self.data_cipher = Some(cipher);
+            match taken_mechanism.into_framer() {
+              Ok((new_framer, peer_id_opt)) => {
+                self.framer = new_framer;
+                if self.peer_identity_from_security.is_none() {
+                  self.peer_identity_from_security = peer_id_opt.map(Blob::from);
+                }
+              }
+              Err(e) => {
+                self.transition_to_error(ops, e, interface);
+                return Err(ZmqError::Internal(
+                  "Failed to create framer from mechanism".into(),
+                ));
+              }
+            }
 
             let old_phase_before_transition = self.phase;
             self.phase = if self.is_server {
@@ -593,9 +570,11 @@ impl ZmtpUringHandler {
                 "[ZmtpHandler FD={}] Client adding its ZMTP READY Send blueprint (from SecurityExchange transition).",
                 self.fd
               );
+              let wire_data = self.framer.write_msg_multipart(vec![client_ready_msg])?;
+
               ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-                data: Self::zmtp_encode_msg_to_bytes(&client_ready_msg)?,
-                send_op_flags: 0, // ZMTP READY is a single ZMTP command frame.
+                data: wire_data,
+                send_op_flags: 0,
                 originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
               });
             } else {
@@ -613,10 +592,7 @@ impl ZmtpUringHandler {
           if self.network_read_accumulator.is_empty() {
             break 'phase_processing_loop; /* Need data */
           }
-          match self
-            .zmtp_parser
-            .decode_from_buffer(&mut self.network_read_accumulator)
-          {
+          match self.framer.try_read_msg(&mut self.network_read_accumulator) {
             Ok(Some(ready_msg_from_client)) => {
               progress_this_iteration = true;
               match ZmtpCommand::parse(&ready_msg_from_client) {
@@ -635,9 +611,11 @@ impl ZmtpUringHandler {
                     "[ZmtpHandler FD={}] S: Adding its ZMTP READY Send blueprint.",
                     self.fd
                   );
+                  let wire_data = self.framer.write_msg_multipart(vec![server_ready_msg])?;
+
                   ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-                    data: Self::zmtp_encode_msg_to_bytes(&server_ready_msg)?,
-                    send_op_flags: 0, // ZMTP READY is a single ZMTP command frame.
+                    data: wire_data,
+                    send_op_flags: 0,
                     originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
                   });
                   self.phase = ZmtpHandlerPhase::ReadyServerSend;
@@ -666,10 +644,7 @@ impl ZmtpUringHandler {
           if self.network_read_accumulator.is_empty() {
             break 'phase_processing_loop; /* Need data */
           }
-          match self
-            .zmtp_parser
-            .decode_from_buffer(&mut self.network_read_accumulator)
-          {
+          match self.framer.try_read_msg(&mut self.network_read_accumulator) {
             Ok(Some(ready_msg_from_server)) => {
               progress_this_iteration = true;
               match ZmtpCommand::parse(&ready_msg_from_server) {
@@ -709,64 +684,23 @@ impl ZmtpUringHandler {
         }
 
         ZmtpHandlerPhase::DataPhase => {
-          // Decrypt network data into plaintext ZMTP frame accumulator first
-          if self.data_cipher.is_some() {
-            while !self.network_read_accumulator.is_empty() {
-              match self
-                .data_cipher
-                .as_mut()
-                .unwrap()
-                .decrypt_wire_data_to_zmtp_frame(&mut self.network_read_accumulator)
-              {
-                Ok(Some(plaintext_zmtp_frame_bytes)) => {
-                  progress_this_iteration = true;
-                  self
-                    .plaintext_zmtp_frame_accumulator
-                    .put(plaintext_zmtp_frame_bytes);
-                }
-                Ok(None) => break, // Need more encrypted data
-                Err(e) => {
-                  self.transition_to_error(ops, e.clone(), interface);
-                  return Err(e);
-                }
-              }
-            }
-          } else {
-            // No cipher, move directly
-            if !self.network_read_accumulator.is_empty() {
-              progress_this_iteration = true;
-              self
-                .plaintext_zmtp_frame_accumulator
-                .extend_from_slice(&self.network_read_accumulator);
-              self.network_read_accumulator.clear();
-            }
-          };
-
-          if self.plaintext_zmtp_frame_accumulator.is_empty() {
-            break 'phase_processing_loop; /* Need plaintext data */
-          }
-
-          // Process all complete ZMTP frames from plaintext_zmtp_frame_accumulator
-          while !self.plaintext_zmtp_frame_accumulator.is_empty() {
-            match self
-              .zmtp_parser
-              .decode_from_buffer(&mut self.plaintext_zmtp_frame_accumulator)
-            {
+          // Framer handles accumulating bytes, checking length, decrypting, and parsing.
+          loop {
+            match self.framer.try_read_msg(&mut self.network_read_accumulator) {
               Ok(Some(msg)) => {
                 progress_this_iteration = true;
                 self.last_activity_time = Instant::now();
+
                 if msg.is_command() {
                   match ZmtpCommand::parse(&msg) {
                     Some(ZmtpCommand::Ping(ping_context_payload)) => {
                       let pong_reply_msg = ZmtpCommand::create_pong(&ping_context_payload);
-                      let pong_plaintext_bytes = Self::zmtp_encode_msg_to_bytes(&pong_reply_msg)?;
-                      let pong_wire_bytes = Self::apply_encryption_if_needed(
-                        self.data_cipher.as_mut(),
-                        pong_plaintext_bytes,
-                      )?;
+                      // Use framer to write the PONG
+                      let wire_bytes = self.framer.write_msg_multipart(vec![pong_reply_msg])?;
+
                       ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-                        data: pong_wire_bytes,
-                        send_op_flags: 0, // PONG is a single ZMTP frame, no MSG_MORE.
+                        data: wire_bytes,
+                        send_op_flags: 0,
                         originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
                       });
                       debug!(fd = self.fd, "DataPhase: Prepared PONG in response to PING");
@@ -808,7 +742,7 @@ impl ZmtpUringHandler {
                   }
                 }
               }
-              Ok(None) => break, // Need more data in plaintext_zmtp_frame_accumulator
+              Ok(None) => break, // Need more network data
               Err(e) => {
                 self.transition_to_error(ops, e.clone(), interface);
                 return Err(e);
@@ -834,14 +768,10 @@ impl ZmtpUringHandler {
       let no_greeting_change_outer = self.greeting_buffer.len() == initial_greeting_len_outer;
       let no_network_acc_change_outer =
         self.network_read_accumulator.len() == initial_network_acc_len_outer;
-      let no_plaintext_acc_change_outer =
-        self.plaintext_zmtp_frame_accumulator.len() == initial_plaintext_acc_len_outer;
 
-      if no_greeting_change_outer
-        && no_network_acc_change_outer
-        && no_plaintext_acc_change_outer
-        && !progress_this_iteration
-      {
+      // Removed plaintext accumulator check
+
+      if no_greeting_change_outer && no_network_acc_change_outer && !progress_this_iteration {
         trace!(fd=self.fd, phase=?self.phase, "ProcessBufferedReads: No data consumed or progress in this iteration. Breaking inner loop.");
         break 'phase_processing_loop;
       }
@@ -853,34 +783,24 @@ impl ZmtpUringHandler {
     Ok(made_progress_this_call) // Return overall progress
   }
 
-  // Helper method that needs to be implemented within ZmtpUringHandler
-  // This is a placeholder for your actual logic to convert a single app Msg
-  // into all necessary ZMTP wire frames (e.g., delimiter + payload for REQ/DEALER).
-  // Each Bytes in the Vec should be a complete, ZMTP-encoded, and encrypted wire frame.
-  fn prepare_zmtp_wire_frames_for_app_msg(&mut self, app_msg: Msg) -> Result<Vec<Bytes>, ZmqError> {
-    let mut wire_frames = Vec::new();
+  // Helper method to prepare the logical frames (e.g. delimiters) before passing to framer.
+  // Returns Vec<Msg> which will be passed to self.framer.write_msg_multipart.
+  fn prepare_logical_frames_for_app_msg(&mut self, app_msg: Msg) -> Vec<Msg> {
+    let mut frames = Vec::new();
 
     // Example for REQ/DEALER like sockets that prepend an empty delimiter
     if self.zmtp_config.socket_type_name == "REQ" || self.zmtp_config.socket_type_name == "DEALER" {
-      let delimiter_zmtp = Msg::new().with_flags(MsgFlags::MORE); // Delimiter always has MORE
-      let d_bytes = Self::zmtp_encode_msg_to_bytes(&delimiter_zmtp)?;
-      let enc_d_bytes = Self::apply_encryption_if_needed(self.data_cipher.as_mut(), d_bytes)?;
-      wire_frames.push(enc_d_bytes);
+      let delimiter_msg = Msg::new().with_flags(MsgFlags::MORE);
+      frames.push(delimiter_msg);
     }
 
     // Prepare the main payload part
-    let mut payload_part_for_wire = app_msg;
-    // The payload is the last part of this logical ZMQ message, so it should not have MORE
-    // (unless this `app_msg` itself was marked by the user as part of a larger sequence,
-    // which is less common for REQ/DEALER app-level messages).
-    // For safety, ensure the app-level payload, when it becomes the last ZMTP frame, has NOMORE.
-    payload_part_for_wire.set_flags(payload_part_for_wire.flags() & !MsgFlags::MORE);
+    let mut payload_part = app_msg;
+    // Ensure the app-level payload, when it becomes the last ZMTP frame, has NOMORE.
+    payload_part.set_flags(payload_part.flags() & !MsgFlags::MORE);
+    frames.push(payload_part);
 
-    let p_bytes = Self::zmtp_encode_msg_to_bytes(&payload_part_for_wire)?;
-    let enc_p_bytes = Self::apply_encryption_if_needed(self.data_cipher.as_mut(), p_bytes)?;
-    wire_frames.push(enc_p_bytes);
-
-    Ok(wire_frames)
+    frames
   }
 
   /// Helper to take final ZMTP wire frames, decide on ZC/normal send,
@@ -967,14 +887,56 @@ impl ZmtpUringHandler {
         .push(HandlerSqeBlueprint::RequestSetCork(false));
     }
   }
-}
 
-impl ZmtpUringHandler {
   pub fn is_closing_or_closed(&self) -> bool {
     matches!(
       self.phase,
       ZmtpHandlerPhase::Closing | ZmtpHandlerPhase::Closed | ZmtpHandlerPhase::Error
     )
+  }
+
+  /// Helper to take final ZMTP wire bytes (from framer), decide on ZC/normal send,
+  /// and add appropriate blueprints to HandlerIoOps.
+  fn add_send_blueprints_for_wire_bytes(
+    &self,
+    final_wire_bytes: Bytes, // Already ZMTP encoded & encrypted by framer
+    originating_op_ud_for_blueprints: UserData,
+    ops: &mut HandlerIoOps,
+  ) {
+    if final_wire_bytes.is_empty() {
+      return;
+    }
+
+    // Framer produces one contiguous Bytes buffer for the whole batch.
+    // We don't need manual corking logic here for a single buffer write.
+
+    if self.zmtp_config.use_send_zerocopy && final_wire_bytes.len() > ZC_SEND_THRESHOLD {
+      trace!(
+        fd = self.fd,
+        len = final_wire_bytes.len(),
+        app_op_ud = originating_op_ud_for_blueprints,
+        "ZmtpHandler (helper): Attempting ZC send."
+      );
+      ops
+        .sqe_blueprints
+        .push(HandlerSqeBlueprint::RequestSendZeroCopy {
+          data_to_send: final_wire_bytes,
+          send_op_flags: 0,
+          originating_app_op_ud: originating_op_ud_for_blueprints,
+        });
+    } else {
+      trace!(
+        fd = self.fd,
+        len = final_wire_bytes.len(),
+        app_op_ud = originating_op_ud_for_blueprints,
+        "ZmtpHandler (helper): Using normal send."
+      );
+      ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
+        data: final_wire_bytes,
+        send_op_flags: 0,
+        originating_app_op_ud: originating_op_ud_for_blueprints,
+      });
+    }
   }
 }
 
@@ -1152,18 +1114,26 @@ impl UringConnectionHandler for ZmtpUringHandler {
           if let Ok(Some(token_vec)) = sec_mech.produce_token() {
             // produce_token() decides if it's turn.
             let token_msg = Msg::from_vec(token_vec).with_flags(MsgFlags::COMMAND);
-            if let Ok(bytes) = Self::zmtp_encode_msg_to_bytes(&token_msg) {
-              ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-                data: bytes,
-                send_op_flags: 0, // Security tokens are ZMTP command frames, usually single.
-                originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD, // Internal protocol message.
-              });
-            } else {
-              let err = ZmqError::Internal("Failed to encode initial server security token".into());
-              let mut temp_ops = std::mem::take(&mut ops);
-              self.transition_to_error(&mut temp_ops, err, interface);
-              ops = temp_ops;
-              return ops;
+
+            // Modified to use Framer
+            match self.framer.write_msg_multipart(vec![token_msg]) {
+              Ok(bytes) => {
+                ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
+                  data: bytes,
+                  send_op_flags: 0, // Security tokens are ZMTP command frames, usually single.
+                  originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD, // Internal protocol message.
+                });
+              }
+              Err(err) => {
+                let err = ZmqError::Internal(format!(
+                  "Failed to encode/encrypt server security token: {}",
+                  err
+                ));
+                let mut temp_ops = std::mem::take(&mut ops);
+                self.transition_to_error(&mut temp_ops, err, interface);
+                ops = temp_ops;
+                return ops;
+              }
             }
           }
         }
@@ -1199,10 +1169,11 @@ impl UringConnectionHandler for ZmtpUringHandler {
         if let Some((multipart_msg_parts, queued_originating_app_op_ud)) =
           self.outgoing_multipart_app_messages.pop_front()
         {
-          match self.zmtp_encode_and_encrypt_frames(multipart_msg_parts.clone()) {
-            Ok(wire_frames_to_send) => {
-              self.add_send_blueprints_for_wire_frames(
-                wire_frames_to_send,
+          // Modified to use Framer
+          match self.framer.write_msg_multipart(multipart_msg_parts.clone()) {
+            Ok(wire_bytes_to_send) => {
+              self.add_send_blueprints_for_wire_bytes(
+                wire_bytes_to_send,
                 queued_originating_app_op_ud,
                 &mut ops,
               );
@@ -1211,7 +1182,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
               /* error handling, potentially re-queue with UD or handle error */
               error!(
                 fd = self.fd,
-                "Failed to encode/encrypt queued multipart message: {}. Message dropped from queue.",
+                "Failed to frame/encrypt queued multipart message: {}. Message dropped from queue.",
                 e
               );
               // Re-queue the original parts along with their UserData on failure
@@ -1226,17 +1197,14 @@ impl UringConnectionHandler for ZmtpUringHandler {
         } else if let Some((next_app_msg, queued_originating_app_op_ud)) =
           self.outgoing_app_messages.pop_front()
         {
-          // This app_msg needs to be converted into one or more ZMTP wire frames.
-          // For example, a REQ socket sends [empty_delimiter_MORE, payload_NOMORE].
-          // A PUSH socket sends [payload_NOMORE].
-          // The prepare_zmtp_wire_frames_for_app_msg helper handles this.
-          match self.prepare_zmtp_wire_frames_for_app_msg(next_app_msg.clone()) {
-            // Clone if re-queue on error
-            Ok(wire_frames_to_send) => {
-              // This returns Vec<Bytes>
+          // Modified to use Framer via logic helper
+          // For PUSH, this might be one frame. For REQ/DEALER, it's [delimiter, payload].
+          let logical_frames = self.prepare_logical_frames_for_app_msg(next_app_msg.clone());
 
-              self.add_send_blueprints_for_wire_frames(
-                wire_frames_to_send,
+          match self.framer.write_msg_multipart(logical_frames) {
+            Ok(wire_bytes_to_send) => {
+              self.add_send_blueprints_for_wire_bytes(
+                wire_bytes_to_send,
                 queued_originating_app_op_ud,
                 &mut ops,
               );
@@ -1244,7 +1212,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
             Err(e) => {
               error!(
                 fd = self.fd,
-                "Failed to prepare_zmtp_wire_frames for queued single message: {}. Re-queuing.", e
+                "Failed to frame/encrypt queued single message: {}. Re-queuing.", e
               );
               // Re-queue the original app message and its UserData on failure
               self
@@ -1262,9 +1230,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
     }
 
     if self.phase != previous_phase
-      && (!self.greeting_buffer.is_empty()
-        || !self.network_read_accumulator.is_empty()
-        || !self.plaintext_zmtp_frame_accumulator.is_empty())
+      && (!self.greeting_buffer.is_empty() || !self.network_read_accumulator.is_empty())
     {
       if let Err(e) = self.process_buffered_reads(interface, &mut ops) {
         if self.phase != ZmtpHandlerPhase::Error && self.phase != ZmtpHandlerPhase::Closed {
@@ -1309,12 +1275,13 @@ impl UringConnectionHandler for ZmtpUringHandler {
         if let Some((multipart_app_parts, queued_originating_app_op_ud)) =
           self.outgoing_multipart_app_messages.pop_front()
         {
-          match self.zmtp_encode_and_encrypt_frames(multipart_app_parts.clone()) {
+          // Modified to use Framer
+          match self.framer.write_msg_multipart(multipart_app_parts.clone()) {
             // Clone for potential re-queue
-            Ok(wire_frames_to_send) => {
-              // wire_frames_to_send is Vec<Bytes>
-              self.add_send_blueprints_for_wire_frames(
-                wire_frames_to_send,
+            Ok(wire_bytes_to_send) => {
+              // wire_bytes_to_send is Bytes
+              self.add_send_blueprints_for_wire_bytes(
+                wire_bytes_to_send,
                 queued_originating_app_op_ud,
                 &mut ops, // ops is the HandlerIoOps being built
               );
@@ -1322,7 +1289,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
             Err(e) => {
               error!(
                 fd = self.fd,
-                "Failed to encode/encrypt multipart message from queue in prepare_sqes (or similar): {}. Re-queuing.",
+                "Failed to frame/encrypt multipart message from queue in prepare_sqes: {}. Re-queuing.",
                 e
               );
               self
@@ -1339,10 +1306,13 @@ impl UringConnectionHandler for ZmtpUringHandler {
         } else if let Some((app_msg_to_send, queued_originating_app_op_ud)) =
           self.outgoing_app_messages.pop_front()
         {
-          match self.prepare_zmtp_wire_frames_for_app_msg(app_msg_to_send.clone()) {
-            Ok(final_wire_frames_for_single_msg) => {
-              self.add_send_blueprints_for_wire_frames(
-                final_wire_frames_for_single_msg,
+          // Modified to use Framer via logic helper
+          let logical_frames = self.prepare_logical_frames_for_app_msg(app_msg_to_send.clone());
+
+          match self.framer.write_msg_multipart(logical_frames) {
+            Ok(wire_bytes_to_send) => {
+              self.add_send_blueprints_for_wire_bytes(
+                wire_bytes_to_send,
                 queued_originating_app_op_ud,
                 &mut ops,
               );
@@ -1350,7 +1320,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
             Err(e) => {
               error!(
                 fd = self.fd,
-                "Failed to prepare_zmtp_wire_frames for queued single message: {}. Re-queuing.", e
+                "Failed to frame/encrypt queued single message: {}. Re-queuing.", e
               );
               self
                 .outgoing_app_messages
@@ -1380,32 +1350,21 @@ impl UringConnectionHandler for ZmtpUringHandler {
             if now.duration_since(self.last_activity_time) >= ivl {
               debug!(fd = self.fd, "Heartbeat interval elapsed. Preparing PING.");
               let ping_msg = ZmtpCommand::create_ping(0, b"hb_ping");
-              match Self::zmtp_encode_msg_to_bytes(&ping_msg) {
-                Ok(ping_plaintext_bytes) => {
-                  match Self::apply_encryption_if_needed(
-                    self.data_cipher.as_mut(),
-                    ping_plaintext_bytes,
-                  ) {
-                    Ok(ping_wire_bytes) => {
-                      ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
-                        data: ping_wire_bytes,
-                        send_op_flags: 0,
-                        originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
-                      });
-                      self.last_sent_was_ping = true;
-                    }
-                    Err(enc_err) => {
-                      error!(fd = self.fd, "Failed to encrypt PING: {}", enc_err);
-                      let mut temp_ops = std::mem::take(&mut ops);
-                      self.transition_to_error(&mut temp_ops, enc_err, interface);
-                      ops = temp_ops;
-                    }
-                  }
+
+              // Modified to use Framer
+              match self.framer.write_msg_multipart(vec![ping_msg]) {
+                Ok(ping_wire_bytes) => {
+                  ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSend {
+                    data: ping_wire_bytes,
+                    send_op_flags: 0,
+                    originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
+                  });
+                  self.last_sent_was_ping = true;
                 }
-                Err(encode_err) => {
-                  error!(fd = self.fd, "Failed to ZMTP encode PING: {}", encode_err);
+                Err(e) => {
+                  error!(fd = self.fd, "Failed to frame PING: {}", e);
                   let mut temp_ops = std::mem::take(&mut ops);
-                  self.transition_to_error(&mut temp_ops, encode_err, interface);
+                  self.transition_to_error(&mut temp_ops, e, interface);
                   ops = temp_ops;
                 }
               }
@@ -1433,14 +1392,9 @@ impl UringConnectionHandler for ZmtpUringHandler {
           && self.outgoing_app_messages.is_empty()
           && self.outgoing_multipart_app_messages.is_empty()
         {
-          match self.zmtp_encode_and_encrypt_frames(app_data_parts_vec.clone()) {
-            Ok(wire_frames_to_send) => {
-              // wire_frames_to_send is Vec<Bytes>
-              self.add_send_blueprints_for_wire_frames(
-                wire_frames_to_send,
-                originating_app_op_ud,
-                &mut ops,
-              );
+          match self.framer.write_msg_multipart(app_data_parts_vec.clone()) {
+            Ok(wire_bytes) => {
+              self.add_send_blueprints_for_wire_bytes(wire_bytes, originating_app_op_ud, &mut ops);
             }
             Err(e) => {
               error!(
@@ -1474,10 +1428,13 @@ impl UringConnectionHandler for ZmtpUringHandler {
               // Let's assume a helper method `prepare_wire_frames_for_app_msg` exists
               // that takes the app `Msg` and returns `Result<Vec<Bytes>, ZmqError>`,
               // where each `Bytes` is a fully ZMTP-encoded and encrypted wire frame.
-              match self.prepare_zmtp_wire_frames_for_app_msg(msg_to_send_app_level.clone()) {
-                Ok(final_wire_frames_for_single_msg) => {
-                  self.add_send_blueprints_for_wire_frames(
-                    final_wire_frames_for_single_msg,
+              let logical_frames =
+                self.prepare_logical_frames_for_app_msg(msg_to_send_app_level.clone());
+
+              match self.framer.write_msg_multipart(logical_frames) {
+                Ok(wire_bytes) => {
+                  self.add_send_blueprints_for_wire_bytes(
+                    wire_bytes,
                     originating_app_op_ud,
                     &mut ops,
                   );

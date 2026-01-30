@@ -422,6 +422,7 @@ async fn handle_new_connection_established(
         target_endpoint_uri: Some(target_endpoint_uri_from_event),
         is_outbound_connection: is_outbound_this_core_initiated,
         connection_iface: connection_iface.clone(),
+        peer_socket_type: None,
       };
 
       uring::global_state::register_uring_fd_socket_core_mailbox(fd, core_arc.command_sender());

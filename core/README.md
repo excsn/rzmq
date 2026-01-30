@@ -193,6 +193,13 @@ async fn main() -> Result<(), ZmqError> {
 *   **Error Handling Parity:** The mapping of internal errors to specific `ZmqError` variants corresponding to all `zmq_errno()` values may not be exhaustive.
 *   **Robustness:** Edge cases, high-concurrency stress, diverse network failure modes, and very long-running stability require more extensive testing.
 
+## Running Examples
+
+```bash
+# Run IO Uring Example then observe req/sec. Should be ~200k+ req/sec and 30-45MB ram.
+cargo run --release --features full-linux --example iouring_dealrtr_multiclient
+```
+
 ## Running Tests
 
 ```bash
