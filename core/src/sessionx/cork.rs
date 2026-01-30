@@ -18,10 +18,6 @@ impl TcpCorkInfoX {
   /// Creates a new `TcpCorkInfoX` if the stream provides a raw file descriptor.
   /// Returns `None` if `fd` cannot be obtained (which shouldn't happen if `S: AsRawFd`).
   pub(crate) fn new<S: AsRawFd>(stream: &S) -> Option<Self> {
-    // In a real scenario, we might not always have the stream at this exact point
-    // if TcpCorkInfoX is part of ZmtpProtocolHandlerX constructed before stream is Some.
-    // For now, assume stream is available to get the FD.
-    // Alternatively, fd could be passed in if obtained earlier.
     let fd = stream.as_raw_fd();
     if fd < 0 {
       // Basic sanity check for a valid FD
@@ -81,17 +77,20 @@ impl TcpCorkInfoX {
       "Attempting to set TCP_CORK"
     );
 
-    // Duplicate the FD to prevent race conditions.
-    // If the original socket closes while this task is pending, the FD number
-    // could be reused by the OS for a NEW connection. dup() ensures we hold
-    // a valid reference to the specific kernel socket object we intend to cork.
     let dup_fd = unsafe { libc::dup(fd_to_cork) };
     if dup_fd < 0 {
-      return Err(std::io::Error::last_os_error());
+      // Log the OS error and return early, instead of trying to return an Err.
+      let e = std::io::Error::last_os_error();
+      tracing::error!(
+        sca_handle = actor_handle,
+        fd = fd_to_cork,
+        error = %e,
+        "Failed to duplicate file descriptor for TCP_CORK operation. Aborting cork change."
+      );
+      return; // Abort the operation.
     }
 
     let res = tokio::task::spawn_blocking(move || {
-      // Create a socket reference from the duplicated FD.
       let socket = unsafe { socket2::Socket::from_raw_fd(dup_fd) };
 
       let result = socket.set_tcp_cork(enable);
