@@ -21,15 +21,7 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
     );
     ZmqError::Internal("Stream unavailable for data frame reading".into())
   })?;
-
-  // Do NOT use RCVTIMEO or arbitrary timeouts for the low-level stream read.
-  // RCVTIMEO is a user-facing API timeout for socket.recv() operations, not for the underlying TCP stream.
-  // Connection liveness is already managed by the actor's select! loop via:
-  //   - ZMTP Heartbeats (PING/PONG mechanism)
-  //   - Overall handshake timeout (for handshake phase)
-  //   - System shutdown events
-  // The stream read can safely block indefinitely. The actor's select! will cancel it if needed.
-
+  
   loop {
     // Protect against buffer bloat from malicious partial frames or protocol violations
     if handler.network_read_buffer.len() > MAX_BUFFER_SIZE {

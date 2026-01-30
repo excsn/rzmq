@@ -4,12 +4,12 @@ use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::core::SocketCore;
+
+use std::time::Duration;
+
 use async_trait::async_trait;
 use fibre::TrySendError;
 use fibre::mpmc::AsyncSender;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone)]

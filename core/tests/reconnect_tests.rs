@@ -1,14 +1,13 @@
-// tests/reconnect_tests.rs
+use std::time::Duration;
 
 use rzmq::{
+  Msg, MsgFlags, Socket, SocketType, ZmqError,
   socket::{
-    options::{RCVTIMEO, RECONNECT_IVL, ROUTER_MANDATORY, ROUTING_ID, SNDTIMEO},
     MonitorReceiver, SocketEvent,
+    options::{RCVTIMEO, RECONNECT_IVL, ROUTER_MANDATORY, ROUTING_ID, SNDTIMEO},
   },
-  Blob, Context, Msg, MsgFlags, Socket, SocketType, ZmqError,
 };
 use serial_test::serial;
-use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 // Assuming 'common' module exists and provides at least:
@@ -28,8 +27,9 @@ const SERVER_RCVTIMEO_MS_MR: i32 = 500;
 
 const RECONNECT_IVL_MS_MR: i32 = 75;
 
-const MONITOR_REACTION_TIMEOUT_MR: Duration = Duration::from_millis(RECONNECT_IVL_MS_MR as u64 * 10); // Increased slightly
-const MONITOR_POLL_INTERVAL_MR: Duration = Duration::from_millis(50); // Used by common::wait_for_monitor_event
+const MONITOR_REACTION_TIMEOUT_MR: Duration =
+  Duration::from_millis(RECONNECT_IVL_MS_MR as u64 * 10);
+const MONITOR_POLL_INTERVAL_MR: Duration = Duration::from_millis(50);
 const SERVER_DOWNTIME_MR: Duration = Duration::from_millis(RECONNECT_IVL_MS_MR as u64 * 4);
 
 fn generate_multi_reconnect_endpoint(test_case_offset: u16) -> String {
@@ -52,14 +52,21 @@ async fn configure_client_socket_for_reconnect_with_monitor(
     "[CLIENT {}] Configuring socket options and monitor...",
     endpoint_for_log
   );
-  socket.set_option_raw(SNDTIMEO, &snd_timo_ms.to_ne_bytes()).await?;
-  socket.set_option_raw(RCVTIMEO, &rcv_timo_ms.to_ne_bytes()).await?;
+  socket
+    .set_option_raw(SNDTIMEO, &snd_timo_ms.to_ne_bytes())
+    .await?;
+  socket
+    .set_option_raw(RCVTIMEO, &rcv_timo_ms.to_ne_bytes())
+    .await?;
   socket
     .set_option_raw(RECONNECT_IVL, &reconnect_ivl_ms.to_ne_bytes())
     .await?;
 
   let monitor_rx = socket.monitor_default().await?;
-  println!("[CLIENT {}] Socket configured with monitor.", endpoint_for_log);
+  println!(
+    "[CLIENT {}] Socket configured with monitor.",
+    endpoint_for_log
+  );
   Ok(monitor_rx)
 }
 
@@ -70,9 +77,16 @@ async fn configure_server_socket_for_test(
   snd_timo_ms: i32,
   rcv_timo_ms: i32,
 ) -> Result<(), ZmqError> {
-  println!("[SERVER {}] Configuring socket options...", endpoint_for_log);
-  socket.set_option_raw(SNDTIMEO, &snd_timo_ms.to_ne_bytes()).await?;
-  socket.set_option_raw(RCVTIMEO, &rcv_timo_ms.to_ne_bytes()).await?;
+  println!(
+    "[SERVER {}] Configuring socket options...",
+    endpoint_for_log
+  );
+  socket
+    .set_option_raw(SNDTIMEO, &snd_timo_ms.to_ne_bytes())
+    .await?;
+  socket
+    .set_option_raw(RCVTIMEO, &rcv_timo_ms.to_ne_bytes())
+    .await?;
   // Specific options like ROUTER_MANDATORY will be set in the test itself if needed
   println!("[SERVER {}] Socket configured.", endpoint_for_log);
   Ok(())
@@ -92,7 +106,7 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   println!("[PUSH {}] Creating PUSH socket...", endpoint);
   let push_socket = ctx.socket(SocketType::Push)?;
-  
+
   let push_monitor_rx = configure_client_socket_for_reconnect_with_monitor(
     &push_socket,
     &endpoint,
@@ -104,9 +118,17 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
   push_socket.connect(&endpoint).await?;
   println!("[PUSH {}] Connect initiated.", endpoint);
 
-  println!("[PUSH {}] Attempting initial send (PULL server not up)...", endpoint);
-  let initial_send_result = push_socket.send(Msg::from_static(b"Initial PUSH Ping")).await;
-  println!("[PUSH {}] Initial send result: {:?}", endpoint, initial_send_result);
+  println!(
+    "[PUSH {}] Attempting initial send (PULL server not up)...",
+    endpoint
+  );
+  let initial_send_result = push_socket
+    .send(Msg::from_static(b"Initial PUSH Ping"))
+    .await;
+  println!(
+    "[PUSH {}] Initial send result: {:?}",
+    endpoint, initial_send_result
+  );
   assert!(
     matches!(
       initial_send_result,
@@ -123,10 +145,19 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
   ); // Using SERVER_DOWNTIME for consistency
   sleep(SERVER_DOWNTIME_MR).await;
 
-  println!("[PULL {}] Creating, configuring, and binding PULL socket...", endpoint);
+  println!(
+    "[PULL {}] Creating, configuring, and binding PULL socket...",
+    endpoint
+  );
   let pull_socket = ctx.socket(SocketType::Pull)?;
-  
-  configure_server_socket_for_test(&pull_socket, &endpoint, SERVER_SNDTIMEO_MS_MR, SERVER_RCVTIMEO_MS_MR).await?;
+
+  configure_server_socket_for_test(
+    &pull_socket,
+    &endpoint,
+    SERVER_SNDTIMEO_MS_MR,
+    SERVER_RCVTIMEO_MS_MR,
+  )
+  .await?;
   pull_socket.bind(&endpoint).await?;
   println!("[PULL {}] Server bound successfully.", endpoint);
 
@@ -134,7 +165,7 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
     "[SYS {}] Waiting for PUSH to reconnect (HandshakeSucceeded)...",
     endpoint
   );
-  
+
   let _connect_event = common::wait_for_monitor_event(
         &push_monitor_rx,
         MONITOR_REACTION_TIMEOUT_MR, // Total timeout for the event
@@ -153,7 +184,11 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
   println!("[PUSH {}] Payload sent successfully.", endpoint);
 
   println!("[PULL {}] Attempting to receive message...", endpoint);
-  let received_msg = common::recv_timeout(&pull_socket, Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64)).await?;
+  let received_msg = common::recv_timeout(
+    &pull_socket,
+    Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64),
+  )
+  .await?;
   println!(
     "[PULL {}] Received: '{}'",
     endpoint,
@@ -166,7 +201,10 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
     endpoint
   );
 
-  println!("--- test_push_pull_reconnect_advanced_style on {} PASSED ---", endpoint);
+  println!(
+    "--- test_push_pull_reconnect_advanced_style on {} PASSED ---",
+    endpoint
+  );
   ctx.term().await?;
   Ok(())
 }
@@ -182,7 +220,7 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   println!("[REQ {}] Creating REQ socket...", endpoint);
   let req_socket = ctx.socket(SocketType::Req)?;
-  
+
   let req_monitor_rx = configure_client_socket_for_reconnect_with_monitor(
     &req_socket,
     &endpoint,
@@ -194,9 +232,15 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
   req_socket.connect(&endpoint).await?;
   println!("[REQ {}] Connect initiated.", endpoint);
 
-  println!("[REQ {}] Attempting initial send (REP server not up)...", endpoint);
+  println!(
+    "[REQ {}] Attempting initial send (REP server not up)...",
+    endpoint
+  );
   let initial_send_result = req_socket.send(Msg::from_static(b"Initial REQuest")).await;
-  println!("[REQ {}] Initial send result: {:?}", endpoint, initial_send_result);
+  println!(
+    "[REQ {}] Initial send result: {:?}",
+    endpoint, initial_send_result
+  );
   assert!(
     matches!(
       initial_send_result,
@@ -213,10 +257,19 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
   );
   sleep(SERVER_DOWNTIME_MR).await;
 
-  println!("[REP {}] Creating, configuring, and binding REP socket...", endpoint);
+  println!(
+    "[REP {}] Creating, configuring, and binding REP socket...",
+    endpoint
+  );
   let rep_socket = ctx.socket(SocketType::Rep)?;
-  
-  configure_server_socket_for_test(&rep_socket, &endpoint, SERVER_SNDTIMEO_MS_MR, SERVER_RCVTIMEO_MS_MR).await?;
+
+  configure_server_socket_for_test(
+    &rep_socket,
+    &endpoint,
+    SERVER_SNDTIMEO_MS_MR,
+    SERVER_RCVTIMEO_MS_MR,
+  )
+  .await?;
   rep_socket.bind(&endpoint).await?;
   println!("[REP {}] Server bound successfully.", endpoint);
 
@@ -224,7 +277,7 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
     "[SYS {}] Waiting for REQ to reconnect (HandshakeSucceeded)...",
     endpoint
   );
-  
+
   let _connect_event = common::wait_for_monitor_event(
         &req_monitor_rx,
         MONITOR_REACTION_TIMEOUT_MR,
@@ -243,7 +296,11 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
   println!("[REQ {}] Payload sent successfully.", endpoint);
 
   println!("[REP {}] Attempting to receive request...", endpoint);
-  let received_on_rep = common::recv_timeout(&rep_socket, Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64)).await?;
+  let received_on_rep = common::recv_timeout(
+    &rep_socket,
+    Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64),
+  )
+  .await?;
   println!(
     "[REP {}] Received: '{}'",
     endpoint,
@@ -266,7 +323,11 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
   println!("[REP {}] Reply sent successfully.", endpoint);
 
   println!("[REQ {}] Attempting to receive reply...", endpoint);
-  let received_on_req = common::recv_timeout(&req_socket, Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64)).await?;
+  let received_on_req = common::recv_timeout(
+    &req_socket,
+    Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64),
+  )
+  .await?;
   println!(
     "[REQ {}] Received: '{}'",
     endpoint,
@@ -279,7 +340,10 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
     endpoint
   );
 
-  println!("--- test_req_rep_reconnect_advanced_style on {} PASSED ---", endpoint);
+  println!(
+    "--- test_req_rep_reconnect_advanced_style on {} PASSED ---",
+    endpoint
+  );
   ctx.term().await?;
   Ok(())
 }
@@ -303,7 +367,7 @@ async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), 
     endpoint, dealer_id_val
   );
   let dealer_socket = ctx.socket(SocketType::Dealer)?;
-  
+
   let dealer_monitor_rx = configure_client_socket_for_reconnect_with_monitor(
     &dealer_socket,
     &endpoint,
@@ -327,8 +391,14 @@ async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), 
       endpoint, cycle
     );
     let router_socket = ctx.socket(SocketType::Router)?;
-    
-    configure_server_socket_for_test(&router_socket, &endpoint, SERVER_SNDTIMEO_MS_MR, SERVER_RCVTIMEO_MS_MR).await?;
+
+    configure_server_socket_for_test(
+      &router_socket,
+      &endpoint,
+      SERVER_SNDTIMEO_MS_MR,
+      SERVER_RCVTIMEO_MS_MR,
+    )
+    .await?;
     router_socket
       .set_option_raw(ROUTER_MANDATORY, &1i32.to_ne_bytes())
       .await?;
@@ -340,7 +410,7 @@ async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), 
       "[DEALER {}] Cycle {}: Waiting for HandshakeSucceeded monitor event...",
       endpoint, cycle
     );
-    
+
     let connect_event = common::wait_for_monitor_event(
             &dealer_monitor_rx,
             MONITOR_REACTION_TIMEOUT_MR,
@@ -354,7 +424,10 @@ async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), 
 
     // 4. Perform a message exchange
     let msg_to_send = format!("Message from DEALER, Cycle {}", cycle);
-    println!("[DEALER {}] Cycle {}: Sending: '{}'", endpoint, cycle, msg_to_send);
+    println!(
+      "[DEALER {}] Cycle {}: Sending: '{}'",
+      endpoint, cycle, msg_to_send
+    );
     dealer_socket
       .send(Msg::from_vec(msg_to_send.as_bytes().to_vec()))
       .await?;
@@ -365,10 +438,16 @@ async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), 
     );
     // ROUTER application expects: [identity_frame, payload_frame_1, ..., payload_frame_N]
     // When a DEALER sends a single payload message, the ROUTER application gets 2 frames:
-    let router_recv_id =
-      common::recv_timeout(&router_socket, Duration::from_millis(SERVER_RCVTIMEO_MS_MR as u64)).await?;
-    let router_recv_payload =
-      common::recv_timeout(&router_socket, Duration::from_millis(SERVER_RCVTIMEO_MS_MR as u64)).await?;
+    let router_recv_id = common::recv_timeout(
+      &router_socket,
+      Duration::from_millis(SERVER_RCVTIMEO_MS_MR as u64),
+    )
+    .await?;
+    let router_recv_payload = common::recv_timeout(
+      &router_socket,
+      Duration::from_millis(SERVER_RCVTIMEO_MS_MR as u64),
+    )
+    .await?;
     // NO DELIMITER is received by the application from the RouterSocket's queue.
 
     println!(
@@ -426,17 +505,26 @@ async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), 
       .await?;
     println!("[ROUTER {}] Cycle {}: Sent reply.", endpoint, cycle);
 
-    let dealer_reply =
-      common::recv_timeout(&dealer_socket, Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64)).await?;
+    let dealer_reply = common::recv_timeout(
+      &dealer_socket,
+      Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64),
+    )
+    .await?;
     assert_eq!(dealer_reply.data().unwrap(), reply_to_send.as_bytes());
     println!(
       "[DEALER {}] Cycle {}: Received router reply correctly.",
       endpoint, cycle
     );
-    println!("[SYS {}] Cycle {}: Message exchange successful.", endpoint, cycle);
+    println!(
+      "[SYS {}] Cycle {}: Message exchange successful.",
+      endpoint, cycle
+    );
 
     // 5. Stop the ROUTER server
-    println!("[ROUTER {}] Cycle {}: Closing ROUTER socket...", endpoint, cycle);
+    println!(
+      "[ROUTER {}] Cycle {}: Closing ROUTER socket...",
+      endpoint, cycle
+    );
     router_socket.close().await?;
     drop(router_socket);
     sleep(Duration::from_millis(RECONNECT_IVL_MS_MR as u64 / 2)).await;
@@ -447,7 +535,7 @@ async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), 
       "[DEALER {}] Cycle {}: Waiting for Disconnected monitor event...",
       endpoint, cycle
     );
-    
+
     let disconnect_event = common::wait_for_monitor_event(
             &dealer_monitor_rx,
             MONITOR_REACTION_TIMEOUT_MR,

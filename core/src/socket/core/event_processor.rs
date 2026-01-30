@@ -272,16 +272,6 @@ async fn handle_new_connection_established(
 ) -> Result<(), ZmqError> {
   let core_handle = core_arc.handle;
 
-  let connection_instance_id = match &interaction_model_from_event {
-    ConnectionInteractionModel::ViaSca { sca_handle_id, .. } => *sca_handle_id,
-    #[cfg(feature = "io-uring")]
-    ConnectionInteractionModel::ViaUringFd { fd } => *fd as usize,
-    #[cfg(not(feature = "io-uring"))]
-    ConnectionInteractionModel::ViaUringFd { .. } => {
-      unreachable!("ViaUringFd model when io-uring feature is disabled")
-    }
-  };
-
   let is_outbound_this_core_initiated = {
     let core_s_guard = core_arc.core_state.read();
     !core_s_guard.endpoints.values().any(|ep_info| {
@@ -289,9 +279,6 @@ async fn handle_new_connection_established(
         && ep_info.endpoint_uri == target_endpoint_uri_from_event
     })
   };
-
-  // Centralized construction of final_connection_iface
-  let final_connection_iface: Arc<dyn ISocketConnection>;
 
   match interaction_model_from_event {
     ConnectionInteractionModel::ViaSca {
@@ -354,11 +341,11 @@ async fn handle_new_connection_established(
       // 6. Create and store EndpointInfo
       let endpoint_info = EndpointInfo {
         mailbox: sca_mailbox, // Mailbox to the SCA (for Stop commands mainly)
-        task_handle: None,    // SocketCore doesn't hold JoinHandle for SCA
+        task_handle: None,
         endpoint_type: EndpointType::Session,
         endpoint_uri: endpoint_uri_from_event.clone(),
         pipe_ids: Some((core_write_id, core_read_id)),
-        handle_id: sca_handle_id, // This is the SCA's own handle
+        handle_id: sca_handle_id,
         target_endpoint_uri: Some(target_endpoint_uri_from_event),
         is_outbound_connection: is_outbound_this_core_initiated,
         peer_socket_type: None,
@@ -416,7 +403,7 @@ async fn handle_new_connection_established(
         "NewConnectionEstablished: io_uring FD path."
       );
 
-      final_connection_iface = connection_iface_from_event_opt.ok_or_else(|| {
+      let connection_iface = connection_iface_from_event_opt.ok_or_else(|| {
         ZmqError::Internal("UringFdConnection missing from NewConnectionEstablished event".into())
       })?;
 
@@ -434,7 +421,7 @@ async fn handle_new_connection_established(
         handle_id: uring_fd_as_endpoint_handle_id,
         target_endpoint_uri: Some(target_endpoint_uri_from_event),
         is_outbound_connection: is_outbound_this_core_initiated,
-        connection_iface: final_connection_iface.clone(),
+        connection_iface: connection_iface.clone(),
       };
 
       uring::global_state::register_uring_fd_socket_core_mailbox(fd, core_arc.command_sender());

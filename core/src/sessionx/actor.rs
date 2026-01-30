@@ -296,23 +296,30 @@ where
       self.current_phase
     );
 
-    // 1. Enforce minimum lifespan FIRST (if there was an error)
-    //    This prevents rapid crash-loops from burning CPU
-    if self.error_for_drop_guard.is_some() {
-      self.session_regulator.enforce_min_lifespan().await;
-    }
-
     // Post-loop cleanup (already initiated if error/stop occurred, this is a final catch-all)
     if self.current_phase != ConnectionPhaseX::Terminating {
       // If loop exited for other reasons
       self.perform_final_cleanup_actions().await;
     }
 
+    let had_error = self.error_for_drop_guard.is_some();
+    
     if let Some(err) = self.error_for_drop_guard.take() {
       actor_drop_guard.set_error(err);
     } else {
       actor_drop_guard.waive();
     }
+
+    // This publishes the ActorStopping event (which triggers the Disconnected monitor event)
+    // IMMEDIATELY, before we potentially sleep for the churn penalty.
+    drop(actor_drop_guard);
+
+    // Now, enforce the minimum lifespan penalty if there was an error.
+    // The rest of the system is already notified that we are dead.
+    if had_error {
+      self.session_regulator.enforce_min_lifespan().await;
+    }
+
     tracing::info!(
       sca_handle = self.handle,
       "SCA {} fully stopped.",

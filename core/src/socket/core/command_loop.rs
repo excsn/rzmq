@@ -197,6 +197,106 @@ pub(crate) async fn run_command_loop(
               }
             }
           }
+
+          // === REAPER: Clean up zombie actors ===
+
+          // 1. READ PASS (Fast, concurrent)
+          let mut dead_endpoints = Vec::new();
+          {
+            let core_read = core_arc.core_state.read();
+            for (uri, info) in core_read.endpoints.iter() {
+              if let Some(handle) = &info.task_handle {
+                if handle.is_finished() {
+                  dead_endpoints.push((uri.clone(), info.handle_id));
+                }
+              }
+            }
+          } // lock dropped
+
+          // 2. WRITE PASS (Only if needed)
+          if !dead_endpoints.is_empty() {
+            tracing::warn!(
+              count = dead_endpoints.len(),
+              "Reaper found zombie endpoints. Performing cleanup."
+            );
+            
+            for (uri, expected_handle_id) in dead_endpoints {
+              // Double-check endpoint still exists with same handle_id to avoid races
+              let should_cleanup = {
+                let core_read = core_arc.core_state.read();
+                core_read.endpoints.get(&uri)
+                  .map(|info| info.handle_id == expected_handle_id)
+                  .unwrap_or(false)
+              };
+              
+              if !should_cleanup {
+                tracing::debug!(
+                  core_handle = core_handle,
+                  expected_sca_handle = expected_handle_id,
+                  uri = %uri,
+                  "Reaper: Endpoint already removed or changed. Skipping."
+                );
+                continue;
+              }
+              
+              tracing::info!(
+                core_handle = core_handle,
+                sca_handle = expected_handle_id,
+                uri = %uri,
+                "Reaper cleaning up zombie endpoint"
+              );
+              
+              // --- Capture Reconnect Flag ---
+              let should_reconnect = crate::socket::core::pipe_manager::cleanup_stopped_child_resources(
+                core_arc.clone(),
+                &socket_logic_strong,
+                expected_handle_id,
+                ActorType::Session,
+                Some(&uri),
+                None, // We assume clean exit or unknown error if task is finished
+                false 
+              ).await;
+
+              // If the cleanup logic says we should reconnect (because it was an outbound session), do it.
+              if should_reconnect {
+                let mut state = core_arc.core_state.write();
+                
+                // Check if already reconnected by another part of the system
+                if state.endpoints.contains_key(&uri) {
+                  tracing::debug!(
+                    core_handle = core_handle,
+                    uri = %uri,
+                    "Reaper: Endpoint already reconnected. Skipping."
+                  );
+                  continue;
+                }
+                
+                let options = state.options.clone();
+                
+                // Check if reconnect is actually enabled
+                let Some(base) = options.reconnect_ivl else {
+                  tracing::debug!(
+                    core_handle = core_handle,
+                    uri = %uri,
+                    "Reaper: Reconnect disabled (RECONNECT_IVL is None)."
+                  );
+                  continue;
+                };
+                
+                let max = options.reconnect_ivl_max.unwrap_or(std::time::Duration::from_secs(60));
+                let recon_state = state.reconnect_states.entry(uri.clone()).or_default();
+                let delay = recon_state.on_connection_failure(base, max);
+                
+                tracing::info!(
+                  core_handle = core_handle,
+                  uri = %uri,
+                  attempt = recon_state.current_attempts,
+                  next_attempt_in = ?delay,
+                  "Reaper: Zombie session cleaned. Scheduled for reconnect."
+                );
+              }
+            }
+          }
         }
       } // end tokio::select!
     } // end loop
