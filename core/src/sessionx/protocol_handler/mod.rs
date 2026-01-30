@@ -37,7 +37,7 @@ pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
   pub(crate) security_mechanism: Box<dyn Mechanism>,
   pub(crate) pending_peer_greeting: Option<ZmtpGreeting>,
   pub(crate) zmtp_manual_parser: ZmtpManualParser, // For the handshake phase
-  pub(crate) framer: Box<dyn ISecureFramer>, // For the data phase
+  pub(crate) framer: Box<dyn ISecureFramer>,       // For the data phase
 
   pub(crate) heartbeat_state: ZmtpHeartbeatStateX,
 
@@ -57,19 +57,18 @@ impl<S: ZmtpStdStream + fmt::Debug> fmt::Debug for ZmtpProtocolHandlerX<S> {
       .field("config", &self.config)
       .field("is_server", &self.is_server)
       .field("stream_is_some", &self.stream.is_some());
-    debug_struct
-      .field("network_read_buffer_len", &self.network_read_buffer.len());
+    debug_struct.field("network_read_buffer_len", &self.network_read_buffer.len());
 
     // REMOVED old fields, ADDED framer (can't debug the trait object itself easily)
-    debug_struct.field("framer_active", &"true"); 
-    
+    debug_struct.field("framer_active", &"true");
+
     debug_struct
       .field("handshake_state", &self.handshake_state)
       .field("security_mechanism_name", &self.security_mechanism.name())
       .field("pending_peer_greeting", &self.pending_peer_greeting);
 
     debug_struct.field("heartbeat_state", &self.heartbeat_state);
-      
+
     #[cfg(target_os = "linux")]
     debug_struct.field("cork_info", &self.cork_info);
     #[cfg(not(target_os = "linux"))]
@@ -194,6 +193,10 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
       sca_handle = self.actor_handle,
       "ZmtpProtocolHandlerX: Initiating stream shutdown."
     );
+
+    // Clear buffers BEFORE shutting down stream
+    self.clear_handshake_state();
+
     if let Some(stream_ref) = self.stream.as_mut() {
       #[cfg(target_os = "linux")]
       {
@@ -218,5 +221,25 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     }
     self.stream = None; // Drop the stream, which should close it.
     Ok(())
+  }
+
+  /// Clears internal buffers and state to free memory on errors.
+  /// Called before stream shutdown to prevent memory leaks.
+  fn clear_handshake_state(&mut self) {
+    tracing::trace!(
+      sca_handle = self.actor_handle,
+      "Clearing handshake state and buffers."
+    );
+
+    self.pending_peer_greeting = None;
+    self.network_read_buffer.clear();
+
+    // Reset security mechanism to free any internal buffers
+    if self.security_mechanism.name() != NullMechanism::NAME {
+      self.security_mechanism = Box::new(NullMechanism);
+    }
+    
+    // Reset framer to free any internal state
+    self.framer = Box::new(NullFramer::new());
   }
 }

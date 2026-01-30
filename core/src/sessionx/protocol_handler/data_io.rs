@@ -5,13 +5,15 @@ use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::transport::ZmtpStdStream;
 
-use bytes::{BufMut, BytesMut};
 use std::time::Duration;
+use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
 ) -> Result<Option<Msg>, ZmqError> {
+  const MAX_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB limit to prevent unbounded growth
+
   let stream = handler.stream.as_mut().ok_or_else(|| {
     tracing::error!(
       sca_handle = handler.actor_handle,
@@ -20,10 +22,25 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
     ZmqError::Internal("Stream unavailable for data frame reading".into())
   })?;
 
-  // Use a long timeout for reading data. The actor's select loop handles higher-level timeouts (like PONG).
-  let operation_timeout = handler.config.rcvtimeo.unwrap_or(Duration::from_secs(300));
+  // Do NOT use RCVTIMEO or arbitrary timeouts for the low-level stream read.
+  // RCVTIMEO is a user-facing API timeout for socket.recv() operations, not for the underlying TCP stream.
+  // Connection liveness is already managed by the actor's select! loop via:
+  //   - ZMTP Heartbeats (PING/PONG mechanism)
+  //   - Overall handshake timeout (for handshake phase)
+  //   - System shutdown events
+  // The stream read can safely block indefinitely. The actor's select! will cancel it if needed.
 
   loop {
+    // Protect against buffer bloat from malicious partial frames or protocol violations
+    if handler.network_read_buffer.len() > MAX_BUFFER_SIZE {
+      tracing::error!(
+        sca_handle = handler.actor_handle,
+        buffer_size = handler.network_read_buffer.len(),
+        "Network buffer exceeded maximum size. Possible attack or protocol violation."
+      );
+      return Err(ZmqError::ResourceLimitReached);
+    }
+
     // 1. Attempt to frame and decrypt a message from the existing network buffer.
     // The framer encapsulates all logic for finding message boundaries.
     match handler
@@ -33,6 +50,14 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
       Ok(Some(msg)) => {
         // Success: a complete message was framed and parsed.
         handler.heartbeat_state.record_activity();
+        
+        // If buffer has grown large and is mostly empty, shrink it
+        if handler.network_read_buffer.capacity() > 65536
+          && handler.network_read_buffer.len() < 8192
+        {
+          handler.network_read_buffer = BytesMut::with_capacity(16384);
+        }
+
         return Ok(Some(msg));
       }
       Ok(None) => {
@@ -47,19 +72,12 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
 
     // 2. If no message could be framed, read more data from the network.
     // `read_buf` appends to the existing buffer.
-    let bytes_read = tokio::time::timeout(
-      operation_timeout,
-      stream.read_buf(&mut handler.network_read_buffer),
-    )
-    .await
-    .map_err(|_| {
-      tracing::warn!(
-        sca_handle = handler.actor_handle,
-        "Timeout reading data frame (single op)."
-      );
-      ZmqError::Timeout
-    })?
-    .map_err(|e| ZmqError::from_io_endpoint(e, "data read"))?;
+    // We await directly on read_buf. The actor's select! loop handles
+    // cancellation if Heartbeats fail or shutdown is requested.
+    let bytes_read = stream
+      .read_buf(&mut handler.network_read_buffer)
+      .await
+      .map_err(|e| ZmqError::from_io_endpoint(e, "data read"))?;
 
     if bytes_read == 0 {
       tracing::debug!(

@@ -25,7 +25,9 @@ impl TcpCorkInfoX {
     let fd = stream.as_raw_fd();
     if fd < 0 {
       // Basic sanity check for a valid FD
-      tracing::warn!("TcpCorkInfoX: Received invalid RawFd (<0) from stream, corking will be disabled.");
+      tracing::warn!(
+        "TcpCorkInfoX: Received invalid RawFd (<0) from stream, corking will be disabled."
+      );
       return None;
     }
     Some(Self {
@@ -79,15 +81,20 @@ impl TcpCorkInfoX {
       "Attempting to set TCP_CORK"
     );
 
+    // Duplicate the FD to prevent race conditions.
+    // If the original socket closes while this task is pending, the FD number
+    // could be reused by the OS for a NEW connection. dup() ensures we hold
+    // a valid reference to the specific kernel socket object we intend to cork.
+    let dup_fd = unsafe { libc::dup(fd_to_cork) };
+    if dup_fd < 0 {
+      return Err(std::io::Error::last_os_error());
+    }
+
     let res = tokio::task::spawn_blocking(move || {
-      // SAFETY: We are assuming fd_to_cork is a valid socket FD.
-      // The FromRawFd trait upholds safety if the FD is valid and owned correctly.
-      // Here, we create a socket2::Socket temporarily.
-      let socket = unsafe { socket2::Socket::from_raw_fd(fd_to_cork) };
+      // Create a socket reference from the duplicated FD.
+      let socket = unsafe { socket2::Socket::from_raw_fd(dup_fd) };
+
       let result = socket.set_tcp_cork(enable);
-      // Crucial: Prevent socket2::Socket from closing the FD when it's dropped.
-      // The original stream still owns the FD.
-      std::mem::forget(socket);
       result
     })
     .await;

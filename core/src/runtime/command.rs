@@ -14,8 +14,8 @@ use fibre::oneshot;
 /// These are primarily for direct, targeted communication, often expecting a reply,
 /// or for high-frequency data flow (like pipe messages).
 /// Broader system notifications and lifecycle events are handled by `SystemEvent` on the `EventBus`.
-#[derive(Debug)] // Auto-derive Debug for now, custom impl if needed for sensitive fields.
-#[allow(dead_code)] // Allow unused variants during development stages.
+#[derive(Debug)]
+#[allow(dead_code)]
 pub enum Command {
   // --- User Requests (from API Handle -> SocketCore's single command mailbox) ---
   /// Command to bind the socket to a local endpoint.

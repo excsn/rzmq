@@ -7,22 +7,17 @@ pub(crate) mod state;
 
 use crate::context::Context;
 use crate::error::ZmqError;
-use crate::runtime::{mailbox, ActorType, MailboxSender};
+use crate::runtime::{mailbox, MailboxSender};
 use crate::socket::options::SocketOptions;
 use crate::socket::types::SocketType;
 use crate::socket::ISocket;
-pub(crate) use pipe_manager::send_msg_with_timeout;
 pub(crate) use state::{EndpointInfo, EndpointType};
-use std::sync::Arc;
-
-// Use Tokio's sync primitives for fields directly in SocketCore if they are mutated across .await points
-// or if they need to be lockable by external components (though less common for these fields).
-// For CoreState, parking_lot::RwLock is often preferred for its performance and try_lock features
-// when synchronous access within async blocks is frequent.
-use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
-
 pub(crate) use state::CoreState;
 use state::ShutdownCoordinator;
+
+use std::sync::Arc;
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
+
 
 #[derive(Debug)]
 pub struct SocketCore {
@@ -31,7 +26,6 @@ pub struct SocketCore {
   pub(crate) command_sender: MailboxSender,
   pub(crate) core_state: parking_lot::RwLock<CoreState>,
   // Weak reference to the ISocket pattern logic to avoid Arc cycles.
-  // Needs Tokio's RwLock because `get_socket_logic` is async.
   pub(crate) socket_logic: TokioRwLock<Option<std::sync::Weak<dyn ISocket>>>,
   // Manages the multi-stage shutdown process. Needs Tokio's Mutex as its methods are async.
   pub(crate) shutdown_coordinator: TokioMutex<ShutdownCoordinator>,
@@ -55,12 +49,10 @@ impl SocketCore {
       context: context.clone(),
       command_sender: cmd_tx.clone(),
       core_state: parking_lot::RwLock::new(core_state_instance_new),
-      socket_logic: TokioRwLock::new(None), // Initialize as None
+      socket_logic: TokioRwLock::new(None),
       shutdown_coordinator: TokioMutex::new(ShutdownCoordinator::default()),
     });
 
-    // Create the ISocket pattern logic (PubSocket, ReqSocket, etc.)
-    // These are defined in `core/src/socket/dealer_socket.rs`, etc.
     let socket_logic_arc_impl: Arc<dyn ISocket> = match socket_type {
       SocketType::Pub => Arc::new(crate::socket::pub_socket::PubSocket::new(socket_core_arc.clone())),
       SocketType::Sub => Arc::new(crate::socket::sub_socket::SubSocket::new(socket_core_arc.clone())),
@@ -72,7 +64,6 @@ impl SocketCore {
       SocketType::Pull => Arc::new(crate::socket::pull_socket::PullSocket::new(socket_core_arc.clone())),
     };
 
-    // Store a weak reference to the ISocket logic back in SocketCore
     {
       // Scope for TokioRwLock write guard
       let mut socket_logic_weak_ref_guard = socket_core_arc.socket_logic.try_write().map_err(|_| {

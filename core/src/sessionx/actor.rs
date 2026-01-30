@@ -296,6 +296,12 @@ where
       self.current_phase
     );
 
+    // 1. Enforce minimum lifespan FIRST (if there was an error)
+    //    This prevents rapid crash-loops from burning CPU
+    if self.error_for_drop_guard.is_some() {
+      self.session_regulator.enforce_min_lifespan().await;
+    }
+
     // Post-loop cleanup (already initiated if error/stop occurred, this is a final catch-all)
     if self.current_phase != ConnectionPhaseX::Terminating {
       // If loop exited for other reasons
@@ -344,6 +350,19 @@ where
             "Already attached. Ignoring ScaInitializePipes."
           );
           drop(rx_from_core); // Still drop the provided channels
+          return;
+        }
+
+        if matches!(
+          self.current_phase,
+          ConnectionPhaseX::ShuttingDownStream | ConnectionPhaseX::Terminating
+        ) {
+          tracing::warn!(
+            sca_handle = self.handle,
+            phase = ?self.current_phase,
+            "Received ScaInitializePipes while shutting down. Dropping pipes."
+          );
+          drop(rx_from_core);
           return;
         }
 
@@ -549,17 +568,13 @@ where
       self.error_for_drop_guard = Some(error);
     }
 
-    // 1. Explicitly shutdown and drop the stream NOW to free the OS File Descriptor.
+    // Explicitly shutdown and drop the stream NOW to free the OS File Descriptor.
     // We do this before the regulator sleep to prevent FD exhaustion attacks.
     // We ignore errors here as we are already handling a fatal error.
     let _ = self.zmtp_handler.initiate_stream_shutdown().await;
 
-    // 2. Mark state as shutting down so the main loop exits correctly after the sleep.
+    // Mark state as shutting down so the main loop exits correctly after the sleep.
     self.transition_to_shutdown_stream(None).await;
-
-    // 3. Enforce minimum lifespan. The actor stays alive (consuming RAM) but not OS handles.
-    // This prevents rapid crash-loops from burning CPU.
-    self.session_regulator.enforce_min_lifespan().await;
   }
 
   async fn transition_to_shutdown_stream(&mut self, accompanying_error: Option<ZmqError>) {

@@ -148,7 +148,7 @@ pub(crate) async fn process_system_event(
                 );
                 ep_info.peer_socket_type = peer_socket_type;
               }
-              
+
               // 2. Reset reconnect backoff state on successful handshake
               if let Some(recon_state) = core_s_write.reconnect_states.get_mut(&uri) {
                 recon_state.on_connection_success();
@@ -341,11 +341,14 @@ async fn handle_new_connection_established(
       );
 
       // 5. Create the connection interface for SocketCore
+      let sndtimeo_snapshot = core_arc.core_state.read().options.sndtimeo;
+
       let sca_iface = Arc::new(ScaConnectionIface::new(
         sca_mailbox.clone(),
         sca_handle_id,
-        core_arc.clone(),
+        tx_core_to_sca.clone(),
         core_write_id,
+        sndtimeo_snapshot,
       ));
 
       // 6. Create and store EndpointInfo

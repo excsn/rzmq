@@ -5,8 +5,9 @@ use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::SocketCore;
-use fibre::TrySendError;
 use async_trait::async_trait;
+use fibre::TrySendError;
+use fibre::mpmc::AsyncSender;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -15,22 +16,25 @@ use tokio::time::timeout;
 pub(crate) struct ScaConnectionIface {
   sca_stop_mailbox: MailboxSender,
   sca_handle_id: usize,
-  socket_core_ref: Arc<SocketCore>,
+  pipe_sender: AsyncSender<Vec<Msg>>,
   pipe_write_id_to_sca: usize,
+  sndtimeo: Option<Duration>,
 }
 
 impl ScaConnectionIface {
   pub(crate) fn new(
     sca_stop_mailbox: MailboxSender,
     sca_handle_id: usize,
-    socket_core_ref: Arc<SocketCore>,
+    pipe_sender: AsyncSender<Vec<Msg>>,
     pipe_write_id_to_sca: usize,
+    sndtimeo: Option<Duration>,
   ) -> Self {
     Self {
       sca_stop_mailbox,
       sca_handle_id,
-      socket_core_ref,
+      pipe_sender,
       pipe_write_id_to_sca,
+      sndtimeo,
     }
   }
 }
@@ -44,42 +48,20 @@ impl ISocketConnection for ScaConnectionIface {
       "ScaConnectionIface sending single message via data pipe."
     );
 
-    let pipe_sender_opt = {
-      // Scope for read lock
-      let core_s_reader = self.socket_core_ref.core_state.read();
-      core_s_reader.pipes_tx.get(&self.pipe_write_id_to_sca).cloned()
-    };
-
-    if let Some(pipe_sender) = pipe_sender_opt {
-      let send_timeout_opt = self.socket_core_ref.core_state.read().options.sndtimeo;
-
-      if send_timeout_opt == Some(Duration::ZERO) {
-        // Non-blocking send attempt
-        match pipe_sender.try_send(vec![msg]) {
-          Ok(()) => Ok(()),
-          Err(TrySendError::Full(_)) => Err(ZmqError::ResourceLimitReached),
-          Err(TrySendError::Closed(_)) => Err(ZmqError::ConnectionClosed),
-          Err(TrySendError::Sent(_)) => unreachable!(),
-        }
-      } else {
-        // Blocking/timed send
-        let timeout_duration = send_timeout_opt.unwrap_or(Duration::from_secs(30)); // Or some other default for None
-        match timeout(timeout_duration, pipe_sender.send(vec![msg])).await {
-          Ok(Ok(())) => Ok(()),
-          Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
-          Err(_) => Err(ZmqError::Timeout), // Use Timeout to match RCVTIMEO behavior
-        }
+    if self.sndtimeo == Some(Duration::ZERO) {
+      match self.pipe_sender.try_send(vec![msg]) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(ZmqError::ResourceLimitReached),
+        Err(TrySendError::Closed(_)) => Err(ZmqError::ConnectionClosed),
+        Err(TrySendError::Sent(_)) => unreachable!(),
       }
     } else {
-      tracing::error!(
-        "Pipe sender for core_write_id {} not found for SCA {} in ScaConnectionIface.",
-        self.pipe_write_id_to_sca,
-        self.sca_handle_id
-      );
-      Err(ZmqError::Internal(format!(
-        "SCA Pipe sender missing in iface for pipe_id {}",
-        self.pipe_write_id_to_sca
-      )))
+      let timeout_duration = self.sndtimeo.unwrap_or(Duration::from_secs(30));
+      match timeout(timeout_duration, self.pipe_sender.send(vec![msg])).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
+        Err(_) => Err(ZmqError::ResourceLimitReached),
+      }
     }
   }
 
@@ -91,38 +73,20 @@ impl ISocketConnection for ScaConnectionIface {
       "ScaConnectionIface sending multipart via data pipe."
     );
 
-    let pipe_sender_opt = {
-      // Scope for read lock
-      let core_s_reader = self.socket_core_ref.core_state.read();
-      core_s_reader.pipes_tx.get(&self.pipe_write_id_to_sca).cloned()
-    };
-
-    if let Some(pipe_sender) = pipe_sender_opt {
-      let send_timeout = self
-        .socket_core_ref
-        .core_state
-        .read()
-        .options
-        .sndtimeo
-        .unwrap_or(Duration::from_secs(5));
-
-      
-      match timeout(send_timeout, pipe_sender.send(msgs)).await {
-        Ok(Ok(())) => {},
-        Ok(Err(_send_error)) => {
-          return Err(ZmqError::ConnectionClosed);
-        }
-        Err(_timeout_elapsed) => {
-          return Err(ZmqError::ResourceLimitReached);
-        }
+    if self.sndtimeo == Some(Duration::ZERO) {
+      match self.pipe_sender.try_send(msgs) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(ZmqError::ResourceLimitReached),
+        Err(TrySendError::Closed(_)) => Err(ZmqError::ConnectionClosed),
+        Err(TrySendError::Sent(_)) => unreachable!(),
       }
-
-      Ok(())
     } else {
-      Err(ZmqError::Internal(format!(
-        "SCA Pipe sender missing in iface for pipe_id {}",
-        self.pipe_write_id_to_sca
-      )))
+      let timeout_duration = self.sndtimeo.unwrap_or(Duration::from_secs(30));
+      match timeout(timeout_duration, self.pipe_sender.send(msgs)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
+        Err(_) => Err(ZmqError::ResourceLimitReached),
+      }
     }
   }
 
@@ -137,7 +101,12 @@ impl ISocketConnection for ScaConnectionIface {
       .sca_stop_mailbox
       .send(Command::Stop)
       .await
-      .map_err(|e| ZmqError::Internal(format!("Failed to send Stop to SCA {}: {}", self.sca_handle_id, e)))
+      .map_err(|e| {
+        ZmqError::Internal(format!(
+          "Failed to send Stop to SCA {}: {}",
+          self.sca_handle_id, e
+        ))
+      })
   }
 
   fn get_connection_id(&self) -> usize {
