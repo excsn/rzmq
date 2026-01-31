@@ -1,6 +1,6 @@
 [package]
 name = "rzmq"
-version = "0.5.11"
+version = "0.5.12"
 edition = "2024"
 license = "MPL-2.0"
 publish = true

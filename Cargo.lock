@@ -1200,7 +1200,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rzmq"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "anyhow",
  "async-recursion",

@@ -5,8 +5,8 @@ use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::transport::ZmtpStdStream;
 
-use std::time::Duration;
 use bytes::BytesMut;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
@@ -21,7 +21,7 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
     );
     ZmqError::Internal("Stream unavailable for data frame reading".into())
   })?;
-  
+
   loop {
     // Protect against buffer bloat from malicious partial frames or protocol violations
     if handler.network_read_buffer.len() > MAX_BUFFER_SIZE {
@@ -42,10 +42,9 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
       Ok(Some(msg)) => {
         // Success: a complete message was framed and parsed.
         handler.heartbeat_state.record_activity();
-        
+
         // If buffer has grown large and is mostly empty, shrink it
-        if handler.network_read_buffer.capacity() > 65536
-          && handler.network_read_buffer.len() < 8192
+        if handler.network_read_buffer.is_empty() && handler.network_read_buffer.capacity() > 65536
         {
           handler.network_read_buffer = BytesMut::with_capacity(16384);
         }
