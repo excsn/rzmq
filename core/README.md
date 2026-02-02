@@ -180,6 +180,16 @@ async fn main() -> Result<(), ZmqError> {
 ```
 *(Note: The example uses `inproc` which requires the `inproc` feature enabled for `rzmq`.)*
 
+### Auto Delimiter Handling
+
+rzmq chooses to insert/strips delimiters for router outgoing messages to dealer (includes identity, delimiter) and dealer incoming messages (strips delimiter).
+
+For interoperation purposes, disable AUTO_DELIMITER to remove rzmq specific router/dealer automatic delimiter handling. This would be useful for already deployed libzmq, jeromq, etc.
+
+```rust
+socket.set_option(AUTO_DELIMITER, false).await?;
+```
+
 ## Missing Features / Limitations (Known)
 
 *   **Limited ZMQ Option Parity:** Many `libzmq` options are not implemented (e.g., various buffer size controls, `ZMQ_IMMEDIATE`, detailed multicast options). **Full parity with all `libzmq` options is a non-goal.**
