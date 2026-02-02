@@ -306,6 +306,7 @@ Constants for socket option integer IDs.
 *   `pub const HEARTBEAT_TTL: i32 = 40`
 *   `pub const HANDSHAKE_IVL: i32 = 41`
 *   `pub const ROUTER_MANDATORY: i32 = 33`
+*   `pub const AUTO_DELIMITER: i32 = 42`
 *   `pub const ZAP_DOMAIN: i32 = 55`
 *   `pub const PLAIN_SERVER: i32 = 44` (Requires `plain` feature)
 *   `pub const PLAIN_USERNAME: i32 = 45` (Requires `plain` feature)

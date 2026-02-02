@@ -325,6 +325,15 @@ Connections are asynchronous. `rzmq` handles retries for TCP connections if `REC
 Fine-tune socket behavior using `socket.set_option_raw(OPTION_ID, byte_slice_value)` or the convenience `socket.set_option(OPTION_ID, typed_value)`.
 Refer to the [API Reference](#8-public-constants) for a list of common option constants (e.g., `rzmq::socket::SNDHWM`).
 
+Example: Setting `AUTO_DELIMITER` (Removes auto delimiting handling from router/dealer sockets, for interoperation purposes)
+```rust
+use rzmq::socket::AUTO_DELIMITER;
+use std::time::Duration;
+async fn set_auto_delimiter_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
+    socket.set_option(AUTO_DELIMITER, false).await?;
+    Ok(())
+}
+```
 Example: Setting `SNDTIMEO` (send timeout)
 ```rust
 use rzmq::socket::SNDTIMEO;
