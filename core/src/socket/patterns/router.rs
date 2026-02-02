@@ -225,19 +225,25 @@ pub(crate) mod strategies {
       mut payload_frames: Vec<Msg>,
       framing: &FramingLatch,
     ) -> Vec<Msg> {
+      // If Manual framing is enabled, we act as a raw ROUTER:
+      // We consume the destination identity (used for routing) but do NOT send it on the wire.
+      if framing.is_manual() {
+        return payload_frames;
+      }
+
       // A ROUTER must send [identity, delimiter, payload...] to a DEALER.
-      
+
       // 1. Prepare Identity (Must have MORE flag if payload follows)
       if !payload_frames.is_empty() {
         destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
       }
-      
+
       // 2. Insert Identity at the front.
       payload_frames.insert(0, destination_identity_msg);
 
       // 3. Apply framing (Auto inserts delimiter at index 1, Manual does nothing)
       framing.encode(&mut payload_frames);
-      
+
       payload_frames
     }
   }
@@ -271,14 +277,14 @@ pub(crate) mod strategies {
       framing: &FramingLatch,
     ) -> Vec<Msg> {
       // Default behavior: [identity, empty_delimiter, payload...]
-      
+
       if !payload_frames.is_empty() {
         destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
       }
-      
+
       payload_frames.insert(0, destination_identity_msg);
       framing.encode(&mut payload_frames);
-      
+
       payload_frames
     }
   }
