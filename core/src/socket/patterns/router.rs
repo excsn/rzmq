@@ -170,7 +170,8 @@ impl RouterMap {
 }
 
 pub(crate) mod strategies {
-  use crate::message::{Blob, Msg, MsgFlags};
+  use crate::message::{Msg, MsgFlags};
+  use crate::socket::patterns::framing::FramingLatch;
   use std::fmt::Debug;
 
   /// Defines a strategy for how a ROUTER socket should prepare outgoing frames
@@ -185,6 +186,7 @@ pub(crate) mod strategies {
       &self,
       destination_identity_msg: Msg,
       payload_frames: Vec<Msg>,
+      framing: &FramingLatch,
     ) -> Vec<Msg>;
   }
 
@@ -197,6 +199,7 @@ pub(crate) mod strategies {
       &self,
       _destination_identity_msg: Msg,
       payload_frames: Vec<Msg>,
+      _framing: &FramingLatch,
     ) -> Vec<Msg> {
       // REQ peers expect: [empty_delimiter, payload...]
       // The destination_identity_msg is discarded.
@@ -219,23 +222,23 @@ pub(crate) mod strategies {
     fn prepare_wire_frames(
       &self,
       mut destination_identity_msg: Msg,
-      payload_frames: Vec<Msg>,
+      mut payload_frames: Vec<Msg>,
+      framing: &FramingLatch,
     ) -> Vec<Msg> {
       // A ROUTER must send [identity, delimiter, payload...] to a DEALER.
-      // The DEALER socket will then strip the identity and delimiter before giving
-      // the payload to the application.
-      let mut zmtp_wire_frames = Vec::with_capacity(2 + payload_frames.len());
-
-      destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
-      zmtp_wire_frames.push(destination_identity_msg);
-
-      let mut delimiter = Msg::new();
+      
+      // 1. Prepare Identity (Must have MORE flag if payload follows)
       if !payload_frames.is_empty() {
-        delimiter.set_flags(MsgFlags::MORE);
+        destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
       }
-      zmtp_wire_frames.push(delimiter);
-      zmtp_wire_frames.extend(payload_frames);
-      zmtp_wire_frames
+      
+      // 2. Insert Identity at the front.
+      payload_frames.insert(0, destination_identity_msg);
+
+      // 3. Apply framing (Auto inserts delimiter at index 1, Manual does nothing)
+      framing.encode(&mut payload_frames);
+      
+      payload_frames
     }
   }
 
@@ -245,8 +248,9 @@ pub(crate) mod strategies {
   impl RouterSendStrategy for RouterPeerStrategy {
     fn prepare_wire_frames(
       &self,
-      destination_identity_msg: Msg,
+      _destination_identity_msg: Msg,
       payload_frames: Vec<Msg>,
+      _framing: &FramingLatch,
     ) -> Vec<Msg> {
       // When a ROUTER sends to another ROUTER peer, it strips the peer's
       // identity (the destination_identity_msg) for routing and sends
@@ -263,21 +267,19 @@ pub(crate) mod strategies {
     fn prepare_wire_frames(
       &self,
       mut destination_identity_msg: Msg,
-      payload_frames: Vec<Msg>,
+      mut payload_frames: Vec<Msg>,
+      framing: &FramingLatch,
     ) -> Vec<Msg> {
       // Default behavior: [identity, empty_delimiter, payload...]
-      let mut zmtp_wire_frames = Vec::with_capacity(2 + payload_frames.len());
-
-      destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
-      zmtp_wire_frames.push(destination_identity_msg);
-
-      let mut delimiter = Msg::new();
+      
       if !payload_frames.is_empty() {
-        delimiter.set_flags(MsgFlags::MORE);
+        destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
       }
-      zmtp_wire_frames.push(delimiter);
-      zmtp_wire_frames.extend(payload_frames);
-      zmtp_wire_frames
+      
+      payload_frames.insert(0, destination_identity_msg);
+      framing.encode(&mut payload_frames);
+      
+      payload_frames
     }
   }
 }

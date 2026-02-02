@@ -5,9 +5,9 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::SocketCore;
-use crate::socket::options::ROUTER_MANDATORY;
+use crate::socket::options::{AUTO_DELIMITER, ROUTER_MANDATORY};
 use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
-use crate::socket::patterns::{RouterMap, WritePipeCoordinator};
+use crate::socket::patterns::{FramingLatch, RouterMap, WritePipeCoordinator, router_auto_decode, router_auto_encode};
 
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -34,6 +34,7 @@ pub(crate) struct RouterSocket {
   pipe_to_identity_shared_map: Arc<DashMap<usize, Blob>>,
   current_send_target: TokioMutex<Option<ActiveFragmentedSend>>,
   pipe_send_coordinator: Arc<WritePipeCoordinator>,
+  framing: FramingLatch,
 }
 
 impl RouterSocket {
@@ -48,6 +49,7 @@ impl RouterSocket {
       pipe_to_identity_shared_map: Arc::new(DashMap::new()),
       current_send_target: TokioMutex::new(None),
       pipe_send_coordinator: Arc::new(WritePipeCoordinator::new()),
+      framing: FramingLatch::new(router_auto_encode, router_auto_decode),
     }
   }
 
@@ -87,6 +89,10 @@ impl RouterSocket {
         .and_then(|uri| core_s.endpoints.get(uri))
         .and_then(|ep_info| ep_info.peer_socket_type.clone())
     };
+
+    if self.framing.is_manual() {
+      return Ok((identity_blob, raw_zmtp_message));
+    }
 
     match peer_socket_type.as_deref() {
       Some("REQ") | Some("DEALER") => {
@@ -315,9 +321,14 @@ impl ISocket for RouterSocket {
 
       match conn_iface.send_message(msg).await {
         Ok(()) => {
-          let mut delimiter_frame = Msg::new();
-          delimiter_frame.set_flags(MsgFlags::MORE);
-          match conn_iface.send_message(delimiter_frame).await {
+          let delimiter_result = if !self.framing.is_manual() {
+            let mut delimiter_frame = Msg::new();
+            delimiter_frame.set_flags(MsgFlags::MORE);
+            conn_iface.send_message(delimiter_frame).await
+          } else {
+            Ok(())
+          };
+          match delimiter_result {
             Ok(()) => {
               *set_target_guard = Some(ActiveFragmentedSend {
                 target_endpoint_uri,
@@ -475,7 +486,7 @@ impl ISocket for RouterSocket {
     let mut zmtp_wire_frames =
       peer_info
         .strategy
-        .prepare_wire_frames(destination_identity_msg, frames);
+        .prepare_wire_frames(destination_identity_msg, frames, &self.framing);
 
     // Final flag setting on the last frame
     if let Some(last_frame) = zmtp_wire_frames.last_mut() {
@@ -520,6 +531,11 @@ impl ISocket for RouterSocket {
         Ok(())
       })?;
       Ok(())
+    } else if option == AUTO_DELIMITER {
+      if !parse_bool_option(value)? {
+        self.framing.set_manual();
+      }
+      Ok(())
     } else {
       Err(ZmqError::UnsupportedOption(option))
     }
@@ -528,6 +544,8 @@ impl ISocket for RouterSocket {
     if option == ROUTER_MANDATORY {
       let val = { self.core.core_state.read().options.router_mandatory };
       Ok((val as i32).to_ne_bytes().to_vec())
+    } else if option == AUTO_DELIMITER {
+      Ok((!self.framing.is_manual() as i32).to_ne_bytes().to_vec())
     } else {
       Err(ZmqError::UnsupportedOption(option))
     }

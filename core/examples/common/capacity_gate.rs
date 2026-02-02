@@ -69,7 +69,6 @@ impl CapacityGate {
   }
 }
 
-// The test module remains unchanged.
 #[cfg(test)]
 mod tests {
   use super::*;

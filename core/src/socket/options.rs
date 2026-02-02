@@ -24,6 +24,7 @@ pub const HEARTBEAT_TTL: i32 = 40; // ZMQ_HEARTBEAT_TTL (Often derived from TIME
 pub const HANDSHAKE_IVL: i32 = 41; // ZMQ_HANDSHAKE_IVL
 
 pub const ROUTER_MANDATORY: i32 = 33;
+pub const AUTO_DELIMITER: i32 = 42; // Router/Dealer Auto Delimiter insertion/stripping handling. Enabled by default.
 
 // Security Options
 /// Not used currently
@@ -543,7 +544,7 @@ pub(crate) fn apply_core_option_value(
 
         // Options handled by pattern logic (ISocket) or read-only, or not applicable for set_option
         SUBSCRIBE | UNSUBSCRIBE | LAST_ENDPOINT  /* Pattern specific */ | ROUTER_MANDATORY |
-        16 /* ZMQ_TYPE (read-only) */ => return Err(ZmqError::UnsupportedOption(option_id)),
+        AUTO_DELIMITER | 16 /* ZMQ_TYPE (read-only) */ => return Err(ZmqError::UnsupportedOption(option_id)),
 
         _ => return Err(ZmqError::InvalidOption(option_id)), // Unknown option ID
     }
@@ -599,7 +600,7 @@ pub(crate) fn retrieve_core_option_value(
 
         // Options handled by pattern logic or read-only by nature
         16 /* ZMQ_TYPE */ => Ok((core_s_reader.socket_type as i32).to_ne_bytes().to_vec()),
-        SUBSCRIBE | UNSUBSCRIBE | ROUTER_MANDATORY => Err(ZmqError::UnsupportedOption(option_id)), // Pattern specific
+        SUBSCRIBE | UNSUBSCRIBE | ROUTER_MANDATORY | AUTO_DELIMITER => Err(ZmqError::UnsupportedOption(option_id)), // Pattern specific
 
         _ => Err(ZmqError::InvalidOption(option_id)),
     }

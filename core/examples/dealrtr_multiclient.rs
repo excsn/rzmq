@@ -15,13 +15,13 @@ use tokio::time::{sleep, timeout};
 mod common;
 use common::capacity_gate::{CapacityGate, OwnedPermitGuard};
 
-// --- Constants (Unchanged) ---
+// --- Constants ---
 const NUM_DEALERS_EXAMPLE: usize = 8;
 const NUM_MSGS_PER_DEALER_EXAMPLE: u64 = 100_000;
 const BIND_ADDR_EXAMPLE: &str = "tcp://127.0.0.1:8960";
 const HWM_EXAMPLE: i32 = 2000;
 const PAYLOAD_SIZE_BYTES: usize = 128;
-const MAX_CONCURRENT_REQUESTS: usize = 1000;
+const MAX_CONCURRENT_REQUESTS: usize = 2000;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CENTRAL_RECEIVER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,7 +38,7 @@ const USE_MULTIPART_API: bool = true;
 type RequestId = u64;
 type PendingRequestsMap = Arc<tokio::sync::Mutex<HashMap<RequestId, OwnedPermitGuard>>>;
 
-// --- Helper Functions (Unchanged) ---
+// --- Helper Functions ---
 async fn wait_for_handshakes(
   router_monitor: &mut MonitorReceiver,
   num_expected: usize,

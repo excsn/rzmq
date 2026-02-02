@@ -5,8 +5,9 @@ use crate::message::{Blob, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
-use crate::socket::patterns::LoadBalancer;
+use crate::socket::options::AUTO_DELIMITER;
 use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use crate::socket::patterns::{FramingLatch, LoadBalancer, dealer_auto_decode, dealer_auto_encode};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -17,6 +18,8 @@ use parking_lot::RwLock as ParkingLotRwLock;
 use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::timeout as tokio_timeout;
+
+use super::parse_bool_option;
 
 const MAX_DEALER_SEND_BUFFER_PARTS: usize = 10240;
 
@@ -240,6 +243,7 @@ pub(crate) struct DealerSocket {
   processor_stop_signal: Arc<Notify>,
   current_send_transaction: TokioMutex<DealerSendTransaction>,
   pipe_send_coordinator: Arc<WritePipeCoordinator>,
+  framing: FramingLatch,
 }
 
 impl DealerSocket {
@@ -278,6 +282,7 @@ impl DealerSocket {
       processor_stop_signal: stop_signal_arc,
       current_send_transaction: TokioMutex::new(DealerSendTransaction::Idle),
       pipe_send_coordinator: pipe_send_coordinator_arc,
+      framing: FramingLatch::new(dealer_auto_encode, dealer_auto_decode),
     }
   }
 
@@ -299,6 +304,10 @@ impl DealerSocket {
         pipe_id = pipe_read_id,
         "Dealer received empty ZMTP message. Returning as empty payload."
       );
+      return Ok(frames);
+    }
+
+    if self.framing.is_manual() {
       return Ok(frames);
     }
 
@@ -361,28 +370,39 @@ impl DealerSocket {
     Ok(frames)
   }
 
-  fn prepare_full_multipart_send_sequence(&self, user_frames: Vec<Msg>) -> Vec<Msg> {
-    if user_frames.is_empty() {
+  fn prepare_full_multipart_send_sequence(&self, mut frames: Vec<Msg>) -> Vec<Msg> {
+    if self.framing.is_manual() {
+      // Manual mode: do not insert delimiter.
+      let len = frames.len();
+      for (i, frame) in frames.iter_mut().enumerate() {
+        if i < len - 1 {
+          frame.set_flags(frame.flags() | MsgFlags::MORE);
+        } else {
+          frame.set_flags(frame.flags() & !MsgFlags::MORE);
+        }
+      }
+      return frames;
+    }
+
+    if frames.is_empty() {
       let mut delimiter = Msg::new();
       delimiter.set_flags(MsgFlags::MORE);
       let mut last_empty = Msg::new();
       last_empty.set_flags(last_empty.flags() & !MsgFlags::MORE);
       return vec![delimiter, last_empty];
     }
-    let mut frames_to_send = Vec::with_capacity(user_frames.len() + 1);
-    let mut delimiter = Msg::new();
-    delimiter.set_flags(MsgFlags::MORE);
-    frames_to_send.push(delimiter);
-    let num_user_frames = user_frames.len();
-    for (i, mut frame) in user_frames.into_iter().enumerate() {
-      if i < num_user_frames - 1 {
+
+    self.framing.encode(&mut frames);
+
+    let len = frames.len();
+    for (i, frame) in frames.iter_mut().enumerate() {
+      if i < len - 1 {
         frame.set_flags(frame.flags() | MsgFlags::MORE);
       } else {
         frame.set_flags(frame.flags() & !MsgFlags::MORE);
       }
-      frames_to_send.push(frame);
     }
-    frames_to_send
+    frames
   }
 }
 
@@ -570,10 +590,21 @@ impl ISocket for DealerSocket {
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
-    Err(ZmqError::UnsupportedOption(option))
+    if option == AUTO_DELIMITER {
+      if !parse_bool_option(_value)? {
+        self.framing.set_manual();
+      }
+      Ok(())
+    } else {
+      Err(ZmqError::UnsupportedOption(option))
+    }
   }
   async fn get_pattern_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
-    Err(ZmqError::UnsupportedOption(option))
+    if option == AUTO_DELIMITER {
+      Ok((!self.framing.is_manual() as i32).to_ne_bytes().to_vec())
+    } else {
+      Err(ZmqError::UnsupportedOption(option))
+    }
   }
 
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {

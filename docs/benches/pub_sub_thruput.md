@@ -6,29 +6,29 @@
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-1_MsgSize-64_NumMessages-5000`
 
-* **Time:** 11.921 ms – 12.054 ms – 12.294 ms
+* **Time:** 11.626 ms - 11.690 ms - 11.783 ms
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-1_MsgSize-1024_NumMessages-5000`
 
-* **Time:** 12.530 ms – 12.710 ms – 13.009 ms
-* **Throughput:** 23.458 MiB/s – 24.010 MiB/s – 24.355 MiB/s
+* **Time:** 12.256 ms - 12.368 ms - 12.489 ms
+* **Throughput:** 24.435 MiB/s - 24.676 MiB/s - 24.899 MiB/s
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-4_MsgSize-64_NumMessages-5000`
 
-* **Time:** 77.148 ms – 78.763 ms – 80.680 ms
-* **Throughput:** 60.521 MiB/s – 61.994 MiB/s – 63.291 MiB/s
+* **Time:** 75.813 ms - 77.422 ms - 79.200 ms
+* **Throughput:** 61.652 MiB/s - 63.067 MiB/s - 64.406 MiB/s
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-4_MsgSize-1024_NumMessages-5000`
 
-* **Time:** 77.082 ms – 79.645 ms – 83.502 ms
-* **Throughput:** 14.619 MiB/s – 15.327 MiB/s – 15.836 MiB/s
+* **Time:** 73.110 ms - 74.850 ms - 77.267 ms
+* **Throughput:** 15.799 MiB/s - 16.309 MiB/s - 16.697 MiB/s
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-8_MsgSize-64_NumMessages-5000`
 
-* **Time:** 158.96 ms – 201.51 ms – 258.40 ms
-* **Throughput:** 75.585 MiB/s – 96.923 MiB/s – 122.87 MiB/s
+* **Time:** 153.51 ms - 158.30 ms - 163.16 ms
+* **Throughput:** 119.71 MiB/s - 123.38 MiB/s - 127.23 MiB/s
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-8_MsgSize-1024_NumMessages-5000`
 
-* **Time:** 159.98 ms – 163.60 ms – 168.09 ms
-* **Throughput:** 14.525 MiB/s – 14.923 MiB/s – 15.260 MiB/s
+* **Time:** 146.93 ms - 150.64 ms - 156.12 ms
+* **Throughput:** 15.638 MiB/s - 16.207 MiB/s - 16.616 MiB/s

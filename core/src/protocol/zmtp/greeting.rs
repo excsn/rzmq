@@ -124,7 +124,7 @@ impl ZmtpGreeting {
     }))
   }
 
-  /// Helper to get mechanism name as &str (trimming nulls). (Unchanged)
+  /// Helper to get mechanism name as &str (trimming nulls).
   pub fn mechanism_name(&self) -> &str {
     let first_null = self
       .mechanism
