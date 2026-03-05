@@ -18,6 +18,10 @@
 *   **Performance:** While leading performance is a key achievement, comprehensive benchmarking across all diverse workloads and hardware is ongoing.
 *   **Robustness:** Tested for common use cases; edge case hardening is continuous.
 
+## Notable Users
+
+[Hi Stakes Markets Game](https://www.histakesgame.com) -  The worlds most advanced financial simulator, available on iPhone and Android.
+
 ## Motivation
 
 1.  **Pure Rust & Async Native:** Memory safety, seamless `async/await` integration with Tokio, and no C `libzmq` dependency.

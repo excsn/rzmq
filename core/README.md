@@ -24,6 +24,10 @@
 
 We encourage testing, feedback, and contributions to help mature the library towards a stable 1.0 release.
 
+## Notable Users
+
+[Hi Stakes Markets Game](https://www.histakesgame.com) -  The worlds most advanced financial simulator, available on iPhone and Android.
+
 ## Key Features
 
 ### Leading Performance on Linux (with `io_uring`)
