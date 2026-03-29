@@ -4,6 +4,13 @@ use crate::protocol::zmtp::command::*;
 use bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
+/// Maximum allowed ZMTP frame body size (64 MiB).
+///
+/// A crafted long-frame header can encode an 8-byte length of up to `u64::MAX`.
+/// Without this guard the decoder would call `src.reserve(~usize::MAX)`, causing
+/// a capacity-overflow panic in the allocator — a trivial 9-byte denial-of-service.
+const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+
 /// Codec for ZMTP/3.1 message framing.
 #[derive(Debug, Default)]
 pub struct ZmtpCodec {
@@ -194,6 +201,16 @@ impl Decoder for ZmtpCodec {
             // Read u8 length
             header_bytes[1] as usize
           };
+
+          // Reject frames whose declared body size exceeds the safety limit.
+          // An attacker can encode u64::MAX in 8 bytes, which when cast to usize
+          // and passed to `BytesMut::reserve` causes a capacity-overflow panic.
+          if size > MAX_FRAME_SIZE {
+            return Err(ZmqError::ProtocolViolation(format!(
+              "ZMTP frame size {} exceeds maximum allowed {} bytes",
+              size, MAX_FRAME_SIZE
+            )));
+          }
 
           // Store header info and move to ReadBody state
           let header = FrameHeader { flags, size };
