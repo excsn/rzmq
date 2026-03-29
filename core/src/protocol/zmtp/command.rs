@@ -40,8 +40,9 @@ impl ZmtpCommand {
     let body = msg.data()?; // Get command body bytes
 
     // Check command name (first part, length-prefixed)
-    if body.starts_with(b"\x04PING") && body.len() >= 5 {
+    if body.starts_with(b"\x04PING") && body.len() >= 7 {
       // PING command format: <length=4>PING<TTL(2)><Context(0+)>
+      // Requires at least 7 bytes: 1 (len prefix) + 4 (PING) + 2 (TTL)
       // Extract context after "PING" + TTL
       let context = Bytes::copy_from_slice(&body[5 + 2..]);
       Some(ZmtpCommand::Ping(context))
