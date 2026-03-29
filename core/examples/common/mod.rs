@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use futures::future::join_all;
 use rzmq::socket::{MonitorReceiver, SocketEvent};
 
+#[allow(dead_code)]
 pub async fn wait_for_event(
   monitor_rx: &MonitorReceiver,
   timeout: Duration,
@@ -30,6 +31,7 @@ pub async fn wait_for_event(
 // Helper function to wait for HandshakeSucceeded events from multiple monitors
 // This function is a general utility and not directly used by the oneshot-based
 // handshake waiting in the main example, but provided as per your request.
+#[allow(dead_code)]
 pub async fn wait_for_handshake_events(
   monitors_info: Vec<(MonitorReceiver, String, String)>, // (receiver, expected_endpoint, description)
   timeout_duration: Duration,

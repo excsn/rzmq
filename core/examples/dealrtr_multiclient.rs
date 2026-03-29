@@ -27,6 +27,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CENTRAL_RECEIVER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
 enum PrintLogLevel {
   Off,
   Info,
@@ -118,6 +119,7 @@ async fn run_router_task(
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct DealerSenderStats {
   id: usize,
   messages_sent: u64,
@@ -327,7 +329,7 @@ async fn main() -> Result<(), ZmqError> {
   }
   let _ = router_socket.close().await;
 
-  tokio::time::timeout(SHUTDOWN_TIMEOUT, ctx.term())
+  let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, ctx.term())
     .await
     .expect("Context termination timed out!");
   Ok(())

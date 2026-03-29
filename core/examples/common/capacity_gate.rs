@@ -2,9 +2,7 @@ use futures_intrusive::sync::{GenericSemaphoreReleaser, Semaphore};
 use parking_lot::RawMutex;
 use std::{future::Future, sync::Arc};
 
-// struct for the owned permit. It holds an Arc to the gate,
-// making it 'static.
-#[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct OwnedPermitGuard {
   gate: Arc<CapacityGate>,
 }
@@ -22,8 +20,10 @@ pub(crate) struct CapacityGate {
   semaphore: Semaphore,
 }
 
-pub(crate) type PermitGuard<'a> = GenericSemaphoreReleaser<'a, RawMutex>;
+#[allow(dead_code)]
+type PermitGuard<'a> = GenericSemaphoreReleaser<'a, RawMutex>;
 
+#[allow(dead_code)]
 impl CapacityGate {
   pub fn new(capacity: usize) -> Self {
     Self {

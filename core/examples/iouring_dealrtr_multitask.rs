@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use futures::future::join_all;
 use futures::{stream::FuturesUnordered, StreamExt};
-use rzmq::socket::{events::SocketEvent, options as zmq_opts};
+use rzmq::socket::options as zmq_opts;
 use rzmq::uring::{initialize_uring_backend, shutdown_uring_backend, UringConfig};
 use rzmq::{Context, Msg, MsgFlags, Socket, SocketType, ZmqError};
 use std::collections::HashMap;
@@ -32,6 +32,7 @@ const TOTAL_MESSAGES_EXPECTED_BY_ROUTER: u64 = (NUM_DEALER_TASKS as u64) * NUM_M
 
 // --- MODIFIED: Implemented PrintLogLevel system ---
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
 enum PrintLogLevel {
   Off,
   Info,
@@ -75,9 +76,9 @@ async fn run_router_task(
 // --- DEALER Side Tasks ---
 #[derive(Debug)]
 struct DealerTaskStats {
+  #[allow(unused)]
   id: usize,
   messages_sent: u64,
-  send_errors: u64,
 }
 
 async fn run_dealer_sender_task(
@@ -89,7 +90,6 @@ async fn run_dealer_sender_task(
   capacity_gate: Arc<CapacityGate>,
 ) -> Result<DealerTaskStats, ZmqError> {
   let mut task_messages_sent = 0u64;
-  let mut send_errors = 0u64;
   for j in 0..num_messages_for_this_task {
     let permit = capacity_gate.clone().acquire_owned().await;
     let request_id = generate_request_id(dealer_id, j);
@@ -114,7 +114,6 @@ async fn run_dealer_sender_task(
         "[DEALER SENDER {}] Send error for RequestId {}: {}",
         dealer_id, request_id, e
       );
-      send_errors += 1;
       if let Some(permit_to_drop) = pending_requests_map_clone.lock().await.remove(&request_id) {
         drop(permit_to_drop);
       }
@@ -125,14 +124,13 @@ async fn run_dealer_sender_task(
   // --- MODIFIED: Conditional logging ---
   if PRINT_LEVEL >= PrintLogLevel::Verbose {
     println!(
-      "[DEALER SENDER {}] Task finished sending. Sent: {} (err:{}).",
-      dealer_id, task_messages_sent, send_errors
+      "[DEALER SENDER {}] Task finished sending. Sent: {}.",
+      dealer_id, task_messages_sent
     );
   }
   Ok(DealerTaskStats {
     id: dealer_id,
     messages_sent: task_messages_sent,
-    send_errors,
   })
 }
 
@@ -346,12 +344,11 @@ async fn main() -> Result<(), ZmqError> {
   // --- Await Completion & Report Results ---
   let sender_results = join_all(sender_task_handles).await;
   let mut total_sent = 0u64;
-  let mut total_errors = 0u64;
+  let _total_errors = 0u64;
   for res in sender_results {
     match res {
       Ok(Ok(stats)) => {
         total_sent += stats.messages_sent;
-        total_errors += stats.send_errors;
       }
       Ok(Err(e)) => eprintln!("[Main] Dealer sender task failed with ZmqError: {}", e),
       Err(e) => eprintln!("[Main] Dealer sender task panicked: {}", e),
