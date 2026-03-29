@@ -1,14 +1,13 @@
 // tests/transport_failures.rs
 
 use rzmq::socket::options::SNDTIMEO; // Import SNDTIMEO
-use rzmq::{Context, Msg, SocketType, ZmqError};
+use rzmq::{Msg, SocketType, ZmqError};
 use std::fs::{self, File}; // For creating dummy files/dirs
 use std::io::Write;
-use std::path::Path;
 use std::time::Duration;
 mod common;
 
-const SHORT_TIMEOUT: Duration = Duration::from_millis(250);
+const _SHORT_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECT_RETRY_WAIT: Duration = Duration::from_millis(300); // Time for connect attempts
 
 // --- Test: Connect to TCP address with no listener ---

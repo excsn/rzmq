@@ -1,10 +1,10 @@
 // tests/req_rep.rs
 
-use rzmq::{Context, Msg, SocketType, ZmqError};
+use rzmq::{Msg, SocketType, ZmqError};
 use std::time::Duration;
 mod common;
 
-const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
+const _SHORT_TIMEOUT: Duration = Duration::from_millis(200);
 const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 
 // --- TCP Tests ---

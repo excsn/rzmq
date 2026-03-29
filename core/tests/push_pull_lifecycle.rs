@@ -1,12 +1,10 @@
-use rzmq::{Context, Msg, SocketType, ZmqError};
+use rzmq::{Msg, SocketType, ZmqError};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
-// Assuming common.rs exists in tests/ directory
-// It should contain at least test_context() and recv_timeout()
 mod common;
 
-const SHORT_TIMEOUT: Duration = Duration::from_millis(250);
+const _SHORT_TIMEOUT: Duration = Duration::from_millis(250);
 const LONG_TIMEOUT: Duration = Duration::from_secs(3); // Slightly longer for debugging
 const NUM_MESSAGES: usize = 5; // Smaller number for faster test
 

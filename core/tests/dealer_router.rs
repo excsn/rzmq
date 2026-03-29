@@ -1,7 +1,6 @@
 // tests/dealer_router.rs
 
-use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
-use std::collections::HashSet;
+use rzmq::{Msg, MsgFlags, SocketType, ZmqError};
 use std::time::Duration;
 mod common;
 

@@ -8,7 +8,7 @@ use serial_test::serial; // Add necessary rzmq imports
 use std::time::Duration;
 use tokio::{task::JoinHandle, time::timeout};
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(5); // Timeout for async test operations
+const _TEST_TIMEOUT: Duration = Duration::from_secs(5); // Timeout for async test operations
 
 async fn setup_server(
   ctx: &rzmq::Context,
@@ -163,7 +163,6 @@ async fn test_plain_client_no_credentials() {
             break;
         }
       }
-      Ok(Ok(_)) => {}, // Ignore other events
       _ => {}
     }
   }
@@ -197,7 +196,7 @@ async fn test_plain_security_enforcement() -> Result<(), ZmqError> {
   client.set_option(PLAIN_USERNAME, "hacker").await?;
   client.set_option(PLAIN_PASSWORD, "wrongpass").await?;
 
-  let mut monitor = client.monitor_default().await?;
+  let monitor = client.monitor_default().await?;
   client.connect(endpoint).await?;
 
   // --- 3. Expect Failure ---
@@ -252,7 +251,7 @@ async fn test_plain_client_to_null_server_fails() {
   // The connect itself might return an error due to rapid handshake failure.
   let client_setup_result = setup_client(&ctx, addr, true, Some("user"), Some("pass")).await;
 
-  if let Ok((client_socket, mut client_monitor)) = client_setup_result {
+  if let Ok((client_socket, client_monitor)) = client_setup_result {
     // Connect "succeeded" at some level, now wait for monitor events for actual failure.
     let mut failure_event_received = false;
     for _ in 0..10 {

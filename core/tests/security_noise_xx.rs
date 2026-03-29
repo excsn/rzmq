@@ -6,12 +6,10 @@ use rzmq::{
     NOISE_XX_REMOTE_STATIC_PUBLIC_KEY,
     NOISE_XX_STATIC_SECRET_KEY,
     RCVHWM,
-    RCVTIMEO,
     SNDHWM,
     SNDTIMEO, // Added SNDTIMEO for PUSH consistency
   },
   socket::SocketEvent, // For monitor events if we add them later
-  Context,
   Msg,
   SocketType,
   ZmqError,
@@ -27,7 +25,7 @@ mod common; // Include your test helpers
 
 const SHORT_TIMEOUT: Duration = Duration::from_millis(500); // Slightly increased for CI
 const LONG_TIMEOUT: Duration = Duration::from_secs(3); // For potentially slow handshakes/ops
-const CONNECT_DELAY: Duration = Duration::from_millis(200); // Time for connect + handshake
+const _CONNECT_DELAY: Duration = Duration::from_millis(200); // Time for connect + handshake
 
 // Helper struct to hold a keypair
 struct Keypair {
@@ -89,7 +87,7 @@ async fn test_noise_xx_push_pull_basic_encrypted_exchange() -> Result<(), ZmqErr
     .set_option_raw(SNDTIMEO, &(connect_timeout.as_millis() as i32).to_ne_bytes())
     .await?;
 
-  let mut client_monitor = push_client.monitor_default().await?;
+  let client_monitor = push_client.monitor_default().await?;
   println!("[PUSH Client {}] Monitor created.", endpoint);
 
   println!("[PUSH Client {}] Connecting...", endpoint);
@@ -100,6 +98,7 @@ async fn test_noise_xx_push_pull_basic_encrypted_exchange() -> Result<(), ZmqErr
   );
 
   // Wait for HandshakeSucceeded event from the client's monitor
+  #[allow(unused_assignments)]
   let mut handshake_succeeded = false;
   loop {
     match tokio::time::timeout(connect_timeout + Duration::from_secs(1), client_monitor.recv()).await {
@@ -237,7 +236,7 @@ async fn test_noise_xx_client_auth_server_pk_mismatch() -> Result<(), ZmqError> 
     .await?; // Crucial: Expecting the wrong server PK
 
   // Monitor client events to observe handshake failure
-  let mut client_monitor = push_client.monitor_default().await?;
+  let client_monitor = push_client.monitor_default().await?;
   println!("[PUSH Client {}] Monitor channel created.", endpoint);
 
   println!(
@@ -254,7 +253,9 @@ async fn test_noise_xx_client_auth_server_pk_mismatch() -> Result<(), ZmqError> 
   // Wait for a monitor event indicating handshake failure or connection drop.
   // The timeout should be generous enough for TCP connect + Noise handshake attempt.
   let client_event_wait_timeout = Duration::from_secs(3); // Increased for reliability
+  #[allow(unused_assignments)]
   let mut expected_failure_event_received = false;
+  #[allow(unused_assignments)]
   let mut received_error_message = String::new();
 
   loop {

@@ -1,9 +1,9 @@
 mod common;
 
-use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError, socket::options::ROUTING_ID};
+use rzmq::{Msg, MsgFlags, SocketType, ZmqError, socket::options::ROUTING_ID};
 use std::time::Duration;
 
-const LONG_TIMEOUT: Duration = Duration::from_secs(2);
+const _LONG_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::test]
 async fn test_router_router_tcp_forwarding() -> Result<(), ZmqError> {

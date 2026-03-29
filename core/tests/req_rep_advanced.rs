@@ -1,4 +1,4 @@
-use rzmq::{Context, Msg, SocketType, ZmqError};
+use rzmq::{Msg, SocketType, ZmqError};
 use std::time::Duration;
 mod common; // Assumes common.rs is in the tests/ directory
 

@@ -1,10 +1,10 @@
 #![cfg(feature = "curve")]
 
 use rzmq::{
-  Context, Msg, MsgFlags, SocketType, ZmqError,
+  Msg, MsgFlags, SocketType, ZmqError,
   socket::SocketEvent,
   socket::options::{
-    CURVE_SECRET_KEY, CURVE_SERVER, CURVE_SERVER_KEY, RCVTIMEO, ROUTING_ID, SNDTIMEO, SUBSCRIBE,
+    CURVE_SECRET_KEY, CURVE_SERVER, CURVE_SERVER_KEY, ROUTING_ID, SUBSCRIBE,
   },
 };
 use serial_test::serial;
@@ -50,7 +50,7 @@ async fn test_curve_req_rep_basic_encrypted_exchange() -> Result<(), ZmqError> {
     .set_option_raw(CURVE_SERVER_KEY, server_keys.public_key.as_slice())
     .await?;
 
-  let mut client_monitor = req_client.monitor_default().await?;
+  let client_monitor = req_client.monitor_default().await?;
   println!("[REQ Client {}] Monitor created.", endpoint);
 
   println!("[REQ Client {}] Connecting...", endpoint);
@@ -134,7 +134,7 @@ async fn test_curve_client_auth_server_pk_mismatch() -> Result<(), ZmqError> {
     .set_option_raw(CURVE_SERVER_KEY, fake_server_keys.public_key.as_slice())
     .await?;
 
-  let mut client_monitor = req_client.monitor_default().await?;
+  let client_monitor = req_client.monitor_default().await?;
   println!(
     "[REQ Client {}] Connecting (expecting server PK mismatch)...",
     endpoint
@@ -212,7 +212,7 @@ async fn test_curve_dealer_router_encrypted_exchange() -> Result<(), ZmqError> {
     .set_option_raw(CURVE_SERVER_KEY, server_keys.public_key.as_slice())
     .await?;
 
-  let mut client_monitor = dealer.monitor_default().await?;
+  let client_monitor = dealer.monitor_default().await?;
   dealer.connect(endpoint).await?;
   common::wait_for_monitor_event(&client_monitor, LONG_TIMEOUT, SHORT_TIMEOUT, |e| {
     matches!(e, SocketEvent::HandshakeSucceeded { .. })
@@ -301,7 +301,7 @@ async fn test_curve_pub_sub_encrypted_exchange() -> Result<(), ZmqError> {
     .set_option_raw(CURVE_SERVER_KEY, server_keys.public_key.as_slice())
     .await?;
 
-  let mut client_monitor = subscriber.monitor_default().await?;
+  let client_monitor = subscriber.monitor_default().await?;
   subscriber.connect(endpoint).await?;
   common::wait_for_monitor_event(&client_monitor, LONG_TIMEOUT, SHORT_TIMEOUT, |e| {
     matches!(e, SocketEvent::HandshakeSucceeded { .. })

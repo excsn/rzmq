@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rzmq::{Context, Msg, SocketType, ZmqError};
+use rzmq::{Msg, SocketType, ZmqError};
 use tokio::sync::Barrier;
 use tokio::task;
 
-const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
+const _SHORT_TIMEOUT: Duration = Duration::from_millis(200);
 const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::test]

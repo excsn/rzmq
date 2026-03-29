@@ -2,9 +2,8 @@
 
 use rzmq::socket::options::{SUBSCRIBE, UNSUBSCRIBE};
 use rzmq::socket::SocketEvent;
-use rzmq::{Context, Msg, SocketType, ZmqError};
+use rzmq::{Msg, SocketType, ZmqError};
 use serial_test::serial;
-use std::collections::HashSet;
 use std::time::Duration;
 mod common;
 

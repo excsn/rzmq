@@ -6,7 +6,7 @@ use std::time::Duration;
 
 mod common;
 
-const SHORT_TIMEOUT: Duration = Duration::from_millis(500);
+const _SHORT_TIMEOUT: Duration = Duration::from_millis(500);
 const LONG_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_DELAY: Duration = Duration::from_millis(150);
 const POST_SEND_DELAY: Duration = Duration::from_millis(50);

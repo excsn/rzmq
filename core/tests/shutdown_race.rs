@@ -23,7 +23,7 @@ const CHAOS_DURATION: Duration = Duration::from_secs(2); // How long to let the 
 const CHAOS_HWM: i32 = 50; // Low HWM to cause backpressure quickly
 const CHAOS_ENDPOINT: &str = "inproc://chaotic-pipe";
 const NUM_PUSHERS: usize = 2;
-const NUM_PULLERS: usize = 2;
+const _NUM_PULLERS: usize = 2;
 const FINAL_TERM_TIMEOUT: Duration = Duration::from_secs(5); // Timeout for ctx.term() itself
 
 async fn wait_for_event(
@@ -483,9 +483,9 @@ async fn test_chaotic_shutdown() -> Result<(), ZmqError> {
   sleep(CHAOS_DURATION).await;
   println!("Chaos duration finished. Initiating context termination.");
 
-  pull_socket.close().await;
+  let _ = pull_socket.close().await;
   for sck in push_sockets {
-    sck.close().await;
+    let _ = sck.close().await;
   }
   // --- Initiate Context Termination ---
   let term_result = timeout(FINAL_TERM_TIMEOUT, ctx.term()).await;
@@ -543,7 +543,7 @@ const TCP_CHAOS_DURATION: Duration = Duration::from_secs(1);
 const TCP_CHAOS_HWM: i32 = 100; // Keep HWM low
 const TCP_CHAOS_ENDPOINT: &str = "tcp://127.0.0.1:5720"; // Unique TCP port
 const TCP_NUM_PUSHERS: usize = 4; // Same as chaotic inproc test
-const TCP_NUM_PULLERS: usize = 1; // Must be 1 for TCP bind
+const _TCP_NUM_PULLERS: usize = 1; // Must be 1 for TCP bind
 const TCP_FINAL_TERM_TIMEOUT: Duration = Duration::from_secs(60); // Slightly longer for TCP cleanup
 const TCP_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_EVENT_RECV_TIMEOUT: Duration = Duration::from_secs(4);
@@ -608,7 +608,7 @@ async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
     TCP_NUM_PUSHERS, TCP_CHAOS_ENDPOINT
   );
   let mut push_connection_futures = vec![];
-  let expected_connections = Arc::new(tokio::sync::Semaphore::new(TCP_NUM_PUSHERS)); // To count connections
+  let _expected_connections = Arc::new(tokio::sync::Semaphore::new(TCP_NUM_PUSHERS)); // To count connections
 
   for i in 0..TCP_NUM_PUSHERS {
     let push = ctx.socket(SocketType::Push)?;

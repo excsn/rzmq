@@ -1,6 +1,6 @@
 use rzmq::{
   socket::{
-    options::{RCVTIMEO, RECONNECT_IVL}, SocketEvent, SNDTIMEO
+    options::{RECONNECT_IVL}, SocketEvent, SNDTIMEO
   }, SocketType, ZmqError
 };
 use serial_test::serial;

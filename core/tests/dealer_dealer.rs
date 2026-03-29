@@ -1,6 +1,6 @@
 mod common;
 
-use rzmq::{Context, Msg, SocketType, ZmqError};
+use rzmq::{Msg, SocketType, ZmqError};
 use std::time::Duration;
 
 const LONG_TIMEOUT: Duration = Duration::from_secs(2);

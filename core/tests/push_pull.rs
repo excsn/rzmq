@@ -1,7 +1,7 @@
 // tests/push_pull.rs
 
 use rzmq::socket::options::{RCVHWM, SNDHWM, SNDTIMEO};
-use rzmq::{Context, Msg, Socket, SocketType, ZmqError};
+use rzmq::{Msg, SocketType, ZmqError};
 use std::time::Duration;
 mod common; // Import common helpers
 

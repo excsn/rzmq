@@ -328,7 +328,8 @@ async fn test_dealer_router_dealer_disconnects_router_sends() -> Result<(), ZmqE
   tokio::time::sleep(Duration::from_millis(10)).await;
 
   let dealer_identity: Vec<u8>;
-  let mut dealer_endpoint_uri = "".to_string(); // Store the specific endpoint URI seen by router
+  #[allow(unused_mut)]
+  let mut dealer_endpoint_uri: String; // Store the specific endpoint URI seen by router
 
   {
     // Scope for the dealer
