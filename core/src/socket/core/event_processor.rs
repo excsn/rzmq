@@ -5,8 +5,6 @@ use crate::runtime::{Command, SystemEvent};
 use crate::sessionx::ScaConnectionIface;
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
-#[cfg(feature = "io-uring")]
-use crate::socket::connection_iface::UringFdConnection;
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
 use crate::socket::core::{SocketCore, command_processor, pipe_manager, shutdown};
 #[cfg(feature = "io-uring")]

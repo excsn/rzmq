@@ -1,6 +1,12 @@
-use crate::{security::{framer::{ISecureFramer, NullFramer}, mechanism::ProcessTokenAction}, Metadata, ZmqError};
+use crate::{
+  security::{
+    framer::{ISecureFramer, NullFramer},
+    mechanism::ProcessTokenAction,
+  },
+  Metadata, ZmqError,
+};
 
-use super::{IDataCipher, Mechanism, MechanismStatus, cipher::PassThroughDataCipher};
+use super::{Mechanism, MechanismStatus};
 
 #[derive(Debug)]
 pub struct NullMechanism;

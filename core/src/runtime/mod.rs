@@ -17,5 +17,5 @@ pub use system_events::{ActorType, SystemEvent};
 
 // Sync Primitives
 pub(crate) use actor_drop_guard::ActorDropGuard;
-pub(crate) use latch::CountDownLatch;
+
 pub(crate) use waitgroup::WaitGroup;

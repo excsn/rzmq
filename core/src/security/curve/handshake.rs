@@ -1,15 +1,15 @@
 use crate::error::ZmqError;
-use crate::security::IDataCipher;
 use crate::security::curve::cipher::CurveDataCipher;
+use crate::security::IDataCipher;
 use crate::socket::options::ZmtpEngineConfig;
 
 use std::collections::HashMap;
 
 use dryoc::classic::crypto_box::{
-  Mac, Nonce, crypto_box_beforenm, crypto_box_detached_afternm, crypto_box_keypair,
-  crypto_box_open_detached_afternm,
+  crypto_box_beforenm, crypto_box_detached_afternm, crypto_box_keypair,
+  crypto_box_open_detached_afternm, Mac, Nonce,
 };
-use dryoc::keypair::{PublicKey, SecretKey, StackKeyPair as Keypair};
+use dryoc::keypair::{PublicKey, StackKeyPair as Keypair};
 use dryoc::types::{ByteArray, Bytes, MutByteArray, MutBytes, NewByteArray, StackByteArray};
 use zeroize::Zeroize;
 

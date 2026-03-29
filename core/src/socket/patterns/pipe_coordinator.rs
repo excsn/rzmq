@@ -9,7 +9,7 @@ use crate::ZmqError;
 type PipeId = usize;
 
 #[derive(Debug)]
-pub(crate) struct PipeState {
+pub struct PipeState {
   semaphore: Arc<Semaphore>,
   is_closing: Arc<AtomicBool>,
 }

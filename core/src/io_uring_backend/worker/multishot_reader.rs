@@ -5,11 +5,10 @@ use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringConnectionHandler, UringWorkerInterface,
 };
 use crate::io_uring_backend::ops::UserData;
-use crate::io_uring_backend::worker::internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType};
+use crate::io_uring_backend::worker::internal_op_tracker::InternalOpTracker;
 use crate::ZmqError;
 use io_uring::cqueue;
-use io_uring::{cqueue::Entry as CqeResult, squeue, types};
-use std::fmt;
+use io_uring::cqueue::Entry as CqeResult;
 use std::os::unix::io::RawFd;
 
 pub const IOURING_CQE_F_MORE: u32 = 1 << 1;
@@ -75,7 +74,11 @@ impl MultishotReader {
   }
 
   /// Called by worker after it successfully submits the ASYNC_CANCEL SQE.
-  pub fn mark_cancellation_submitted(&mut self, cancel_sqe_user_data: UserData, _target_op_user_data: UserData) {
+  pub fn mark_cancellation_submitted(
+    &mut self,
+    cancel_sqe_user_data: UserData,
+    _target_op_user_data: UserData,
+  ) {
     // _target_op_user_data should match self.active_op_user_data if logic is correct
     self.cancel_op_user_data = Some(cancel_sqe_user_data);
     // is_active remains true until cancel CQE or original op CQE without MORE.
@@ -141,7 +144,8 @@ impl MultishotReader {
       if bytes_read > 0 {
         match unsafe { buffer_manager.borrow_kernel_filled_buffer(buffer_id, bytes_read) } {
           Ok(borrowed_buffer) => {
-            ops_to_return = owner_handler.process_ring_read_data(&borrowed_buffer, buffer_id, worker_interface);
+            ops_to_return =
+              owner_handler.process_ring_read_data(&borrowed_buffer, buffer_id, worker_interface);
             // BorrowedBuffer is dropped here, returning it to the pool.
           }
           Err(e) => {
@@ -262,12 +266,16 @@ impl MultishotReader {
 
   /// Checks if the given CQE UserData matches any operation this reader is expecting.
   pub(crate) fn matches_cqe_user_data(&self, cqe_user_data: UserData) -> bool {
-    self.active_op_user_data == Some(cqe_user_data) || self.cancel_op_user_data == Some(cqe_user_data)
+    self.active_op_user_data == Some(cqe_user_data)
+      || self.cancel_op_user_data == Some(cqe_user_data)
   }
 
   /// Called when the owning handler's FD is closed, ensuring the reader is marked inactive.
   pub(crate) fn set_inactive_due_to_close(&mut self) {
-    tracing::debug!("[MultishotReader FD={}] Marked as inactive due to FD closure.", self.fd);
+    tracing::debug!(
+      "[MultishotReader FD={}] Marked as inactive due to FD closure.",
+      self.fd
+    );
     self.is_active = false;
     self.active_op_user_data = None;
     self.cancel_op_user_data = None; // Clear any pending cancellation state too

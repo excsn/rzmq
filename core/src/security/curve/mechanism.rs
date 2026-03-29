@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use dryoc::types::Bytes;
 
 use crate::error::ZmqError;
+use crate::message::Metadata;
 use crate::security::curve::handshake::{CurveHandshake, CurveHandshakePhase};
 use crate::security::framer::{ISecureFramer, LengthPrefixedFramer};
 use crate::security::mechanism::ProcessTokenAction;
-use crate::security::{IDataCipher, Mechanism, MechanismStatus, Metadata};
+use crate::security::{Mechanism, MechanismStatus};
 
 /// The public-facing wrapper for the CurveZMQ security mechanism.
 /// This struct implements the `Mechanism` trait and holds the underlying handshake state machine.

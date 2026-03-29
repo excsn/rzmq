@@ -1,14 +1,14 @@
 use bytes::{Buf, BufMut, BytesMut};
 
 use crate::{
-  Metadata, ZmqError,
   security::{
     framer::{ISecureFramer, NullFramer},
     mechanism::ProcessTokenAction,
   },
+  Metadata, ZmqError,
 };
 
-use super::{IDataCipher, Mechanism, MechanismStatus, cipher::PassThroughDataCipher};
+use super::{Mechanism, MechanismStatus};
 
 /// State for the PLAIN security mechanism handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

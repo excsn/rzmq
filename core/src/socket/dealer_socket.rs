@@ -509,7 +509,7 @@ impl ISocket for DealerSocket {
     let sndtimeo_opt = { self.core.core_state.read().options.sndtimeo };
 
     loop {
-      let mut transaction_guard = self.current_send_transaction.lock().await;
+      let transaction_guard = self.current_send_transaction.lock().await;
       match &*transaction_guard {
         DealerSendTransaction::Idle => {
           drop(transaction_guard);
@@ -666,7 +666,7 @@ impl ISocket for DealerSocket {
     _pipe_write_id: usize,
     _peer_identity: Option<&[u8]>,
   ) {
-    let (endpoint_uri_opt, connection_id_opt) = {
+    let (endpoint_uri_opt, _connection_id_opt) = {
       let core_s_read = self.core.core_state.read();
       let uri = core_s_read
         .pipe_read_id_to_endpoint_uri

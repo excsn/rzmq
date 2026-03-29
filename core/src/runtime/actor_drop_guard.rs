@@ -1,15 +1,13 @@
 use tracing::debug;
 
-use crate::runtime::{ActorType, SystemEvent}; // Adjust imports as needed
+use crate::runtime::ActorType;
 use crate::{Context, ZmqError};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 pub(crate) struct ActorDropGuard {
   context: Context,
   handle_id: usize,
   actor_type: ActorType,
-  parent_id: Option<usize>, 
+  parent_id: Option<usize>,
   endpoint_uri: Option<String>,
   // Use an Arc<AtomicBool> to signal normal exit, preventing double publish
   stopped_normally: bool,
@@ -17,8 +15,13 @@ pub(crate) struct ActorDropGuard {
 }
 
 impl ActorDropGuard {
-  pub fn new(context: Context, handle_id: usize, actor_type: ActorType, endpoint_uri: Option<String>, parent_handle_id: Option<usize>) -> Self {
-
+  pub fn new(
+    context: Context,
+    handle_id: usize,
+    actor_type: ActorType,
+    endpoint_uri: Option<String>,
+    parent_handle_id: Option<usize>,
+  ) -> Self {
     context.publish_actor_started(handle_id, actor_type, parent_handle_id);
     Self {
       context,
@@ -45,13 +48,18 @@ impl Drop for ActorDropGuard {
     // Only publish stop if the task didn't signal normal completion
     let error;
     if !self.stopped_normally {
-      error = self.error.take().or_else(|| Some(ZmqError::Internal("Actor task cancelled/aborted".into())));
+      error = self
+        .error
+        .take()
+        .or_else(|| Some(ZmqError::Internal("Actor task cancelled/aborted".into())));
 
       // Log carefully here, as we are in drop context
       debug!(
         // Use eprintln or tracing::error! if subscriber setup handles panics
         "ActorDropGuard: Actor {} ({:?}) stopping abnormally (error: {}). Publishing stop.",
-        self.handle_id, self.actor_type, error.as_ref().unwrap(),
+        self.handle_id,
+        self.actor_type,
+        error.as_ref().unwrap(),
       );
     } else {
       error = None;

@@ -9,7 +9,6 @@ pub(crate) use cipher::IDataCipher;
 pub(crate) use mechanism::{Mechanism, MechanismStatus};
 pub(crate) use {null::NullMechanism, plain::PlainMechanism};
 
-use crate::message::Metadata;
 use crate::{error::ZmqError, protocol::zmtp::ZmtpGreeting, socket::ZmtpEngineConfig};
 
 #[cfg(feature = "curve")]
@@ -62,7 +61,7 @@ fn initialize_plain(
     .map(|s| s.as_bytes().to_vec());
 
   let mut plain_mech = PlainMechanism::new(is_server);
-  
+
   if is_server {
     // For server, these are the EXPECTED credentials
     plain_mech.set_server_expected_credentials(user_bytes, pass_bytes);
@@ -70,7 +69,7 @@ fn initialize_plain(
     // For client, these are the OUTGOING credentials
     plain_mech.set_client_credentials(user_bytes, pass_bytes);
   }
-  
+
   Ok(Box::new(plain_mech))
 }
 

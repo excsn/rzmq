@@ -4,19 +4,16 @@ use super::{cqe_processor, ExternalOpContext, UringWorker};
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::UringWorkerInterface;
 use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest};
-use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerState};
+use crate::io_uring_backend::worker::WorkerState;
 use crate::profiler::LoopProfiler;
-use crate::transport::endpoint::parse_endpoint;
 use crate::ZmqError;
 
-use std::collections::VecDeque;
 use std::mem;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-use std::os::unix::io::RawFd;
 use std::time::Duration;
 
-use io_uring::{opcode, squeue, types};
+use io_uring::{opcode, types};
 use tracing::{debug, error, info, trace, warn};
 
 // Constants for the kernel polling strategy
@@ -121,8 +118,8 @@ impl UringWorker {
       UringOpRequest::Listen {
         user_data,
         addr,
-        protocol_handler_factory_id,
-        protocol_config,
+        protocol_handler_factory_id: _,
+        protocol_config: _,
         reply_tx,
       } => {
         let socket_fd = match addr {

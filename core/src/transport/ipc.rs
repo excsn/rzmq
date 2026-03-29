@@ -1,4 +1,5 @@
 #![cfg(feature = "ipc")]
+#![allow(unused_assignments)]
 
 use crate::context::Context;
 use crate::error::ZmqError;
@@ -281,7 +282,8 @@ impl IpcListener {
               // Variables for the common event publishing logic
               let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
               let mut managing_actor_task_id_for_event: Option<TaskId> = None;
-              let mut setup_successful = true;
+              let setup_successful = true;
+
 
               // IPC doesn't have an io_uring path like TCP. It always uses an actor.
               let sca_handle_id =
@@ -487,7 +489,7 @@ impl IpcConnecter {
     tracing::info!(handle = connecter_handle, uri = %endpoint_uri_original, path = ?self.path, "IPC Connecter actor started.");
 
     // Variables to hold the outcome of the connection attempt
-    let mut connection_outcome: Result<
+    let connection_outcome: Result<
       (
         ConnectionInteractionModel,
         Option<TaskId>,

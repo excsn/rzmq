@@ -12,10 +12,7 @@ use crate::{Blob, MailboxReceiver};
 
 use futures::FutureExt;
 use std::fmt::Debug;
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd; // For AsRawFd bound if S needs it for cork_info init
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, broadcast};
 use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};

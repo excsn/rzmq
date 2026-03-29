@@ -1,3 +1,5 @@
+#![allow(private_interfaces)]
+
 use std::time::Duration;
 
 use crate::{Blob, CoreState, ZmqError};
@@ -37,8 +39,8 @@ pub const PLAIN_PASSWORD: i32 = 46;
 pub const NOISE_XX_ENABLED: i32 = 1202; // Boolean (0 or 1)
 pub const NOISE_XX_STATIC_SECRET_KEY: i32 = 1200; // Expects 32-byte secret key
 pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201; // Client uses this for server's PK, expects 32-byte public key
-// Optional: For server, a list of allowed client public keys (if not using ZAP for this)
-// pub const NOISE_XX_ALLOWED_PEERS: i32 = 1203; // Would take a list of PKs
+                                                         // Optional: For server, a list of allowed client public keys (if not using ZAP for this)
+                                                         // pub const NOISE_XX_ALLOWED_PEERS: i32 = 1203; // Would take a list of PKs
 
 // Security/CURVE
 pub const CURVE_SERVER: i32 = 47; // Matches libzmq's ZMQ_CURVE_SERVER
@@ -237,18 +239,26 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
   fn from(options: &SocketOptions) -> Self {
     // Determine if any security mechanism is active.
     let security_enabled = options.plain_options.enabled
-    || {
+      || {
         #[cfg(feature = "noise_xx")]
-        { options.noise_xx_options.enabled }
+        {
+          options.noise_xx_options.enabled
+        }
         #[cfg(not(feature = "noise_xx"))]
-        { false }
-    }
-    || {
+        {
+          false
+        }
+      }
+      || {
         #[cfg(feature = "curve")]
-        { options.curve_options.enabled }
+        {
+          options.curve_options.enabled
+        }
         #[cfg(not(feature = "curve"))]
-        { false }
-    };
+        {
+          false
+        }
+      };
 
     ZmtpEngineConfig {
       routing_id: options.routing_id.clone(),

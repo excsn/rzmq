@@ -1,4 +1,5 @@
 #![cfg(feature = "io-uring")]
+#![allow(private_interfaces)]
 
 // Declare internal worker sub-modules
 mod cqe_processor;
@@ -12,7 +13,7 @@ mod sqe_builder;
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
-  HandlerSqeBlueprint, HandlerUpstreamEvent, ProtocolHandlerFactory, WorkerIoConfig
+  HandlerSqeBlueprint, HandlerUpstreamEvent, ProtocolHandlerFactory, WorkerIoConfig,
 };
 use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
@@ -28,7 +29,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use fibre::mpmc::{unbounded, AsyncSender, Sender as SyncSender, Receiver as SyncReceiver};
+use fibre::mpmc::{unbounded, AsyncSender, Receiver as SyncReceiver, Sender as SyncSender};
 use fibre::mpsc;
 use io_uring::opcode;
 use io_uring::IoUring;
@@ -40,7 +41,6 @@ pub(crate) use external_op_tracker::{ExternalOpContext, ExternalOpTracker};
 pub(crate) use handler_manager::HandlerManager;
 pub(crate) use internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType};
 pub(crate) use multishot_reader::MultishotReader;
-
 
 #[derive(Debug, Default)]
 struct FdWork {
@@ -54,7 +54,7 @@ struct FdWork {
 pub(crate) enum WorkerState {
   Running,
   Draining, // Shutdown initiated, processing in-flight completions only
-  CleaningUp, 
+  CleaningUp,
   Stopped,
 }
 
@@ -90,9 +90,18 @@ impl fmt::Debug for UringWorker {
       .field("op_rx_len", &self.op_rx.len())
       .field("op_rx_is_closed", &self.op_rx.is_closed())
       .field("buffer_manager_is_some", &self.buffer_manager.is_some())
-      .field("external_op_tracker_len", &self.external_op_tracker.in_flight.len())
-      .field("internal_op_tracker_len", &self.internal_op_tracker.op_to_details.len())
-      .field("default_buffer_ring_group_id_val", &self.default_buffer_ring_group_id_val)
+      .field(
+        "external_op_tracker_len",
+        &self.external_op_tracker.in_flight.len(),
+      )
+      .field(
+        "internal_op_tracker_len",
+        &self.internal_op_tracker.op_to_details.len(),
+      )
+      .field(
+        "default_buffer_ring_group_id_val",
+        &self.default_buffer_ring_group_id_val,
+      )
       .field("event_fd_poller", &self.event_fd_poller)
       .field("fd_to_mpsc_rx_len", &self.fd_to_mpsc_rx.len())
       .finish_non_exhaustive()
@@ -104,19 +113,29 @@ impl UringWorker {
     config: UringConfig,
     factories: Vec<Arc<dyn ProtocolHandlerFactory>>,
     upstream_event_tx: SyncSender<(RawFd, HandlerUpstreamEvent)>,
-  ) -> Result<(SignalingOpSender, std::thread::JoinHandle<Result<(), ZmqError>>), ZmqError> {
+  ) -> Result<
+    (
+      SignalingOpSender,
+      std::thread::JoinHandle<Result<(), ZmqError>>,
+    ),
+    ZmqError,
+  > {
     let (op_tx_sync, op_rx) = unbounded::<UringOpRequest>();
     let op_tx_async_for_signaler: AsyncSender<UringOpRequest> = op_tx_sync.to_async();
 
     let worker_io_config = Arc::new(WorkerIoConfig { upstream_event_tx });
 
-    let event_fd_master_instance =
-      eventfd::EventFD::new(0, eventfd::EfdFlags::EFD_CLOEXEC | eventfd::EfdFlags::EFD_NONBLOCK).map_err(|e| {
-        error!("Failed to create master EventFD for UringWorker: {}", e);
-        ZmqError::Internal(format!("Master EventFD creation failed: {}", e))
-      })?;
+    let event_fd_master_instance = eventfd::EventFD::new(
+      0,
+      eventfd::EfdFlags::EFD_CLOEXEC | eventfd::EfdFlags::EFD_NONBLOCK,
+    )
+    .map_err(|e| {
+      error!("Failed to create master EventFD for UringWorker: {}", e);
+      ZmqError::Internal(format!("Master EventFD creation failed: {}", e))
+    })?;
 
-    let signaling_op_sender = SignalingOpSender::new(op_tx_async_for_signaler, event_fd_master_instance.clone());
+    let signaling_op_sender =
+      SignalingOpSender::new(op_tx_async_for_signaler, event_fd_master_instance.clone());
 
     let worker_thread_join_handle = std::thread::Builder::new()
       .name("rzmq-io-uring-worker".into())
@@ -225,20 +244,24 @@ impl UringWorker {
   fn transition_to_draining(&mut self) {
     info!("UringWorker: Transitioning to DRAINING state.");
     self.state = WorkerState::Draining;
-    
+
     // Instead of aborting, we take and drop the sender side of the
     // upstream channel. The processor's `recv().await` will then return an
     // error, causing its loop to terminate gracefully.
     if let Some(tx) = global_state::get_global_parsed_msg_tx_mutex().lock().take() {
-        drop(tx);
-        debug!("UringWorker: Dropped upstream TX channel to signal processor shutdown.");
+      drop(tx);
+      debug!("UringWorker: Dropped upstream TX channel to signal processor shutdown.");
     }
 
     let mut sq_for_shutdown = unsafe { self.ring.submission_shared() };
 
     // Cancel all in-flight internal kernel operations.
-    let internal_ops_to_cancel: Vec<UserData> =
-      self.internal_op_tracker.op_to_details.keys().copied().collect();
+    let internal_ops_to_cancel: Vec<UserData> = self
+      .internal_op_tracker
+      .op_to_details
+      .keys()
+      .copied()
+      .collect();
 
     info!(
       "UringWorker: Draining state - Cancelling {} in-flight internal operations.",
@@ -371,7 +394,9 @@ pub(crate) fn sockaddr_storage_to_socket_addr(
         let port = u16::from_be(sa.sin6_port); // sin6_port is network order
         let flowinfo = u32::from_be(sa.sin6_flowinfo); // sin6_flowinfo is network order
         let scope_id = u32::from_be(sa.sin6_scope_id); // sin6_scope_id is network order
-        Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, flowinfo, scope_id)))
+        Ok(SocketAddr::V6(SocketAddrV6::new(
+          ip, port, flowinfo, scope_id,
+        )))
       } else {
         Err(std::io::Error::new(
           std::io::ErrorKind::InvalidInput,

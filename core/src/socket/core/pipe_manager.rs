@@ -6,7 +6,7 @@ use crate::message::Msg;
 use crate::runtime::ActorDropGuard;
 use crate::runtime::ActorType;
 use crate::socket::core::state::{EndpointInfo, EndpointType};
-use crate::socket::core::{SocketCore, command_processor};
+use crate::socket::core::SocketCore;
 use crate::socket::{ISocket, SocketEvent};
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};

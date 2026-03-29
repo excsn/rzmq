@@ -20,8 +20,8 @@ pub(crate) struct ExternalOpContext {
   pub protocol_handler_factory_id: Option<String>, // For Listen/Connect
   pub protocol_config: Option<ProtocolConfig>,
   pub fd_created_for_connect_op: Option<RawFd>, // For Connect, FD before CQE
-  pub listener_fd: Option<RawFd>,               // For Listen, the FD of the successfully created listener
-  pub target_fd_for_shutdown: Option<RawFd>,    // For ShutdownConnectionHandler
+  pub listener_fd: Option<RawFd>, // For Listen, the FD of the successfully created listener
+  pub target_fd_for_shutdown: Option<RawFd>, // For ShutdownConnectionHandler
   pub multipart_state: Option<MultipartSendState>,
 }
 
@@ -69,21 +69,32 @@ impl ExternalOpTracker {
 
   /// Gets a mutable reference to an operation's context.
   /// Used for updating multipart send state.
-  pub(crate) fn get_op_context_mut(&mut self, user_data: UserData) -> Option<&mut ExternalOpContext> {
+  pub(crate) fn get_op_context_mut(
+    &mut self,
+    user_data: UserData,
+  ) -> Option<&mut ExternalOpContext> {
     self.in_flight.get_mut(&user_data)
   }
 
   /// Takes an operation if it's a ShutdownConnectionHandler targeting the specified FD.
-  pub fn take_op_if_shutdown_for_fd(&mut self, fd_to_check: RawFd) -> Option<(UserData, ExternalOpContext)> {
+  pub fn take_op_if_shutdown_for_fd(
+    &mut self,
+    fd_to_check: RawFd,
+  ) -> Option<(UserData, ExternalOpContext)> {
     let mut found_ud: Option<UserData> = None;
     for (ud, ctx) in self.in_flight.iter() {
-      if ctx.op_name == "ShutdownConnectionHandler" && ctx.target_fd_for_shutdown == Some(fd_to_check) {
+      if ctx.op_name == "ShutdownConnectionHandler"
+        && ctx.target_fd_for_shutdown == Some(fd_to_check)
+      {
         found_ud = Some(*ud);
         break;
       }
     }
     if let Some(ud_to_remove) = found_ud {
-      self.in_flight.remove(&ud_to_remove).map(|ctx| (ud_to_remove, ctx))
+      self
+        .in_flight
+        .remove(&ud_to_remove)
+        .map(|ctx| (ud_to_remove, ctx))
     } else {
       None
     }

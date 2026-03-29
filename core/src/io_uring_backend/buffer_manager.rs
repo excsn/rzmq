@@ -39,7 +39,7 @@ impl BufferRingManager {
     // `IoUringBufRing::new_with_buffers` takes ownership of the iterator.
     // The actual number of entries in the ring will be `bufs_iter.count().next_power_of_two()`.
     // If `ring_entries` is already a power of two, it will be that.
-    match IoUringBufRing::new_with_buffers(ring, bufs_iter, bgid) {
+    match IoUringBufRing::new_with_buffers_and_flags(ring, bufs_iter, bgid, 0) {
       Ok(buf_ring_instance) => {
         tracing::info!(
           "BufferRingManager: IoUringBufRing built and registered successfully for bgid: {}",
@@ -65,15 +65,17 @@ impl BufferRingManager {
     &self,
     buffer_id: u16,
     available_len: usize,
-  ) -> Result<BorrowedBuffer<BytesMut>, ZmqError> {
-    self
-      .buf_ring_instance
-      .get_buf(buffer_id, available_len)
-      .ok_or_else(|| {
-        ZmqError::Internal(format!(
-          "Failed to borrow buffer ID {} from ring",
-          buffer_id
-        ))
-      })
+  ) -> Result<BorrowedBuffer<'_, BytesMut>, ZmqError> {
+    unsafe {
+      self
+        .buf_ring_instance
+        .get_buf(buffer_id, available_len)
+        .ok_or_else(|| {
+          ZmqError::Internal(format!(
+            "Failed to borrow buffer ID {} from ring",
+            buffer_id
+          ))
+        })
+    }
   }
 }

@@ -94,6 +94,6 @@ impl<T: Send + 'static> FairQueue<T> {
   }
 
   pub fn close(&self) {
-    self.sender.close();
+    let _ = self.sender.close();
   }
 }

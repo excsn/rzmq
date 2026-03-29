@@ -2,7 +2,7 @@ use crate::error::ZmqError;
 use crate::runtime::{ActorType, Command, SystemEvent};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::state::{CoreState, EndpointType, ShutdownCoordinator, ShutdownPhase};
-use crate::socket::core::{command_processor, pipe_manager, SocketCore};
+use crate::socket::core::{pipe_manager, SocketCore};
 use crate::socket::ISocket;
 
 use std::collections::HashMap;

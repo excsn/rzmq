@@ -1,4 +1,5 @@
 #![cfg(feature = "io-uring")]
+#![allow(private_interfaces)]
 
 use crate::message::Msg;
 use crate::{Blob, ZmqError};
@@ -86,7 +87,7 @@ impl<'sq_borrow> SubmissionQueueWriter<'sq_borrow> {
       .map_err(|e| format!("SQ push error: {:?}", e))
   }
   pub fn is_full(&self) -> bool {
-    unsafe { self.sq.is_full() }
+    self.sq.is_full()
   }
 }
 
@@ -133,10 +134,9 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
 pub trait UringConnectionHandler: Send {
   fn fd(&self) -> RawFd;
 
-
   /// Checks if the handler is in a terminal (Closing, Closed, Error) state.
   fn is_closing_or_closed(&self) -> bool;
-  
+
   /// Called when the connection is first established and ready.
   /// Handler should return blueprints for initial I/O (e.g., start reading, send greeting).
   fn connection_ready(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps;

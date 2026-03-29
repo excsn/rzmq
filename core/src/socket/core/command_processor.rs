@@ -487,7 +487,6 @@ async fn handle_user_bind(
       }
     }
     Err(e) => bind_result = Err(e), // Error from parse_endpoint
-    _ => bind_result = Err(ZmqError::UnsupportedTransport(endpoint.to_string())),
   };
 
   // Post-bind actions: update last_bound_endpoint, send monitor event
@@ -550,10 +549,6 @@ async fn handle_user_connect(
     }
     Err(e) => {
       let _ = reply_tx.send(Err(e));
-    }
-    _ => {
-      // Other endpoint types not connectable or unsupported
-      let _ = reply_tx.send(Err(ZmqError::UnsupportedTransport(endpoint_uri)));
     }
   }
 }
@@ -637,9 +632,6 @@ pub(crate) async fn respawn_connecter_actor(
           target_endpoint_uri: target_uri,
           error: err,
         });
-    }
-    _ => {
-      tracing::warn!(handle = core_handle, %target_uri, "Unsupported transport for respawning connecter.");
     }
   }
 }

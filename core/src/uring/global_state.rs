@@ -2,7 +2,6 @@
 
 use crate::io_uring_backend::connection_handler::HandlerUpstreamEvent;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
-use crate::message::Blob;
 use crate::runtime::command::Command;
 use crate::runtime::MailboxSender as SocketCoreMailboxSender;
 use crate::{error::ZmqError, uring::URING_BACKEND_INITIALIZED};
@@ -13,7 +12,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle as StdThreadJoinHandle;
 
 #[cfg(feature = "io-uring")]
-use fibre::mpmc::{AsyncReceiver, Receiver as SyncReceiver, Sender as SyncSender};
+use fibre::mpmc::{AsyncReceiver, Sender as SyncSender};
 use once_cell::sync::OnceCell;
 #[cfg(feature = "io-uring")]
 use parking_lot::Mutex;

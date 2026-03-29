@@ -4,7 +4,7 @@ use super::internal_op_tracker::{InternalOpDetails, InternalOpPayload, InternalO
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringWorkerInterface,
 };
-use crate::io_uring_backend::ops::{UringOpCompletion, UserData, HANDLER_INTERNAL_SEND_OP_UD};
+use crate::io_uring_backend::ops::{UringOpCompletion, HANDLER_INTERNAL_SEND_OP_UD};
 use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
 use crate::io_uring_backend::worker::UringWorker;
 use crate::{uring, Command, ZmqError};
@@ -30,7 +30,7 @@ pub(crate) fn process_handler_blueprints(
   let internal_ops = &mut worker.internal_op_tracker;
   let handler_manager = &mut worker.handler_manager;
   let send_buffer_pool = &worker.send_buffer_pool;
-  let default_bgid_for_read_sqe = worker.default_buffer_ring_group_id_val;
+  let _default_bgid_for_read_sqe = worker.default_buffer_ring_group_id_val;
 
   let worker_cfg_send_zerocopy_enabled = worker.cfg_send_zerocopy_enabled;
 
@@ -382,7 +382,7 @@ pub(crate) fn process_all_cqes(
             let (peer_addr, local_addr) = crate::io_uring_backend::worker::get_peer_local_addr(
               connected_fd,
             )
-            .unwrap_or_else(|e| {
+            .unwrap_or_else(|_e| {
               (
                 crate::io_uring_backend::worker::dummy_socket_addr(),
                 crate::io_uring_backend::worker::dummy_socket_addr(),
@@ -681,7 +681,7 @@ pub(crate) fn process_all_cqes(
           }
         }
         InternalOpType::Send | InternalOpType::SendZeroCopy => {
-          let (app_op_ud, app_op_name) = match &op_details.payload {
+          let (app_op_ud, _app_op_name) = match &op_details.payload {
             InternalOpPayload::SendBuffer {
               app_op_ud: Some(ud),
               app_op_name: Some(name),
@@ -750,7 +750,7 @@ pub(crate) fn process_all_cqes(
                     Ok(borrowed_buf) => {
                       handler.process_ring_read_data(&borrowed_buf, bid, &interface)
                     }
-                    Err(e) => {
+                    Err(_e) => {
                       worker
                         .fds_needing_close_initiated_pass
                         .push_back(handler_fd);

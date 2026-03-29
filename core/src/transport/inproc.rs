@@ -4,7 +4,6 @@ use crate::context::Context;
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::SystemEvent;
-use crate::socket::core::pipe_manager::run_pipe_reader_task;
 use crate::socket::core::{EndpointInfo, EndpointType, SocketCore};
 use crate::socket::SocketEvent;
 
@@ -97,7 +96,7 @@ pub(crate) async fn connect_inproc(
   );
 
   // This task now directly processes Vec<Msg> and forwards individual frames to ISocket.
-  let connector_context_clone = core_arc.context.clone();
+  let _connector_context_clone = core_arc.context.clone();
   tokio::spawn(async move {
     loop {
       match rx_connector_from_binder.recv().await {

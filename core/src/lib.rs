@@ -3,6 +3,8 @@
 //! This library aims to provide a compatible API with ZeroMQ patterns
 //! while leveraging Rust's safety and Tokio's asynchronous capabilities.
 
+#![allow(dead_code)]
+
 // These modules encapsulate different aspects of the ZMQ implementation.
 
 /// Defines the `Context`, which is the entry point for creating sockets.
@@ -39,7 +41,7 @@ pub use context::Context;
 pub use error::ZmqError;
 pub use message::{Blob, Metadata, Msg, MsgFlags};
 pub use runtime::Command;
-pub(crate) use runtime::{MailboxReceiver, MailboxSender};
+pub(crate) use runtime::MailboxReceiver;
 
 pub(crate) use socket::core::CoreState;
 

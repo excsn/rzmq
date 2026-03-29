@@ -3,7 +3,8 @@
 use crate::io_uring_backend::{
   buffer_manager::BufferRingManager,
   connection_handler::{
-    HandlerIoOps, ProtocolHandlerFactory, UringConnectionHandler, UringWorkerInterface, WorkerIoConfig,
+    HandlerIoOps, ProtocolHandlerFactory, UringConnectionHandler, UringWorkerInterface,
+    WorkerIoConfig,
   },
   ops::ProtocolConfig,
   UserData,
@@ -12,7 +13,7 @@ use crate::io_uring_backend::{
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 /// Metadata stored for active listener FDs.
 #[derive(Debug, Clone)] // ProtocolConfig needs to be Clone
@@ -24,12 +25,15 @@ pub(crate) struct ListenerMetadata {
 pub(crate) struct HandlerManager {
   handlers: HashMap<RawFd, Box<dyn UringConnectionHandler + Send>>,
   factories: Arc<HashMap<String, Arc<dyn ProtocolHandlerFactory>>>, // Stores Arc<dyn Trait>
-  worker_io_config: Arc<WorkerIoConfig>,                            // Passed to handlers via UringWorkerInterface
-  listener_metadata: HashMap<RawFd, ListenerMetadata>,              // Keyed by listener FD
+  worker_io_config: Arc<WorkerIoConfig>, // Passed to handlers via UringWorkerInterface
+  listener_metadata: HashMap<RawFd, ListenerMetadata>, // Keyed by listener FD
 }
 
 impl HandlerManager {
-  pub fn new(factories_vec: Vec<Arc<dyn ProtocolHandlerFactory>>, worker_io_config: Arc<WorkerIoConfig>) -> Self {
+  pub fn new(
+    factories_vec: Vec<Arc<dyn ProtocolHandlerFactory>>,
+    worker_io_config: Arc<WorkerIoConfig>,
+  ) -> Self {
     let mut factory_map = HashMap::new();
     for factory_arc in factories_vec {
       factory_map.insert(factory_arc.id().to_string(), factory_arc);
@@ -178,7 +182,9 @@ impl HandlerManager {
 
   /// Removes all handlers, calling `fd_has_been_closed` on each.
   /// Also clears all listener metadata.
-  pub fn drain_all_handlers_calling_closed(&mut self) -> Vec<Box<dyn UringConnectionHandler + Send>> {
+  pub fn drain_all_handlers_calling_closed(
+    &mut self,
+  ) -> Vec<Box<dyn UringConnectionHandler + Send>> {
     info!("HandlerManager: Draining all handlers and calling fd_has_been_closed.");
     let mut drained_handlers = Vec::new();
     for (_fd, mut handler) in self.handlers.drain() {

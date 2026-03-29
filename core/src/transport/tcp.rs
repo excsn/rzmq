@@ -1,3 +1,5 @@
+#![allow(unused_assignments)]
+
 use crate::context::Context;
 use crate::error::ZmqError;
 use crate::runtime::{
@@ -31,7 +33,7 @@ use std::os::unix::io::{AsRawFd, IntoRawFd};
 
 use core::fmt;
 use std::io;
-use std::net::{SocketAddr as StdSocketAddr, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +41,7 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::sync::{Semaphore, broadcast};
 use tokio::task::{Id as TaskId, JoinHandle};
 use tokio::time::sleep;
-use tracing::{debug, error, info, trace, warn};
+use tracing;
 
 mod underlying_std_net {
   pub use tokio::net::TcpListener;
@@ -184,7 +186,7 @@ impl TcpListener {
     Ok((tx, cmd_loop_jh, resolved_uri))
   }
 
-  async fn run_command_loop(mut self, parent_socket_id: usize) {
+  async fn run_command_loop(self, parent_socket_id: usize) {
     let listener_cmd_loop_handle = self.handle;
     let endpoint_uri_clone_log = self.endpoint.clone();
     let event_bus = self.context.event_bus();
@@ -345,13 +347,13 @@ impl TcpListener {
             let socket_logic = socket_logic.clone();
 
             async move {
-              let max_connection_permit = _permit_guard; 
+              let max_connection_permit = _permit_guard;
 
               let mut connection_iface_for_event: Option<Arc<dyn ISocketConnection>> = None;
-              let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
-              let mut managing_actor_task_id_for_event: Option<TaskId> = None;
+              let mut interaction_model_for_event = None;
+              let mut managing_actor_task_id_for_event = None;
               let mut setup_successful = true;
-              let mut sca_or_session_join_handle_opt: Option<JoinHandle<()>> = None;
+              let _sca_or_session_join_handle_opt: Option<JoinHandle<()>> = None;
 
               if use_io_uring_for_session {
                 #[cfg(feature = "io-uring")]
@@ -428,7 +430,7 @@ impl TcpListener {
                             }))
                               if returned_fd == raw_fd =>
                             {
-                              info!("Registered accepted FD {} with UringWorker.", raw_fd);
+                              tracing::info!("Registered accepted FD {} with UringWorker.", raw_fd);
                               connection_iface_for_event = Some(new_conn_iface);
                               interaction_model_for_event =
                                 Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
@@ -984,7 +986,7 @@ impl TcpConnecter {
               }))
                 if returned_fd == raw_fd =>
               {
-                info!(
+                tracing::info!(
                   "Successfully registered connected FD {} with UringWorker.",
                   raw_fd
                 );

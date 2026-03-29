@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, private_interfaces)]
 
 use crate::message::Msg;
 use crate::runtime::mailbox::MailboxSender as SessionCommandMailboxSender;
@@ -221,7 +221,7 @@ impl fmt::Debug for SystemEvent {
         .field("parent_core_id", parent_core_id)
         .field("connection_identifier", connection_identifier)
         .field("peer_identity", peer_identity)
-        .field("peer_socket_type", peer_socket_type) 
+        .field("peer_socket_type", peer_socket_type)
         .finish(),
       SystemEvent::ConnectionAttemptFailed {
         parent_core_id,

@@ -1,4 +1,5 @@
 #![cfg(feature = "io-uring")]
+#![allow(private_interfaces)]
 
 use super::buffer_manager::BufferRingManager;
 use super::worker::InternalOpTracker;
@@ -6,20 +7,17 @@ use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, HandlerUpstreamEvent, ProtocolHandlerFactory,
   UringConnectionHandler, UringWorkerInterface, UserData, WorkerIoConfig,
 };
-use crate::io_uring_backend::ops::{HANDLER_INTERNAL_SEND_OP_UD, ProtocolConfig};
+use crate::io_uring_backend::ops::{ProtocolConfig, HANDLER_INTERNAL_SEND_OP_UD};
 use crate::io_uring_backend::worker::MultishotReader;
 use crate::message::{Msg, MsgFlags};
 use crate::protocol::zmtp::{
   command::{ZmtpCommand, ZmtpReady},
-  greeting::{GREETING_LENGTH, MECHANISM_LENGTH, ZmtpGreeting},
-  manual_parser::ZmtpManualParser,
+  greeting::{ZmtpGreeting, GREETING_LENGTH, MECHANISM_LENGTH},
 };
+use crate::security::framer::{ISecureFramer, NullFramer};
 #[cfg(feature = "noise_xx")]
 use crate::security::NoiseXxMechanism;
-use crate::security::framer::{ISecureFramer, NullFramer};
-use crate::security::{
-  IDataCipher, Mechanism, NullMechanism, PlainMechanism, negotiate_security_mechanism,
-};
+use crate::security::{negotiate_security_mechanism, Mechanism, NullMechanism, PlainMechanism};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::{Blob, ZmqError};
 
@@ -30,8 +28,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use dryoc::types::Bytes as DryocBytes;
-use tokio_util::codec::Encoder;
 use tracing::{debug, error, info, trace, warn};
 
 const ZC_SEND_THRESHOLD: usize = 1024;
@@ -385,7 +381,6 @@ impl ZmtpUringHandler {
 
           let mut should_transition_out_of_security_exchange = false;
           let mut mechanism_name_for_log_on_completion = "";
-          let mut peer_id_from_sec_mech_on_completion: Option<Blob> = None;
           let mut mechanism_had_error = false;
           let mut error_reason_from_mechanism = String::new();
 
@@ -397,7 +392,8 @@ impl ZmtpUringHandler {
                 sec_mech_ref.name()
               );
               mechanism_name_for_log_on_completion = sec_mech_ref.name();
-              peer_id_from_sec_mech_on_completion = sec_mech_ref.peer_identity().map(Blob::from);
+              let _peer_id_from_sec_mech_on_completion =
+                sec_mech_ref.peer_identity().map(Blob::from);
               should_transition_out_of_security_exchange = true;
             } else {
               let mut token_action_this_iteration = false;
@@ -491,7 +487,7 @@ impl ZmtpUringHandler {
                     sec_mech_ref.name()
                   );
                   mechanism_name_for_log_on_completion = sec_mech_ref.name();
-                  peer_id_from_sec_mech_on_completion =
+                  let _peer_id_from_sec_mech_on_completion =
                     sec_mech_ref.peer_identity().map(Blob::from);
                   should_transition_out_of_security_exchange = true;
                 } else if sec_mech_ref.is_error() {
