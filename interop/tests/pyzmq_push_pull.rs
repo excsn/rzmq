@@ -1,7 +1,7 @@
 mod common;
 
 use anyhow::Result;
-use rzmq::{Msg, SocketType, context::context};
+use rzmq::{SocketType, context::context};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
