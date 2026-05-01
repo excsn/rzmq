@@ -27,17 +27,22 @@ pub(crate) async fn advance_handshake_step_impl<S: ZmtpStdStream>(
 ) -> Result<ZmtpHandshakeProgressX, ZmqError> {
   // The overall handshake timeout (handler.config.handshake_timeout)
   // will be enforced by SessionConnectionActorX.
-  let operation_timeout = Duration::from_secs(15); // Default for individual send/recv during handshake
+  let operation_timeout = handler.config.handshake_timeout.unwrap_or(Duration::from_secs(15));
 
   match handler.handshake_state.sub_phase {
-    HandshakeSubPhaseX::GreetingExchange => {
-      exchange_greetings_impl(handler, operation_timeout).await
-    }
+    HandshakeSubPhaseX::GreetingExchange => send_greeting_impl(handler, operation_timeout).await,
+    HandshakeSubPhaseX::WaitingForGreeting => receive_greeting_impl(handler, operation_timeout).await,
     HandshakeSubPhaseX::SecurityHandshake => {
       perform_security_handshake_step_impl(handler, operation_timeout).await
     }
     HandshakeSubPhaseX::ReadyExchange => {
       perform_ready_exchange_step_impl(handler, operation_timeout).await
+    }
+    HandshakeSubPhaseX::ClientSentReady => {
+      client_receive_peer_ready_impl(handler, operation_timeout).await
+    }
+    HandshakeSubPhaseX::ServerReceivedReady => {
+      server_send_ready_impl(handler, operation_timeout).await
     }
     HandshakeSubPhaseX::Done => Ok(ZmtpHandshakeProgressX::HandshakeComplete),
   }
@@ -134,7 +139,10 @@ async fn send_handshake_command_frame_impl<S: ZmtpStdStream>(
   Ok(())
 }
 
-async fn exchange_greetings_impl<S: ZmtpStdStream>(
+/// Sends our local ZMTP greeting and transitions to `WaitingForGreeting`.
+/// Clears `network_read_buffer` here so that `receive_greeting_impl` can safely
+/// accumulate partial reads across cancellations without losing bytes.
+async fn send_greeting_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
   operation_timeout: Duration,
 ) -> Result<ZmtpHandshakeProgressX, ZmqError> {
@@ -166,15 +174,28 @@ async fn exchange_greetings_impl<S: ZmtpStdStream>(
     role = if handler.is_server { "S" } else { "C" },
     "Sent ZMTP greeting."
   );
-
   handler.network_read_buffer.clear();
   if handler.network_read_buffer.capacity() < GREETING_LENGTH {
     handler.network_read_buffer.reserve(GREETING_LENGTH);
   }
+  handler.handshake_state.sub_phase = HandshakeSubPhaseX::WaitingForGreeting;
+  Ok(ZmtpHandshakeProgressX::InProgress)
+}
+
+/// Receives the peer's ZMTP greeting.  Does NOT clear `network_read_buffer` so
+/// that any bytes accumulated before a prior cancellation are preserved.
+async fn receive_greeting_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  operation_timeout: Duration,
+) -> Result<ZmtpHandshakeProgressX, ZmqError> {
   let deadline = Instant::now() + operation_timeout;
+  let stream = handler
+    .stream
+    .as_mut()
+    .ok_or_else(|| ZmqError::Internal("Stream unavailable".into()))?;
   while handler.network_read_buffer.len() < GREETING_LENGTH {
     let remaining_time = deadline.saturating_duration_since(Instant::now());
-    if remaining_time.is_zero() && handler.network_read_buffer.len() < GREETING_LENGTH {
+    if remaining_time.is_zero() {
       return Err(ZmqError::Timeout);
     }
     let br = tokio::time::timeout(
@@ -359,86 +380,104 @@ async fn perform_security_handshake_step_impl<S: ZmtpStdStream>(
   }
 }
 
+fn build_ready_properties<S: ZmtpStdStream>(handler: &ZmtpProtocolHandlerX<S>) -> HashMap<String, Vec<u8>> {
+  let mut props = HashMap::new();
+  props.insert(
+    "Socket-Type".to_string(),
+    handler.config.socket_type_name.as_bytes().to_vec(),
+  );
+  let socket_type = &handler.config.socket_type_name;
+  if socket_type == "REQ" || socket_type == "DEALER" || socket_type == "ROUTER" {
+    let identity = handler.config.routing_id.as_ref().map_or_else(
+      Vec::new,
+      |blob| blob.to_vec(),
+    );
+    if identity.len() <= 255 {
+      props.insert("Identity".to_string(), identity);
+    }
+  }
+  props
+}
+
+fn parse_peer_ready_identity(peer_ready_data: &ZmtpReady) -> Option<Blob> {
+  peer_ready_data.properties.get("Identity")
+    .filter(|id_v| !id_v.is_empty() && id_v.len() <= 255)
+    .map(|id_v| id_v.clone().into())
+}
+
+/// Client: sends its READY command and transitions to `ClientSentReady`.
+/// Server: reads the client's READY, stores parsed data, transitions to `ServerReceivedReady`.
 async fn perform_ready_exchange_step_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
   operation_timeout: Duration,
 ) -> Result<ZmtpHandshakeProgressX, ZmqError> {
-  let build_properties = |handler: &ZmtpProtocolHandlerX<S>| -> HashMap<String, Vec<u8>> {
-    let mut props = HashMap::new();
-    props.insert(
-      "Socket-Type".to_string(),
-      handler.config.socket_type_name.as_bytes().to_vec(),
-    );
-
-    let socket_type = &handler.config.socket_type_name;
-    // This is the key logic from libzmq: REQ, DEALER, and ROUTER sockets
-    // include the Identity property to identify themselves to peers like ROUTER.
-    // ROUTER and REP sockets MUST NOT include an Identity.
-    if socket_type == "REQ" || socket_type == "DEALER" || socket_type == "ROUTER" {
-      // If an identity is set, use it. Otherwise, send an empty one.
-      let identity = handler.config.routing_id.as_ref().map_or_else(
-        || Vec::new(), // Default to empty Vec<u8> if None
-        |blob| blob.to_vec(),
-      );
-      // Only include if length is valid (though empty is valid).
-      if identity.len() <= 255 {
-        props.insert("Identity".to_string(), identity);
-      }
-    }
-    props
-  };
-
-  let mut final_peer_id_from_ready: Option<Blob> = None;
   if !handler.is_server {
-    // Client-side READY send
-    let props = build_properties(handler);
+    let props = build_ready_properties(handler);
     send_handshake_command_frame_impl(handler, ZmtpReady::create_msg(props), operation_timeout)
       .await?;
     tracing::debug!(sca_handle = handler.actor_handle, "Client sent READY.");
+    handler.handshake_state.sub_phase = HandshakeSubPhaseX::ClientSentReady;
+    Ok(ZmtpHandshakeProgressX::InProgress)
+  } else {
+    let recv_ready_msg = read_handshake_command_frame_impl(handler, operation_timeout).await?;
+    let peer_ready_data = match ZmtpCommand::parse(&recv_ready_msg) {
+      Some(ZmtpCommand::Ready(data)) => data,
+      _ => return Err(ZmqError::ProtocolViolation("Expected READY".into())),
+    };
+    let peer_socket_type_str = peer_ready_data
+      .properties
+      .get("Socket-Type")
+      .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+    if let Some(ref peer_type) = peer_socket_type_str {
+      tracing::debug!(sca_handle = handler.actor_handle, %peer_type, "Peer announced its Socket-Type in READY command.");
+      handler.handshake_state.peer_socket_type = Some(peer_type.clone());
+    } else {
+      tracing::warn!(sca_handle = handler.actor_handle, "Peer did not announce Socket-Type in READY command. Assuming legacy or non-compliant peer.");
+    }
+    tracing::debug!(sca_handle = handler.actor_handle, "Recvd peer READY.");
+    handler.handshake_state.peer_identity_from_ready = parse_peer_ready_identity(&peer_ready_data);
+    handler.handshake_state.sub_phase = HandshakeSubPhaseX::ServerReceivedReady;
+    Ok(ZmtpHandshakeProgressX::InProgress)
   }
+}
 
-  // Both sides receive the peer's READY
+/// Client: reads the server's READY and completes the handshake.
+async fn client_receive_peer_ready_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  operation_timeout: Duration,
+) -> Result<ZmtpHandshakeProgressX, ZmqError> {
   let recv_ready_msg = read_handshake_command_frame_impl(handler, operation_timeout).await?;
   let peer_ready_data = match ZmtpCommand::parse(&recv_ready_msg) {
     Some(ZmtpCommand::Ready(data)) => data,
     _ => return Err(ZmqError::ProtocolViolation("Expected READY".into())),
   };
-
   let peer_socket_type_str = peer_ready_data
     .properties
     .get("Socket-Type")
     .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
-
   if let Some(ref peer_type) = peer_socket_type_str {
-    tracing::debug!(
-        sca_handle = handler.actor_handle,
-        %peer_type,
-        "Peer announced its Socket-Type in READY command."
-    );
+    tracing::debug!(sca_handle = handler.actor_handle, %peer_type, "Peer announced its Socket-Type in READY command.");
     handler.handshake_state.peer_socket_type = Some(peer_type.clone());
   } else {
-    tracing::warn!(
-      sca_handle = handler.actor_handle,
-      "Peer did not announce Socket-Type in READY command. Assuming legacy or non-compliant peer."
-    );
+    tracing::warn!(sca_handle = handler.actor_handle, "Peer did not announce Socket-Type in READY command. Assuming legacy or non-compliant peer.");
   }
   tracing::debug!(sca_handle = handler.actor_handle, "Recvd peer READY.");
-  if let Some(id_v) = peer_ready_data.properties.get("Identity") {
-    if !id_v.is_empty() && id_v.len() <= 255 {
-      final_peer_id_from_ready = Some(id_v.clone().into());
-    }
-  }
-
-  if handler.is_server {
-    // Server-side READY send
-    let props = build_properties(handler);
-    send_handshake_command_frame_impl(handler, ZmtpReady::create_msg(props), operation_timeout)
-      .await?;
-    tracing::debug!(sca_handle = handler.actor_handle, "Server sent READY.");
-  }
+  let final_peer_id = parse_peer_ready_identity(&peer_ready_data);
   handler.handshake_state.sub_phase = HandshakeSubPhaseX::Done;
-  Ok(final_peer_id_from_ready.map_or(
-    ZmtpHandshakeProgressX::HandshakeComplete,
-    ZmtpHandshakeProgressX::IdentityReady,
-  ))
+  Ok(final_peer_id.map_or(ZmtpHandshakeProgressX::HandshakeComplete, ZmtpHandshakeProgressX::IdentityReady))
+}
+
+/// Server: sends its own READY command and completes the handshake.
+/// The peer identity (parsed in `perform_ready_exchange_step_impl`) is taken from state.
+async fn server_send_ready_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  operation_timeout: Duration,
+) -> Result<ZmtpHandshakeProgressX, ZmqError> {
+  let props = build_ready_properties(handler);
+  send_handshake_command_frame_impl(handler, ZmtpReady::create_msg(props), operation_timeout)
+    .await?;
+  tracing::debug!(sca_handle = handler.actor_handle, "Server sent READY.");
+  let final_peer_id = handler.handshake_state.peer_identity_from_ready.take();
+  handler.handshake_state.sub_phase = HandshakeSubPhaseX::Done;
+  Ok(final_peer_id.map_or(ZmtpHandshakeProgressX::HandshakeComplete, ZmtpHandshakeProgressX::IdentityReady))
 }

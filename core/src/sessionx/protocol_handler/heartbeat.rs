@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 pub(crate) struct ZmtpHandshakeStateX {
   pub sub_phase: super::HandshakeSubPhaseX,
   pub(crate) peer_socket_type: Option<String>,
+  /// Holds the peer's identity extracted from its READY command (server side only).
+  /// Persisted between `ServerReceivedReady` (read) and `Done` (send own READY) so that
+  /// a cancelled-and-restarted future does not lose the value.
+  pub(crate) peer_identity_from_ready: Option<crate::Blob>,
 }
 
 impl ZmtpHandshakeStateX {
@@ -20,6 +24,7 @@ impl ZmtpHandshakeStateX {
     Self {
       sub_phase: super::HandshakeSubPhaseX::GreetingExchange,
       peer_socket_type: None,
+      peer_identity_from_ready: None,
     }
   }
 }

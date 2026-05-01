@@ -165,6 +165,11 @@ where
 
     // --- Main Loop ---
     while self.current_phase != ConnectionPhaseX::Terminating {
+      if self.current_phase == ConnectionPhaseX::ShuttingDownStream {
+        self.perform_graceful_shutdown().await;
+        continue;
+      }
+
       let mut pong_timeout_future = futures::future::pending().left_future();
       if self.current_phase == ConnectionPhaseX::Operational
         && self.zmtp_handler.heartbeat_state.waiting_for_pong
@@ -185,11 +190,6 @@ where
 
       tokio::select! {
         biased;
-
-        // --- ARM 0: Shutdown Step ---
-         _ = async {}, if self.current_phase == ConnectionPhaseX::ShuttingDownStream => {
-            self.perform_graceful_shutdown().await;
-        }
 
         // --- ARM 1: Control Commands (AttachPipes, Stop) ---
         maybe_cmd = self.command_mailbox_receiver.recv(), if !matches!(self.current_phase, ConnectionPhaseX::Terminating) => {
@@ -221,11 +221,6 @@ where
             self.set_fatal_error(ZmqError::Timeout).await; // Specific handshake timeout error if desired
         }
 
-        // --- ARM 4: ZMTP Handshake Progression ---
-        _ = async {}, if self.current_phase == ConnectionPhaseX::HandshakeInProgress => {
-          self.handle_handshake_progression().await;
-        }
-
         // --- ARM 5: Ping Check Timer ---
         _ = async { self.ping_check_timer.as_mut().map_or(futures::future::pending().left_future(), |t| t.tick().right_future()).await },
             if self.current_phase == ConnectionPhaseX::Operational && self.ping_check_timer.is_some() => {
@@ -242,27 +237,29 @@ where
           }
         }
 
-        // --- ARM 6: Incoming Data (from Network to SocketCore) ---
-        maybe_parsed_frame = async { self.zmtp_handler.read_and_parse_data_frame().await },
-          if self.current_phase == ConnectionPhaseX::Operational && self.zmtp_handler.stream.is_some() => {
-          match maybe_parsed_frame {
-            Ok(Some(msg)) => {
-
+        // --- ARM: Network I/O (Handshake or Data) ---
+        network_res = self.zmtp_handler.do_network_read_work(self.current_phase),
+          if matches!(self.current_phase, ConnectionPhaseX::HandshakeInProgress | ConnectionPhaseX::Operational)
+            && self.zmtp_handler.stream.is_some() => {
+          match network_res {
+            Ok(crate::sessionx::protocol_handler::NetworkActionX::HandshakeProgress(progress)) => {
+              self.handle_handshake_progression(progress).await;
+            }
+            Ok(crate::sessionx::protocol_handler::NetworkActionX::DataFrame(Some(msg))) => {
               let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Ingress);
-
               self.handle_incoming_from_network(msg).await;
-
               if throttle_guard.should_throttle() {
                 yield_now().await;
               }
-
-            },
-            Ok(None) => { /* Not enough data yet */ }
+            }
+            Ok(crate::sessionx::protocol_handler::NetworkActionX::DataFrame(None)) => { /* Not enough data yet */ }
             Err(ZmqError::ConnectionClosed) => {
-              tracing::info!(sca_handle = self.handle, "Peer closed connection (data phase).");
+              tracing::info!(sca_handle = self.handle, "Peer closed connection.");
               self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
             }
-            Err(e) => self.set_fatal_error(e).await,
+            Err(e) => {
+              self.set_fatal_error(e).await;
+            }
           }
         }
 
@@ -427,42 +424,37 @@ where
     }
   }
 
-  async fn handle_handshake_progression(&mut self) {
+  async fn handle_handshake_progression(&mut self, progress: ZmtpHandshakeProgressX) {
     if self.current_phase != ConnectionPhaseX::HandshakeInProgress {
       return;
     }
 
-    match self.zmtp_handler.advance_handshake().await {
-      Ok(ZmtpHandshakeProgressX::InProgress) => {}
-      Ok(ZmtpHandshakeProgressX::IdentityReady(blob)) => {
+    match progress {
+      ZmtpHandshakeProgressX::InProgress => {}
+      ZmtpHandshakeProgressX::IdentityReady(blob) => {
         self.pending_peer_identity_from_handshake = Some(blob);
-        // Continue handshake if not yet complete overall
         if !self.zmtp_handler.is_handshake_complete() {
           return;
         }
-        // If complete, fall through to HandshakeComplete logic
       }
-      Ok(ZmtpHandshakeProgressX::HandshakeComplete) => {
-        // If IdentityReady was also emitted in the same step, pending_peer_identity_from_handshake is set.
-      }
-      Ok(ZmtpHandshakeProgressX::ProtocolError(s)) => {
+      ZmtpHandshakeProgressX::HandshakeComplete => {}
+      ZmtpHandshakeProgressX::ProtocolError(s) => {
         self.set_fatal_error(ZmqError::ProtocolViolation(s)).await;
-        return; // Error handled, no further progression this tick
+        return;
       }
-      Ok(ZmtpHandshakeProgressX::FatalError(e)) | Err(e) => {
+      ZmtpHandshakeProgressX::FatalError(e) => {
         self.set_fatal_error(e).await;
         return;
       }
     }
 
-    // Check if overall handshake is now complete
     if self.zmtp_handler.is_handshake_complete() {
       tracing::info!(
         sca_handle = self.handle,
         "Handshake complete via ZmtpProtocolHandlerX."
       );
       self.current_phase = ConnectionPhaseX::WaitingForPipes;
-      self.handshake_deadline = None; // Handshake done, clear deadline
+      self.handshake_deadline = None;
       self.check_and_transition_to_operational().await;
     }
   }

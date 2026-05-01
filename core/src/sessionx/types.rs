@@ -39,8 +39,16 @@ pub(crate) enum ZmtpHandshakeProgressX {
 /// Internal sub-phases for ZmtpProtocolHandlerX's handshake state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HandshakeSubPhaseX {
+  /// Sending our local greeting to the peer.
   GreetingExchange,
+  /// Greeting sent; waiting to receive the peer's greeting.
+  WaitingForGreeting,
   SecurityHandshake,
+  /// About to do READY exchange: client sends first, server receives first.
   ReadyExchange,
+  /// Client has sent its READY; waiting to receive the server's READY.
+  ClientSentReady,
+  /// Server has received the client's READY; needs to send its own READY.
+  ServerReceivedReady,
   Done,
 }

@@ -22,8 +22,13 @@ use tokio::io::AsyncWriteExt;
 use self::heartbeat::ZmtpHeartbeatStateX;
 #[cfg(target_os = "linux")]
 use super::cork::{TcpCorkInfoX, try_create_cork_info};
-use super::types::{HandshakeSubPhaseX, ZmtpHandshakeProgressX};
+use super::types::{ConnectionPhaseX, HandshakeSubPhaseX, ZmtpHandshakeProgressX};
 use heartbeat::ZmtpHandshakeStateX;
+
+pub(crate) enum NetworkActionX {
+  HandshakeProgress(ZmtpHandshakeProgressX),
+  DataFrame(Option<Msg>),
+}
 
 pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
   // --- Shared State accessible by sub-module functions via &self or &mut self ---
@@ -140,6 +145,25 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
   /// (data or command) during the operational data phase.
   pub(crate) async fn read_and_parse_data_frame(&mut self) -> Result<Option<Msg>, ZmqError> {
     data_io::read_data_frame_impl(self).await
+  }
+
+  /// Unified network read future suitable for use in a single `select!` arm.
+  /// Dispatches to handshake or data-frame reads based on current connection phase.
+  /// Returns `futures::future::pending()` for phases where no network read is needed,
+  /// so the arm is safely ignored by the scheduler.
+  pub(crate) async fn do_network_read_work(
+    &mut self,
+    phase: ConnectionPhaseX,
+  ) -> Result<NetworkActionX, ZmqError> {
+    match phase {
+      ConnectionPhaseX::HandshakeInProgress => {
+        self.advance_handshake().await.map(NetworkActionX::HandshakeProgress)
+      }
+      ConnectionPhaseX::Operational => {
+        self.read_and_parse_data_frame().await.map(NetworkActionX::DataFrame)
+      }
+      _ => futures::future::pending().await,
+    }
   }
 
   /// Frames, encrypts (if applicable), manages TCP_CORK, and writes a ZMTP message
