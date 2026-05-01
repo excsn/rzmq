@@ -97,6 +97,7 @@ impl ZmtpUringHandler {
         .map_or(Duration::from_secs(30), |ivl| ivl.saturating_mul(2))
     });
     let heartbeat_ivl_val = zmtp_config_arg.heartbeat_ivl;
+    let max_msg_size = zmtp_config_arg.max_msg_size;
 
     Self {
       fd,
@@ -106,7 +107,7 @@ impl ZmtpUringHandler {
       greeting_buffer: BytesMut::with_capacity(GREETING_LENGTH),
       network_read_accumulator: BytesMut::with_capacity(8192 * 2),
       security_mechanism: None,
-      framer: Box::new(NullFramer::new()),
+      framer: Box::new(NullFramer::new(max_msg_size)),
       last_activity_time: Instant::now(),
       last_ping_sent_time: None,
       waiting_for_pong: false,
@@ -541,7 +542,7 @@ impl ZmtpUringHandler {
               "INTERNAL ERROR: security_mechanism was Some but now None before take for transition",
             );
 
-            match taken_mechanism.into_framer() {
+            match taken_mechanism.into_framer(self.zmtp_config.max_msg_size) {
               Ok((new_framer, peer_id_opt)) => {
                 self.framer = new_framer;
                 if self.peer_identity_from_security.is_none() {
