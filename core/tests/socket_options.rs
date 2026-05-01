@@ -1,5 +1,5 @@
 use rzmq::{
-  socket::options::{LAST_ENDPOINT, LINGER, RCVHWM, SNDHWM},
+  socket::options::{LAST_ENDPOINT, LINGER, MAXMSGSIZE, RCVHWM, SNDHWM},
   Context, Msg, SocketType, ZmqError,
 };
 use std::time::Duration;
@@ -191,5 +191,31 @@ async fn test_option_last_endpoint_inproc() -> Result<(), ZmqError> {
   println!("Terminating context for inproc test...");
   ctx.term().await?;
   println!("--- Test test_option_last_endpoint_inproc Finished ---");
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_option_maxmsgsize_default_and_set() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  let pull = ctx.socket(SocketType::Pull)?;
+
+  // Default is -1 (unlimited)
+  let raw = pull.get_option(MAXMSGSIZE).await?;
+  let val = i64::from_ne_bytes(raw.try_into().expect("MAXMSGSIZE should be 8 bytes"));
+  assert_eq!(val, -1, "default MAXMSGSIZE should be -1");
+
+  // Set to 1024
+  pull.set_option_raw(MAXMSGSIZE, &1024i64.to_ne_bytes()).await?;
+  let raw2 = pull.get_option(MAXMSGSIZE).await?;
+  let val2 = i64::from_ne_bytes(raw2.try_into().unwrap());
+  assert_eq!(val2, 1024);
+
+  // Reset to unlimited
+  pull.set_option_raw(MAXMSGSIZE, &(-1i64).to_ne_bytes()).await?;
+  let raw3 = pull.get_option(MAXMSGSIZE).await?;
+  let val3 = i64::from_ne_bytes(raw3.try_into().unwrap());
+  assert_eq!(val3, -1);
+
+  ctx.term().await?;
   Ok(())
 }

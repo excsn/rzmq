@@ -286,6 +286,7 @@ Represents significant events occurring within a socket or its connections, used
 ### In `rzmq::socket::options`:
 
 Constants for socket option integer IDs.
+*   `pub const MAXMSGSIZE: i32 = 22` — maximum inbound frame size in bytes; value is `i64` (`-1` = unlimited, default)
 *   `pub const SNDHWM: i32 = 23`
 *   `pub const RCVHWM: i32 = 24`
 *   `pub const LINGER: i32 = 17`

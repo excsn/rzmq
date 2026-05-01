@@ -290,7 +290,7 @@ async fn perform_security_handshake_step_impl<S: ZmtpStdStream>(
       let mechanism_to_finalize =
         std::mem::replace(&mut handler.security_mechanism, Box::new(NullMechanism));
 
-      let (new_framer, id_opt) = mechanism_to_finalize.into_framer()?;
+      let (new_framer, id_opt) = mechanism_to_finalize.into_framer(handler.config.max_msg_size)?;
       handler.framer = new_framer;
 
       // Transition the main handshake state machine to the next phase.

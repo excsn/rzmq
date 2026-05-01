@@ -19,9 +19,9 @@ pub(crate) struct NullFramer {
 }
 
 impl NullFramer {
-  pub(crate) fn new() -> Self {
+  pub(crate) fn new(max_msg_size: i64) -> Self {
     Self {
-      parser: ZmtpManualParser::new(),
+      parser: ZmtpManualParser::new(max_msg_size),
     }
   }
 }
@@ -48,10 +48,10 @@ pub(crate) struct LengthPrefixedFramer {
 }
 
 impl LengthPrefixedFramer {
-  pub(crate) fn new(cipher: Box<dyn IDataCipher>) -> Self {
+  pub(crate) fn new(cipher: Box<dyn IDataCipher>, max_msg_size: i64) -> Self {
     Self {
       cipher,
-      parser: ZmtpManualParser::new(),
+      parser: ZmtpManualParser::new(max_msg_size),
       decrypted_buffer: BytesMut::with_capacity(65536 * 2),
     }
   }

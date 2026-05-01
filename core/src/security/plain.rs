@@ -339,13 +339,12 @@ impl Mechanism for PlainMechanism {
     Ok(())
   }
 
-  fn into_framer(self: Box<Self>) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
+  fn into_framer(self: Box<Self>, max_msg_size: i64) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     if self.status() != MechanismStatus::Ready {
       return Err(ZmqError::InvalidState(
         "PLAIN handshake not complete.".into(),
       ));
     }
-    // For PLAIN, the framer is a passthrough (NullFramer) and the identity is the username.
-    Ok((Box::new(NullFramer::new()), self.username.clone()))
+    Ok((Box::new(NullFramer::new(max_msg_size)), self.username.clone()))
   }
 }

@@ -4,6 +4,10 @@ use crate::protocol::zmtp::command::*;
 use bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
+/// Hard cap applied in the codec decode path (not the live framer path).
+/// Prevents the allocator panic when the fuzzer sends a long-frame header with size ≈ u64::MAX.
+const CODEC_MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
+
 /// Codec for ZMTP/3.1 message framing.
 #[derive(Debug, Default)]
 pub struct ZmtpCodec {
@@ -185,15 +189,20 @@ impl Decoder for ZmtpCodec {
           let header_bytes = src.split_to(header_len);
           let flags = header_bytes[0]; // Consume flags byte
 
-          // Read length
-          let size = if is_long {
-            // Read u64 length (network byte order)
-            let mut len_bytes = &header_bytes[1..]; // Slice starting after flags
-            len_bytes.get_u64() as usize
+          // Read length — check raw u64 before cast to prevent allocator panic
+          let raw_size = if is_long {
+            let mut len_bytes = &header_bytes[1..];
+            len_bytes.get_u64()
           } else {
-            // Read u8 length
-            header_bytes[1] as usize
+            header_bytes[1] as u64
           };
+          if raw_size > CODEC_MAX_FRAME_SIZE {
+            return Err(ZmqError::ProtocolViolation(format!(
+              "codec: frame size {} exceeds hard cap of {} bytes",
+              raw_size, CODEC_MAX_FRAME_SIZE
+            )));
+          }
+          let size = raw_size as usize;
 
           // Store header info and move to ReadBody state
           let header = FrameHeader { flags, size };

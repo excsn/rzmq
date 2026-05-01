@@ -484,6 +484,7 @@ impl Mechanism for NoiseXxMechanism {
 
   fn into_framer(
     mut self: Box<Self>,
+    max_msg_size: i64,
   ) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     if self.current_status != MechanismStatus::Ready {
       return Err(ZmqError::InvalidState(
@@ -491,12 +492,8 @@ impl Mechanism for NoiseXxMechanism {
       ));
     }
 
-    // The into_data_cipher method consumes the mechanism to produce the cipher.
-    // We can call it here to get the parts.
     let (cipher, peer_id) = self.into_data_cipher()?;
-
-    // Wrap the pure cipher in the framer.
-    let framer = Box::new(LengthPrefixedFramer::new(cipher));
+    let framer = Box::new(LengthPrefixedFramer::new(cipher, max_msg_size));
 
     Ok((framer, peer_id))
   }

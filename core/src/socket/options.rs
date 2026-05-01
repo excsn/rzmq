@@ -45,6 +45,7 @@ pub const CURVE_SERVER: i32 = 47; // Matches libzmq's ZMQ_CURVE_SERVER
 pub const CURVE_SECRET_KEY: i32 = 49; // Matches libzmq's ZMQ_CURVE_SECRETKEY
 pub const CURVE_SERVER_KEY: i32 = 48; // Matches libzmq's ZMQ_CURVE_SERVERKEY
 
+pub const MAXMSGSIZE: i32 = 22;
 pub const MAX_CONNECTIONS: i32 = 1000;
 
 // IO Uring Options
@@ -85,6 +86,8 @@ pub(crate) struct SocketOptions {
   pub tcp_keepalive_interval: Option<Duration>,
   pub tcp_nodelay: bool, // Usually enabled by default
   pub max_connections: Option<usize>,
+  /// Maximum inbound frame size in bytes. -1 means unlimited.
+  pub maxmsgsize: i64,
 
   /// Interval between sending ZMTP PING probes if no traffic received.
   /// `None` disables PINGs.
@@ -129,6 +132,7 @@ impl Default for SocketOptions {
       tcp_keepalive_interval: None,
       tcp_nodelay: true, // Common default for messaging
       max_connections: Some(1024),
+      maxmsgsize: -1,      // -1 = unlimited
       heartbeat_ivl: None, // Disabled by default
       heartbeat_timeout: None,
       handshake_ivl: None,
@@ -231,6 +235,8 @@ pub(crate) struct ZmtpEngineConfig {
   pub use_plain: bool,
   pub plain_username_for_engine: Option<String>,
   pub plain_password_for_engine: Option<String>,
+  /// Maximum inbound frame size in bytes. -1 means unlimited.
+  pub max_msg_size: i64,
 }
 
 impl From<&SocketOptions> for ZmtpEngineConfig {
@@ -277,6 +283,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       use_plain: options.plain_options.enabled,
       plain_username_for_engine: options.plain_options.username.clone(),
       plain_password_for_engine: options.plain_options.password.clone(),
+      max_msg_size: options.maxmsgsize,
     }
   }
 }
@@ -418,6 +425,18 @@ pub(crate) fn parse_reconnect_ivl_max_option(value: &[u8]) -> Result<Option<Dura
   }
 }
 
+/// Parses ZMQ_MAXMSGSIZE: accepts -1 (unlimited) or any non-negative i64.
+pub(crate) fn parse_maxmsgsize_option(value: &[u8]) -> Result<i64, ZmqError> {
+  let arr: [u8; 8] = value
+    .try_into()
+    .map_err(|_| ZmqError::InvalidOptionValue(MAXMSGSIZE))?;
+  let v = i64::from_ne_bytes(arr);
+  if v < -1 {
+    return Err(ZmqError::InvalidOptionValue(MAXMSGSIZE));
+  }
+  Ok(v)
+}
+
 pub(crate) fn parse_max_connections_option(
   value: &[u8],
   option_id: i32,
@@ -494,6 +513,7 @@ pub(crate) fn apply_core_option_value(
         HEARTBEAT_IVL => options.heartbeat_ivl = parse_heartbeat_option(value, option_id)?,
         HEARTBEAT_TIMEOUT => options.heartbeat_timeout = parse_heartbeat_option(value, option_id)?,
         HANDSHAKE_IVL => options.handshake_ivl = parse_handshake_option(value, option_id)?,
+        MAXMSGSIZE => options.maxmsgsize = parse_maxmsgsize_option(value)?,
         MAX_CONNECTIONS => options.max_connections = parse_max_connections_option(value, option_id)?,
         TCP_CORK => options.tcp_cork = parse_bool_option(value)?,
         ZAP_DOMAIN => options.zap_domain = Some(parse_string_option(value, option_id)?),
@@ -574,6 +594,7 @@ pub(crate) fn retrieve_core_option_value(
         HEARTBEAT_IVL => Ok(options.heartbeat_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
         HEARTBEAT_TIMEOUT => Ok(options.heartbeat_timeout.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
         HANDSHAKE_IVL => Ok(options.handshake_ivl.map_or(0, |d| d.as_millis() as i32).to_ne_bytes().to_vec()),
+        MAXMSGSIZE => Ok(options.maxmsgsize.to_ne_bytes().to_vec()),
         MAX_CONNECTIONS => Ok(options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
         TCP_CORK => Ok((options.tcp_cork as i32).to_ne_bytes().to_vec()),
         ZAP_DOMAIN => options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option ZAP_DOMAIN not set".into())),

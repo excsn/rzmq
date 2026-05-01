@@ -51,8 +51,7 @@ impl Mechanism for NullMechanism {
     Ok(())
   }
 
-  fn into_framer(self: Box<Self>) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
-    // For PLAIN, the second tuple element would be self.username.clone()
-    Ok((Box::new(NullFramer::new()), None))
+  fn into_framer(self: Box<Self>, max_msg_size: i64) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
+    Ok((Box::new(NullFramer::new(max_msg_size)), None))
   }
 }

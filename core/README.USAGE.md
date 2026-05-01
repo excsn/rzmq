@@ -334,6 +334,22 @@ async fn set_auto_delimiter_example(socket: &rzmq::Socket) -> Result<(), ZmqErro
     Ok(())
 }
 ```
+Example: Setting `MAXMSGSIZE` (maximum inbound frame size)
+```rust
+use rzmq::socket::MAXMSGSIZE;
+async fn set_maxmsgsize_example(socket: &rzmq::Socket) -> Result<(), rzmq::ZmqError> {
+    // Reject any inbound frame larger than 1 MiB
+    let limit: i64 = 1024 * 1024;
+    socket.set_option_raw(MAXMSGSIZE, &limit.to_ne_bytes()).await?;
+
+    // Restore the default (unlimited)
+    socket.set_option_raw(MAXMSGSIZE, &(-1i64).to_ne_bytes()).await?;
+    Ok(())
+}
+```
+The value is an `i64` (8 bytes, native-endian). `-1` means unlimited and is the default. A peer that
+sends a frame exceeding the limit will have its connection dropped with a protocol violation.
+
 Example: Setting `SNDTIMEO` (send timeout)
 ```rust
 use rzmq::socket::SNDTIMEO;

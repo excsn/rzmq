@@ -85,6 +85,6 @@ pub trait Mechanism: Send + Sync + fmt::Debug + 'static {
   /// specific indicator that no cipher is needed (engine then uses raw stream).
   /// For simplicity, let's have it always return a Result. Non-encrypting mechanisms
   /// would return a pass-through cipher.
-fn into_framer(self: Box<Self>) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError>;
+fn into_framer(self: Box<Self>, max_msg_size: i64) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError>;
   
 }

@@ -80,7 +80,7 @@ impl Mechanism for CurveMechanism {
     }
   }
 
-  fn into_framer(self: Box<Self>) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
+  fn into_framer(self: Box<Self>, max_msg_size: i64) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     if self.status != MechanismStatus::Ready {
       return Err(ZmqError::InvalidState("Curve handshake is not complete."));
     }
@@ -91,11 +91,8 @@ impl Mechanism for CurveMechanism {
       .as_ref()
       .map(|pk| pk.as_slice().to_vec());
 
-    // 1. Get the pure cipher from the completed handshake
     let cipher = self.handshake.into_data_cipher()?;
-
-    // 2. Wrap the cipher in the LengthPrefixedFramer
-    let framer = Box::new(LengthPrefixedFramer::new(cipher));
+    let framer = Box::new(LengthPrefixedFramer::new(cipher, max_msg_size));
 
     Ok((framer, peer_identity))
   }

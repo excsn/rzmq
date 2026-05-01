@@ -98,6 +98,7 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
         ivl.max(Duration::from_millis(100))
       })
     });
+    let max_msg_size = config.max_msg_size;
 
     #[cfg(target_os = "linux")]
     let cork_info_val = {
@@ -118,8 +119,8 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
       handshake_state: ZmtpHandshakeStateX::new(),
       security_mechanism: Box::new(NullMechanism),
       pending_peer_greeting: None,
-      zmtp_manual_parser: ZmtpManualParser::new(),
-      framer: Box::new(NullFramer::new()),
+      zmtp_manual_parser: ZmtpManualParser::new(max_msg_size),
+      framer: Box::new(NullFramer::new(max_msg_size)),
       heartbeat_state: ZmtpHeartbeatStateX::new(
         heartbeat_ivl_from_config,
         effective_timeout_corrected,
@@ -264,6 +265,6 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     }
     
     // Reset framer to free any internal state
-    self.framer = Box::new(NullFramer::new());
+    self.framer = Box::new(NullFramer::new(self.config.max_msg_size));
   }
 }
