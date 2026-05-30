@@ -18,7 +18,7 @@ full = ["default", "ipc", "inproc", "plain", "noise_xx", "curve"]
 full-linux = ["full", "io-uring"]
 default = ["ipc", "inproc", "plain"]
 
-io-uring = ["dep:eventfd", "dep:io-uring", "dep:io_uring_buf_ring"]
+io-uring = ["dep:eventfd", "dep:io-uring", "dep:io_uring_buf_ring", "dep:dryoc"]
 noise_xx = ["dep:snow", "dep:x25519-dalek"]
 curve = ["dep:dryoc"]
 ipc = []

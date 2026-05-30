@@ -126,10 +126,11 @@ impl UringFdConnection {
 #[async_trait]
 impl ISocketConnection for UringFdConnection {
   
-  /// This method is now effectively synchronous, wrapping the non-blocking `try_send`.
-  /// The `async` keyword is only here to satisfy the trait definition.
   async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
-    self.send_multipart_sync(msgs)
+    match self.mpsc_tx.send(Arc::new(msgs)).await {
+      Ok(()) => Ok(()),
+      Err(_) => Err(ZmqError::ConnectionClosed),
+    }
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
