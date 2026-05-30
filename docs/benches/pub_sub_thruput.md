@@ -1,4 +1,4 @@
-# Pub‑Sub Benchmark: `Scalability_Throughput`
+# Pub-Sub Benchmark: `Scalability_Throughput`
 
 **Test Machine:** Macbook M4 Pro
 
@@ -6,29 +6,29 @@
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-1_MsgSize-64_NumMessages-5000`
 
-* **Time:** 11.626 ms - 11.690 ms - 11.783 ms
+* **Time:** 10.138 ms - 10.277 ms - 10.505 ms
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-1_MsgSize-1024_NumMessages-5000`
 
-* **Time:** 12.256 ms - 12.368 ms - 12.489 ms
-* **Throughput:** 24.435 MiB/s - 24.676 MiB/s - 24.899 MiB/s
+* **Time:** 11.382 ms - 11.465 ms - 11.539 ms
+* **Throughput:** 26.448 MiB/s - 26.618 MiB/s - 26.813 MiB/s
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-4_MsgSize-64_NumMessages-5000`
 
-* **Time:** 75.813 ms - 77.422 ms - 79.200 ms
-* **Throughput:** 61.652 MiB/s - 63.067 MiB/s - 64.406 MiB/s
+* **Time:** 72.408 ms - 72.612 ms - 72.799 ms
+* **Throughput:** 67.072 MiB/s - 67.246 MiB/s - 67.435 MiB/s
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-4_MsgSize-1024_NumMessages-5000`
 
-* **Time:** 73.110 ms - 74.850 ms - 77.267 ms
-* **Throughput:** 15.799 MiB/s - 16.309 MiB/s - 16.697 MiB/s
+* **Time:** 72.011 ms - 72.441 ms - 72.866 ms
+* **Throughput:** 16.753 MiB/s - 16.851 MiB/s - 16.952 MiB/s
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-8_MsgSize-64_NumMessages-5000`
 
-* **Time:** 153.51 ms - 158.30 ms - 163.16 ms
-* **Throughput:** 119.71 MiB/s - 123.38 MiB/s - 127.23 MiB/s
+* **Time:** 158.76 ms - 159.59 ms - 160.38 ms
+* **Throughput:** 121.78 MiB/s - 122.38 MiB/s - 123.02 MiB/s
 
 ### `PUB_SUB_Scalability_Throughput/NumSubscribers-8_MsgSize-1024_NumMessages-5000`
 
-* **Time:** 146.93 ms - 150.64 ms - 156.12 ms
-* **Throughput:** 15.638 MiB/s - 16.207 MiB/s - 16.616 MiB/s
+* **Time:** 160.49 ms - 160.94 ms - 161.59 ms
+* **Throughput:** 15.109 MiB/s - 15.170 MiB/s - 15.213 MiB/s
