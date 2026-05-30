@@ -37,7 +37,7 @@ pub async fn run(args: Cli) -> Result<(), ZmqError> {
   ];
 
   if args.cork {
-    base_args.push("--cork=true".to_string());
+    base_args.push("--cork".to_string()); // FIXED: Just pass the flag name
   }
   if let Some(msg_count) = args.messages {
     base_args.push(format!("--messages={}", msg_count));
@@ -49,13 +49,13 @@ pub async fn run(args: Cli) -> Result<(), ZmqError> {
   #[cfg(feature = "io-uring")]
   {
     if args.use_io_uring {
-      base_args.push("--use-io-uring=true".to_string());
+      base_args.push("--use-io-uring".to_string()); // FIXED
     }
     if args.uring_zerocopy {
-      base_args.push("--uring-zerocopy=true".to_string());
+      base_args.push("--uring-zerocopy".to_string()); // FIXED
     }
     if args.uring_multishot {
-      base_args.push("--uring-multishot=true".to_string());
+      base_args.push("--uring-multishot".to_string()); // FIXED
     }
   }
 
