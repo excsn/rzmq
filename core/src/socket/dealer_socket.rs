@@ -320,14 +320,6 @@ impl DealerSocket {
     // The DEALER application should see app_payload_frames.
 
     // We need to determine if the first frame is an identity (non-empty) or a delimiter (empty).
-    // This is inherently ambiguous for a DEALER as it doesn't know its peer type.
-    // However, the ZMQ spec implies that the DEALER socket itself handles stripping
-    // its own identity if present, and always strips the first empty delimiter before payload.
-
-    // For rzmq, the 'identity_of_this_dealer' is a ZMTP routing detail.
-    // The ISocketConnection would have received it. If it's part of the `frames` here,
-    // it means it was part of the ZMTP message on the wire for this specific connection.
-    // Let's assume if the first frame is NOT empty, it's an identity from a ROUTER and should be stripped.
     if frames[0].size() != 0 {
       // Assume it's an identity frame sent by a ROUTER, discard it.
       tracing::trace!(
@@ -509,7 +501,7 @@ impl ISocket for DealerSocket {
     let sndtimeo_opt = { self.core.core_state.read().options.sndtimeo };
 
     loop {
-      let mut transaction_guard = self.current_send_transaction.lock().await;
+      let transaction_guard = self.current_send_transaction.lock().await;
       match &*transaction_guard {
         DealerSendTransaction::Idle => {
           drop(transaction_guard);
@@ -666,7 +658,7 @@ impl ISocket for DealerSocket {
     _pipe_write_id: usize,
     _peer_identity: Option<&[u8]>,
   ) {
-    let (endpoint_uri_opt, connection_id_opt) = {
+    let (endpoint_uri_opt, _connection_id_opt) = {
       let core_s_read = self.core.core_state.read();
       let uri = core_s_read
         .pipe_read_id_to_endpoint_uri

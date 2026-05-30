@@ -109,10 +109,6 @@ impl ISocketConnection for ScaConnectionIface {
       })
   }
 
-  fn get_connection_id(&self) -> usize {
-    self.sca_handle_id
-  }
-
   fn as_any(&self) -> &dyn std::any::Any {
     self
   }

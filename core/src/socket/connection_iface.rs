@@ -5,7 +5,6 @@ use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::message::Msg;
 use crate::runtime::SystemEvent;
-use crate::runtime::{command::Command, mailbox::MailboxSender as SessionMailboxSender};
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
 use crate::socket::SocketEvent;
@@ -18,6 +17,7 @@ use std::fmt;
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
+#[cfg(feature = "io-uring")]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,7 +42,6 @@ pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
   async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError>;
 
   async fn close_connection(&self) -> Result<(), ZmqError>;
-  fn get_connection_id(&self) -> usize;
   fn as_any(&self) -> &dyn Any;
 }
 
@@ -65,10 +64,6 @@ impl ISocketConnection for DummyConnection {
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
     Ok(())
-  }
-
-  fn get_connection_id(&self) -> usize {
-    0
   }
 
   fn as_any(&self) -> &dyn Any {
@@ -160,9 +155,6 @@ impl ISocketConnection for UringFdConnection {
     }
   }
 
-  fn get_connection_id(&self) -> usize {
-    self.fd as usize
-  }
   fn as_any(&self) -> &dyn Any {
     self
   }
@@ -309,9 +301,7 @@ impl ISocketConnection for InprocConnection {
     }
     Ok(())
   }
-  fn get_connection_id(&self) -> usize {
-    self.connection_id
-  }
+  
   fn as_any(&self) -> &dyn Any {
     self
   }

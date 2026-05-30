@@ -11,7 +11,6 @@ pub mod types;
 
 pub(crate) mod connection_iface;
 
-// Declare modules for each specific socket type implementation (ISocket trait implementors).
 pub mod dealer_socket;
 pub mod pub_socket;
 pub mod pull_socket;
@@ -21,19 +20,17 @@ pub mod req_socket;
 pub mod router_socket;
 pub mod sub_socket;
 
-// Import necessary types from other modules within the crate.
-use crate::context::Context; // For `create_socket_actor`.
-use crate::error::{ZmqError, ZmqResult}; // For `Result` types in API methods.
-use crate::message::Msg; // For `send`/`recv` message types.
-use crate::runtime::{Command, MailboxSender}; // For actor communication.
-use crate::socket::options::SocketOptions; // For initial socket configuration.
+use crate::context::Context;
+use crate::error::{ZmqError, ZmqResult};
+use crate::message::Msg;
+use crate::runtime::{Command, MailboxSender};
+use crate::socket::options::SocketOptions;
 
-// Import specific socket pattern implementations.
-use crate::socket::core::SocketCore; // The core actor logic.
+use crate::socket::core::SocketCore;
 use crate::Blob;
 
-use async_trait::async_trait; // For defining asynchronous traits.
-use std::sync::Arc; // For shared ownership of `SocketCore`.
+use async_trait::async_trait;
+use std::sync::Arc;
 
 /// Helper macro to implement API methods that send a command to `SocketCore`'s mailbox
 /// and await a `oneshot` reply. This reduces boilerplate in `ISocket` implementations.
@@ -204,7 +201,7 @@ pub trait ISocket: Send + Sync + 'static {
 // Re-export types from sub-modules for easier access at `rzmq::socket::*`.
 pub use events::{MonitorReceiver, MonitorSender, SocketEvent, DEFAULT_MONITOR_CAPACITY};
 pub use options::*; // Re-export all socket option constants (e.g., SNDHWM).
-pub use types::{Socket, SocketType}; // Re-export the public Socket handle and SocketType enum.
+pub use types::{Socket, SocketType};
 
 /// Internal factory function to create and spawn the `SocketCore` actor and its
 /// associated `ISocket` pattern implementation.
@@ -223,6 +220,3 @@ pub(crate) fn create_socket_actor(
   // Delegate to SocketCore's factory method.
   SocketCore::create_and_spawn(handle, ctx, socket_type, initial_options)
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SourcePipeReadId(usize);
