@@ -592,6 +592,12 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
         // --- PHASE 4 & 5: SUBMIT AND IDLE ---
         profiler.mark_segment_end_and_start_new("submit_and_idle");
+
+        {
+          let mut sq = unsafe { worker.ring.submission_shared() };
+          worker.event_fd_poller.try_submit_initial_poll_sqe(&mut sq);
+        }
+        
         let sq_len = unsafe { worker.ring.submission_shared().len() };
         let mut sqes_submitted_to_kernel_this_batch = 0;
         let needs_wait = !work_was_available

@@ -86,9 +86,10 @@ impl SignalingOpSender {
     self.op_tx.len()
   }
 
-  // Note: Other methods like `send_blocking` or `send_timeout` from Sender
-  // would need to be implemented here if they are intended to be used through SignalingOpSender,
-  // each also signaling the event_fd on success. For now, focusing on `send` (async) and `try_send`.
+  /// Clones the underlying EventFD to be shared across data connections.
+  pub fn clone_event_fd(&self) -> eventfd::EventFD {
+    self.event_fd.clone()
+  }
 }
 
 // Optional: Implement Debug manually if EventFD's Debug is not available or desired.

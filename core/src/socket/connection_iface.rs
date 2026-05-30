@@ -15,7 +15,7 @@ use crate::Context;
 use std::any::Any;
 use std::fmt;
 #[cfg(feature = "io-uring")]
-use std::os::unix::io::RawFd;
+use std::os::{fd::AsRawFd, unix::io::RawFd};
 use std::sync::Arc;
 #[cfg(feature = "io-uring")]
 use std::time::Duration;
@@ -74,8 +74,8 @@ impl ISocketConnection for DummyConnection {
 #[cfg(feature = "io-uring")]
 pub(crate) struct UringFdConnection {
   fd: RawFd,
-  // The application pushes messages here.
   mpsc_tx: mpsc::BoundedAsyncSender<Arc<Vec<Msg>>>,
+  event_fd: eventfd::EventFD,
   context: Context,
 }
 
@@ -85,6 +85,7 @@ impl fmt::Debug for UringFdConnection {
     f.debug_struct("UringFdConnection")
       .field("fd", &self.fd)
       .field("mpsc_tx_is_closed", &self.mpsc_tx.is_closed())
+      .field("event_fd_raw", &self.event_fd.as_raw_fd())
       .field("context_present", &true)
       .finish()
   }
@@ -95,29 +96,14 @@ impl UringFdConnection {
   pub(crate) fn new(
     fd: RawFd,
     mpsc_tx: mpsc::BoundedAsyncSender<Arc<Vec<Msg>>>,
+    event_fd: eventfd::EventFD,
     context: Context,
   ) -> Self {
     Self {
       fd,
       mpsc_tx,
+      event_fd,
       context,
-    }
-  }
-
-  /// Synchronously and non-blockingly attempts to send a multipart message.
-  /// This is the primary method for sending data on this connection type.
-  pub fn send_multipart_sync(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
-    match self.mpsc_tx.try_send(Arc::new(msgs)) {
-      Ok(()) => Ok(()),
-      Err(TrySendError::Full(_)) => {
-        // This is the expected backpressure signal when the worker can't keep up.
-        Err(ZmqError::ResourceLimitReached)
-      }
-      Err(TrySendError::Closed(_)) => {
-        // The worker has dropped the receiver, meaning the connection is dead.
-        Err(ZmqError::ConnectionClosed)
-      }
-      _ => unreachable!(),
     }
   }
 }
@@ -128,7 +114,16 @@ impl ISocketConnection for UringFdConnection {
   
   async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
     match self.mpsc_tx.send(Arc::new(msgs)).await {
-      Ok(()) => Ok(()),
+      Ok(()) => {
+        // Coalesced Signaling: Only execute the eventfd write syscall if the queue 
+        // was empty before our write, indicating the worker might be asleep.
+        if self.mpsc_tx.len() <= 1 {
+          if let Err(e) = self.event_fd.write(1) {
+            tracing::error!("UringFdConnection: Failed to signal eventfd: {}", e);
+          }
+        }
+        Ok(())
+      }
       Err(_) => Err(ZmqError::ConnectionClosed),
     }
   }
