@@ -1,0 +1,44 @@
+[package]
+name = "rzmq_bench"
+version = "0.1.0"
+edition = "2024"
+authors = { workspace = true }
+description = "A dedicated multi-process benchmarking tool for rzmq"
+publish = false
+
+[dependencies]
+# Local workspace dependencies
+rzmq = { path = "../core" }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Command-line interface parsing
+clap = { version = "4.4", features = ["derive"] }
+
+# High-fidelity latency tracking
+hdrhistogram = "7.5"
+
+# Binary and buffer handling
+bytes = "1.5"
+
+# Platform-agnostic utilities (such as CPU affinity/pinning)
+nix = { version = "0.27", features = ["sched"] }
+
+# Serialization for structured benchmark outputs
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging and diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+full = []
+default = []
+# Propagates the io-uring feature to rzmq for conditional compilation on Linux
+io-uring = ["rzmq/io-uring"]
+
+[[bin]]
+name = "rzmq_bench"
+path = "src/main.rs"
