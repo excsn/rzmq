@@ -121,7 +121,7 @@ impl ISocket for ReqSocket {
       let current_state_guard = self.state.lock();
       if !matches!(*current_state_guard, ReqState::ReadyToSend) {
         return Err(ZmqError::InvalidState(
-          "REQ socket must call send() before sending again",
+          "REQ socket must call recv() before sending again",
         ));
       }
     }
@@ -428,9 +428,6 @@ impl ISocket for ReqSocket {
                   *state_guard_err = ReqState::ReadyToSend;
                 }
                 self.reply_available_notifier.notify_waiters();
-              } else {
-                // Successfully queued item, notify any waiting recv/recv_multipart.
-                self.reply_available_notifier.notify_one();
               }
             }
             Err(e) => {
@@ -534,5 +531,92 @@ impl ISocket for ReqSocket {
       .incoming_orchestrator
       .clear_pipe_state(pipe_read_id)
       .await;
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::Context;
+  use crate::socket::options::SocketOptions;
+  use crate::socket::types::SocketType;
+  use std::sync::Arc;
+
+  #[tokio::test]
+  async fn test_req_socket_no_stale_notifier() {
+    let context = Context::new().unwrap();
+    let handle = context.inner().next_handle();
+    let core_state =
+      crate::socket::core::CoreState::new(handle, SocketType::Req, SocketOptions::default());
+
+    // Instantiate a minimal SocketCore to satisfy the ReqSocket constructor
+    let core = Arc::new(crate::socket::core::SocketCore {
+      handle,
+      context: context.clone(),
+      command_sender: fibre::mpmc::bounded_async(1).0, // Dummy sender
+      core_state: parking_lot::RwLock::new(core_state),
+      socket_logic: tokio::sync::RwLock::new(None),
+      shutdown_coordinator: tokio::sync::Mutex::new(
+        crate::socket::core::state::ShutdownCoordinator::default(),
+      ),
+    });
+
+    let req_socket = ReqSocket::new(core);
+    let target_uri = "tcp://127.0.0.1:19876".to_string();
+
+    // Map the pipe read ID to the endpoint URI so handle_pipe_event can resolve the source
+    req_socket
+      .pipe_read_to_endpoint_uri
+      .write()
+      .insert(1, target_uri.clone());
+
+    // 1. Set state to ExpectingReply (simulates a completed send)
+    {
+      let mut state_guard = req_socket.state.lock();
+      *state_guard = ReqState::ExpectingReply {
+        target_endpoint_uri: target_uri.clone(),
+      };
+    }
+
+    // 2. Simulate the arrival of a ZMTP reply message via the real handle_pipe_event pathway
+    let reply_msg = Msg::from_static(b"reply");
+    req_socket
+      .handle_pipe_event(
+        1,
+        Command::PipeMessageReceived {
+          pipe_id: 1,
+          msg: reply_msg,
+        },
+      )
+      .await
+      .unwrap();
+
+    // 3. Consume the message
+    let recv_result = req_socket.recv().await;
+    assert!(recv_result.is_ok());
+    assert_eq!(recv_result.unwrap().data().unwrap(), b"reply");
+
+    // 4. Set state back to ExpectingReply (simulating the next send)
+    {
+      let mut state_guard = req_socket.state.lock();
+      *state_guard = ReqState::ExpectingReply {
+        target_endpoint_uri: target_uri,
+      };
+    }
+
+    // 5. Verify that no stale permit was left in the notifier.
+    // Awaiting notified() must timeout if no stale permit is present.
+    let notify_check = tokio::time::timeout(
+      Duration::from_millis(50),
+      req_socket.reply_available_notifier.notified(),
+    )
+    .await;
+
+    // If the fix is correct, we expect a Timeout (meaning the notification check timed out).
+    // If the bug is still present, the stale permit would cause notified() to resolve instantly.
+    assert!(
+      notify_check.is_err(),
+      "Bug present: A stale permit was deposited in the notifier during a normal message cycle!"
+    );
   }
 }
