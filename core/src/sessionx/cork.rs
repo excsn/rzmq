@@ -61,7 +61,7 @@ impl TcpCorkInfoX {
   /// * `enable`: `true` to enable `TCP_CORK`, `false` to disable it.
   /// * `actor_handle`: The handle of the calling actor, for logging purposes.
   ///
-  /// This operation is performed in a blocking Tokio task because `socket2`'s
+  /// This operation is performed in a blocking Tokio task because `socket2`s
   /// `set tcp cork` is a blocking syscall.
   pub(crate) async fn apply_cork_state(&mut self, enable: bool, actor_handle: usize) {
     if self.is_corked == enable {
@@ -77,64 +77,37 @@ impl TcpCorkInfoX {
       "Attempting to set TCP_CORK"
     );
 
-    let dup_fd = unsafe { libc::dup(fd_to_cork) };
-    if dup_fd < 0 {
-      // Log the OS error and return early, instead of trying to return an Err.
-      let e = std::io::Error::last_os_error();
-      tracing::error!(
+    let optval: libc::c_int = if enable { 1 } else { 0 };
+
+    // Perform the setsockopt synchronously directly on the raw file descriptor.
+    // This executes in the nanosecond range and eliminates thread spawning overhead.
+    let res = unsafe {
+      libc::setsockopt(
+        fd_to_cork,
+        libc::IPPROTO_TCP,
+        libc::TCP_CORK,
+        &optval as *const _ as *const libc::c_void,
+        std::mem::size_of_val(&optval) as libc::socklen_t,
+      )
+    };
+
+    if res == 0 {
+      tracing::debug!(
         sca_handle = actor_handle,
         fd = fd_to_cork,
-        error = %e,
-        "Failed to duplicate file descriptor for TCP_CORK operation. Aborting cork change."
+        cork_enable = enable,
+        "TCP_CORK successfully {}set",
+        if enable { "" } else { "un" }
       );
-      return; // Abort the operation.
-    }
-
-    let res = tokio::task::spawn_blocking(move || {
-      let socket = unsafe { socket2::Socket::from_raw_fd(dup_fd) };
-
-      let result = socket.set_tcp_cork(enable);
-      result
-    })
-    .await;
-
-    match res {
-      Ok(Ok(())) => {
-        tracing::debug!(
-          sca_handle = actor_handle,
-          fd = fd_to_cork,
-          cork_enable = enable,
-          "TCP_CORK successfully {}set",
-          if enable { "" } else { "un" }
-        );
-        self.is_corked = enable;
-      }
-      Ok(Err(e)) => {
-        tracing::warn!(
-          sca_handle = actor_handle,
-          fd = fd_to_cork,
-          cork_enable = enable,
-          error = %e, "Failed to set TCP_CORK socket option"
-        );
-        // If setting cork failed, we should probably assume it's not in the desired state.
-        // If enable=true failed, is_corked remains false.
-        // If enable=false failed, is_corked might still be true (undesirable).
-        // For robustness, if an attempt to change state fails, reflect that accurately.
-        // However, setting cork is unlikely to fail when disabling if it was previously enabled,
-        // unless the FD became invalid.
-        // If we failed to enable, self.is_corked is already false.
-        // If we failed to disable, it means self.is_corked was true, and we couldn't change it.
-        // This state might be problematic. For now, we just log.
-      }
-      Err(join_err) => {
-        // This is a Tokio JoinError, meaning the spawn_blocking task panicked.
-        tracing::error!(
-          sca_handle = actor_handle,
-          fd = fd_to_cork,
-          cork_enable = enable,
-          error = %join_err, "Task for setting TCP_CORK panicked"
-        );
-      }
+      self.is_corked = enable;
+    } else {
+      let e = std::io::Error::last_os_error();
+      tracing::warn!(
+        sca_handle = actor_handle,
+        fd = fd_to_cork,
+        cork_enable = enable,
+        error = %e, "Failed to set TCP_CORK socket option"
+      );
     }
   }
 }

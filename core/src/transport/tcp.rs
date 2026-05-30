@@ -345,29 +345,32 @@ impl TcpListener {
             let socket_logic = socket_logic.clone();
 
             async move {
-              let max_connection_permit = _permit_guard; 
+              let max_connection_permit = _permit_guard;
 
               let mut connection_iface_for_event: Option<Arc<dyn ISocketConnection>> = None;
               let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
               let mut managing_actor_task_id_for_event: Option<TaskId> = None;
               let mut setup_successful = true;
-              let mut sca_or_session_join_handle_opt: Option<JoinHandle<()>> = None;
 
               if use_io_uring_for_session {
                 #[cfg(feature = "io-uring")]
                 {
                   match tokio_tcp_stream.into_std() {
                     Ok(std_stream) => {
-                      if socket_options_clone.tcp_cork {
+                      // Only apply permanent startup corking if the socket is a streaming type
+                      let socket_type = socket_options_clone.socket_type_name.as_str();
+                      let use_cork_at_startup = socket_options_clone.tcp_cork
+                        && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB");
+
+                      if use_cork_at_startup {
                         tracing::debug!(
                           handle = accept_loop_handle,
                           fd = std_stream.as_raw_fd(),
-                          "TcpListener: Applying TCP_CORK to accepted connection FD for IO URing."
+                          "TcpListener: Applying permanent TCP_CORK to accepted streaming connection FD."
                         );
                         let sock_ref = socket2::SockRef::from(&std_stream);
                         if let Err(e) = sock_ref.set_tcp_cork(true) {
-                          tracing::error!(handle = accept_loop_handle, fd = std_stream.as_raw_fd(), error = %e, "TcpListener: Failed to set TCP_CORK for IO URing FD. Proceeding without.");
-                          // Not making this fatal for the connection, it will proceed without CORK.
+                          tracing::error!(handle = accept_loop_handle, fd = std_stream.as_raw_fd(), error = %e, "TcpListener: Failed to set TCP_CORK.");
                         }
                       }
 
@@ -499,6 +502,25 @@ impl TcpListener {
                   );
                   setup_successful = false;
                 } else {
+                  // Apply permanent startup corking for standard TCP streaming sockets
+                  let socket_type = socket_options_clone.socket_type_name.as_str();
+                  let use_cork_at_startup = socket_options_clone.tcp_cork
+                    && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB");
+
+                  if use_cork_at_startup {
+                    tracing::debug!(
+                      handle = accept_loop_handle,
+                      "TcpListener: Applying permanent TCP_CORK to standard streaming connection."
+                    );
+                    let sock_ref = socket2::SockRef::from(&tokio_tcp_stream);
+                    if let Err(e) = sock_ref.set_tcp_cork(true) {
+                      tracing::error!(
+                        "TcpListener: Failed to set TCP_CORK on standard stream: {:?}",
+                        e
+                      );
+                    }
+                  }
+
                   let sca_handle_id =
                     handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                   let actor_conf = ActorConfigX {
@@ -925,13 +947,18 @@ impl TcpConnecter {
               socket2::Socket::new(domain, socket2::Type::STREAM, None).map_err(ZmqError::from)?;
             apply_socket2_options_pre_connect(&socket, &self.config)?;
 
-            if self.socket_options.tcp_cork {
+            // Only apply permanent startup corking if the socket is a streaming type
+            let socket_type = self.socket_options.socket_type_name.as_str();
+            let use_cork_at_startup = self.socket_options.tcp_cork
+              && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB");
+
+            if use_cork_at_startup {
               tracing::debug!(
                 handle = self.handle,
-                "TcpConnecter: Applying TCP_CORK to outgoing connection FD before connect for IO URing."
+                "TcpConnecter: Applying permanent TCP_CORK to outgoing streaming connection FD."
               );
               if let Err(e) = socket.set_tcp_cork(true) {
-                tracing::error!(handle = self.handle, error = %e, "TcpConnecter: Failed to set TCP_Cork (socket2) for IO URing FD. Proceeding without.");
+                tracing::error!(handle = self.handle, error = %e, "TcpConnecter: Failed to set TCP_CORK.");
               }
             }
 
@@ -1048,7 +1075,6 @@ impl TcpConnecter {
             unreachable!();
           }
         } else {
-          // Standard path for SessionBase
           let std_tokio_stream = underlying_std_net::TcpStream::connect(target_socket_addr)
             .await
             .map_err(|e| ZmqError::from_io_endpoint(e, endpoint_uri_original))?;
@@ -1063,6 +1089,25 @@ impl TcpConnecter {
           }
 
           apply_tcp_socket_options_to_tokio(&std_tokio_stream, &self.config)?;
+
+          // Apply permanent startup corking for standard TCP streaming sockets
+          let socket_type = self.socket_options.socket_type_name.as_str();
+          let use_cork_at_startup =
+            self.socket_options.tcp_cork && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB");
+
+          if use_cork_at_startup {
+            tracing::debug!(
+              handle = self.handle,
+              "TcpConnecter: Applying permanent TCP_CORK to standard streaming connection."
+            );
+            let sock_ref = socket2::SockRef::from(&std_tokio_stream);
+            if let Err(e) = sock_ref.set_tcp_cork(true) {
+              tracing::error!(
+                "TcpConnecter: Failed to set TCP_CORK on standard stream: {:?}",
+                e
+              );
+            }
+          }
 
           let actual_connected_uri = format!("tcp://{}", peer_addr_actual);
           let sca_handle_id = self

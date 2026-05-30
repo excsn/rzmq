@@ -36,6 +36,13 @@ On modern Linux kernels, the `io_uring` backend bypasses the standard reactor-po
 *   **Zero-Copy Send (`--uring-zerocopy`):** Maps pages from a pre-registered send buffer pool directly into the network device's DMA engine, avoiding memory copies between user space and kernel space during transmit operations.
 *   **Multishot Receive (`--uring-multishot`):** Issues a single, persistent read request to the kernel. As data arrives, the kernel automatically assigns a buffer from a pre-registered receive buffer ring to hold the payload and pushes a completion entry, eliminating the need to re-submit read requests after every receive event.
 
+ ### ⚠️ Operational Constraint: TCP Corking vs. Latency Workloads
+
+> The `--cork` flag utilizes the Linux-specific `TCP_CORK` socket option to aggregate multiple small frames into a single physical network packet.
+
+*   **Recommended Use Cases:** Only use `--cork` with unidirectional, high-throughput streaming workloads (such as **`push-pull`** or **`pub-sub`**). Under these patterns, the high message volume continuously saturates the TCP buffer, triggering highly efficient, consolidated kernel flushes.
+*   **Do Not Use With:** Any synchronous, latency-bound ping-pong workloads (such as **`req-rep`** or **`dealer-router`**). Because these patterns restrict the pipeline to a single message in-flight, the socket buffer cannot be saturated. The kernel will hold your single 64-byte request in memory until its delayed-flush timer expires, causing round-trip latencies to spike to **~400ms** and dropping throughput to **~2 msg/s**.
+
 ---
 
 ## 3. Socket Patterns & Workloads
@@ -122,7 +129,7 @@ This transport leverages the default Tokio event loop (which resolves to `epoll`
 
 #### 1. Standard TCP with TCP_CORK Enabled
 ```bash
-cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern dealer-router --msg-size 64 --duration 10 --cork
+cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --duration 10 --cork
 
 ### 2. High-Performance `io_uring` Transport
 

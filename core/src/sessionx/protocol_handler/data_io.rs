@@ -92,10 +92,9 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
 
 /// Batches, frames, encrypts, and writes a full logical ZMQ message (one or more `Msg` parts).
 /// This is the optimal path for multipart messages.
-/// Batches, frames, encrypts, and writes a full logical ZMQ message (one or more `Msg` parts).
 pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
-  msgs: Vec<Msg>, // Takes ownership of the Vec
+  msgs: Vec<Msg>,
 ) -> Result<(), ZmqError> {
   if msgs.is_empty() {
     return Ok(());
@@ -108,14 +107,21 @@ pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
 
   let operation_timeout = handler.config.sndtimeo.unwrap_or(Duration::from_secs(300));
 
+  // Determine if this is a multipart message on a latency socket requiring dynamic corking
+  let socket_type = handler.config.socket_type_name.as_str();
+  let is_latency_pattern = matches!(socket_type, "REQ" | "REP" | "DEALER" | "ROUTER");
+  let should_dynamic_cork = is_latency_pattern && msgs.len() > 1;
+
   // 1. Delegate framing and encryption entirely to the framer.
   let wire_bytes_to_send = handler.framer.write_msg_multipart(msgs)?;
 
-  // 2. Apply CORK, write the entire buffer, and then uncork.
+  // 2. Only dynamic-cork if it is a multipart message on a latency socket
   #[cfg(target_os = "linux")]
   {
-    if let Some(ci) = handler.cork_info.as_mut() {
-      ci.apply_cork_state(true, handler.actor_handle).await;
+    if should_dynamic_cork {
+      if let Some(ci) = handler.cork_info.as_mut() {
+        ci.apply_cork_state(true, handler.actor_handle).await;
+      }
     }
   }
 
@@ -126,18 +132,18 @@ pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
 
   handler.heartbeat_state.record_activity();
 
-  // CRUCIAL: Uncork after the write operation, regardless of success or failure.
+  // 3. Only uncork/flush if we dynamically applied the cork
   #[cfg(target_os = "linux")]
   {
-    if let Some(ci) = handler.cork_info.as_mut() {
-      if ci.is_corked() {
-        ci.apply_cork_state(false, handler.actor_handle).await;
+    if should_dynamic_cork {
+      if let Some(ci) = handler.cork_info.as_mut() {
+        if ci.is_corked() {
+          ci.apply_cork_state(false, handler.actor_handle).await;
+        }
       }
-      ci.set_expecting_first_frame(true);
     }
   }
 
-  // Finally, return the result of the write operation.
   write_result
 }
 
