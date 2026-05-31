@@ -3,9 +3,9 @@
 [![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 
-**rzmq** is an ongoing effort to build a high-performance, asynchronous pure Rust implementation of the ZeroMQ (ØMQ) messaging library. It leverages the [Tokio](https://tokio.rs/) runtime for its asynchronous capabilities and aims to provide a familiar ZeroMQ API within the modern Rust ecosystem.
+**rzmq** is a high-performance, asynchronous pure Rust implementation of the ZeroMQ (ØMQ) messaging library. It leverages the [Tokio](https://tokio.rs/) runtime for its asynchronous capabilities and aims to provide a familiar ZeroMQ API.
 
-**A primary focus of `rzmq` is to deliver leading performance on Linux.** By integrating an advanced `io_uring` backend with TCP Corking, `rzmq` **has demonstrated superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.**
+**The primary focus of `rzmq` is to deliver leading performance on Linux.** By integrating `io_uring` with TCP Cork, `rzmq` **has demonstrated superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput benchmark scenarios.**
 
 ## Project Status: Beta ⚠️
 
@@ -15,8 +15,8 @@
 *   **Feature Scope:** The focus is on core ZMTP 3.1 compliance and popular patterns. **Full feature parity with all of `libzmq`'s extensive options and advanced behaviors is a non-goal.** Notably, **ZAP (ZeroMQ Authentication Protocol) is not supported and is not planned.**
 *   **Interoperability:** `rzmq` aims for wire-level interoperability with `libzmq` for supported socket patterns using **NULL, PLAIN, and CURVE** security. The **Noise_XX** mechanism is specific to `rzmq` and will only interoperate with other `rzmq` instances.
 *   **Testing Environment:** Primarily tested on **macOS (ARM & x86)** and **Linux (Kernel 6.x)**. The `io_uring` backend is Linux-specific and best tested on Kernel 6.x+. Windows is not currently supported.
-*   **Performance:** While leading performance is a key achievement, comprehensive benchmarking across all diverse workloads and hardware is ongoing.
-*   **Robustness:** Tested for common use cases; edge case hardening is continuous.
+*   **Performance:** While leading performance is a key achievement, comprehensive benchmarking across all diverse workloads and hardware is desired.
+*   **Robustness:** Tested for common use cases; edge case hardening is a continuous effort.
 
 ## Notable Users
 
@@ -25,7 +25,7 @@
 ## Motivation
 
 1.  **Pure Rust & Async Native:** Memory safety, seamless `async/await` integration with Tokio, and no C `libzmq` dependency.
-2.  **High Performance on Linux:** Specifically designed to leverage `io_uring` for superior throughput and low latency, as demonstrated in benchmarks.
+2.  **High Performance on Linux:** Specifically designed to leverage `io_uring` and TCP Cork for superior throughput and low latency, as demonstrated in benchmarks.
 3.  **Flexible & Modern Security:** Provides interoperable security with `libzmq`'s traditional **CURVE** mechanism, while also offering the modern **Noise_XX** protocol as a high-performance alternative for `rzmq`-to-`rzmq` communication.
 4.  **Learning & Innovation:** A platform to explore messaging system architecture in Rust.
 
@@ -73,7 +73,7 @@
 
 ## When to Consider `rzmq` (Currently)
 
-*   **Performance-Critical Linux Applications:** When seeking the highest possible messaging throughput and lowest latency, leveraging the `io_uring` backend.
+*   **Performance-Critical Linux Applications:** When seeking the highest possible messaging throughput and lowest latency, leveraging `io_uring` and TCP Cork.
 *   **Pure Rust Environments:** To avoid C dependencies and benefit from Rust's safety and async ecosystem.
 *   **Modern Security Needs:** If Noise_XX is a desired security protocol for `rzmq`-to-`rzmq` communication.
 *   **Learning & Contribution:** For those interested in ZeroMQ internals, asynchronous Rust, `io_uring`, or contributing to a modern messaging library.
@@ -89,7 +89,7 @@ Detailed benchmark results across hardware and socket patterns are available in 
 | Linux (AMD Ryzen 5 7640U) | [`bench/docs/linux_bench.md`](bench/docs/linux_bench.md) |
 | macOS (Apple M4) | [`bench/docs/mac_bench.md`](bench/docs/mac_bench.md) |
 
-Benchmarks cover `REQ/REP` and `DEALER/ROUTER` patterns at various message sizes. See the [`bench/`](bench/) crate for instructions on running them yourself.
+Benchmarks cover `REQ/REP`, `DEALER/ROUTER`, `PUB/SUB`, `PUSH/PULL` patterns. See the [`bench/`](bench/) crate for instructions on running them yourself.
 
 ## Structure
 
