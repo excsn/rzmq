@@ -1,15 +1,14 @@
 #![cfg(feature = "io-uring")]
 
+use crate::ZmqError;
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringConnectionHandler, UringWorkerInterface,
 };
 use crate::io_uring_backend::ops::UserData;
-use crate::io_uring_backend::worker::internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType};
-use crate::ZmqError;
+use crate::io_uring_backend::worker::internal_op_tracker::InternalOpTracker;
 use io_uring::cqueue;
-use io_uring::{cqueue::Entry as CqeResult, squeue, types};
-use std::fmt;
+use io_uring::cqueue::Entry as CqeResult;
 use std::os::unix::io::RawFd;
 
 pub const IOURING_CQE_F_MORE: u32 = 1 << 1;
@@ -75,7 +74,11 @@ impl MultishotReader {
   }
 
   /// Called by worker after it successfully submits the ASYNC_CANCEL SQE.
-  pub fn mark_cancellation_submitted(&mut self, cancel_sqe_user_data: UserData, _target_op_user_data: UserData) {
+  pub fn mark_cancellation_submitted(
+    &mut self,
+    cancel_sqe_user_data: UserData,
+    _target_op_user_data: UserData,
+  ) {
     // _target_op_user_data should match self.active_op_user_data if logic is correct
     self.cancel_op_user_data = Some(cancel_sqe_user_data);
     // is_active remains true until cancel CQE or original op CQE without MORE.
@@ -103,12 +106,29 @@ impl MultishotReader {
       // This CQE is for our active multishot read operation.
       // is_active should be true here if logic is correct.
       if !self.is_active {
-        tracing::warn!("[MultishotReader FD={}] CQE (ud {}) for active_op_user_data, but reader not marked active_in_kernel. State inconsistency?", self.fd, cqe_ud);
+        tracing::warn!(
+          "[MultishotReader FD={}] CQE (ud {}) for active_op_user_data, but reader not marked active_in_kernel. State inconsistency?",
+          self.fd,
+          cqe_ud
+        );
         self.is_active = true;
       }
 
       if cqe_res < 0 {
         let errno = -cqe_res;
+        if errno == libc::ENOBUFS {
+          // Non-fatal: the kernel ran out of buffers in the ring.
+          // Terminate the active operation so the worker can resubmit a new read
+          // on the next iteration once buffers are returned to the pool.
+          tracing::debug!(
+            "[MultishotReader FD={}] Buffer ring exhausted (ENOBUFS). Multishot read stopped; will resubmit.",
+            self.fd
+          );
+          self.active_op_user_data = None;
+          self.is_active = false;
+          return Ok((ops_to_return, true));
+        }
+
         tracing::error!(
           "[MultishotReader FD={}] Error on active multishot read (ud {}): errno {}. Terminating multishot.",
           self.fd,
@@ -141,7 +161,8 @@ impl MultishotReader {
       if bytes_read > 0 {
         match unsafe { buffer_manager.borrow_kernel_filled_buffer(buffer_id, bytes_read) } {
           Ok(borrowed_buffer) => {
-            ops_to_return = owner_handler.process_ring_read_data(&borrowed_buffer, buffer_id, worker_interface);
+            ops_to_return =
+              owner_handler.process_ring_read_data(&borrowed_buffer, buffer_id, worker_interface);
             // BorrowedBuffer is dropped here, returning it to the pool.
           }
           Err(e) => {
@@ -232,7 +253,11 @@ impl MultishotReader {
     } else {
       // This CQE was not for this MultishotReader. This should ideally not be reached
       // if cqe_processor calls delegate_cqe_to_multishot_reader only after handler.matches_cqe_user_data().
-      tracing::error!("[MultishotReader FD={}] process_cqe called with non-matching UserData (ud {}). This indicates a logic error in cqe_processor's delegation.", self.fd, cqe_ud);
+      tracing::error!(
+        "[MultishotReader FD={}] process_cqe called with non-matching UserData (ud {}). This indicates a logic error in cqe_processor's delegation.",
+        self.fd,
+        cqe_ud
+      );
       return Err(ZmqError::Internal(
         "MultishotReader::process_cqe called with non-matching UserData".into(),
       ));
@@ -255,19 +280,28 @@ impl MultishotReader {
       // This can happen if a new multishot op is prepared (generating new active_op_user_data)
       // but the worker calls set_active for the *old* UserData if a submit attempt failed and retried.
       // Or if an old blueprint was processed.
-      tracing::warn!("[MultishotReader FD={}] set_active called with UserData {}, but current expected is {:?}. State unchanged unless matching.", self.fd, user_data, self.active_op_user_data);
+      tracing::warn!(
+        "[MultishotReader FD={}] set_active called with UserData {}, but current expected is {:?}. State unchanged unless matching.",
+        self.fd,
+        user_data,
+        self.active_op_user_data
+      );
       // Only set active if the UserData matches the one we are currently tracking for submission.
     }
   }
 
   /// Checks if the given CQE UserData matches any operation this reader is expecting.
   pub(crate) fn matches_cqe_user_data(&self, cqe_user_data: UserData) -> bool {
-    self.active_op_user_data == Some(cqe_user_data) || self.cancel_op_user_data == Some(cqe_user_data)
+    self.active_op_user_data == Some(cqe_user_data)
+      || self.cancel_op_user_data == Some(cqe_user_data)
   }
 
   /// Called when the owning handler's FD is closed, ensuring the reader is marked inactive.
   pub(crate) fn set_inactive_due_to_close(&mut self) {
-    tracing::debug!("[MultishotReader FD={}] Marked as inactive due to FD closure.", self.fd);
+    tracing::debug!(
+      "[MultishotReader FD={}] Marked as inactive due to FD closure.",
+      self.fd
+    );
     self.is_active = false;
     self.active_op_user_data = None;
     self.cancel_op_user_data = None; // Clear any pending cancellation state too

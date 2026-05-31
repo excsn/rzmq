@@ -239,20 +239,36 @@ impl ISocket for SubSocket {
           .incoming_orchestrator
           .accumulate_pipe_frame(pipe_read_id, msg)?
         {
-          // raw_zmtp_message_vec is, e.g., [topic_frame_M, data_frame_NM] from a PUB.
           let topic_data = raw_zmtp_message_vec
             .get(0)
             .and_then(|frame| frame.data())
             .unwrap_or_default();
-
           if self.subscriptions.matches(topic_data).await {
-            // If it matches, raw_zmtp_message_vec *is* the QItem (the logical message for SUB app).
             self
               .incoming_orchestrator
               .queue_item(pipe_read_id, raw_zmtp_message_vec)
               .await?;
           } else {
             tracing::trace!(handle = self.core.handle, pipe_id = pipe_read_id, topic = ?String::from_utf8_lossy(topic_data), "SUB: Message dropped (no subscription match).");
+          }
+        }
+      }
+      Command::PipeMessageBatchReceived { msgs, .. } => {
+        for msg in msgs {
+          if let Some(raw_zmtp_message_vec) = self
+            .incoming_orchestrator
+            .accumulate_pipe_frame(pipe_read_id, msg)?
+          {
+            let topic_data = raw_zmtp_message_vec
+              .get(0)
+              .and_then(|frame| frame.data())
+              .unwrap_or_default();
+            if self.subscriptions.matches(topic_data).await {
+              self
+                .incoming_orchestrator
+                .queue_item(pipe_read_id, raw_zmtp_message_vec)
+                .await?;
+            }
           }
         }
       }

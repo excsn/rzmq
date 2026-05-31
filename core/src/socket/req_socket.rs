@@ -447,6 +447,52 @@ impl ISocket for ReqSocket {
           }
         }
       }
+      Command::PipeMessageBatchReceived { msgs, .. } => {
+        // REQ is a ping-pong socket: at most one reply per request, so batches are typically
+        // size 1. Loop with the same state-machine logic as the single-message path.
+        for msg in msgs {
+          let source_uri = {
+            self.pipe_read_to_endpoint_uri.read().get(&pipe_read_id).cloned()
+          };
+          let source_uri = match source_uri {
+            Some(s) => s,
+            None => continue,
+          };
+          let is_expected_reply = {
+            let op_state_guard = self.state.lock();
+            match &*op_state_guard {
+              ReqState::ExpectingReply { target_endpoint_uri } => *target_endpoint_uri == source_uri,
+              ReqState::ReadyToSend => false,
+            }
+          };
+          if !is_expected_reply {
+            continue;
+          }
+          if let Some(raw_zmtp_reply_vec) = self
+            .incoming_orchestrator
+            .accumulate_pipe_frame(pipe_read_id, msg)?
+          {
+            match self.process_incoming_zmtp_message_for_req(pipe_read_id, raw_zmtp_reply_vec) {
+              Ok(reply_payload_parts) => {
+                if self
+                  .incoming_orchestrator
+                  .queue_item(pipe_read_id, reply_payload_parts)
+                  .await
+                  .is_err()
+                {
+                  *self.state.lock() = ReqState::ReadyToSend;
+                  self.reply_available_notifier.notify_waiters();
+                }
+              }
+              Err(e) => {
+                tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "REQ batch: Error processing ZMTP reply: {}. Dropping.", e);
+                *self.state.lock() = ReqState::ReadyToSend;
+                self.reply_available_notifier.notify_waiters();
+              }
+            }
+          }
+        }
+      }
       _ => {}
     }
     Ok(())

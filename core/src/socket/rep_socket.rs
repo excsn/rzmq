@@ -49,6 +49,53 @@ impl RepSocket {
   fn core_state_read(&self) -> RwLockReadGuard<'_, CoreState> {
     self.core.core_state.read()
   }
+
+  async fn process_and_queue_rep_message(
+    &self,
+    pipe_read_id: usize,
+    raw_zmtp_message: Vec<Msg>,
+  ) -> Result<(), ZmqError> {
+    let target_endpoint_uri_for_reply = {
+      let core_s_read = self.core_state_read();
+      core_s_read
+        .pipe_read_id_to_endpoint_uri
+        .get(&pipe_read_id)
+        .cloned()
+        .ok_or_else(|| ZmqError::Internal("REP: Endpoint URI lookup failed for request".into()))?
+    };
+
+    let mut routing_prefix: Vec<Msg> = Vec::new();
+    let mut payload_frames: Vec<Msg> = Vec::new();
+    let mut delimiter_found = false;
+
+    for frame in raw_zmtp_message {
+      if !delimiter_found {
+        let is_delimiter = frame.size() == 0;
+        routing_prefix.push(frame);
+        if is_delimiter {
+          delimiter_found = true;
+        }
+      } else {
+        payload_frames.push(frame);
+      }
+    }
+
+    if !delimiter_found {
+      payload_frames = routing_prefix;
+      routing_prefix = Vec::new();
+    }
+
+    let peer_info = PeerInfo {
+      source_pipe_read_id: pipe_read_id,
+      target_endpoint_uri: target_endpoint_uri_for_reply,
+      routing_prefix,
+    };
+
+    self
+      .incoming_orchestrator
+      .queue_item(pipe_read_id, (peer_info, payload_frames))
+      .await
+  }
 }
 
 #[async_trait]
@@ -250,52 +297,17 @@ impl ISocket for RepSocket {
           .incoming_orchestrator
           .accumulate_pipe_frame(pipe_read_id, msg)?
         {
-          let target_endpoint_uri_for_reply = {
-            let core_s_read = self.core_state_read();
-            core_s_read
-              .pipe_read_id_to_endpoint_uri
-              .get(&pipe_read_id)
-              .cloned()
-              .ok_or_else(|| {
-                ZmqError::Internal("REP: Endpoint URI lookup failed for request".into())
-              })?
-          };
-
-          let mut routing_prefix: Vec<Msg> = Vec::new();
-          let mut payload_frames: Vec<Msg> = Vec::new();
-          let mut delimiter_found = false;
-
-          for frame in raw_zmtp_message {
-            if !delimiter_found {
-              // Keep adding frames to the routing prefix until we find the empty delimiter.
-              let is_delimiter = frame.size() == 0;
-              routing_prefix.push(frame);
-              if is_delimiter {
-                delimiter_found = true;
-              }
-            } else {
-              // Once the delimiter is found, all subsequent frames are part of the payload.
-              payload_frames.push(frame);
-            }
-          }
-
-          // In the case of a REQ socket, there is no delimiter. The spec says the
-          // entire message is the payload and the routing prefix is empty.
-          if !delimiter_found {
-            payload_frames = routing_prefix;
-            routing_prefix = Vec::new();
-          }
-
-          let peer_info = PeerInfo {
-            source_pipe_read_id: pipe_read_id,
-            target_endpoint_uri: target_endpoint_uri_for_reply,
-            routing_prefix,
-          };
-
-          self
+          self.process_and_queue_rep_message(pipe_read_id, raw_zmtp_message).await?;
+        }
+      }
+      Command::PipeMessageBatchReceived { msgs, .. } => {
+        for msg in msgs {
+          if let Some(raw_zmtp_message) = self
             .incoming_orchestrator
-            .queue_item(pipe_read_id, (peer_info, payload_frames))
-            .await?;
+            .accumulate_pipe_frame(pipe_read_id, msg)?
+          {
+            self.process_and_queue_rep_message(pipe_read_id, raw_zmtp_message).await?;
+          }
         }
       }
       _ => {}

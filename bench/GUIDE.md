@@ -125,13 +125,30 @@ This transport leverages the default Tokio event loop (which resolves to `epoll`
 
 ---
 
-### B Linux-only Transport
+### B. Linux-only Transport
 
 #### 1. Standard TCP with TCP_CORK Enabled
 ```bash
 cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --duration 10 --cork
+```
 
-### 2. High-Performance `io_uring` Transport
+#### 2. CPU Pinning (`--pin-cpus`)
+
+By default, child processes are allowed to float across any available CPU core. Passing `--pin-cpus` instructs the orchestrator to pin the server process to core 0 and the client process to core 1 before they start.
+
+This reduces context-switch noise and improves measurement stability, particularly for tail-latency percentiles, but requires that at least two physical cores be available.
+
+> **Note:** `--pin-cpus` is Linux-only and is **disabled by default**. Enabling it on a heavily loaded single-core machine will hurt performance rather than help.
+
+```bash
+# PUSH/PULL throughput with CPU pinning
+cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --duration 10 --pin-cpus
+
+# REQ/REP latency with CPU pinning
+cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern req-rep --msg-size 64 --duration 10 --pin-cpus
+```
+
+### 3. High-Performance `io_uring` Transport
 
 This transport requires compiling the binary with the `io-uring` feature flag enabled:
 ```bash
@@ -211,4 +228,4 @@ Latency Distribution (Microseconds):
 ```
 
 *   **Throughput Metrics:** Ensure that your network interface is not saturating. For TCP throughput, compare these numbers against the theoretical bandwidth of your link.
-*   **Tail Latency (p99 to Max):** In latency-focused patterns, monitor the delta between the median (p50) and the high percentiles (p99+). High p99+ latency indicates jitter, which can point to CPU context switching overhead, garbage collection/allocation pauses, or packet retransmission in the network layer. Ensure CPU affinity (pinning) is active on Linux to keep tail latencies stable.
+*   **Tail Latency (p99 to Max):** In latency-focused patterns, monitor the delta between the median (p50) and the high percentiles (p99+). High p99+ latency indicates jitter, which can point to CPU context switching overhead, garbage collection/allocation pauses, or packet retransmission in the network layer. Pass `--pin-cpus` on Linux to keep tail latencies stable by pinning server and client to dedicated cores.

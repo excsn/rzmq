@@ -123,22 +123,27 @@ impl ISocket for PullSocket {
   async fn handle_pipe_event(&self, pipe_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
-        // Let the orchestrator handle frame accumulation.
         if let Some(raw_zmtp_message_vec) = self
           .incoming_orchestrator
           .accumulate_pipe_frame(pipe_id, msg)?
         {
-          // A full logical message is ready. The QItem for PULL is the message itself.
-          tracing::trace!(
-            handle = self.core.handle,
-            pipe_id = pipe_id,
-            num_frames = raw_zmtp_message_vec.len(),
-            "PULL handle_pipe_event: Complete message assembled, pushing to orchestrator."
-          );
           self
             .incoming_orchestrator
             .queue_item(pipe_id, raw_zmtp_message_vec)
             .await?;
+        }
+      }
+      Command::PipeMessageBatchReceived { msgs, .. } => {
+        for msg in msgs {
+          if let Some(raw_zmtp_message_vec) = self
+            .incoming_orchestrator
+            .accumulate_pipe_frame(pipe_id, msg)?
+          {
+            self
+              .incoming_orchestrator
+              .queue_item(pipe_id, raw_zmtp_message_vec)
+              .await?;
+          }
         }
       }
       _ => {}

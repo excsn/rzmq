@@ -37,7 +37,11 @@ pub async fn run(args: Cli) -> Result<(), ZmqError> {
   ];
 
   if args.cork {
-    base_args.push("--cork".to_string()); // FIXED: Just pass the flag name
+    base_args.push("--cork".to_string());
+  }
+  #[cfg(target_os = "linux")]
+  if args.pin_cpus {
+    base_args.push("--pin-cpus".to_string());
   }
   if let Some(msg_count) = args.messages {
     base_args.push(format!("--messages={}", msg_count));
@@ -73,17 +77,19 @@ pub async fn run(args: Cli) -> Result<(), ZmqError> {
   }
   server_cmd.stderr(Stdio::inherit());
 
-  // Apply CPU Pinning (Server to Core 0) on Linux
+  // Apply CPU Pinning (Server to Core 0) on Linux, only when --pin-cpus is set
   #[cfg(target_os = "linux")]
-  unsafe {
-    server_cmd.pre_exec(|| {
-      let mut cpuset = nix::sched::CpuSet::new();
-      let _ = cpuset.set(0); // Bind server to Core 0
-      if let Err(e) = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
-        eprintln!("Warning: Failed to set server CPU affinity: {:?}", e);
-      }
-      Ok(())
-    });
+  if args.pin_cpus {
+    unsafe {
+      server_cmd.pre_exec(|| {
+        let mut cpuset = nix::sched::CpuSet::new();
+        let _ = cpuset.set(0); // Bind server to Core 0
+        if let Err(e) = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
+          eprintln!("Warning: Failed to set server CPU affinity: {:?}", e);
+        }
+        Ok(())
+      });
+    }
   }
 
   // 3. Launch the Server
@@ -102,17 +108,19 @@ pub async fn run(args: Cli) -> Result<(), ZmqError> {
   client_cmd.stdout(Stdio::inherit());
   client_cmd.stderr(Stdio::inherit());
 
-  // Apply CPU Pinning (Client to Core 1) on Linux
+  // Apply CPU Pinning (Client to Core 1) on Linux, only when --pin-cpus is set
   #[cfg(target_os = "linux")]
-  unsafe {
-    client_cmd.pre_exec(|| {
-      let mut cpuset = nix::sched::CpuSet::new();
-      let _ = cpuset.set(1); // Bind client to Core 1
-      if let Err(e) = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
-        eprintln!("Warning: Failed to set client CPU affinity: {:?}", e);
-      }
-      Ok(())
-    });
+  if args.pin_cpus {
+    unsafe {
+      client_cmd.pre_exec(|| {
+        let mut cpuset = nix::sched::CpuSet::new();
+        let _ = cpuset.set(1); // Bind client to Core 1
+        if let Err(e) = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
+          eprintln!("Warning: Failed to set client CPU affinity: {:?}", e);
+        }
+        Ok(())
+      });
+    }
   }
 
   // 5. Launch the Client

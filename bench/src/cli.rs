@@ -66,6 +66,11 @@ pub struct Cli {
   #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
   pub output: OutputFormat,
 
+  /// Pin server/client processes to dedicated CPU cores (Linux only, off by default)
+  #[cfg(target_os = "linux")]
+  #[arg(long, default_value_t = false)]
+  pub pin_cpus: bool,
+
   /// Enable the io_uring backend instead of standard Epoll (Linux only)
   #[cfg(feature = "io-uring")]
   #[arg(long, default_value_t = false)]

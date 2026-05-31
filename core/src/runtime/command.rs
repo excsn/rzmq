@@ -82,6 +82,12 @@ pub enum Command {
     pipe_id: usize,
     msg: Msg, // The message received from the pipe.
   },
+  /// Coalesced batch of messages from the io_uring upstream processor.
+  /// Delivered to ISocket::handle_pipe_event as a single call to eliminate per-message scheduler yields.
+  PipeMessageBatchReceived {
+    pipe_id: usize,
+    msgs: Vec<Msg>,
+  },
   /// Sent from PipeReaderTask -> SocketCore when the session closes its *sending* end of the data pipe.
   PipeClosedByPeer {
     /// The ID of the pipe (from SocketCore's perspective, its read pipe ID) that was closed.
@@ -111,7 +117,7 @@ pub enum Command {
     core_pipe_read_id_for_incoming_routing: usize,
   },
   #[cfg(feature = "io-uring")]
-  UringFdMessage { fd: RawFd, msg: Msg },
+  UringFdMessage { fd: RawFd, msgs: Vec<Msg> },
   #[cfg(feature = "io-uring")]
   UringFdError { fd: RawFd, error: ZmqError },
   #[cfg(feature = "io-uring")]
@@ -138,6 +144,7 @@ impl Command {
       Command::UserClose { .. } => "UserClose",
       Command::Stop => "Stop",
       Command::PipeMessageReceived { .. } => "PipeMessageReceived",
+      Command::PipeMessageBatchReceived { .. } => "PipeMessageBatchReceived",
       Command::PipeClosedByPeer { .. } => "PipeClosedByPeer",
       Command::AttachPipe { .. } => "AttachPipe",
       Command::ScaInitializePipes { .. } => "ScaInitializePipes",

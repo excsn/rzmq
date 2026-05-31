@@ -637,12 +637,27 @@ impl ISocket for DealerSocket {
                 .await?;
             }
             Err(e) => {
-              tracing::error!(
-                handle = self.core.handle,
-                pipe_id = pipe_read_id,
-                "DEALER: Error processing raw ZMTP message: {}. Message dropped.",
-                e
-              );
+              tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "DEALER: Error processing raw ZMTP message: {}. Message dropped.", e);
+            }
+          }
+        }
+      }
+      Command::PipeMessageBatchReceived { msgs, .. } => {
+        for msg in msgs {
+          if let Some(raw) = self
+            .incoming_orchestrator
+            .accumulate_pipe_frame(pipe_read_id, msg)?
+          {
+            match self.process_incoming_zmtp_message_for_dealer(pipe_read_id, raw) {
+              Ok(payload_parts_vec) => {
+                self
+                  .incoming_orchestrator
+                  .queue_item(pipe_read_id, payload_parts_vec)
+                  .await?;
+              }
+              Err(e) => {
+                tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "DEALER batch: Error processing ZMTP message: {}. Dropped.", e);
+              }
             }
           }
         }

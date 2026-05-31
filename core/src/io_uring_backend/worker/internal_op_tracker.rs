@@ -2,15 +2,36 @@
 
 use crate::io_uring_backend::ops::UserData;
 use crate::io_uring_backend::send_buffer_pool::RegisteredSendBufferId;
-use bytes::Bytes; // For storing send buffer
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
+
+/// Heap-allocated pair of iovecs whose address is stable for the lifetime of an in-flight Writev.
+/// The `Box` ensures the array doesn't move even as `InternalOpPayload` is moved in the tracker.
+pub(crate) struct PinnedIovecs(pub Box<[libc::iovec; 2]>);
+// SAFETY: `libc::iovec` contains raw pointers, but they point into `Bytes` values held by the
+// same `InternalOpPayload`. The worker thread is the only accessor; no cross-thread sharing.
+unsafe impl Send for PinnedIovecs {}
+impl std::fmt::Debug for PinnedIovecs {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("PinnedIovecs")
+      .field("iov[0].len", &self.0[0].iov_len)
+      .field("iov[1].len", &self.0[1].iov_len)
+      .finish()
+  }
+}
+impl Clone for PinnedIovecs {
+  fn clone(&self) -> Self {
+    PinnedIovecs(Box::new(*self.0))
+  }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum InternalOpType {
   Accept,
   RingRead,
   Send,
+  SendVectored,
   CloseFd,
   GenericHandlerOp,
   EventFdPoll,
@@ -25,6 +46,7 @@ pub(crate) enum InternalOpPayload {
   None,
   SendBuffer {
     buffer: Bytes,               // Data being sent (if not ZC)
+    send_op_flags: i32,          // Stored flags for EAGAIN retries
     app_op_ud: Option<UserData>, // UserData of the originating UringOpRequest (e.g., SendDataViaHandler)
     app_op_name: Option<String>, // Name of the app-level operation
   },
@@ -33,8 +55,19 @@ pub(crate) enum InternalOpPayload {
   },
   SendZeroCopy {
     send_buf_id: RegisteredSendBufferId, // ID from SendBufferPool
+    original_data: Bytes,                // Stored original data for EAGAIN fallback to standard Send
+    send_op_flags: i32,                  // Stored flags for fallback
     app_op_ud: UserData,                 // UserData of the originating UringOpRequest
     app_op_name: String,                 // Name of the app-level operation
+  },
+  /// Header + payload submitted as a two-iovec Writev to avoid user-space payload copy.
+  SendVectored {
+    header: Bytes,
+    payload: Bytes,
+    iovecs: PinnedIovecs, // keeps *const iovec stable until the CQE is reaped
+    send_op_flags: i32,
+    app_op_ud: Option<UserData>,
+    app_op_name: Option<String>,
   },
 }
 

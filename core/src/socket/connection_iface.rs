@@ -1,5 +1,7 @@
 use crate::error::ZmqError;
 #[cfg(feature = "io-uring")]
+use crate::io_uring_backend::connection_handler::OutgoingMessage;
+#[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::UringOpRequest;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
@@ -16,6 +18,8 @@ use std::any::Any;
 use std::fmt;
 #[cfg(feature = "io-uring")]
 use std::os::{fd::AsRawFd, unix::io::RawFd};
+#[cfg(feature = "io-uring")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "io-uring")]
 use std::time::Duration;
@@ -74,8 +78,9 @@ impl ISocketConnection for DummyConnection {
 #[cfg(feature = "io-uring")]
 pub(crate) struct UringFdConnection {
   fd: RawFd,
-  mpsc_tx: mpsc::BoundedAsyncSender<Arc<Vec<Msg>>>,
+  mpsc_tx: mpsc::BoundedAsyncSender<OutgoingMessage>,
   event_fd: eventfd::EventFD,
+  worker_asleep: Arc<AtomicBool>,
   context: Context,
 }
 
@@ -95,29 +100,30 @@ impl fmt::Debug for UringFdConnection {
 impl UringFdConnection {
   pub(crate) fn new(
     fd: RawFd,
-    mpsc_tx: mpsc::BoundedAsyncSender<Arc<Vec<Msg>>>,
+    mpsc_tx: mpsc::BoundedAsyncSender<OutgoingMessage>,
     event_fd: eventfd::EventFD,
+    worker_asleep: Arc<AtomicBool>,
     context: Context,
   ) -> Self {
     Self {
       fd,
       mpsc_tx,
       event_fd,
+      worker_asleep,
       context,
     }
   }
 }
 
 #[cfg(feature = "io-uring")]
-#[async_trait]
-impl ISocketConnection for UringFdConnection {
-  
-  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
-    match self.mpsc_tx.send(Arc::new(msgs)).await {
+impl UringFdConnection {
+  async fn send_outgoing(&self, msg: OutgoingMessage) -> Result<(), ZmqError> {
+    match self.mpsc_tx.send(msg).await {
       Ok(()) => {
-        // Coalesced Signaling: Only execute the eventfd write syscall if the queue 
-        // was empty before our write, indicating the worker might be asleep.
-        if self.mpsc_tx.len() <= 1 {
+        // Only write to the eventfd when the queue was previously empty AND the worker
+        // is actually blocked waiting for kernel events. Skipping the syscall when the
+        // worker is already spinning eliminates ~200 ns of overhead per message.
+        if self.mpsc_tx.len() <= 1 && self.worker_asleep.load(Ordering::Acquire) {
           if let Err(e) = self.event_fd.write(1) {
             tracing::error!("UringFdConnection: Failed to signal eventfd: {}", e);
           }
@@ -126,6 +132,19 @@ impl ISocketConnection for UringFdConnection {
       }
       Err(_) => Err(ZmqError::ConnectionClosed),
     }
+  }
+}
+
+#[cfg(feature = "io-uring")]
+#[async_trait]
+impl ISocketConnection for UringFdConnection {
+  
+  async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
+    self.send_outgoing(OutgoingMessage::Single(msg)).await
+  }
+
+  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+    self.send_outgoing(OutgoingMessage::Multipart(msgs)).await
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {

@@ -577,12 +577,27 @@ impl ISocket for RouterSocket {
                 .await?;
             }
             Err(e) => {
-              tracing::error!(
-                handle = self.core.handle,
-                pipe_id = pipe_read_id,
-                "Router: Error processing incoming ZMTP message: {}. Dropped.",
-                e
-              );
+              tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "Router: Error processing incoming ZMTP message: {}. Dropped.", e);
+            }
+          }
+        }
+      }
+      Command::PipeMessageBatchReceived { msgs, .. } => {
+        for msg in msgs {
+          if let Some(raw) = self
+            .incoming_orchestrator
+            .accumulate_pipe_frame(pipe_read_id, msg)?
+          {
+            match self.process_incoming_zmtp_message(pipe_read_id, raw) {
+              Ok((identity_blob, payload_only_vec)) => {
+                self
+                  .incoming_orchestrator
+                  .queue_item(pipe_read_id, (identity_blob, payload_only_vec))
+                  .await?;
+              }
+              Err(e) => {
+                tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "Router batch: Error processing ZMTP message: {}. Dropped.", e);
+              }
             }
           }
         }

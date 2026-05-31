@@ -1,19 +1,22 @@
 #![cfg(feature = "io-uring")]
 
-use super::{cqe_processor, ExternalOpContext, UringWorker};
+use super::{ExternalOpContext, UringWorker, cqe_processor};
+use crate::ZmqError;
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
-use crate::io_uring_backend::connection_handler::UringWorkerInterface;
-use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest};
+use crate::io_uring_backend::connection_handler::{HandlerSqeBlueprint, UringWorkerInterface};
+use crate::io_uring_backend::ops::{HANDLER_INTERNAL_SEND_OP_UD, UringOpCompletion, UringOpRequest};
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerState};
+
+use bytes::BufMut;
 use crate::profiler::LoopProfiler;
 use crate::transport::endpoint::parse_endpoint;
-use crate::ZmqError;
 
 use std::collections::VecDeque;
 use std::mem;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use io_uring::{opcode, squeue, types};
@@ -67,8 +70,7 @@ impl UringWorker {
 
     trace!(
       "UringWorker: Handling external op request: {}, ud: {}",
-      op_name_str,
-      user_data
+      op_name_str, user_data
     );
 
     match request {
@@ -80,7 +82,10 @@ impl UringWorker {
         reply_tx,
       } => {
         if self.buffer_manager.is_some() {
-          warn!("UringWorker: BufferRingManager already initialized. Ignoring InitializeBufferRing (ud: {})", user_data);
+          warn!(
+            "UringWorker: BufferRingManager already initialized. Ignoring InitializeBufferRing (ud: {})",
+            user_data
+          );
           let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
             user_data,
             op_name: op_name_str,
@@ -89,7 +94,10 @@ impl UringWorker {
         } else {
           match BufferRingManager::new(&self.ring, num_buffers, bgid, buffer_capacity) {
             Ok(bm) => {
-              info!("UringWorker: BufferRingManager initialized with bgid: {}, {} buffers of {} capacity.", bgid, num_buffers, buffer_capacity);
+              info!(
+                "UringWorker: BufferRingManager initialized with bgid: {}, {} buffers of {} capacity.",
+                bgid, num_buffers, buffer_capacity
+              );
               self.buffer_manager = Some(bm);
               if self.default_buffer_ring_group_id_val.is_none() {
                 self.default_buffer_ring_group_id_val = Some(bgid);
@@ -306,14 +314,13 @@ impl UringWorker {
           user_data,
         ) {
           Ok(initial_ops) => {
-            // Treat the entire set of initial blueprints as one atomic batch.
             if !initial_ops.sqe_blueprints.is_empty() {
               self
                 .work_map
                 .entry(fd)
                 .or_default()
-                .atomic_batches
-                .push_back(initial_ops.sqe_blueprints);
+                .pending_blueprints
+                .extend(initial_ops.sqe_blueprints);
             }
 
             if initial_ops.initiate_close_due_to_error {
@@ -413,15 +420,22 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         // 1b. Drain application data into the work_map
         let fds_to_drain: Vec<_> = worker.fd_to_mpsc_rx.keys().copied().collect();
         for fd in &fds_to_drain {
+          // Limit user-space buffering to propagate backpressure back to the socket's mpsc_tx channel
+          let pending_count = worker
+            .work_map
+            .get(fd)
+            .map_or(0, |w| w.pending_blueprints.len() + w.app_data.len());
+          if pending_count >= 16 {
+            continue; // Leave messages in the bounded channel to block the sender
+          }
           if let Some(rx) = worker.fd_to_mpsc_rx.get(fd) {
             while let Ok(msg_parts) = rx.try_recv() {
               work_was_available = true;
-              worker
-                .work_map
-                .entry(*fd)
-                .or_default()
-                .app_data
-                .push_back(msg_parts);
+              let work = worker.work_map.entry(*fd).or_default();
+              work.app_data.push_back(msg_parts);
+              if work.app_data.len() >= 16 {
+                break; // Stop draining once our local buffer has sufficient work
+              }
             }
           }
         }
@@ -440,8 +454,8 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               .work_map
               .entry(fd)
               .or_default()
-              .atomic_batches
-              .push_back(ops.sqe_blueprints);
+              .pending_blueprints
+              .extend(ops.sqe_blueprints);
           }
           if ops.initiate_close_due_to_error
             && !worker.fds_needing_close_initiated_pass.contains(&fd)
@@ -467,8 +481,8 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 .work_map
                 .entry(fd_to_close)
                 .or_default()
-                .atomic_batches
-                .push_back(close_io_ops.sqe_blueprints);
+                .pending_blueprints
+                .extend(close_io_ops.sqe_blueprints);
             }
           }
         }
@@ -492,7 +506,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           // This moves ownership of the `FdWork` struct and releases the mutable borrow on the map.
           let mut work = worker.work_map.remove(&fd).unwrap_or_default();
 
-          // Convert all pending app_data to atomic_batches
+          // Convert all pending app_data into the flat blueprint queue.
           if let Some(handler) = worker.handler_manager.get_mut(fd) {
             while let Some(msg_parts) = work.app_data.pop_front() {
               let interface = UringWorkerInterface::new(
@@ -503,36 +517,108 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 0,
               );
               let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
-              if !ops_output.sqe_blueprints.is_empty() {
-                work.atomic_batches.push_back(ops_output.sqe_blueprints);
-              }
+              work.pending_blueprints.extend(ops_output.sqe_blueprints);
             }
           }
 
-          // Try to submit the atomic batches for this FD
           let mut stop_processing_this_fd = false;
-          while let Some(batch) = work.atomic_batches.pop_front() {
-            if batches_processed_this_iteration >= MAX_BATCHES_PER_ITERATION
-              || unsafe { worker.ring.submission_shared().is_full() }
-            {
-              work.atomic_batches.push_front(batch); // Put it back
+          while let Some(first_blueprint) = work.pending_blueprints.pop_front() {
+            if unsafe { worker.ring.submission_shared().is_full() } {
+              work.pending_blueprints.push_front(first_blueprint);
               stop_processing_this_fd = true;
               break;
             }
 
-            // Now it is safe to pass `worker` mutably.
-            if let Err(returned_batch) =
-              cqe_processor::process_handler_blueprints(worker, fd, batch)
-            {
-              work.atomic_batches.push_front(returned_batch);
-              stop_processing_this_fd = true;
-              break;
+            if let Some(first_write_len) = first_blueprint.write_len() {
+              // --- Write op path ---
+              if work.write_in_flight {
+                work.pending_blueprints.push_front(first_blueprint);
+                break; // Serialization gate: wait for in-flight CQE
+              }
+
+              // Coalesce if the next pending item is also a write that fits within 64KB.
+              let next_is_write_and_fits = work.pending_blueprints.front()
+                .and_then(|bp| bp.write_len())
+                .map_or(false, |next_len| first_write_len + next_len <= 65536);
+
+              let blueprint_to_submit = if next_is_write_and_fits {
+                let mut coalesce_buf = worker.coalesce_buffer_pool
+                  .pop_front()
+                  .unwrap_or_else(|| bytes::BytesMut::with_capacity(65536));
+                coalesce_buf.clear();
+
+                match first_blueprint {
+                  HandlerSqeBlueprint::RequestSend { data, .. }
+                  | HandlerSqeBlueprint::RequestSendZeroCopy { data_to_send: data, .. } => {
+                    coalesce_buf.put(data);
+                  }
+                  HandlerSqeBlueprint::RequestSendVectored { header, payload, .. } => {
+                    coalesce_buf.put(header);
+                    coalesce_buf.put(payload);
+                  }
+                  _ => unreachable!(),
+                }
+
+                while let Some(next_bp) = work.pending_blueprints.front() {
+                  if let Some(next_len) = next_bp.write_len() {
+                    if coalesce_buf.len() + next_len > 65536 {
+                      break;
+                    }
+                    let bp = work.pending_blueprints.pop_front().unwrap();
+                    match bp {
+                      HandlerSqeBlueprint::RequestSend { data, .. }
+                      | HandlerSqeBlueprint::RequestSendZeroCopy { data_to_send: data, .. } => {
+                        coalesce_buf.put(data);
+                      }
+                      HandlerSqeBlueprint::RequestSendVectored { header, payload, .. } => {
+                        coalesce_buf.put(header);
+                        coalesce_buf.put(payload);
+                      }
+                      _ => unreachable!(),
+                    }
+                  } else {
+                    break; // Control op — stop coalescing
+                  }
+                }
+
+                HandlerSqeBlueprint::RequestSend {
+                  data: coalesce_buf.freeze(),
+                  send_op_flags: 0,
+                  originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
+                }
+              } else {
+                first_blueprint
+              };
+
+              if let Err(returned_bp) =
+                cqe_processor::process_handler_blueprint(worker, fd, blueprint_to_submit)
+              {
+                // Push back for retry. Buffer is reclaimed on CQE success, not here.
+                work.pending_blueprints.push_front(returned_bp);
+                stop_processing_this_fd = true;
+                break;
+              }
+
+              work.write_in_flight = true;
+              batches_processed_this_iteration += 1;
+              break; // One physical write per cycle
+            } else {
+              // --- Control op path (RequestSetCork, RequestClose, etc.) ---
+              if let Err(returned_bp) =
+                cqe_processor::process_handler_blueprint(worker, fd, first_blueprint)
+              {
+                work.pending_blueprints.push_front(returned_bp);
+                stop_processing_this_fd = true;
+                break;
+              }
+              batches_processed_this_iteration += 1;
             }
-            batches_processed_this_iteration += 1;
           }
 
-          // If there's any work left for this FD, put it back into the main work_map.
-          if !work.app_data.is_empty() || !work.atomic_batches.is_empty() {
+          // Keep FdWork in the map if there is pending work OR a write is in-flight.
+          // write_in_flight=true with no pending blueprints must still be preserved so
+          // new app_data arriving before the CQE sees the correct lock state.
+          if !work.app_data.is_empty() || !work.pending_blueprints.is_empty() || work.write_in_flight {
             worker.work_map.insert(fd, work);
           }
 
@@ -546,9 +632,16 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         let active_fds_for_read = worker.handler_manager.get_active_fds();
         let mut sq = unsafe { worker.ring.submission_shared() };
         for fd in active_fds_for_read {
+          // Skip standard reads if this connection manages its own multishot read pathway or is throttled
+          if let Some(handler) = worker.handler_manager.get_mut(fd) {
+            if handler.should_throttle_reads() || handler.prefers_multishot_read() {
+              continue;
+            }
+          }
           if worker.internal_op_tracker.has_pending_read_op(fd) {
             continue;
           }
+
           if sq.is_full() {
             trace!("UringWorker: SQ full during read submission phase. Will retry next cycle.");
             break;
@@ -579,13 +672,15 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               } else {
                 trace!(
                   "UringWorker: Queued new standard read for FD {}. UD: {}",
-                  fd,
-                  user_data
+                  fd, user_data
                 );
               }
             }
           } else {
-            error!("UringWorker: Cannot submit read for FD {} because no default buffer ring is configured.", fd);
+            error!(
+              "UringWorker: Cannot submit read for FD {} because no default buffer ring is configured.",
+              fd
+            );
           }
         }
         drop(sq);
@@ -597,7 +692,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           let mut sq = unsafe { worker.ring.submission_shared() };
           worker.event_fd_poller.try_submit_initial_poll_sqe(&mut sq);
         }
-        
+
         let sq_len = unsafe { worker.ring.submission_shared().len() };
         let mut sqes_submitted_to_kernel_this_batch = 0;
         let needs_wait = !work_was_available
@@ -608,7 +703,10 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           let submitted_count_res = if needs_wait {
             let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
             let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
-            worker.ring.submitter().submit_with_args(1, &submit_args)
+            worker.worker_asleep.store(true, Ordering::Release);
+            let res = worker.ring.submitter().submit_with_args(1, &submit_args);
+            worker.worker_asleep.store(false, Ordering::Release);
+            res
           } else {
             worker.ring.submitter().submit()
           };
@@ -650,8 +748,8 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               .work_map
               .entry(fd)
               .or_default()
-              .atomic_batches
-              .push_back(blueprints);
+              .pending_blueprints
+              .extend(blueprints);
           }
         }
 

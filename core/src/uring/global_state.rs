@@ -144,7 +144,7 @@ pub(crate) async fn run_global_uring_upstream_processor(
 
         if let Some(socket_core_mailbox) = socket_core_mailbox_clone {
           let command_to_send_to_core: Option<Command> = match upstream_event {
-            HandlerUpstreamEvent::Data(msg) => Some(Command::UringFdMessage { fd, msg }),
+            HandlerUpstreamEvent::Data(msgs) => Some(Command::UringFdMessage { fd, msgs }),
             HandlerUpstreamEvent::HandshakeComplete { peer_identity } => {
               Some(Command::UringFdHandshakeComplete { fd, peer_identity })
             }

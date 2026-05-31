@@ -12,20 +12,21 @@ mod sqe_builder;
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
-  HandlerSqeBlueprint, HandlerUpstreamEvent, ProtocolHandlerFactory, WorkerIoConfig
+  HandlerSqeBlueprint, HandlerUpstreamEvent, OutgoingMessage, ProtocolHandlerFactory, WorkerIoConfig
 };
 use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::io_uring_backend::UserData;
 use crate::uring::{global_state, UringConfig};
-use crate::{Msg, ZmqError};
+use crate::ZmqError;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use fibre::mpmc::{unbounded, AsyncSender, Sender as SyncSender, Receiver as SyncReceiver};
@@ -38,16 +39,15 @@ use tracing::{debug, error, info, trace, warn};
 pub(crate) use eventfd_poller::EventFdPoller;
 pub(crate) use external_op_tracker::{ExternalOpContext, ExternalOpTracker};
 pub(crate) use handler_manager::HandlerManager;
-pub(crate) use internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType};
+pub(crate) use internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType, PinnedIovecs};
 pub(crate) use multishot_reader::MultishotReader;
 
 
 #[derive(Debug, Default)]
 struct FdWork {
-  // Each inner Vec is an atomic batch of blueprints.
-  pub(crate) atomic_batches: VecDeque<Vec<HandlerSqeBlueprint>>,
-  // We still need a place to gather incoming application data before it's turned into blueprints.
-  pub(crate) app_data: VecDeque<Arc<Vec<Msg>>>,
+  pub(crate) pending_blueprints: VecDeque<HandlerSqeBlueprint>,
+  pub(crate) app_data: VecDeque<OutgoingMessage>,
+  pub(crate) write_in_flight: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,11 +76,18 @@ pub struct UringWorker {
   fds_needing_close_initiated_pass: VecDeque<RawFd>,
   pub(crate) event_fd_poller: EventFdPoller,
   send_buffer_pool: Option<Arc<SendBufferPool>>, // For zero-copy sends
-  pub(crate) fd_to_mpsc_rx: HashMap<RawFd, Arc<mpsc::BoundedReceiver<Arc<Vec<Msg>>>>>,
+  pub(crate) fd_to_mpsc_rx: HashMap<RawFd, Arc<mpsc::BoundedReceiver<OutgoingMessage>>>,
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
   cfg_send_buffer_count: usize, //TODO revisit
   cfg_send_buffer_size: usize,
+  // Shared flag: true while the worker is blocked in submit_with_args waiting for kernel events.
+  // Connections check this before writing to eventfd to avoid redundant syscalls.
+  pub(crate) worker_asleep: Arc<AtomicBool>,
+  // Pool of recycled iovec pairs for zero-allocation Writev submissions.
+  pub(crate) iovec_pool: VecDeque<PinnedIovecs>,
+  // Pool of pre-allocated buffers for coalescing multiple outgoing writes into one SQE.
+  pub(crate) coalesce_buffer_pool: VecDeque<bytes::BytesMut>,
 }
 
 impl fmt::Debug for UringWorker {
@@ -116,7 +123,12 @@ impl UringWorker {
         ZmqError::Internal(format!("Master EventFD creation failed: {}", e))
       })?;
 
-    let signaling_op_sender = SignalingOpSender::new(op_tx_async_for_signaler, event_fd_master_instance.clone());
+    let worker_asleep = Arc::new(AtomicBool::new(false));
+    let signaling_op_sender = SignalingOpSender::new(
+      op_tx_async_for_signaler,
+      event_fd_master_instance.clone(),
+      Arc::clone(&worker_asleep),
+    );
 
     let worker_thread_join_handle = std::thread::Builder::new()
       .name("rzmq-io-uring-worker".into())
@@ -178,6 +190,21 @@ impl UringWorker {
                   info!("UringWorker: Default provided-buffer recv ring not configured (count/size is zero).");
             }
 
+            // Pre-populate the iovec pool to avoid per-message Box allocations on the vectored send path.
+            let mut iovec_pool = VecDeque::with_capacity(256);
+            for _ in 0..256 {
+              iovec_pool.push_back(PinnedIovecs(Box::new([
+                libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 },
+                libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 },
+              ])));
+            }
+
+            // Pre-allocate coalescing buffers (32 × 64KB = 2MB) to avoid per-send allocations.
+            let mut coalesce_buffer_pool = VecDeque::with_capacity(32);
+            for _ in 0..32 {
+              coalesce_buffer_pool.push_back(bytes::BytesMut::with_capacity(65536));
+            }
+
             let mut worker = UringWorker {
               state: WorkerState::Running,
               ring,
@@ -194,9 +221,11 @@ impl UringWorker {
               send_buffer_pool: worker_send_buffer_pool,
               fd_to_mpsc_rx: HashMap::new(),
               cfg_send_zerocopy_enabled: effective_send_zerocopy_enabled_for_worker,
-              // Store original config values for reference if needed, though behavior is driven by effective values.
               cfg_send_buffer_count: config.default_send_buffer_count,
               cfg_send_buffer_size: config.default_send_buffer_size,
+              worker_asleep,
+              iovec_pool,
+              coalesce_buffer_pool,
             };
 
             {

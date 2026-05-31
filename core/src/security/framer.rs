@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{Msg, MsgFlags};
 use crate::protocol::zmtp::{ZmtpCodec, manual_parser::ZmtpManualParser};
 use crate::security::IDataCipher;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -12,6 +12,14 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
 
   /// Frames and encrypts a multi-part ZMTP message into a single byte buffer for the wire.
   fn write_msg_multipart(&mut self, msgs: Vec<Msg>) -> Result<Bytes, ZmqError>;
+
+  /// Frames a single Msg and returns `(header, Some(payload))` for vectored I/O — the
+  /// header contains only the ZMTP frame prefix (≤9 bytes) and payload is a zero-copy
+  /// ref to the message data. Encrypted framers fall back to `(merged_bytes, None)`.
+  fn write_msg_split(&mut self, msg: Msg) -> Result<(Bytes, Option<Bytes>), ZmqError> {
+    let merged = self.write_msg_multipart(vec![msg])?;
+    Ok((merged, None))
+  }
 }
 
 pub(crate) struct NullFramer {
@@ -38,6 +46,24 @@ impl ISecureFramer for NullFramer {
       codec.encode(msg, &mut buffer)?;
     }
     Ok(buffer.freeze())
+  }
+
+  fn write_msg_split(&mut self, msg: Msg) -> Result<(Bytes, Option<Bytes>), ZmqError> {
+    let payload = msg.data_bytes().unwrap_or_default();
+    let payload_len = payload.len();
+    let is_more = msg.flags().contains(MsgFlags::MORE);
+
+    // Build ZMTP frame header: 2 bytes (short) or 9 bytes (long)
+    let mut hdr = BytesMut::with_capacity(9);
+    if payload_len <= 255 {
+      hdr.put_u8(if is_more { 0x01 } else { 0x00 }); // flags: MORE | (no LONG)
+      hdr.put_u8(payload_len as u8);
+    } else {
+      hdr.put_u8(if is_more { 0x03 } else { 0x02 }); // flags: LONG (+ optional MORE)
+      hdr.put_u64(payload_len as u64);
+    }
+
+    Ok((hdr.freeze(), Some(payload)))
   }
 }
 

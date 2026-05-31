@@ -3,7 +3,6 @@
 use crate::message::Msg;
 use crate::{Blob, ZmqError};
 
-use std::any::Any;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
@@ -30,6 +29,14 @@ pub enum HandlerSqeBlueprint {
     send_op_flags: i32,  // For MSG_MORE
     originating_app_op_ud: UserData,
   },
+  /// Vectored write: header (≤9 bytes of ZMTP framing) + payload (zero-copy Bytes ref).
+  /// Only valid for unencrypted (NullFramer) paths; encrypted framers emit RequestSend instead.
+  RequestSendVectored {
+    header: Bytes,
+    payload: Bytes,
+    send_op_flags: i32,
+    originating_app_op_ud: UserData,
+  },
   /// Request to close the handler's FD. The UringWorker will build a Close SQE.
   RequestClose,
   /// Request a multishot ring-buffered read for the handler's FD.
@@ -44,6 +51,18 @@ pub enum HandlerSqeBlueprint {
   /// worker action, not an SQE submission.
   RequestSetCork(bool),
   // Potentially others: RequestPollAdd, RequestTimeout, etc.
+}
+
+impl HandlerSqeBlueprint {
+  /// Returns `Some(total_bytes)` for write ops; `None` for control ops.
+  pub fn write_len(&self) -> Option<usize> {
+    match self {
+      Self::RequestSend { data, .. } => Some(data.len()),
+      Self::RequestSendZeroCopy { data_to_send, .. } => Some(data_to_send.len()),
+      Self::RequestSendVectored { header, payload, .. } => Some(header.len() + payload.len()),
+      _ => None,
+    }
+  }
 }
 
 /// Output from handler methods, indicating what I/O the worker should perform.
@@ -171,7 +190,7 @@ pub trait UringConnectionHandler: Send {
   /// returns blueprints, typically `RequestSend`.
   fn handle_outgoing_app_data(
     &mut self,
-    data: Arc<dyn Any + Send + Sync>,
+    data: OutgoingMessage,
     interface: &UringWorkerInterface<'_>,
   ) -> HandlerIoOps;
 
@@ -204,7 +223,7 @@ pub trait UringConnectionHandler: Send {
     internal_op_tracker: &mut InternalOpTracker,
   ) -> Option<Result<(HandlerIoOps, bool), ZmqError>>;
 
-  /// Called by `cqe_processor` (specifically `process_handler_blueprints`) after it successfully
+  /// Called by `cqe_processor` (specifically `process_handler_blueprint`) after it successfully
   /// submits an SQE that was initiated by this handler's `MultishotReader` (either a new
   /// multishot read or a cancellation for one).
   ///
@@ -218,6 +237,17 @@ pub trait UringConnectionHandler: Send {
     is_cancel_op: bool,
     target_op_data_if_cancel: Option<UserData>,
   );
+
+  /// Returns true if this handler manages its own multishot read operations.
+  /// When true, the global worker will not automatically submit standard single-shot reads for its FD.
+  fn prefers_multishot_read(&self) -> bool {
+    false
+  }
+
+  /// Returns true if the handler's internal receive buffers are full and reads should be throttled.
+  fn should_throttle_reads(&self) -> bool {
+    false
+  }
 }
 
 pub trait ProtocolHandlerFactory: Send + Sync + 'static {
@@ -234,11 +264,19 @@ pub trait ProtocolHandlerFactory: Send + Sync + 'static {
   ) -> Result<Box<dyn UringConnectionHandler + Send>, String>;
 }
 
+/// A message sent from a socket actor to the io_uring worker over the per-FD mpsc channel.
+/// Using an enum avoids the `Arc<Vec<Msg>>` double-allocation on the single-part fast path.
+#[derive(Debug)]
+pub enum OutgoingMessage {
+  Single(Msg),
+  Multipart(Vec<Msg>),
+}
+
 /// Events sent upstream from a UringConnectionHandler to the UringUpstreamProcessor.
 #[derive(Debug, Clone)] // Clone might be needed if it's ever peeked from a channel
 pub enum HandlerUpstreamEvent {
-  /// A complete ZMTP data message.
-  Data(Msg),
+  /// A batch of complete ZMTP data messages coalesced for high-performance thread transfer.
+  Data(Vec<Msg>),
   /// ZMTP handshake (including security) completed successfully.
   HandshakeComplete {
     peer_identity: Option<Blob>,

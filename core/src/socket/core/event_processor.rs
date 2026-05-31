@@ -157,6 +157,25 @@ pub(crate) async fn process_system_event(
             }
           }
 
+          let core_write_id_opt = {
+            let core_s = core_arc.core_state.read();
+            core_s
+              .pipe_read_id_to_endpoint_uri
+              .get(&connection_identifier)
+              .and_then(|uri| core_s.endpoints.get(uri))
+              .and_then(|ep_info| ep_info.pipe_ids.map(|pids| pids.0))
+          };
+
+          if let Some(core_write_id) = core_write_id_opt {
+            socket_logic_strong
+              .pipe_attached(
+                connection_identifier,
+                core_write_id,
+                peer_identity.as_ref().map(|b| b.as_ref()),
+              )
+              .await;
+          }
+
           socket_logic_strong
             .update_peer_identity(connection_identifier, peer_identity)
             .await;
@@ -382,16 +401,17 @@ async fn handle_new_connection_established(
           .insert(core_read_id, endpoint_uri_from_event.clone());
       }
 
-      // 7. Notify ISocket logic that pipes are attached
-      // The ISocket pattern logic uses these IDs to manage its internal state for the connection.
+      // 7. Notify ISocket logic that pipes are attached immediately on connection establishment.
+      // The LoadBalancer (and other ISocket routing tables) must know about this connection
+      // as soon as the TCP link is up, so that concurrent send() calls can unblock even if
+      // the ZMTP handshake has not completed yet. If the handshake subsequently fails,
+      // pipe_detached will be called when the session stops, cleanly removing the URI.
+      // PeerIdentityEstablished (fired on handshake success) will call pipe_attached again
+      // with the resolved identity; that is safe because add_connection() is idempotent.
+      tracing::debug!(handle=core_handle, sca_id=sca_handle_id, conn_uri=%endpoint_uri_from_event, "Notifying ISocket of pipe attachment for new SCA connection.");
       socket_logic_strong
-        .pipe_attached(
-          core_read_id,
-          core_write_id,
-          None, /* peer_identity comes later */
-        )
+        .pipe_attached(core_read_id, core_write_id, None)
         .await;
-      tracing::info!(handle=core_handle, sca_id=sca_handle_id, conn_uri=%endpoint_uri_from_event, "SessionConnectionActorX connection fully attached to SocketCore.");
     }
 
     #[cfg(feature = "io-uring")]
@@ -445,10 +465,8 @@ async fn handle_new_connection_established(
           .uring_fd_to_endpoint_uri
           .insert(fd, endpoint_uri_from_event.clone());
       }
-      socket_logic_strong
-        .pipe_attached(synthetic_read_id, synthetic_write_id, None)
-        .await;
-      tracing::info!(handle=core_handle, raw_fd=fd, conn_uri=%endpoint_uri_from_event, "UringFd-based connection fully attached.");
+      // Defer notifying ISocket logic that pipes are attached until UringFdHandshakeComplete is received
+      tracing::info!(handle=core_handle, raw_fd=fd, conn_uri=%endpoint_uri_from_event, "UringFd-based connection registered; awaiting handshake before pipe attachment.");
     }
     #[cfg(not(feature = "io-uring"))]
     ConnectionInteractionModel::ViaUringFd { _fd_placeholder } => {

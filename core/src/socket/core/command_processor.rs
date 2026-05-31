@@ -190,7 +190,7 @@ pub(crate) async fn process_socket_command(
 
     // --- Uring Specific Commands ---
     #[cfg(feature = "io-uring")]
-    Command::UringFdMessage { fd, msg } => {
+    Command::UringFdMessage { fd, msgs } => {
       let endpoint_uri_opt = core_arc
         .core_state
         .read()
@@ -198,8 +198,6 @@ pub(crate) async fn process_socket_command(
         .get(&fd)
         .cloned();
       if let Some(uri) = endpoint_uri_opt {
-        // The synthetic_read_id is what ISocket knows this FD by.
-        // We need to find it from the EndpointInfo associated with this FD/URI.
         let synthetic_read_id_opt = core_arc
           .core_state
           .read()
@@ -208,23 +206,18 @@ pub(crate) async fn process_socket_command(
           .and_then(|ep_info| ep_info.pipe_ids.map(|pids| pids.1)); // pids.1 is the read_id
 
         if let Some(s_read_id) = synthetic_read_id_opt {
-          let cmd_for_isocket = Command::PipeMessageReceived {
-            pipe_id: s_read_id,
-            msg,
-          };
+          let batch_cmd = Command::PipeMessageBatchReceived { pipe_id: s_read_id, msgs };
           if let Err(e) = socket_logic_strong
-            .handle_pipe_event(s_read_id, cmd_for_isocket)
+            .handle_pipe_event(s_read_id, batch_cmd)
             .await
           {
-            tracing::error!(handle=core_handle, %fd, "Error from ISocket::handle_pipe_event for UringFdMessage: {}", e);
-            // This error might require closing the UringFdConnection.
-            // The error should ideally propagate from ISocket::handle_pipe_event if it's fatal for the "pipe".
+            tracing::error!(handle=core_handle, %fd, "Error from ISocket::handle_pipe_event for UringFdMessage batch: {}", e);
           }
         } else {
           tracing::warn!(handle=core_handle, %fd, %uri, "No synthetic_read_id found for UringFdMessage. Inconsistent state?");
         }
       } else {
-        tracing::warn!(handle=core_handle, %fd, "Received UringFdMessage for unknown FD. Message dropped.");
+        tracing::warn!(handle=core_handle, %fd, "Received UringFdMessage for unknown FD. Messages dropped.");
       }
     }
     #[cfg(feature = "io-uring")]
@@ -304,8 +297,26 @@ pub(crate) async fn process_socket_command(
         if let Some(s_read_id) = synthetic_read_id_opt {
           tracing::debug!(
               handle = core_handle, %fd, %uri, synth_pipe_id = s_read_id, ?peer_identity,
-              "SocketCore: Processing UringFdHandshakeComplete. Notifying ISocket."
+              "SocketCore: Processing UringFdHandshakeComplete. Attaching pipes and notifying ISocket."
           );
+
+          let synthetic_write_id = core_arc
+            .core_state
+            .read()
+            .endpoints
+            .get(&uri)
+            .and_then(|ep_info| ep_info.pipe_ids.map(|pids| pids.0))
+            .unwrap_or(0);
+
+          // Complete the deferred pipe attachment now that the handshake has succeeded
+          socket_logic_strong
+            .pipe_attached(
+              s_read_id,
+              synthetic_write_id,
+              peer_identity.as_ref().map(|b| b.as_ref()),
+            )
+            .await;
+
           // Notify the ISocket pattern logic (e.g., RouterSocket) about the identity.
           socket_logic_strong
             .update_peer_identity(s_read_id, peer_identity)
@@ -577,7 +588,7 @@ pub(crate) async fn respawn_connecter_actor(
       let core_s_read = core_arc.core_state.read();
       let options_clone = core_s_read.options.clone();
       let monitor_tx_clone = core_s_read.get_monitor_sender_clone();
-      
+
       let current_attempts = core_s_read
         .reconnect_states
         .get(&target_uri)

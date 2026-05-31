@@ -2,17 +2,29 @@
 
 use crate::io_uring_backend::ops::UringOpRequest;
 use fibre::{mpmc::AsyncSender, SendError, TrySendError};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::{os::fd::AsRawFd, usize};
 
 #[derive(Clone)] // EventFD is Cloneable
 pub struct SignalingOpSender {
   op_tx: AsyncSender<UringOpRequest>, // Store the async sender directly
   event_fd: eventfd::EventFD,              // Clone of the UringWorker's EventFD
+  worker_asleep: Arc<AtomicBool>,
 }
 
 impl SignalingOpSender {
-  pub fn new(op_tx: AsyncSender<UringOpRequest>, event_fd: eventfd::EventFD) -> Self {
-    Self { op_tx, event_fd }
+  pub fn new(
+    op_tx: AsyncSender<UringOpRequest>,
+    event_fd: eventfd::EventFD,
+    worker_asleep: Arc<AtomicBool>,
+  ) -> Self {
+    Self { op_tx, event_fd, worker_asleep }
+  }
+
+  /// Clones the worker-asleep flag to share with data connections.
+  pub fn clone_worker_asleep(&self) -> Arc<AtomicBool> {
+    Arc::clone(&self.worker_asleep)
   }
 
   /// Asynchronously sends an operation request and signals the eventfd on success.

@@ -36,10 +36,7 @@ impl BufferRingManager {
     // Create an iterator that yields `ring_entries` number of BytesMut buffers.
     let bufs_iter = (0..ring_entries).map(|_| BytesMut::with_capacity(buffer_capacity));
 
-    // `IoUringBufRing::new_with_buffers` takes ownership of the iterator.
-    // The actual number of entries in the ring will be `bufs_iter.count().next_power_of_two()`.
-    // If `ring_entries` is already a power of two, it will be that.
-    match IoUringBufRing::new_with_buffers(ring, bufs_iter, bgid) {
+    match IoUringBufRing::new_with_buffers_and_flags(ring, bufs_iter, bgid, 0) {
       Ok(buf_ring_instance) => {
         tracing::info!(
           "BufferRingManager: IoUringBufRing built and registered successfully for bgid: {}",

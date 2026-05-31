@@ -51,13 +51,15 @@ impl ZmtpManualParser {
             return Ok(None); // Not enough data for full header
           }
 
-          // Consume header
-          let flags = src.get_u8(); // Consumes the flags byte
+          // Non-destructive length parsing to avoid mutating the accumulator on partial reads
           let raw_size = if is_long {
-            src.get_u64()
+            let mut len_bytes = [0u8; 8];
+            len_bytes.copy_from_slice(&src[1..9]);
+            u64::from_be_bytes(len_bytes)
           } else {
-            src.get_u8() as u64
+            src[1] as u64
           };
+
           if self.max_msg_size >= 0 && raw_size > self.max_msg_size as u64 {
             return Err(ZmqError::ProtocolViolation(format!(
               "frame size {} exceeds ZMQ_MAXMSGSIZE {}",
@@ -66,7 +68,29 @@ impl ZmtpManualParser {
           }
           let size = raw_size as usize;
 
-          self.state = ManualDecodingState::ReadBody { flags, size };
+          // Guard: Verify if the full body is present as well.
+          // Use subtraction (not addition) to avoid overflow when size == usize::MAX.
+          // Safe because src.len() >= header_len is guaranteed by the early-return above.
+          if src.len() - header_len < size {
+            return Ok(None); // Return early without mutating accumulator or state
+          }
+
+          // Consume the header now that we are guaranteed to have the complete frame
+          let flags = src.get_u8();
+          let _ = src.split_to(header_len - 1); // Discard length bytes
+          let body_bytes = src.split_to(size).freeze();
+
+          // Construct rzmq Msg
+          let mut msg = Msg::from_bytes(body_bytes);
+          let mut rz_flags = MsgFlags::empty();
+          if (flags & ZMTP_FLAG_MORE) != 0 {
+            rz_flags |= MsgFlags::MORE;
+          }
+          if (flags & ZMTP_FLAG_COMMAND) != 0 {
+            rz_flags |= MsgFlags::COMMAND;
+          }
+          msg.set_flags(rz_flags);
+          return Ok(Some(msg));
         }
         ManualDecodingState::ReadBody { flags, size } => {
           if src.len() < size {
@@ -144,7 +168,9 @@ mod tests {
     buf.put_u8(payload.len() as u8);
     buf.put_slice(payload);
     let result = parser.decode_from_buffer(&mut buf);
-    let msg = result.expect("should succeed").expect("should have message");
+    let msg = result
+      .expect("should succeed")
+      .expect("should have message");
     assert_eq!(msg.data().unwrap(), payload);
   }
 }
