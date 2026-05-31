@@ -61,11 +61,11 @@ Pattern                   : PushPull
 Role                      : Client
 Message Size              : 64 bytes
 Elapsed Time              : 10.0000 seconds
-Total Messages            : 2690731
-Total Data                : 164.23 MB
+Total Messages            : 2827166
+Total Data                : 172.56 MB
 --------------------------------------------------------
-Throughput                : 269072.76 msg/s
-Throughput Rate           : 16.42 MB/s
+Throughput                : 282716.45 msg/s
+Throughput Rate           : 17.26 MB/s
 ========================================================
 
 Command: cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern pub-sub --msg-size 64
