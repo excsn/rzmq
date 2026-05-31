@@ -80,12 +80,24 @@
 
 For applications requiring the broadest `libzmq` feature set (e.g., ZAP), or support for platforms beyond macOS/Linux, the official C `libzmq` (typically via Rust bindings like `zmq-rs`) remains the established choice.
 
+## Benchmarks
+
+Detailed benchmark results across hardware and socket patterns are available in [`bench/docs/`](bench/docs/):
+
+| Platform | Results |
+|---|---|
+| Linux (AMD Ryzen 5 7640U) | [`bench/docs/linux_bench.md`](bench/docs/linux_bench.md) |
+| macOS (Apple M4) | [`bench/docs/mac_bench.md`](bench/docs/mac_bench.md) |
+
+Benchmarks cover `REQ/REP` and `DEALER/ROUTER` patterns at various message sizes. See the [`bench/`](bench/) crate for instructions on running them yourself.
+
 ## Structure
 
 This repository may contain multiple crates:
 
 *   `core/`: The main `rzmq` library implementation. (See `core/README.md` for detailed information about the library itself).
 *   `cli/`: Command Line Utility to help generate NoiseXX keys. (See `cli/README.md` for detailed information about the cli itself).
+*   `bench/`: Standalone benchmarking tool for measuring throughput and latency.
 
 ## Getting Started
 
