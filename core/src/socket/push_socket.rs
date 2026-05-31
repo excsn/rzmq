@@ -1,9 +1,9 @@
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
+use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
 use crate::socket::patterns::LoadBalancer;
-use crate::socket::ISocket;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use tokio::time::timeout as tokio_timeout;
 
-use crate::{delegate_to_core, Blob, MsgFlags};
+use crate::{Blob, MsgFlags, delegate_to_core};
 
 #[derive(Debug)]
 pub(crate) struct PushSocket {
@@ -81,7 +81,7 @@ impl ISocket for PushSocket {
           // Stale URI in load balancer, remove it and try again
           tracing::warn!(handle = self.core.handle, uri = %uri, "PUSH send: Stale URI found in LoadBalancer. Removing.");
           self.load_balancer.remove_connection(&uri); // remove_connection takes &str
-                                                      // No need to notify waiters here, as we are in a loop that will re-check or wait.
+          // No need to notify waiters here, as we are in a loop that will re-check or wait.
         }
       } else {
         // No URI available from load balancer
@@ -92,12 +92,12 @@ impl ISocket for PushSocket {
         match sndtimeo_opt {
           Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
           None => {
-            self.load_balancer.wait_for_connection().await;
+            self.load_balancer.wait_for_connection().await?;
             // continue loop implicitly
           }
           Some(duration) => {
             match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
-              Ok(()) => { /* continue loop implicitly */ }
+              Ok(res) => res?,
               Err(_timeout_elapsed) => return Err(ZmqError::Timeout),
             }
           }
@@ -108,7 +108,7 @@ impl ISocket for PushSocket {
     // 2. Get the ISocketConnection interface for this URI.
     let connection_iface_arc = {
       let core_s = self.core.core_state.read(); // Read lock
-                                                // We re-check contains_key here in case of races, though LB should be fairly up to date.
+      // We re-check contains_key here in case of races, though LB should be fairly up to date.
       core_s
         .endpoints
         .get(&endpoint_uri_to_send_to)
@@ -130,13 +130,12 @@ impl ISocket for PushSocket {
     match connection_iface_arc.send_message(msg).await {
       Ok(()) => Ok(()),
       Err(ZmqError::ConnectionClosed) => {
-        tracing::warn!(
-          handle = self.core.handle,
-          uri = %endpoint_uri_to_send_to,
-          "PUSH send: Connection closed by peer or transport for URI. Removing from LB."
-        );
-        self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-        Err(ZmqError::HostUnreachable("Peer connection closed during send".into()))
+        self
+          .load_balancer
+          .remove_connection(&endpoint_uri_to_send_to);
+        Err(ZmqError::HostUnreachable(
+          "Peer connection closed during send".into(),
+        ))
       }
       Err(e @ ZmqError::ResourceLimitReached) | Err(e @ ZmqError::Timeout) => {
         // These are expected errors if the peer's HWM is hit or SNDTIMEO expires.
@@ -160,14 +159,18 @@ impl ISocket for PushSocket {
             error = %e,
             "PUSH send: Unexpected error on connection_iface.send_message. Removing from LB."
         );
-        self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
+        self
+          .load_balancer
+          .remove_connection(&endpoint_uri_to_send_to);
         Err(e)
       }
     }
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    Err(ZmqError::UnsupportedFeature("PUSH sockets cannot receive messages"))
+    Err(ZmqError::UnsupportedFeature(
+      "PUSH sockets cannot receive messages",
+    ))
   }
 
   async fn send_multipart(&self, mut frames: Vec<Msg>) -> Result<(), ZmqError> {
@@ -207,13 +210,18 @@ impl ISocket for PushSocket {
         match sndtimeo_opt {
           Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
           None => {
-            self.load_balancer.wait_for_connection().await;
+            self.load_balancer.wait_for_connection().await?;
             continue;
           }
-          Some(duration) => match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
-            Ok(()) => continue,
-            Err(_) => return Err(ZmqError::Timeout),
-          },
+          Some(duration) => {
+            match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
+              Ok(res) => {
+                res?;
+                continue;
+              }
+              Err(_) => return Err(ZmqError::Timeout),
+            }
+          }
         }
       }
     };
@@ -225,15 +233,21 @@ impl ISocket for PushSocket {
         .get(&endpoint_uri_to_send_to)
         .map(|ep_info| ep_info.connection_iface.clone())
         .ok_or_else(|| {
-          self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-          ZmqError::HostUnreachable("PUSH: Peer for multipart send disappeared after selection".into())
+          self
+            .load_balancer
+            .remove_connection(&endpoint_uri_to_send_to);
+          ZmqError::HostUnreachable(
+            "PUSH: Peer for multipart send disappeared after selection".into(),
+          )
         })?
     };
 
     match connection_iface_arc.send_multipart(frames).await {
       Ok(()) => Ok(()),
       Err(ZmqError::ConnectionClosed) => {
-        self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
+        self
+          .load_balancer
+          .remove_connection(&endpoint_uri_to_send_to);
         Err(ZmqError::HostUnreachable(
           "PUSH: Peer connection closed during multipart send".into(),
         ))
@@ -243,7 +257,9 @@ impl ISocket for PushSocket {
   }
 
   async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    Err(ZmqError::UnsupportedFeature("PUSH sockets cannot receive messages"))
+    Err(ZmqError::UnsupportedFeature(
+      "PUSH sockets cannot receive messages",
+    ))
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -260,8 +276,18 @@ impl ISocket for PushSocket {
     Err(ZmqError::UnsupportedOption(option))
   }
 
-  async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
-    Ok(false)
+  async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
+    match command {
+      Command::Stop => {
+        tracing::debug!(
+          handle = self.core.handle,
+          "PushSocket received Stop. Deactivating load balancer."
+        );
+        self.load_balancer.deactivate();
+      }
+      _ => return Ok(false),
+    }
+    Ok(true)
   }
 
   async fn handle_pipe_event(&self, pipe_id: usize, event: Command) -> Result<(), ZmqError> {

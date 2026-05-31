@@ -48,6 +48,8 @@ pub async fn run(args: Cli) -> Result<(), ZmqError> {
   } else {
     base_args.push(format!("--duration={}", args.duration));
   }
+  base_args.push(format!("--concurrency={}", args.concurrency));
+  base_args.push(format!("--pipeline={}", args.pipeline));
 
   // Include Linux io_uring options if the feature was compiled
   #[cfg(feature = "io-uring")]

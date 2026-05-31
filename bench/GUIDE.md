@@ -192,7 +192,46 @@ cargo run --release --bin rzmq_bench -- --role client --endpoint tcp://192.168.1
 
 ---
 
-## 5. Output Metrics & Interpretation
+## 5. Concurrency and Pipelining
+
+Two flags control parallel execution within the client process:
+
+| Flag | Default | Applies To | Description |
+| :--- | :--- | :--- | :--- |
+| `--concurrency N` | `1` | All patterns | Spawn N independent async worker tasks in the client |
+| `--pipeline N` | `1` | `dealer-router` only | In-flight message window depth per worker |
+
+### How They Work
+
+**`--concurrency`** spawns N tokio tasks that each run their own send/receive loop on a cloned socket handle. Because `rzmq::Socket` is `Arc`-backed and cheaply cloneable, this adds no socket-layer overhead. All tasks share a single `BenchmarkCollector` via `Arc`, so the final report reflects the combined throughput across all workers.
+
+**`--pipeline`** applies only to the `dealer-router` pattern. It uses a `tokio::sync::Semaphore` to cap in-flight requests. A sender task acquires a permit before each send; a paired receiver task releases a permit for each reply received. The total window is `concurrency × pipeline`. Latency tracking (RTT histogram) is automatically disabled when `pipeline > 1` because individual message RTTs cannot be measured when sends and receives are decoupled.
+
+### Constraints
+
+> **`req-rep` + `--concurrency`:** The ZeroMQ `REQ` socket enforces a strict `send → recv → send → recv` alternation. Running multiple concurrent tasks on the same socket would violate this state machine. `rzmq_bench` logs a warning and clamps to 1 worker for `req-rep` regardless of the `--concurrency` value.
+
+> **`--pipeline` without `dealer-router`:** The `--pipeline` flag is silently ignored for non-`dealer-router` patterns.
+
+### Example Commands
+
+```bash
+# PUSH/PULL: 4 concurrent workers (throughput scaling)
+cargo run --release --bin rzmq_bench -- --role orchestrate --pattern push-pull --concurrency 4 --duration 10
+
+# PUSH/PULL: 8 concurrent workers, message-count termination
+cargo run --release --bin rzmq_bench -- --role orchestrate --pattern push-pull --concurrency 8 --messages 1000000
+
+# DEALER/ROUTER: 16 in-flight requests per worker (pipelining)
+cargo run --release --bin rzmq_bench -- --role orchestrate --pattern dealer-router --pipeline 16 --duration 10
+
+# DEALER/ROUTER: 2 workers × 16 pipeline depth = 32 total in-flight requests
+cargo run --release --bin rzmq_bench -- --role orchestrate --pattern dealer-router --concurrency 2 --pipeline 16 --duration 10
+```
+
+---
+
+## 6. Output Metrics & Interpretation
 
 `rzmq_bench` supports three output formats:
 

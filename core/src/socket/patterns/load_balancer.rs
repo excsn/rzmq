@@ -1,13 +1,25 @@
 use parking_lot::Mutex;
 use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::Notify;
+use crate::ZmqError;
 
 /// Distributes access to available connections in a round-robin fashion.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct LoadBalancer {
   /// Stores the endpoint URIs of available connections.
   connection_uris: Mutex<VecDeque<String>>,
   notify_waiters: Arc<Notify>,
+  deactivated: std::sync::atomic::AtomicBool,
+}
+
+impl Default for LoadBalancer {
+  fn default() -> Self {
+    Self {
+      connection_uris: Mutex::new(VecDeque::new()),
+      notify_waiters: Arc::new(Notify::new()),
+      deactivated: std::sync::atomic::AtomicBool::new(false),
+    }
+  }
 }
 
 impl LoadBalancer {
@@ -53,11 +65,14 @@ impl LoadBalancer {
   }
 
   /// Waits until at least one connection is available in the balancer.
-  pub async fn wait_for_connection(&self) {
+  pub async fn wait_for_connection(&self) -> Result<(), ZmqError> {
     let notify = self.notify_waiters.clone();
     loop {
+      if self.deactivated.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(ZmqError::InvalidState("Socket closed".into()));
+      }
       if !self.connection_uris.lock().is_empty() {
-        return;
+        return Ok(());
       }
       notify.notified().await;
     }
@@ -69,11 +84,13 @@ impl LoadBalancer {
   }
 
   /// Returns the current number of connections being managed by the load balancer.
-  /// Note: This is an async fn because it locks the mutex. In practice, this lock
-  /// is very short-lived for just getting the length. If this becomes a performance
-  /// concern for extremely high-frequency calls not involving .await, alternative
-  /// atomic counting could be considered, but for now, this is simplest and correct.
   pub async fn connection_count(&self) -> usize {
     self.connection_uris.lock().len()
+  }
+
+  /// Deactivates the load balancer and unblocks all waiting senders.
+  pub fn deactivate(&self) {
+    self.deactivated.store(true, std::sync::atomic::Ordering::Release);
+    self.notify_waiters.notify_waiters();
   }
 }

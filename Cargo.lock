@@ -1329,8 +1329,10 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "fibre",
  "hdrhistogram",
  "nix 0.27.1",
+ "parking_lot",
  "rzmq",
  "serde",
  "serde_json",

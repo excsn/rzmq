@@ -42,8 +42,8 @@ pub struct Cli {
   #[arg(long, value_enum, default_value_t = Pattern::PushPull)]
   pub pattern: Pattern,
 
-  /// Size of individual message payloads in bytes
-  #[arg(long, default_value_t = 64)]
+  /// Size of individual message payloads in bytes (minimum 8 for in-band latency timestamps)
+  #[arg(long, default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(8..))]
   pub msg_size: usize,
 
   /// Total number of messages to process (omitting runs indefinitely or uses duration)
@@ -53,6 +53,18 @@ pub struct Cli {
   /// Maximum duration of the test run in seconds
   #[arg(long, default_value_t = 10)]
   pub duration: u64,
+
+  /// Warmup duration in seconds before recording measurements (default: no warmup)
+  #[arg(long, default_value_t = 5)]
+  pub warmup: u64,
+
+  /// Number of concurrent asynchronous worker tasks to spawn
+  #[arg(long, default_value_t = 1)]
+  pub concurrency: usize,
+
+  /// Maximum in-flight messages per connection (pipelining depth, DealerRouter only)
+  #[arg(long, default_value_t = 1)]
+  pub pipeline: usize,
 
   /// High-Water Mark (HWM) limit applied to socket queues
   #[arg(long, default_value_t = 1000)]

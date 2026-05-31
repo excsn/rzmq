@@ -1,9 +1,10 @@
 use crate::cli::{Cli, Pattern};
 use crate::metrics::BenchmarkCollector;
+use fibre::mpsc;
 use rzmq::socket::{RCVHWM, SUBSCRIBE, TCP_CORK};
 use rzmq::{Context, SocketType, ZmqError};
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 #[cfg(feature = "io-uring")]
 use rzmq::socket::{IO_URING_RCVMULTISHOT, IO_URING_SESSION_ENABLED};
@@ -51,54 +52,116 @@ pub async fn run(args: Cli) -> Result<(), ZmqError> {
   let mut collector = BenchmarkCollector::new(false);
   let mut last_interim_check = Instant::now();
   let interim_interval = Duration::from_secs(1);
+  let mut total_received = 0u64;
 
   match args.pattern {
     Pattern::PushPull | Pattern::PubSub => {
       // Unidirectional Drain (Throughput)
       loop {
-        let msg = socket.recv().await?;
-        let size = msg.size();
-        std::hint::black_box(msg);
+        match socket.recv().await {
+          Ok(msg) => {
+            let size = msg.size();
+            std::hint::black_box(msg);
+            total_received += 1;
 
-        collector.record_message(size, None);
+            collector.record_message(size);
 
-        if last_interim_check.elapsed() >= interim_interval {
-          collector.print_interim_report_if_due(interim_interval, "Server");
-          last_interim_check = Instant::now();
+            if last_interim_check.elapsed() >= interim_interval {
+              collector.print_interim_report_if_due(interim_interval, "Server");
+              last_interim_check = Instant::now();
+            }
+          }
+          Err(ZmqError::ConnectionClosed) => {
+            info!("Server: Connection closed by peer. Stopping receiver loop. Total received: {}", total_received);
+            break;
+          }
+          Err(e) => {
+            error!("Server receiver loop error: {}", e);
+            return Err(e);
+          }
         }
       }
     }
     Pattern::ReqRep => {
       // Bidirectional Echo (Latency)
       loop {
-        let msg = socket.recv().await?;
-        let size = msg.size();
-        socket.send(msg).await?;
+        match socket.recv().await {
+          Ok(msg) => {
+            let size = msg.size();
+            socket.send(msg).await?;
+            total_received += 1;
 
-        collector.record_message(size, None);
+            collector.record_message(size);
 
-        if last_interim_check.elapsed() >= interim_interval {
-          collector.print_interim_report_if_due(interim_interval, "Server");
-          last_interim_check = Instant::now();
+            if last_interim_check.elapsed() >= interim_interval {
+              collector.print_interim_report_if_due(interim_interval, "Server");
+              last_interim_check = Instant::now();
+            }
+          }
+          Err(ZmqError::ConnectionClosed) => {
+            info!("Server: Connection closed by peer. Stopping ReqRep loop. Total handled: {}", total_received);
+            break;
+          }
+          Err(e) => {
+            error!("Server ReqRep loop error: {}", e);
+            return Err(e);
+          }
         }
       }
     }
     Pattern::DealerRouter => {
-      // Bidirectional Multipart Echo
+      // Bidirectional Multipart Echo — decoupled read/write paths.
+      //
+      // A single dedicated sender task drains a lock-free MPSC queue in FIFO
+      // order, guaranteeing sequential consistency for echoed replies. The main
+      // read loop never blocks on network backpressure.
+      let (send_tx, send_rx) = mpsc::unbounded_async::<Vec<rzmq::Msg>>();
+
+      let socket_clone = socket.clone();
+      tokio::spawn(async move {
+        while let Ok(frames) = send_rx.recv().await {
+          if let Err(e) = socket_clone.send_multipart(frames).await {
+            if !matches!(e, ZmqError::ConnectionClosed | ZmqError::InvalidState(_)) {
+              error!("Server echo failed: {}", e);
+            }
+            if matches!(e, ZmqError::ConnectionClosed | ZmqError::InvalidState(_)) {
+              break;
+            }
+          }
+        }
+      });
+
       loop {
-        let frames = socket.recv_multipart().await?;
+        match socket.recv_multipart().await {
+          Ok(frames) => {
+            let size: usize = frames.iter().map(|f| f.size()).sum();
+            total_received += 1;
 
-        // Calculate total payload size of the frames
-        let size: usize = frames.iter().map(|f| f.size()).sum();
-        socket.send_multipart(frames).await?;
+            collector.record_message(size);
 
-        collector.record_message(size, None);
+            if send_tx.send(frames).await.is_err() {
+              error!("Server internal send channel closed unexpectedly.");
+              break;
+            }
 
-        if last_interim_check.elapsed() >= interim_interval {
-          collector.print_interim_report_if_due(interim_interval, "Server");
-          last_interim_check = Instant::now();
+            if last_interim_check.elapsed() >= interim_interval {
+              collector.print_interim_report_if_due(interim_interval, "Server");
+              last_interim_check = Instant::now();
+            }
+          }
+          Err(ZmqError::ConnectionClosed) => {
+            info!("Server: Connection closed by peer. Stopping DealerRouter loop. Total handled: {}", total_received);
+            break;
+          }
+          Err(e) => {
+            error!("Server DealerRouter loop error: {}", e);
+            return Err(e);
+          }
         }
       }
     }
   }
+
+  info!("Server task run finished cleanly.");
+  Ok(())
 }

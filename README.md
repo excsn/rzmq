@@ -5,7 +5,7 @@
 
 **rzmq** is a high-performance, asynchronous pure Rust implementation of the ZeroMQ (ØMQ) messaging library. It leverages the [Tokio](https://tokio.rs/) runtime for its asynchronous capabilities and aims to provide a familiar ZeroMQ API.
 
-**The primary focus of `rzmq` is to deliver leading performance on Linux.** By integrating `io_uring` with TCP Cork, `rzmq` **has demonstrated superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput benchmark scenarios.**
+**The primary focus of `rzmq` is to deliver leading performance on Linux.** By integrating `io_uring` with TCP Cork, `rzmq` **has demonstrated superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput [benchmarks](#benchmarks) included in this repository.**
 
 ## Project Status: Beta ⚠️
 
@@ -80,17 +80,6 @@
 
 For applications requiring the broadest `libzmq` feature set (e.g., ZAP), or support for platforms beyond macOS/Linux, the official C `libzmq` (typically via Rust bindings like `zmq-rs`) remains the established choice.
 
-## Benchmarks
-
-Detailed benchmark results across hardware and socket patterns are available in [`bench/docs/`](bench/docs/):
-
-| Platform | Results |
-|---|---|
-| Linux (AMD Ryzen 5 7640U) | [`bench/docs/linux_bench.md`](bench/docs/linux_bench.md) |
-| macOS (Apple M4) | [`bench/docs/mac_bench.md`](bench/docs/mac_bench.md) |
-
-Benchmarks cover `REQ/REP`, `DEALER/ROUTER`, `PUB/SUB`, `PUSH/PULL` patterns. See the [`bench/`](bench/) crate for instructions on running them yourself.
-
 ## Structure
 
 This repository may contain multiple crates:
@@ -102,6 +91,17 @@ This repository may contain multiple crates:
 ## Getting Started
 
 Please refer to the **[`core/README.md`](core/README.md)** for detailed installation instructions, prerequisites, API usage, and examples.
+
+## Benchmarks
+
+Detailed benchmark results across hardware and socket patterns are available in [`bench/docs/`](bench/docs/):
+
+| Platform | Results |
+|---|---|
+| Linux (AMD Ryzen 5 7640U) | [`bench/docs/linux_bench.md`](bench/docs/linux_bench.md) |
+| macOS (Apple M4) | [`bench/docs/mac_bench.md`](bench/docs/mac_bench.md) |
+
+Benchmarks cover `REQ/REP`, `DEALER/ROUTER`, `PUB/SUB`, `PUSH/PULL` patterns. See the [`bench/`](bench/) crate for instructions on running them yourself.
 
 ## License
 

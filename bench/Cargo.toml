@@ -10,6 +10,9 @@ publish = false
 # Local workspace dependencies
 rzmq = { path = "../core" }
 
+# High-performance async channels (lock-free segmented block queue)
+fibre = { version = "^0.5" }
+
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 
@@ -24,6 +27,9 @@ bytes = "1.5"
 
 # Platform-agnostic utilities (such as CPU affinity/pinning)
 nix = { version = "0.27", features = ["sched"] }
+
+# Fast mutex for non-async critical sections (histogram, interim timer)
+parking_lot = "0.12"
 
 # Serialization for structured benchmark outputs
 serde = { version = "1.0", features = ["derive"] }

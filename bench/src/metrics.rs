@@ -2,18 +2,20 @@
 
 use crate::cli::OutputFormat;
 use hdrhistogram::Histogram;
+use parking_lot::Mutex;
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Serialize)]
 struct LatencyReport {
-  min_us: u64,
-  p50_us: u64,
-  p90_us: u64,
-  p95_us: u64,
-  p99_us: u64,
-  p999_us: u64,
-  max_us: u64,
+  min_ns: u64,
+  p50_ns: u64,
+  p90_ns: u64,
+  p95_ns: u64,
+  p99_ns: u64,
+  p999_ns: u64,
+  max_ns: u64,
 }
 
 #[derive(Serialize)]
@@ -26,79 +28,109 @@ struct FinalReport {
   total_megabytes: f64,
   throughput_msg_sec: f64,
   throughput_mb_sec: f64,
-  latency_us: Option<LatencyReport>,
+  latency_ns: Option<LatencyReport>,
 }
 
 pub struct BenchmarkCollector {
   start_time: Instant,
-  messages_count: usize,
-  bytes_count: u64,
-  histogram: Option<Histogram<u64>>,
+  // Resets to Instant::now() when begin_measurement() is called after warmup.
+  // The final report uses this as the elapsed-time base so warmup is excluded.
+  measure_start: Mutex<Instant>,
+  messages_count: AtomicUsize,
+  bytes_count: AtomicU64,
+  // Written only via merge_histogram() at worker-task exit, never per-message.
+  histogram: Option<Mutex<Histogram<u64>>>,
 
-  // Tracking fields for 1-second interim reports
-  interim_last_report: Instant,
-  interim_messages_count: usize,
-  interim_bytes_count: u64,
+  // Tracking fields for 1-second interim reports.
+  // interim_last_report is Mutex-guarded because there is no AtomicInstant in std.
+  // try_lock() ensures only one concurrent task prints per interval without
+  // blocking the hot path — contending tasks skip the report for that cycle.
+  interim_last_report: Mutex<Instant>,
+  interim_messages_count: AtomicUsize,
+  interim_bytes_count: AtomicU64,
 }
 
 impl BenchmarkCollector {
   pub fn new(record_latency: bool) -> Self {
     let now = Instant::now();
     let histogram = if record_latency {
-      // Significant figures = 3 (retains 0.1% accuracy across the range)
-      Some(Histogram::<u64>::new(3).unwrap())
+      Some(Mutex::new(Histogram::<u64>::new(3).unwrap()))
     } else {
       None
     };
 
     Self {
       start_time: now,
-      messages_count: 0,
-      bytes_count: 0,
+      measure_start: Mutex::new(now),
+      messages_count: AtomicUsize::new(0),
+      bytes_count: AtomicU64::new(0),
       histogram,
-      interim_last_report: now,
-      interim_messages_count: 0,
-      interim_bytes_count: 0,
+      interim_last_report: Mutex::new(now),
+      interim_messages_count: AtomicUsize::new(0),
+      interim_bytes_count: AtomicU64::new(0),
     }
   }
 
   #[inline]
-  pub fn record_message(&mut self, bytes_len: usize, rtt_duration: Option<Duration>) {
-    self.messages_count += 1;
-    self.bytes_count += bytes_len as u64;
+  pub fn record_message(&self, bytes_len: usize) {
+    self.messages_count.fetch_add(1, Ordering::Relaxed);
+    self.bytes_count.fetch_add(bytes_len as u64, Ordering::Relaxed);
+    self.interim_messages_count.fetch_add(1, Ordering::Relaxed);
+    self.interim_bytes_count.fetch_add(bytes_len as u64, Ordering::Relaxed);
+  }
 
-    self.interim_messages_count += 1;
-    self.interim_bytes_count += bytes_len as u64;
-
-    if let (Some(hist), Some(duration)) = (&mut self.histogram, rtt_duration) {
-      // Record latency in microseconds
-      let us = duration.as_micros() as u64;
-      let _ = hist.record(us);
+  // Merges a worker-local histogram into the shared one. Called once per
+  // worker lifetime at task exit — never on the per-message hot path.
+  pub fn merge_histogram(&self, local_hist: &Histogram<u64>) {
+    if let Some(ref mutex) = self.histogram {
+      let _ = mutex.lock().add(local_hist);
     }
   }
 
-  pub fn print_interim_report_if_due(&mut self, interval: Duration, role: &str) {
+  // Resets all measurement counters and the measurement clock to now.
+  // Called once when the warmup period ends so the final report only
+  // covers the steady-state measurement window.
+  pub fn begin_measurement(&self) {
     let now = Instant::now();
-    let elapsed = now.duration_since(self.interim_last_report);
+    self.messages_count.store(0, Ordering::Relaxed);
+    self.bytes_count.store(0, Ordering::Relaxed);
+    self.interim_messages_count.store(0, Ordering::Relaxed);
+    self.interim_bytes_count.store(0, Ordering::Relaxed);
+    *self.measure_start.lock() = now;
+    *self.interim_last_report.lock() = now;
+  }
 
-    if elapsed >= interval {
-      let seconds = elapsed.as_secs_f64();
-      let msg_sec = self.interim_messages_count as f64 / seconds;
-      let mb_sec = (self.interim_bytes_count as f64 / 1_048_576.0) / seconds;
+  pub fn print_interim_report_if_due(&self, interval: Duration, role: &str) {
+    // try_lock returns None immediately if another task holds the lock,
+    // so only one task prints per interval window.
+    let mut guard = match self.interim_last_report.try_lock() {
+      Some(g) => g,
+      None => return,
+    };
 
-      println!(
-        "[{}] Interim: {:.2}s | throughput: {:10.2} msg/s | {:8.2} MB/s",
-        role,
-        now.duration_since(self.start_time).as_secs_f64(),
-        msg_sec,
-        mb_sec
-      );
+    let now = Instant::now();
+    let elapsed = now.duration_since(*guard);
 
-      // Reset interim state
-      self.interim_last_report = now;
-      self.interim_messages_count = 0;
-      self.interim_bytes_count = 0;
+    if elapsed < interval {
+      return;
     }
+
+    let msg_count = self.interim_messages_count.swap(0, Ordering::Relaxed);
+    let byte_count = self.interim_bytes_count.swap(0, Ordering::Relaxed);
+    *guard = now;
+    drop(guard);
+
+    let seconds = elapsed.as_secs_f64();
+    let msg_sec = msg_count as f64 / seconds;
+    let mb_sec = (byte_count as f64 / 1_048_576.0) / seconds;
+
+    println!(
+      "[{}] Interim: {:.2}s | throughput: {:10.2} msg/s | {:8.2} MB/s",
+      role,
+      now.duration_since(self.start_time).as_secs_f64(),
+      msg_sec,
+      mb_sec
+    );
   }
 
   pub fn print_final_report(
@@ -108,19 +140,25 @@ impl BenchmarkCollector {
     role: &str,
     msg_size: usize,
   ) {
-    let elapsed = self.start_time.elapsed().as_secs_f64().max(0.000001);
-    let msg_sec = self.messages_count as f64 / elapsed;
-    let total_mb = self.bytes_count as f64 / 1_048_576.0;
+    let total_messages = self.messages_count.load(Ordering::Relaxed);
+    let total_bytes = self.bytes_count.load(Ordering::Relaxed);
+
+    let elapsed = self.measure_start.lock().elapsed().as_secs_f64().max(0.000001);
+    let msg_sec = total_messages as f64 / elapsed;
+    let total_mb = total_bytes as f64 / 1_048_576.0;
     let mb_sec = total_mb / elapsed;
 
-    let latency_metrics = self.histogram.as_ref().map(|hist| LatencyReport {
-      min_us: hist.min(),
-      p50_us: hist.value_at_quantile(0.50),
-      p90_us: hist.value_at_quantile(0.90),
-      p95_us: hist.value_at_quantile(0.95),
-      p99_us: hist.value_at_quantile(0.99),
-      p999_us: hist.value_at_quantile(0.999),
-      max_us: hist.max(),
+    let latency_metrics = self.histogram.as_ref().map(|m| {
+      let hist = m.lock();
+      LatencyReport {
+        min_ns: hist.min(),
+        p50_ns: hist.value_at_quantile(0.50),
+        p90_ns: hist.value_at_quantile(0.90),
+        p95_ns: hist.value_at_quantile(0.95),
+        p99_ns: hist.value_at_quantile(0.99),
+        p999_ns: hist.value_at_quantile(0.999),
+        max_ns: hist.max(),
+      }
     });
 
     let report = FinalReport {
@@ -128,11 +166,11 @@ impl BenchmarkCollector {
       role: role.to_string(),
       msg_size_bytes: msg_size,
       elapsed_seconds: elapsed,
-      total_messages: self.messages_count,
+      total_messages,
       total_megabytes: total_mb,
       throughput_msg_sec: msg_sec,
       throughput_mb_sec: mb_sec,
-      latency_us: latency_metrics,
+      latency_ns: latency_metrics,
     };
 
     match format {
@@ -143,34 +181,36 @@ impl BenchmarkCollector {
   }
 
   fn print_text_report(&self, r: &FinalReport) {
-    println!("\n========================================================");
-    println!("               rzmq BENCHMARK FINAL REPORT              ");
-    println!("========================================================");
-    println!("{:<25} : {}", "Pattern", r.pattern);
-    println!("{:<25} : {}", "Role", r.role);
-    println!("{:<25} : {} bytes", "Message Size", r.msg_size_bytes);
-    println!("{:<25} : {:.4} seconds", "Elapsed Time", r.elapsed_seconds);
-    println!("{:<25} : {}", "Total Messages", r.total_messages);
-    println!("{:<25} : {:.2} MB", "Total Data", r.total_megabytes);
-    println!("--------------------------------------------------------");
-    println!("{:<25} : {:.2} msg/s", "Throughput", r.throughput_msg_sec);
-    println!(
-      "{:<25} : {:.2} MB/s",
-      "Throughput Rate", r.throughput_mb_sec
-    );
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(1024);
 
-    if let Some(ref lat) = r.latency_us {
-      println!("--------------------------------------------------------");
-      println!("Latency Distribution (Microseconds):");
-      println!("  {:<15} : {:>10} us", "Min", lat.min_us);
-      println!("  {:<15} : {:>10} us", "p50 (Median)", lat.p50_us);
-      println!("  {:<15} : {:>10} us", "p90", lat.p90_us);
-      println!("  {:<15} : {:>10} us", "p95", lat.p95_us);
-      println!("  {:<15} : {:>10} us", "p99", lat.p99_us);
-      println!("  {:<15} : {:>10} us", "p99.9", lat.p999_us);
-      println!("  {:<15} : {:>10} us", "Max", lat.max_us);
+    let _ = writeln!(out, "\n========================================================");
+    let _ = writeln!(out, "               rzmq BENCHMARK FINAL REPORT              ");
+    let _ = writeln!(out, "========================================================");
+    let _ = writeln!(out, "{:<25} : {}", "Pattern", r.pattern);
+    let _ = writeln!(out, "{:<25} : {}", "Role", r.role);
+    let _ = writeln!(out, "{:<25} : {} bytes", "Message Size", r.msg_size_bytes);
+    let _ = writeln!(out, "{:<25} : {:.4} seconds", "Elapsed Time", r.elapsed_seconds);
+    let _ = writeln!(out, "{:<25} : {}", "Total Messages", r.total_messages);
+    let _ = writeln!(out, "{:<25} : {:.2} MB", "Total Data", r.total_megabytes);
+    let _ = writeln!(out, "--------------------------------------------------------");
+    let _ = writeln!(out, "{:<25} : {:.2} msg/s", "Throughput", r.throughput_msg_sec);
+    let _ = writeln!(out, "{:<25} : {:.2} MB/s", "Throughput Rate", r.throughput_mb_sec);
+
+    if let Some(ref lat) = r.latency_ns {
+      let _ = writeln!(out, "--------------------------------------------------------");
+      let _ = writeln!(out, "Latency Distribution:");
+      let _ = writeln!(out, "  {:<15} : {:>12}", "Min", fmt_ns(lat.min_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p50 (Median)", fmt_ns(lat.p50_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p90", fmt_ns(lat.p90_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p95", fmt_ns(lat.p95_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99", fmt_ns(lat.p99_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9", fmt_ns(lat.p999_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "Max", fmt_ns(lat.max_ns));
     }
-    println!("========================================================\n");
+    let _ = writeln!(out, "========================================================\n");
+
+    print!("{out}");
   }
 
   fn print_json_report(&self, r: &FinalReport) {
@@ -180,16 +220,20 @@ impl BenchmarkCollector {
   }
 
   fn print_csv_report(&self, r: &FinalReport) {
-    println!(
-      "pattern,role,msg_size_bytes,elapsed_seconds,total_messages,throughput_msg_sec,throughput_mb_sec,min_us,p50_us,p99_us,max_us"
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(256);
+
+    let _ = writeln!(
+      out,
+      "pattern,role,msg_size_bytes,elapsed_seconds,total_messages,throughput_msg_sec,throughput_mb_sec,min_ns,p50_ns,p99_ns,max_ns"
     );
     let lat_vals = r
-      .latency_us
+      .latency_ns
       .as_ref()
-      .map(|l| format!("{},{},{},{}", l.min_us, l.p50_us, l.p99_us, l.max_us))
+      .map(|l| format!("{},{},{},{}", l.min_ns, l.p50_ns, l.p99_ns, l.max_ns))
       .unwrap_or_else(|| "N/A,N/A,N/A,N/A".to_string());
-
-    println!(
+    let _ = writeln!(
+      out,
       "{},{},{},{:.4},{},{:.2},{:.2},{}",
       r.pattern,
       r.role,
@@ -200,5 +244,19 @@ impl BenchmarkCollector {
       r.throughput_mb_sec,
       lat_vals
     );
+
+    print!("{out}");
+  }
+}
+
+fn fmt_ns(ns: u64) -> String {
+  if ns < 1_000 {
+    format!("{} ns", ns)
+  } else if ns < 1_000_000 {
+    format!("{:.3} µs", ns as f64 / 1_000.0)
+  } else if ns < 1_000_000_000 {
+    format!("{:.3} ms", ns as f64 / 1_000_000.0)
+  } else {
+    format!("{:.3} s", ns as f64 / 1_000_000_000.0)
   }
 }

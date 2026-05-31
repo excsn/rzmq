@@ -137,20 +137,16 @@ impl ISocket for ReqSocket {
           self.load_balancer.remove_connection(&uri);
         }
       } else {
-        if !self.core.is_running().await {
-          return Err(ZmqError::InvalidState(
-            "Socket terminated while waiting for peer".into(),
-          ));
+        if self.core.command_sender().is_closed() {
+          return Err(ZmqError::InvalidState("Socket terminated".into()));
         }
         match timeout_opt {
           Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
-          None => self.load_balancer.wait_for_connection().await,
+          None => self.load_balancer.wait_for_connection().await?,
           Some(duration) => {
-            if tokio_timeout(duration, self.load_balancer.wait_for_connection())
-              .await
-              .is_err()
-            {
-              return Err(ZmqError::Timeout);
+            match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
+              Ok(res) => res?,
+              Err(_timeout_elapsed) => return Err(ZmqError::Timeout),
             }
           }
         }
@@ -452,7 +448,11 @@ impl ISocket for ReqSocket {
         // size 1. Loop with the same state-machine logic as the single-message path.
         for msg in msgs {
           let source_uri = {
-            self.pipe_read_to_endpoint_uri.read().get(&pipe_read_id).cloned()
+            self
+              .pipe_read_to_endpoint_uri
+              .read()
+              .get(&pipe_read_id)
+              .cloned()
           };
           let source_uri = match source_uri {
             Some(s) => s,
@@ -461,7 +461,9 @@ impl ISocket for ReqSocket {
           let is_expected_reply = {
             let op_state_guard = self.state.lock();
             match &*op_state_guard {
-              ReqState::ExpectingReply { target_endpoint_uri } => *target_endpoint_uri == source_uri,
+              ReqState::ExpectingReply {
+                target_endpoint_uri,
+              } => *target_endpoint_uri == source_uri,
               ReqState::ReadyToSend => false,
             }
           };
@@ -485,7 +487,12 @@ impl ISocket for ReqSocket {
                 }
               }
               Err(e) => {
-                tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "REQ batch: Error processing ZMTP reply: {}. Dropping.", e);
+                tracing::error!(
+                  handle = self.core.handle,
+                  pipe_id = pipe_read_id,
+                  "REQ batch: Error processing ZMTP reply: {}. Dropping.",
+                  e
+                );
                 *self.state.lock() = ReqState::ReadyToSend;
                 self.reply_available_notifier.notify_waiters();
               }
