@@ -7,6 +7,13 @@
 
 **A key design goal and demonstrated capability of `rzmq` is achieving exceptional performance on Linux.** Leveraging its advanced `io_uring` backend, **`rzmq` has shown superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a compelling choice for performance-critical distributed applications on Linux.
 
+## Performance Highlights
+
+TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U
+
+- **2.2 M msg/s** — PushPull · 64 B · Linux · io\_uring + cork · 4 workers
+- **6.6 GB/s** — PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
+
 ## Project Status: Beta ⚠️
 
 **Please Note:** `rzmq` is currently in **Beta**. While core functionality and significant performance advantages (on Linux with `io_uring`) are in place, users should be aware of the following:
@@ -232,7 +239,16 @@ cargo test --all-features
 
 ## Benchmarks
 
-Benchmarks are located in the `core/benches` directory and can be run using Criterion:
+Full results across all patterns and configurations are in [`bench/docs/`](../bench/docs/):
+
+| Platform | Results |
+|---|---|
+| Linux (AMD Ryzen 5 7640U) | [`bench/docs/linux_bench.md`](../bench/docs/linux_bench.md) |
+| macOS (Apple M4) | [`bench/docs/mac_bench.md`](../bench/docs/mac_bench.md) |
+
+See the [`bench/`](../bench/) crate for instructions on running benchmarks yourself.
+
+Benchmarks are also located in the `core/benches` directory and can be run using Criterion:
 
 ```bash
 # Run all benchmarks
