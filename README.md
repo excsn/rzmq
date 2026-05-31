@@ -7,6 +7,13 @@
 
 **The primary focus of `rzmq` is to deliver leading performance on Linux.** By integrating `io_uring` with TCP Cork, `rzmq` **has demonstrated superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput [benchmarks](#benchmarks) included in this repository.**
 
+## Performance Highlights
+
+ TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U
+
+- **2.2 M msg/s** — PushPull · 64 B · Linux · io\_uring + cork · 4 workers
+- **6.6 GB/s** — PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
+
 ## Project Status: Beta ⚠️
 
 **`rzmq` is currently in Beta.** While core functionality and significant performance advantages (on Linux with `io_uring`) are in place, users should be aware of the following:
@@ -94,14 +101,14 @@ Please refer to the **[`core/README.md`](core/README.md)** for detailed installa
 
 ## Benchmarks
 
-Detailed benchmark results across hardware and socket patterns are available in [`bench/docs/`](bench/docs/):
+Full results across all patterns and configurations are in [`bench/docs/`](bench/docs/):
 
 | Platform | Results |
 |---|---|
 | Linux (AMD Ryzen 5 7640U) | [`bench/docs/linux_bench.md`](bench/docs/linux_bench.md) |
 | macOS (Apple M4) | [`bench/docs/mac_bench.md`](bench/docs/mac_bench.md) |
 
-Benchmarks cover `REQ/REP`, `DEALER/ROUTER`, `PUB/SUB`, `PUSH/PULL` patterns. See the [`bench/`](bench/) crate for instructions on running them yourself.
+See the [`bench/`](bench/) crate for instructions on running benchmarks yourself.
 
 ## License
 
