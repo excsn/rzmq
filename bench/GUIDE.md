@@ -37,6 +37,12 @@ On modern Linux kernels, the `io_uring` backend bypasses the standard reactor-po
 *   **Zero-Copy Send (`--uring-zerocopy`):** Maps pages from a pre-registered send buffer pool directly into the network device's DMA engine, avoiding memory copies between user space and kernel space during transmit operations.
 *   **Multishot Receive (`--uring-multishot`):** Issues a single, persistent read request to the kernel. As data arrives, the kernel automatically assigns a buffer from a pre-registered receive buffer ring to hold the payload and pushes a completion entry, eliminating the need to re-submit read requests after every receive event.
 
+ ### Fixed Configuration: Adaptive Throttling Disabled
+
+> `rzmq`'s adaptive I/O throttle is **disabled on every socket created by this benchmark** (`ADAPTIVE_THROTTLE = 0`). The throttle is a fairness engine designed for production workloads where ingress and egress must share an actor fairly. In a benchmark, each socket is deliberately one-directional and the throttle's probabilistic yields would introduce artificial latency and reduce peak throughput. Disabling it gives a clean measurement of the transport and runtime without fairness overhead.
+>
+> If you want to measure the cost or benefit of the throttle itself, re-enable it by removing the `set_option(ADAPTIVE_THROTTLE, 0i32)` calls in `src/server.rs` and `src/client.rs`.
+
  ### ⚠️ Operational Constraint: TCP Corking vs. Latency Workloads
 
 > The `--cork` flag utilizes the Linux-specific `TCP_CORK` socket option to aggregate multiple small frames into a single physical network packet. It only has effect with `tcp://` endpoints; it is silently ignored for `ipc://` and `inproc://`.

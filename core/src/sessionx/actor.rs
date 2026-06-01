@@ -6,7 +6,7 @@ use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};
 use crate::sessionx::regulator::SessionRegulator;
 use crate::socket::ISocket;
 use crate::socket::options::ZmtpEngineConfig;
-use crate::throttle::{AdaptiveThrottle, types::AdaptiveThrottleConfig};
+use crate::throttle::AdaptiveThrottle;
 use crate::transport::ZmtpStdStream;
 use crate::{Blob, MailboxReceiver};
 
@@ -146,20 +146,13 @@ where
     );
 
     let adaptive_throttle = {
-      let mut config = AdaptiveThrottleConfig::default(); //TODO Need to make this adjustable per socket
-      config.credit_per_message = 5;
-      config.healthy_balance_width = 1024000;
-      config.max_imbalance = 6553600;
-      config.yield_after_n_consecutive = 256;
-      // config.curve_factor = 2.0;
-      config.priority_boost_factor = 5.0;
-
+      let mut config = self.zmtp_handler.config.throttle_config.clone();
+      // Priority is role-dependent and cannot be set via socket options.
       if self.actor_config.is_server_role {
         config.priority = crate::throttle::types::Priority::Egress;
       } else {
         config.priority = crate::throttle::types::Priority::Ingress;
       }
-
       AdaptiveThrottle::new(config)
     };
 

@@ -76,6 +76,45 @@ Configuration for the global `io_uring` backend. This is used when calling `rzmq
     *   `default_send_buffer_count: rzmq::uring::DEFAULT_IO_URING_SND_BUFFER_COUNT` (16)
     *   `default_send_buffer_size: rzmq::uring::DEFAULT_IO_URING_SND_BUFFER_SIZE` (65536)
 
+### `rzmq::throttle::types::AdaptiveThrottleConfig` Struct
+
+Configuration for the per-connection adaptive I/O throttle. Pass to `Socket::with_throttle_config()` before connecting. Implements `Debug`, `Clone`, and `Default`.
+
+*   **Public Fields**:
+    *   `enabled: bool`
+        *   Master switch. When `false`, `begin_work` returns a zero-cost bypass guard with no atomic operations. Default: `true`.
+    *   `credit_per_message: i32`
+        *   The unit of balance change per operation ("weight" of one message). Default: `5`.
+    *   `healthy_balance_width: u32`
+        *   Half-width of the "zone of tolerance" around the learned balance. No probabilistic throttling occurs inside this zone. Default: `1_024_000`.
+    *   `max_imbalance: u32`
+        *   Distance beyond the healthy zone at which throttling probability reaches 100%. Acts as a hard safety cap. Default: `6_553_600`.
+    *   `yield_after_n_consecutive: u32`
+        *   Hard fairness rule: always yield after this many consecutive same-direction operations regardless of balance. Default: `256`.
+    *   `nudge_interval_ops: u32`
+        *   Number of operations between forced EMA updates. Default: `100`.
+    *   `adaptive_learning_rate: f64`
+        *   EMA smoothing factor (α). Range `[0.01, 0.2]`; smaller = slower adaptation. Default: `0.05`.
+    *   `curve_factor: f64`
+        *   Exponent for the probability curve (e.g. `2.0` = quadratic). Default: `2.0`.
+    *   `strategy: ThrottlingStrategy`
+        *   Function pointer to the probabilistic strategy. Use `rzmq::throttle::strategies::power_curve_strategy` (default) or supply a custom function matching `fn(&ThrottleStateView) -> f64`.
+    *   `priority: Priority`
+        *   Preferred I/O direction. See `rzmq::throttle::types::Priority`. Note: the per-connection role (server/client) overrides this at connection time. Default: `Priority::None`.
+    *   `priority_boost_factor: f64`
+        *   Multiplier applied to yield probability when doing non-priority work during an imbalance. Values > 1.0 make the throttle more aggressive. Default: `5.0`.
+
+*   **Default Values** (via `AdaptiveThrottleConfig::default()`): see field descriptions above.
+
+### `rzmq::throttle::types::Priority` Enum
+
+Defines which I/O direction the throttle should favor.
+
+*   **Variants**:
+    *   `Egress` — Favor outbound traffic. Typical for server-role connections.
+    *   `Ingress` — Favor inbound traffic. Typical for client-role connections.
+    *   `None` — No preference; treat both directions equally (default).
+
 ## 3. Main Types and Their Public Methods
 
 ### `rzmq::Context` Struct
@@ -129,6 +168,8 @@ The public handle for an `rzmq` socket. Provides methods for network operations,
         *   Creates a monitoring channel for this socket with the specified event capacity.
     *   `pub async fn monitor_default(&self) -> Result<MonitorReceiver, ZmqError>`
         *   Creates a monitoring channel with default capacity (`rzmq::socket::DEFAULT_MONITOR_CAPACITY`).
+    *   `pub async fn with_throttle_config(self, config: AdaptiveThrottleConfig) -> Result<Self, ZmqError>`
+        *   Fluent builder that configures the adaptive I/O throttle for this socket and returns the socket. Must be called **before** any `bind` or `connect`. Currently propagates the `enabled` field via the `ADAPTIVE_THROTTLE` socket option; other fields take effect via the full `AdaptiveThrottleConfig` passed at construction time.
 
 ### `rzmq::Msg` Struct
 
@@ -321,6 +362,7 @@ Constants for socket option integer IDs.
 *   `pub const NOISE_XX_STATIC_SECRET_KEY: i32 = 1200` (Requires `noise_xx` feature)
 *   `pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201` (Requires `noise_xx` feature)
 *   `pub const MAX_CONNECTIONS: i32 = 1000`
+*   `pub const ADAPTIVE_THROTTLE: i32 = 1210` — Enable (`1`) or disable (`0`) the adaptive I/O throttle; value is `i32`. Prefer `Socket::with_throttle_config()` for full configuration. Set before `bind`/`connect`.
 *   `pub const IO_URING_SNDZEROCOPY: i32 = 1170` (Requires `io-uring` feature)
 *   `pub const IO_URING_RCVMULTISHOT: i32 = 1171` (Requires `io-uring` feature)
 *   `pub const TCP_CORK: i32 = 1172` (Requires `io-uring` feature, Linux only)

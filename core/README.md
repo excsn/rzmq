@@ -9,7 +9,7 @@
 
 ## Performance Highlights
 
-TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U
+TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U with Adaptive Throttling enabled.
 
 - **2.2 M msg/s** — PushPull · 64 B · Linux · io\_uring + cork · 4 workers
 - **6.6 GB/s** — PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
@@ -36,7 +36,6 @@ We encourage testing, feedback, and contributions to help mature the library tow
 [Hi Stakes Markets Game](https://www.histakesgame.com) -  The worlds most advanced financial simulator, available on iPhone and Android.
 
 ## Key Features
-
 ### Leading Performance on Linux (with `io_uring`)
 *   **`io_uring` Backend**: On supported Linux systems, `rzmq`'s `io_uring` backend has demonstrated superior throughput and lower latency compared to other ZeroMQ implementations, including `libzmq`, in high-throughput benchmark scenarios. This is achieved by optimized syscall patterns, reduced data copying (especially with zerocopy send enabled), and efficient kernel-level I/O batching.
     *   Activated per-socket session using the `IO_URING_SESSION_ENABLED` socket option.
@@ -45,6 +44,10 @@ We encourage testing, feedback, and contributions to help mature the library tow
 
 ### Asynchronous & Pure Rust
 Built entirely on Tokio for non-blocking I/O, with no dependency on the C `libzmq` library.
+
+### Adaptive I/O Throttling
+
+A unique built-in fairness engine (not present in `libzmq`) that probabilistically balances ingress vs. egress work per connection, preventing starvation under asymmetric load. Enabled by default; disable or tune via `Socket::with_throttle_config()` or the `ADAPTIVE_THROTTLE` socket option. See [Usage Guide](./README.USAGE.md#adaptive-io-throttling) for details.
 
 ### Core API
 Provides a `Context` for managing sockets and a `Socket` handle with async methods (`bind`, `connect`, `send`, `recv`, `set_option_raw`, `get_option`, `close`). A convenience `set_option` method is also available for types implementing the `ToBytes` trait.
@@ -82,6 +85,7 @@ Supports a range of common socket options for fine-tuning behavior, including:
 *   Binding: `LAST_ENDPOINT` (read-only, to get actual bound endpoint, e.g., after binding to port 0)
 *   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE` (for SUB), `ROUTING_ID` (for DEALER/ROUTER identity), `ROUTER_MANDATORY`
 *   Keepalives: ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
+*   Adaptive throttle: `ADAPTIVE_THROTTLE` (enable/disable the I/O fairness engine; see `Socket::with_throttle_config` for full configuration)
 *   Security:
     *   `PLAIN_SERVER`, `PLAIN_USERNAME`, `PLAIN_PASSWORD` (requires `plain` feature)
     *   `CURVE_SERVER`, `CURVE_SECRET_KEY`, `CURVE_SERVER_KEY` (requires `curve` feature)

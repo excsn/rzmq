@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use crate::cli::{Cli, Pattern};
 use crate::metrics::BenchmarkCollector;
 use hdrhistogram::Histogram;
-use rzmq::socket::{SNDHWM, TCP_CORK};
+use rzmq::socket::{ADAPTIVE_THROTTLE, SNDHWM, TCP_CORK};
 use rzmq::{Context, Msg, SocketType, ZmqError};
 use std::sync::{
   Arc,
@@ -34,6 +34,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
   // Configure common socket options
   socket.set_option(SNDHWM, args.hwm as i32).await?;
   socket.set_option(TCP_CORK, args.cork).await?;
+  socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
 
   #[cfg(feature = "io-uring")]
   {
@@ -254,6 +255,7 @@ async fn run_throughput_worker(
   let socket = context.socket(socket_type)?;
   socket.set_option(SNDHWM, hwm as i32).await?;
   socket.set_option(TCP_CORK, cork).await?;
+  socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
   socket.connect(&endpoint).await?;
   info!("[Throughput Worker {}] Connected. Loop started.", id);
 
@@ -342,6 +344,7 @@ async fn run_reqrep_worker(
   let socket = context.socket(SocketType::Req)?;
   socket.set_option(SNDHWM, hwm as i32).await?;
   socket.set_option(TCP_CORK, cork).await?;
+  socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
   socket.connect(&endpoint).await?;
   info!("[ReqRep Worker {}] Connected. Loop started.", id);
 

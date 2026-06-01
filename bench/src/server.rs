@@ -1,7 +1,7 @@
 use crate::cli::{Cli, Pattern};
 use crate::metrics::BenchmarkCollector;
 use fibre::mpsc;
-use rzmq::socket::{RCVHWM, SUBSCRIBE, TCP_CORK};
+use rzmq::socket::{ADAPTIVE_THROTTLE, RCVHWM, SUBSCRIBE, TCP_CORK};
 use rzmq::{Context, SocketType, ZmqError};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
@@ -28,6 +28,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
   // Configure common socket options
   socket.set_option(RCVHWM, args.hwm as i32).await?;
   socket.set_option(TCP_CORK, args.cork).await?;
+  socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
 
   // Configure Linux-specific io_uring options if compiled and enabled
   #[cfg(feature = "io-uring")]

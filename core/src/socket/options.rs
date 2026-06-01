@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::throttle::types::AdaptiveThrottleConfig;
 use crate::{Blob, CoreState, ZmqError};
 
 // Use values consistent with libzmq where possible
@@ -62,6 +63,8 @@ pub const TCP_CORK: i32 = 1172;
 
 pub const IO_URING_SESSION_ENABLED: i32 = 1175;
 
+pub const ADAPTIVE_THROTTLE: i32 = 1210;
+
 pub const DEFAULT_RECONNECT_IVL_MS: u64 = 1000;
 
 /// Holds parsed and validated socket options.
@@ -114,6 +117,7 @@ pub(crate) struct SocketOptions {
   pub curve_options: CurveMechanismSocketOptions,
   #[cfg(feature = "noise_xx")]
   pub noise_xx_options: NoiseXxSocketOptions,
+  pub throttle_config: AdaptiveThrottleConfig,
 }
 
 impl Default for SocketOptions {
@@ -151,6 +155,15 @@ impl Default for SocketOptions {
       noise_xx_options: NoiseXxSocketOptions::default(),
       #[cfg(feature = "curve")]
       curve_options: CurveMechanismSocketOptions::default(),
+      throttle_config: {
+        let mut c = AdaptiveThrottleConfig::default();
+        c.credit_per_message = 5;
+        c.healthy_balance_width = 1024000;
+        c.max_imbalance = 6553600;
+        c.yield_after_n_consecutive = 256;
+        c.priority_boost_factor = 5.0;
+        c
+      },
     }
   }
 }
@@ -244,6 +257,7 @@ pub(crate) struct ZmtpEngineConfig {
   pub plain_password_for_engine: Option<String>,
   /// Maximum inbound frame size in bytes. -1 means unlimited.
   pub max_msg_size: i64,
+  pub throttle_config: AdaptiveThrottleConfig,
 }
 
 impl From<&SocketOptions> for ZmtpEngineConfig {
@@ -291,6 +305,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       plain_username_for_engine: options.plain_options.username.clone(),
       plain_password_for_engine: options.plain_options.password.clone(),
       max_msg_size: options.maxmsgsize,
+      throttle_config: options.throttle_config.clone(),
     }
   }
 }
@@ -571,6 +586,8 @@ pub(crate) fn apply_core_option_value(
         #[cfg(feature = "io-uring")]
         IO_URING_RCVMULTISHOT => options.io_uring.recv_multishot = parse_bool_option(value)?,
 
+        ADAPTIVE_THROTTLE => options.throttle_config.enabled = parse_bool_option(value)?,
+
         // Options handled by pattern logic (ISocket) or read-only, or not applicable for set_option
         SUBSCRIBE | UNSUBSCRIBE | LAST_ENDPOINT  /* Pattern specific */ | ROUTER_MANDATORY |
         AUTO_DELIMITER | 16 /* ZMQ_TYPE (read-only) */ => return Err(ZmqError::UnsupportedOption(option_id)),
@@ -629,6 +646,8 @@ pub(crate) fn retrieve_core_option_value(
 
         #[cfg(feature = "io-uring")]
         IO_URING_RCVMULTISHOT => Ok((options.io_uring.recv_multishot as i32).to_ne_bytes().to_vec()),
+
+        ADAPTIVE_THROTTLE => Ok((options.throttle_config.enabled as i32).to_ne_bytes().to_vec()),
 
         // Options handled by pattern logic or read-only by nature
         16 /* ZMQ_TYPE */ => Ok((core_s_reader.socket_type as i32).to_ne_bytes().to_vec()),

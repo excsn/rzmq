@@ -25,6 +25,7 @@ This guide provides a detailed overview of how to use the `rzmq` library, coveri
 *   [Supported Socket Types](#supported-socket-types)
 *   [Security Mechanisms](#security-mechanisms)
 *   [Using `io_uring` (Linux Specific)](#using-io_uring-linux-specific)
+*   [Adaptive I/O Throttling](#adaptive-io-throttling)
 *   [Error Handling](#error-handling)
 
 ## Introduction
@@ -505,6 +506,108 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
     *   `rzmq::socket::IO_URING_RCVMULTISHOT`: (Boolean) Request multishot receives. Fulfillment depends on global `UringConfig.default_recv_multishot` and default ring setup.
 
     Global parameters for zero-copy send pools and the default multishot receive ring are set via `UringConfig` during `initialize_uring_backend()`.
+
+## Adaptive I/O Throttling
+
+`rzmq` includes a built-in, probabilistic I/O fairness engine that runs transparently inside each connection's async loop. It prevents one direction of traffic (ingress or egress) from completely starving the other when the workload is asymmetric. This feature is **unique to `rzmq`** and has no equivalent in `libzmq`.
+
+### How It Works
+
+Each connection tracks a real-time **debt/credit balance**:
+
+*   Every ingress operation adds `credit_per_message` to the balance (creating "debt").
+*   Every egress operation subtracts `credit_per_message` from the balance (paying it off).
+
+An exponential moving average (EMA) continuously learns the natural operating balance of the workload. When the real-time balance strays too far from the learned average, the throttle probabilistically calls `tokio::task::yield_now()`, handing CPU time back to the scheduler so the under-served direction can run. A hard consecutive-op cap ensures eventual fairness regardless of probability.
+
+The throttle uses a static function pointer (`should_throttle_fn`) on the guard struct, so **a disabled throttle adds zero branches to the hot path** — `begin_work` returns immediately, touching no atomics.
+
+### Default Behavior
+
+The throttle is **enabled by default** on every socket with sensible production defaults:
+
+| Parameter | Default |
+|---|---|
+| `credit_per_message` | 5 |
+| `healthy_balance_width` | 1 024 000 |
+| `max_imbalance` | 6 553 600 |
+| `yield_after_n_consecutive` | 256 |
+| `priority_boost_factor` | 5.0 |
+| `priority` | Role-derived per connection (Egress for servers, Ingress for clients) |
+| `enabled` | `true` |
+
+### Disabling the Throttle
+
+If your workload is already well-balanced and you want to avoid any overhead, disable the throttle before connecting:
+
+```rust
+use rzmq::{Context, SocketType, ZmqError};
+use rzmq::throttle::types::AdaptiveThrottleConfig;
+
+async fn example(ctx: &Context) -> Result<(), ZmqError> {
+    let socket = ctx.socket(SocketType::Push)?
+        .with_throttle_config(AdaptiveThrottleConfig { enabled: false, ..Default::default() })
+        .await?;
+
+    socket.connect("tcp://127.0.0.1:5555").await?;
+    Ok(())
+}
+```
+
+Alternatively, use the raw socket option:
+
+```rust
+use rzmq::socket::ADAPTIVE_THROTTLE;
+
+socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?; // 0 = disabled, 1 = enabled
+```
+
+### Custom Configuration
+
+For full control over the throttle's behavior, construct an `AdaptiveThrottleConfig` and pass it via `with_throttle_config`. This must be called **before** any `bind` or `connect`.
+
+```rust
+use rzmq::throttle::types::{AdaptiveThrottleConfig, Priority};
+use rzmq::throttle::strategies::power_curve_strategy;
+
+let config = AdaptiveThrottleConfig {
+    enabled: true,
+    credit_per_message: 10,       // Heavier weight per message
+    healthy_balance_width: 512_000,
+    max_imbalance: 4_000_000,
+    yield_after_n_consecutive: 128,
+    nudge_interval_ops: 100,
+    adaptive_learning_rate: 0.05,
+    curve_factor: 2.0,            // Quadratic probability curve
+    strategy: power_curve_strategy,
+    priority: Priority::Egress,   // Favor outbound traffic
+    priority_boost_factor: 3.0,
+};
+
+let socket = ctx.socket(SocketType::Push)?
+    .with_throttle_config(config)
+    .await?;
+```
+
+### Priority
+
+The `priority` field biases the throttle to favor one I/O direction:
+
+*   `Priority::Egress` — favor sending (typical for server-side reply sockets).
+*   `Priority::Ingress` — favor receiving (typical for client-side request sockets).
+*   `Priority::None` — treat both directions equally (default).
+
+> **Note:** The per-connection role (server vs. client) automatically overrides the `priority` field at connection time. You can set any other field in `AdaptiveThrottleConfig` via `with_throttle_config`, but the priority will be corrected to match the connection role unless you disable that behavior.
+
+### Checking Current State
+
+The `ADAPTIVE_THROTTLE` option can be read back to confirm the current enabled state:
+
+```rust
+let raw = socket.get_option(rzmq::socket::ADAPTIVE_THROTTLE).await?;
+let enabled = i32::from_ne_bytes(raw.try_into().unwrap()) != 0;
+println!("Throttle enabled: {}", enabled);
+```
 
 ## Error Handling
 

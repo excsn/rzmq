@@ -9,7 +9,7 @@
 
 ## Performance Highlights
 
- TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U
+ TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U with Adaptive Throttling enabled.
 
 - **2.2 M msg/s** — PushPull · 64 B · Linux · io\_uring + cork · 4 workers
 - **6.6 GB/s** — PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
@@ -56,6 +56,7 @@
         *   `CURVE_SERVER/SECRET_KEY/SERVER_KEY` (`curve` feature)
         *   `NOISE_XX_ENABLED/STATIC_SECRET_KEY/REMOTE_STATIC_PUBLIC_KEY` (`noise_xx` feature)
         *   Linux Performance (`io-uring` feature): `IO_URING_SESSION_ENABLED`, `TCP_CORK`, `IO_URING_SNDZEROCOPY`, `IO_URING_RCVMULTISHOT`.
+*   **Adaptive I/O Throttling:** A unique built-in fairness engine (not present in `libzmq`) that probabilistically balances ingress vs. egress work per connection, preventing starvation under asymmetric load. Uses static function-pointer dispatch for a zero-overhead bypass when disabled. Fully configurable or toggled via the `ADAPTIVE_THROTTLE` socket option / `Socket::with_throttle_config()`.
 *   **Socket Monitoring:** Event system (`Socket::monitor()`) for lifecycle events.
 *   **Supported Security Mechanisms:**
     *   **NULL**: No security (default, interoperable).

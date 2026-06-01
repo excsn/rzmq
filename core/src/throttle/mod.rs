@@ -105,6 +105,14 @@ impl AdaptiveThrottle {
   /// state, reflecting the work that is about to happen. The returned guard
   /// must be used to complete the work cycle.
   pub fn begin_work(&self, dir: Direction) -> ThrottleGuard {
+    if !self.shared.config.enabled {
+      return ThrottleGuard {
+        shared: None,
+        direction: dir,
+        should_throttle_fn: bypass_should_throttle,
+      };
+    }
+
     let delta = self.shared.config.credit_per_message;
     let new_balance = match dir {
       Direction::Ingress => {
@@ -155,8 +163,9 @@ impl AdaptiveThrottle {
     }
 
     ThrottleGuard {
-      shared: self.shared.clone(),
+      shared: Some(self.shared.clone()),
       direction: dir,
+      should_throttle_fn: active_should_throttle,
     }
   }
 }
@@ -166,86 +175,90 @@ impl AdaptiveThrottle {
 /// A temporary guard representing an in-progress I/O operation.
 /// Its purpose is to call the throttling logic when the operation is complete.
 pub struct ThrottleGuard {
-  shared: Arc<InternalSharedState>,
+  shared: Option<Arc<InternalSharedState>>,
   direction: Direction,
+  should_throttle_fn: fn(&ThrottleGuard) -> bool,
 }
 
 impl ThrottleGuard {
   pub fn get_current_balance(&self) -> i32 {
-    return self.shared.current_balance.load(Ordering::Relaxed);
+    self
+      .shared
+      .as_ref()
+      .map_or(0, |s| s.current_balance.load(Ordering::Relaxed))
   }
 
-  /// Finalizes the work cycle by checking the throttle's state and potentially
-  /// yielding control to the async runtime.
-  ///
-  /// This method should be called after every I/O operation that was started
-  /// with `begin_work`.
+  #[inline(always)]
   pub fn should_throttle(&self) -> bool {
-    let cfg = &self.shared.config;
-
-    // Hard cap per-direction
-    let cons = match self.direction {
-      Direction::Ingress => self.shared.consecutive_ingress.load(Ordering::Relaxed),
-      Direction::Egress => self.shared.consecutive_egress.load(Ordering::Relaxed),
-    };
-    if cons >= cfg.yield_after_n_consecutive {
-      self.shared.consecutive_ingress.store(0, Ordering::Relaxed);
-      self.shared.consecutive_egress.store(0, Ordering::Relaxed);
-      return true;
-    }
-
-    // Probabilistic
-    let state = ThrottleStateView {
-      current_balance: self.shared.current_balance.load(Ordering::Relaxed),
-      learned_balance: self.shared.learned_balance.load(Ordering::Relaxed),
-      config: cfg,
-    };
-    let mut p = (cfg.strategy)(&state);
-
-    // If the current work direction is NOT the prioritized one, and we are
-    // imbalanced in a way that favors the *prioritized* direction, we
-    // dramatically increase the probability of yielding to give the
-    // priority work a chance to run.
-    let is_priority_work = match cfg.priority {
-      Priority::Egress => self.direction == Direction::Egress,
-      Priority::Ingress => self.direction == Direction::Ingress,
-      Priority::None => true, // With no priority, all work is "priority" work.
-    };
-
-    if !is_priority_work {
-      let is_imbalanced_towards_priority = match cfg.priority {
-        // We are doing Ingress (non-priority), and the balance is high (debt),
-        // which means we need to do more Egress (priority) work.
-        Priority::Egress => state.current_balance > state.learned_balance as i32,
-        // We are doing Egress (non-priority), and the balance is low (credit),
-        // which means we need to do more Ingress (priority) work.
-        Priority::Ingress => state.current_balance < state.learned_balance as i32,
-        Priority::None => false,
-      };
-
-      if is_imbalanced_towards_priority {
-        // We are doing non-priority work while the system is waiting for
-        // priority work to happen. Be much more aggressive about yielding.
-        // We can scale the probability, for example, by squaring it to make
-        // small probabilities even smaller, but for larger p, it increases.
-        // A simpler, more direct approach is to just multiply it.
-        p *= cfg.priority_boost_factor; // Add priority_boost_factor to config
-      }
-    }
-
-    // piecewise: beyond 2× max_imbalance, always yield
-    let dev = (state.current_balance as f64 - state.learned_balance).abs();
-    let hard_cut = (cfg.max_imbalance as f64) * 2.0;
-    if dev >= hard_cut {
-      p = 1.0;
-    }
-
-    if random::<f64>() < p {
-      self.shared.consecutive_ingress.store(0, Ordering::Relaxed);
-      self.shared.consecutive_egress.store(0, Ordering::Relaxed);
-      return true;
-    }
-
-    false
+    (self.should_throttle_fn)(self)
   }
+}
+
+fn bypass_should_throttle(_guard: &ThrottleGuard) -> bool {
+  false
+}
+
+fn active_should_throttle(guard: &ThrottleGuard) -> bool {
+  let shared = guard.shared.as_ref().unwrap();
+  let cfg = &shared.config;
+
+  // Hard cap per-direction
+  let cons = match guard.direction {
+    Direction::Ingress => shared.consecutive_ingress.load(Ordering::Relaxed),
+    Direction::Egress => shared.consecutive_egress.load(Ordering::Relaxed),
+  };
+  if cons >= cfg.yield_after_n_consecutive {
+    shared.consecutive_ingress.store(0, Ordering::Relaxed);
+    shared.consecutive_egress.store(0, Ordering::Relaxed);
+    return true;
+  }
+
+  // Probabilistic
+  let state = ThrottleStateView {
+    current_balance: shared.current_balance.load(Ordering::Relaxed),
+    learned_balance: shared.learned_balance.load(Ordering::Relaxed),
+    config: cfg,
+  };
+  let mut p = (cfg.strategy)(&state);
+
+  // If the current work direction is NOT the prioritized one, and we are
+  // imbalanced in a way that favors the *prioritized* direction, we
+  // dramatically increase the probability of yielding to give the
+  // priority work a chance to run.
+  let is_priority_work = match cfg.priority {
+    Priority::Egress => guard.direction == Direction::Egress,
+    Priority::Ingress => guard.direction == Direction::Ingress,
+    Priority::None => true, // With no priority, all work is "priority" work.
+  };
+
+  if !is_priority_work {
+    let is_imbalanced_towards_priority = match cfg.priority {
+      // We are doing Ingress (non-priority), and the balance is high (debt),
+      // which means we need to do more Egress (priority) work.
+      Priority::Egress => state.current_balance > state.learned_balance as i32,
+      // We are doing Egress (non-priority), and the balance is low (credit),
+      // which means we need to do more Ingress (priority) work.
+      Priority::Ingress => state.current_balance < state.learned_balance as i32,
+      Priority::None => false,
+    };
+
+    if is_imbalanced_towards_priority {
+      p *= cfg.priority_boost_factor;
+    }
+  }
+
+  // piecewise: beyond 2× max_imbalance, always yield
+  let dev = (state.current_balance as f64 - state.learned_balance).abs();
+  let hard_cut = (cfg.max_imbalance as f64) * 2.0;
+  if dev >= hard_cut {
+    p = 1.0;
+  }
+
+  if random::<f64>() < p {
+    shared.consecutive_ingress.store(0, Ordering::Relaxed);
+    shared.consecutive_egress.store(0, Ordering::Relaxed);
+    return true;
+  }
+
+  false
 }

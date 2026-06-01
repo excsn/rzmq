@@ -210,6 +210,21 @@ impl Socket {
   pub async fn monitor_default(&self) -> Result<MonitorReceiver, ZmqError> {
     self.monitor(DEFAULT_MONITOR_CAPACITY).await
   }
+
+  /// Configures the adaptive throttle for this socket.
+  /// Call immediately after socket creation and before any binds or connects.
+  pub async fn with_throttle_config(
+    self,
+    config: crate::throttle::types::AdaptiveThrottleConfig,
+  ) -> Result<Self, ZmqError> {
+    self
+      .set_option_raw(
+        crate::socket::options::ADAPTIVE_THROTTLE,
+        &(config.enabled as i32).to_ne_bytes(),
+      )
+      .await?;
+    Ok(self)
+  }
 }
 
 impl fmt::Debug for Socket {

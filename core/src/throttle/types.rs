@@ -60,6 +60,9 @@ pub struct AdaptiveThrottleConfig {
   /// A multiplier applied to the yield probability for non-prioritized work.
   /// Values greater than 1.0 (e.g., 2.0 or 3.0) make it more likely to yield.
   pub priority_boost_factor: f64,
+  /// When false, `begin_work` returns a zero-cost bypass guard and no atomic
+  /// state is touched. Set once before any connections are made.
+  pub enabled: bool,
 }
 
 impl Default for AdaptiveThrottleConfig {
@@ -83,6 +86,7 @@ impl Default for AdaptiveThrottleConfig {
       strategy: power_curve_strategy,
       priority: Priority::None,
       priority_boost_factor: 2.5, // A sensible default.
+      enabled: true,
     }
   }
 }

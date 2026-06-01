@@ -211,6 +211,21 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 * **Throughput:** 442,199.00 msg/s
 * **Throughput Rate:** 26.99 MB/s
 
+#### Concurrency 4, Msg Size 32KB
+
+**Command:**
+```bash
+cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --concurrency 4
+```
+
+**Metrics:**
+* **Pattern:** PushPull
+* **Elapsed Time:** 10.0003 seconds
+* **Total Messages:** 2,651,215
+* **Total Data:** 82,850.47 MB
+* **Throughput:** 265,114.72 msg/s
+* **Throughput Rate:** 8,284.83 MB/s
+
 ---
 
 ### 4. PubSub
@@ -259,3 +274,18 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 * **Total Data:** 339.40 MB
 * **Throughput:** 556,105.58 msg/s
 * **Throughput Rate:** 33.94 MB/s
+
+#### Concurrency 4, Msg size 32KB
+
+**Command:**
+```bash
+cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern pub-sub --msg-size 32768 --concurrency 4
+```
+
+**Metrics:**
+* **Pattern:** PubSub
+* **Elapsed Time:** 10.0004 seconds
+* **Total Messages:** 1,938,524
+* **Total Data:** 60,578.88 MB
+* **Throughput:** 193,844.85 msg/s
+* **Throughput Rate:** 6,057.65 MB/s
