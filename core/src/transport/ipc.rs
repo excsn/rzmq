@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use socket2::SockRef;
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 use tokio::sync::{Semaphore, broadcast};
 use tokio::task::{Id as TaskId, JoinHandle};
@@ -261,6 +262,16 @@ impl IpcListener {
               endpoint: endpoint_uri.clone(),
               peer_addr: peer_addr_str.clone(),
             });
+          }
+
+          {
+            let socket_ref = SockRef::from(&unix_stream);
+            if let Some(size) = socket_options.sndbuf {
+              let _ = socket_ref.set_send_buffer_size(size);
+            }
+            if let Some(size) = socket_options.rcvbuf {
+              let _ = socket_ref.set_recv_buffer_size(size);
+            }
           }
 
           // IPC always uses the standard SessionBase + ZmtpEngineCoreStd<UnixStream> path.
@@ -548,6 +559,16 @@ impl IpcConnecter {
               connected_endpoint_uri: actual_connected_uri.clone(),
               is_server_role: false, // Outgoing connection is client role
             };
+            {
+              let socket_ref = SockRef::from(&unix_stream);
+              if let Some(size) = self.context_options.sndbuf {
+                let _ = socket_ref.set_send_buffer_size(size);
+              }
+              if let Some(size) = self.context_options.rcvbuf {
+                let _ = socket_ref.set_recv_buffer_size(size);
+              }
+            }
+
             let engine_conf = Arc::new(ZmtpEngineConfig::from(&*self.context_options));
 
             let (command_sender_for_sca, command_receiver_for_sca) =

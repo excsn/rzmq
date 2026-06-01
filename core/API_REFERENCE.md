@@ -286,6 +286,8 @@ Represents significant events occurring within a socket or its connections, used
 ### In `rzmq::socket::options`:
 
 Constants for socket option integer IDs.
+*   `pub const SNDBUF: i32 = 11` — OS kernel send buffer size in bytes; value is `i32` (`0` = OS default); applies to TCP and IPC
+*   `pub const RCVBUF: i32 = 12` — OS kernel receive buffer size in bytes; value is `i32` (`0` = OS default); applies to TCP and IPC
 *   `pub const MAXMSGSIZE: i32 = 22` — maximum inbound frame size in bytes; value is `i64` (`-1` = unlimited, default)
 *   `pub const SNDHWM: i32 = 23`
 *   `pub const RCVHWM: i32 = 24`

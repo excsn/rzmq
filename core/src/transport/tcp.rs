@@ -149,6 +149,8 @@ impl TcpListener {
       keepalive_time: options.tcp_keepalive_idle,
       keepalive_interval: options.tcp_keepalive_interval,
       keepalive_count: options.tcp_keepalive_count,
+      sndbuf: options.sndbuf,
+      rcvbuf: options.rcvbuf,
     };
 
     let accept_loop_parent_hdl = handle;
@@ -686,6 +688,8 @@ impl TcpConnecter {
       keepalive_time: options.tcp_keepalive_idle,
       keepalive_interval: options.tcp_keepalive_interval,
       keepalive_count: options.tcp_keepalive_count,
+      sndbuf: options.sndbuf,
+      rcvbuf: options.rcvbuf,
     };
     let connecter_actor = TcpConnecter {
       handle,
@@ -1331,6 +1335,12 @@ fn apply_tcp_socket_options_to_tokio(
     }
     socket_ref.set_tcp_keepalive(&keepalive)?;
   }
+  if let Some(size) = config.sndbuf {
+    socket_ref.set_send_buffer_size(size)?;
+  }
+  if let Some(size) = config.rcvbuf {
+    socket_ref.set_recv_buffer_size(size)?;
+  }
   Ok(())
 }
 
@@ -1358,6 +1368,12 @@ fn apply_tcp_socket_options_to_std(
       keepalive = keepalive.with_retries(count);
     }
     socket_ref.set_tcp_keepalive(&keepalive)?;
+  }
+  if let Some(size) = config.sndbuf {
+    socket_ref.set_send_buffer_size(size)?;
+  }
+  if let Some(size) = config.rcvbuf {
+    socket_ref.set_recv_buffer_size(size)?;
   }
   Ok(())
 }

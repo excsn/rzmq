@@ -3,6 +3,8 @@ use std::time::Duration;
 use crate::{Blob, CoreState, ZmqError};
 
 // Use values consistent with libzmq where possible
+pub const SNDBUF: i32 = 11;
+pub const RCVBUF: i32 = 12;
 pub const SNDHWM: i32 = 23;
 pub const RCVHWM: i32 = 24;
 pub const LINGER: i32 = 17;
@@ -103,6 +105,8 @@ pub(crate) struct SocketOptions {
   // Add other commonly used options as needed
   // pub heartbeat_ttl: Option<Duration>, // TTL often derived from timeout
   pub tcp_cork: bool,
+  pub sndbuf: Option<usize>,
+  pub rcvbuf: Option<usize>,
   pub io_uring: IOURingSocketOptions,
   pub zap_domain: Option<String>, // ZAP Domain
   pub plain_options: PlainMechanismSocketOptions,
@@ -138,6 +142,8 @@ impl Default for SocketOptions {
       handshake_ivl: None,
       router_mandatory: false, // Default ZMQ behavior is to drop silently
       tcp_cork: false,
+      sndbuf: None,
+      rcvbuf: None,
       io_uring: Default::default(),
       zap_domain: None,
       plain_options: Default::default(),
@@ -191,7 +197,8 @@ pub(crate) struct TcpTransportConfig {
   pub keepalive_time: Option<Duration>,
   pub keepalive_interval: Option<Duration>,
   pub keepalive_count: Option<u32>,
-  // Add other options settable BEFORE connect/accept if needed (e.g., SO_REUSEADDR?)
+  pub sndbuf: Option<usize>,
+  pub rcvbuf: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -498,6 +505,8 @@ pub(crate) fn apply_core_option_value(
     "Applying core socket option"
   );
   match option_id {
+        SNDBUF => options.sndbuf = Some(parse_i32_option(value)?.max(0) as usize),
+        RCVBUF => options.rcvbuf = Some(parse_i32_option(value)?.max(0) as usize),
         SNDHWM => options.sndhwm = parse_i32_option(value)?.max(0) as usize,
         RCVHWM => options.rcvhwm = parse_i32_option(value)?.max(0) as usize,
         LINGER => options.linger = parse_linger_option(value)?,
@@ -578,6 +587,8 @@ pub(crate) fn retrieve_core_option_value(
   option_id: i32,
 ) -> Result<Vec<u8>, ZmqError> {
   match option_id {
+        SNDBUF => Ok(options.sndbuf.map_or(0, |v| v as i32).to_ne_bytes().to_vec()),
+        RCVBUF => Ok(options.rcvbuf.map_or(0, |v| v as i32).to_ne_bytes().to_vec()),
         SNDHWM => Ok((options.sndhwm as i32).to_ne_bytes().to_vec()),
         RCVHWM => Ok((options.rcvhwm as i32).to_ne_bytes().to_vec()),
         LINGER => Ok(options.linger.map_or(-1, |d| d.as_millis().try_into().unwrap_or(i32::MAX)).to_ne_bytes().to_vec()),

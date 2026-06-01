@@ -350,6 +350,25 @@ async fn set_maxmsgsize_example(socket: &rzmq::Socket) -> Result<(), rzmq::ZmqEr
 The value is an `i64` (8 bytes, native-endian). `-1` means unlimited and is the default. A peer that
 sends a frame exceeding the limit will have its connection dropped with a protocol violation.
 
+Example: Setting `SNDBUF`/`RCVBUF` (OS socket buffer sizes)
+```rust
+use rzmq::socket::{SNDBUF, RCVBUF};
+async fn set_socket_buffers_example(socket: &rzmq::Socket) -> Result<(), rzmq::ZmqError> {
+    // Request 256 KiB send and receive buffers from the OS.
+    // Note: Linux silently doubles the requested value and may cap it at
+    // /proc/sys/net/core/wmem_max and rmem_max. Set 0 to use the OS default.
+    let buf_size: i32 = 256 * 1024;
+    socket.set_option(SNDBUF, buf_size).await?;
+    socket.set_option(RCVBUF, buf_size).await?;
+    Ok(())
+}
+```
+`SNDBUF` and `RCVBUF` configure the **OS kernel** send/receive socket buffers, which are distinct
+from the application-level high-water marks (`SNDHWM`/`RCVHWM`). Increasing these values can
+reduce kernel context-switching overhead on high-throughput TCP and IPC connections. The setting
+is applied when a connection is accepted or established; changing it after that has no effect on
+existing connections.
+
 Example: Setting `SNDTIMEO` (send timeout)
 ```rust
 use rzmq::socket::SNDTIMEO;
