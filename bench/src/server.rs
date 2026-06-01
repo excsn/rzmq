@@ -11,7 +11,10 @@ use rzmq::socket::{IO_URING_RCVMULTISHOT, IO_URING_SESSION_ENABLED};
 
 pub async fn run(args: Cli) -> Result<(), ZmqError> {
   let context = Context::new()?;
+  run_with_context(args, context).await
+}
 
+pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqError> {
   // Determine target socket type based on pattern
   let socket_type = match args.pattern {
     Pattern::ReqRep => SocketType::Rep,

@@ -9,6 +9,37 @@ use tracing::{error, info};
 use std::os::unix::process::CommandExt;
 
 pub async fn run(args: Cli) -> Result<(), ZmqError> {
+  if args.endpoint.starts_with("inproc://") {
+    run_in_process_orchestration(args).await
+  } else {
+    run_multi_process_orchestration(args).await
+  }
+}
+
+async fn run_in_process_orchestration(args: Cli) -> Result<(), ZmqError> {
+  info!("Orchestrator: Initiating in-process benchmark execution for inproc.");
+  let context = rzmq::Context::new()?;
+
+  let server_args = args.clone();
+  let server_context = context.clone();
+
+  let server_handle = tokio::spawn(async move {
+    if let Err(e) = crate::server::run_with_context(server_args, server_context).await {
+      error!("In-process server task exited with error: {}", e);
+    }
+  });
+
+  tokio::time::sleep(Duration::from_millis(250)).await;
+
+  let client_result = crate::client::run_with_context(args, context).await;
+
+  server_handle.abort();
+  info!("Orchestrator: In-process execution complete.");
+
+  client_result
+}
+
+async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
   let current_exe = std::env::current_exe()
     .map_err(|e| ZmqError::Internal(format!("Failed to locate current binary: {}", e)))?;
 

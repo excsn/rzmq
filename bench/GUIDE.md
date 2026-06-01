@@ -6,10 +6,11 @@ This document provides a technical overview and operating instructions for the `
 
 ## 1. Architectural Overview
 
-`rzmq_bench` provides a highly isolated testing environment by supporting both orchestrated multi-process runs on a single host and manual distributed runs across separate physical hosts. It separates execution profiles into two distinct architectural streams:
+`rzmq_bench` provides a highly isolated testing environment by supporting both orchestrated multi-process runs on a single host and manual distributed runs across separate physical hosts. It separates execution profiles into three distinct architectural streams:
 
 1.  **Standard Native Transport (Cross-Platform):** Built on top of the default Tokio asynchronous runtime, leveraging the host operating system's native event-polling interface.
 2.  **`io_uring` Transport (Linux-Specific):** An optional, high-performance transport path designed to minimize system call overhead and memory copying using Linux kernel asynchronous I/O queues.
+3.  **In-Process Orchestration (`inproc://`):** When the endpoint scheme is `inproc://`, the orchestrator runs server and client as tasks within the same OS process, sharing a single `Context`. No subprocesses are spawned. This eliminates OS scheduling overhead and inter-process communication between the benchmark parties entirely.
 
 ---
 
@@ -38,7 +39,7 @@ On modern Linux kernels, the `io_uring` backend bypasses the standard reactor-po
 
  ### ⚠️ Operational Constraint: TCP Corking vs. Latency Workloads
 
-> The `--cork` flag utilizes the Linux-specific `TCP_CORK` socket option to aggregate multiple small frames into a single physical network packet.
+> The `--cork` flag utilizes the Linux-specific `TCP_CORK` socket option to aggregate multiple small frames into a single physical network packet. It only has effect with `tcp://` endpoints; it is silently ignored for `ipc://` and `inproc://`.
 
 *   **Recommended Use Cases:** Only use `--cork` with unidirectional, high-throughput streaming workloads (such as **`push-pull`** or **`pub-sub`**). Under these patterns, the high message volume continuously saturates the TCP buffer, triggering highly efficient, consolidated kernel flushes.
 *   **Do Not Use With:** Any synchronous, latency-bound ping-pong workloads (such as **`req-rep`** or **`dealer-router`**). Because these patterns restrict the pipeline to a single message in-flight, the socket buffer cannot be saturated. The kernel will hold your single 64-byte request in memory until its delayed-flush timer expires, causing round-trip latencies to spike to **~400ms** and dropping throughput to **~2 msg/s**.
@@ -87,40 +88,42 @@ This transport leverages the default Tokio event loop (which resolves to `epoll`
 
 #### 2. In-Process Transport (`inproc://`)
 
+The orchestrator detects the `inproc://` scheme and automatically runs both server and client as tasks within the same OS process (shared `Context`, no subprocesses). `--pin-cpus` has no effect in this mode.
+
 *   **PUSH / PULL (Throughput Stream):**
     ```bash
-    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint inproc://bench_stream --pattern push-pull --msg-size 64 --duration 10
+    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint inproc://bench --pattern push-pull --msg-size 64 --duration 10
     ```
 *   **REQ / REP (Latency Ping-Pong):**
     ```bash
-    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint inproc://bench_latency --pattern req-rep --msg-size 64 --duration 10
+    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint inproc://bench --pattern req-rep --msg-size 64 --duration 10
     ```
 *   **DEALER / ROUTER (Multipart RTT):**
     ```bash
-    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint inproc://bench_async --pattern dealer-router --msg-size 64 --duration 10
+    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint inproc://bench --pattern dealer-router --msg-size 64 --duration 10
     ```
 *   **PUB / SUB (Fan-out Stream):**
     ```bash
-    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint inproc://bench_pubsub --pattern pub-sub --msg-size 64 --duration 10
+    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint inproc://bench --pattern pub-sub --msg-size 64 --duration 10
     ```
 
 #### 3. Inter-Process Communication (IPC - `ipc://` - Unix-only)
 
 *   **PUSH / PULL (Throughput Stream):**
     ```bash
-    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint ipc:///tmp/rzmq_push_pull --pattern push-pull --msg-size 64 --duration 10
+    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint ipc:///tmp/rzmq_bench.ipc --pattern push-pull --msg-size 64 --duration 10
     ```
 *   **REQ / REP (Latency Ping-Pong):**
     ```bash
-    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint ipc:///tmp/rzmq_req_rep --pattern req-rep --msg-size 64 --duration 10
+    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint ipc:///tmp/rzmq_bench.ipc --pattern req-rep --msg-size 64 --duration 10
     ```
 *   **DEALER / ROUTER (Multipart RTT):**
     ```bash
-    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint ipc:///tmp/rzmq_dealer_router --pattern dealer-router --msg-size 64 --duration 10
+    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint ipc:///tmp/rzmq_bench.ipc --pattern dealer-router --msg-size 64 --duration 10
     ```
 *   **PUB / SUB (Fan-out Stream):**
     ```bash
-    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint ipc:///tmp/rzmq_pub_sub --pattern pub-sub --msg-size 64 --duration 10
+    cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint ipc:///tmp/rzmq_bench.ipc --pattern pub-sub --msg-size 64 --duration 10
     ```
 
 ---
@@ -138,7 +141,7 @@ By default, child processes are allowed to float across any available CPU core. 
 
 This reduces context-switch noise and improves measurement stability, particularly for tail-latency percentiles, but requires that at least two physical cores be available.
 
-> **Note:** `--pin-cpus` is Linux-only and is **disabled by default**. Enabling it on a heavily loaded single-core machine will hurt performance rather than help.
+> **Note:** `--pin-cpus` is Linux-only, **disabled by default**, and only applies to multi-process orchestration (`tcp://`, `ipc://`). It has no effect when the endpoint scheme is `inproc://`, since both benchmark parties run in the same process. Enabling it on a heavily loaded single-core machine will hurt performance rather than help.
 
 ```bash
 # PUSH/PULL throughput with CPU pinning

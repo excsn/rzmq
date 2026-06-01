@@ -490,18 +490,16 @@ pub(crate) async fn process_inproc_binding_request_event(
       loop {
         match pipe_rx_for_binder_to_receive_from_connector.recv().await {
           Ok(msgs_vec) => {
-            for msg in msgs_vec {
-              let cmd_for_isocket = Command::PipeMessageReceived {
-                pipe_id: binder_read_id_for_this_connection,
-                msg,
-              };
-              if socket_logic
-                .handle_pipe_event(binder_read_id_for_this_connection, cmd_for_isocket)
-                .await
-                .is_err()
-              {
-                break;
-              }
+            let cmd_batch = Command::PipeMessageBatchReceived {
+              pipe_id: binder_read_id_for_this_connection,
+              msgs: msgs_vec,
+            };
+            if socket_logic
+              .handle_pipe_event(binder_read_id_for_this_connection, cmd_batch)
+              .await
+              .is_err()
+            {
+              break;
             }
           }
           Err(_) => {
