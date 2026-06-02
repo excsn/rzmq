@@ -1,5 +1,3 @@
-// src/metrics.rs
-
 use crate::cli::OutputFormat;
 use hdrhistogram::Histogram;
 use parking_lot::Mutex;
@@ -42,9 +40,6 @@ pub struct BenchmarkCollector {
   histogram: Option<Mutex<Histogram<u64>>>,
 
   // Tracking fields for 1-second interim reports.
-  // interim_last_report is Mutex-guarded because there is no AtomicInstant in std.
-  // try_lock() ensures only one concurrent task prints per interval without
-  // blocking the hot path — contending tasks skip the report for that cycle.
   interim_last_report: Mutex<Instant>,
   interim_messages_count: AtomicUsize,
   interim_bytes_count: AtomicU64,
@@ -80,7 +75,7 @@ impl BenchmarkCollector {
   }
 
   // Merges a worker-local histogram into the shared one. Called once per
-  // worker lifetime at task exit — never on the per-message hot path.
+  // worker lifetime at task exit and never on the per-message hot path.
   pub fn merge_histogram(&self, local_hist: &Histogram<u64>) {
     if let Some(ref mutex) = self.histogram {
       let _ = mutex.lock().add(local_hist);

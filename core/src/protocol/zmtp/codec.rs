@@ -189,7 +189,7 @@ impl Decoder for ZmtpCodec {
           let header_bytes = src.split_to(header_len);
           let flags = header_bytes[0]; // Consume flags byte
 
-          // Read length — check raw u64 before cast to prevent allocator panic
+          // Read length: check raw u64 before cast to prevent allocator panic
           let raw_size = if is_long {
             let mut len_bytes = &header_bytes[1..];
             len_bytes.get_u64()

@@ -520,7 +520,7 @@ Each connection tracks a real-time **debt/credit balance**:
 
 An exponential moving average (EMA) continuously learns the natural operating balance of the workload. When the real-time balance strays too far from the learned average, the throttle probabilistically calls `tokio::task::yield_now()`, handing CPU time back to the scheduler so the under-served direction can run. A hard consecutive-op cap ensures eventual fairness regardless of probability.
 
-The throttle uses a static function pointer (`should_throttle_fn`) on the guard struct, so **a disabled throttle adds zero branches to the hot path** — `begin_work` returns immediately, touching no atomics.
+The throttle uses a static function pointer (`should_throttle_fn`) on the guard struct, so **a disabled throttle adds zero branches to the hot path** and `begin_work` returns immediately, touching no atomics.
 
 ### Default Behavior
 
@@ -593,9 +593,9 @@ let socket = ctx.socket(SocketType::Push)?
 
 The `priority` field biases the throttle to favor one I/O direction:
 
-*   `Priority::Egress` — favor sending (typical for server-side reply sockets).
-*   `Priority::Ingress` — favor receiving (typical for client-side request sockets).
-*   `Priority::None` — treat both directions equally (default).
+*   `Priority::Egress`: favor sending (typical for server-side reply sockets).
+*   `Priority::Ingress`: favor receiving (typical for client-side request sockets).
+*   `Priority::None`: treat both directions equally (default).
 
 > **Note:** The per-connection role (server vs. client) automatically overrides the `priority` field at connection time. You can set any other field in `AdaptiveThrottleConfig` via `with_throttle_config`, but the priority will be corrected to match the connection role unless you disable that behavior.
 

@@ -189,7 +189,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
     }
   }
 
-  // Active Socket Closing Shutdown — fires after warmup + measurement window.
+  // Active Socket Closing Shutdown, fires after warmup + measurement window.
   {
     let sd = Arc::clone(&shutdown);
     let socket_clone = socket.clone();

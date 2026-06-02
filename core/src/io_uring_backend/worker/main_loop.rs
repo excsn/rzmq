@@ -577,7 +577,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                       _ => unreachable!(),
                     }
                   } else {
-                    break; // Control op — stop coalescing
+                    break; // Control op, stop coalescing
                   }
                 }
 

@@ -13,7 +13,7 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
   /// Frames and encrypts a multi-part ZMTP message into a single byte buffer for the wire.
   fn write_msg_multipart(&mut self, msgs: Vec<Msg>) -> Result<Bytes, ZmqError>;
 
-  /// Frames a single Msg and returns `(header, Some(payload))` for vectored I/O — the
+  /// Frames a single Msg and returns `(header, Some(payload))` for vectored I/O, the
   /// header contains only the ZMTP frame prefix (≤9 bytes) and payload is a zero-copy
   /// ref to the message data. Encrypted framers fall back to `(merged_bytes, None)`.
   fn write_msg_split(&mut self, msg: Msg) -> Result<(Bytes, Option<Bytes>), ZmqError> {

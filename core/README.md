@@ -3,16 +3,18 @@
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 [![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
 
-`rzmq` is an asynchronous, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, built on top of the [Tokio](https://tokio.rs/) runtime. It aims to provide a familiar ZeroMQ-style API within the Rust async ecosystem, **striving for wire-level interoperability with `libzmq` and other ZeroMQ implementations for core patterns and ZMTP 3.1 using NULL, PLAIN, and CURVE security.**
+`rzmq` is an asynchronous, cpu/memory efficient, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, built on top of the [Tokio](https://tokio.rs/) runtime. It provides a familiar ZeroMQ-style API within the Rust async ecosystem, **strives for wire-level interoperability with `libzmq` and other ZeroMQ implementations for core patterns and ZMTP 3.1 using NULL, PLAIN, and CURVE security.**
 
-**A key design goal and demonstrated capability of `rzmq` is achieving exceptional performance on Linux.** Leveraging its advanced `io_uring` backend, **`rzmq` has shown superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a compelling choice for performance-critical distributed applications on Linux.
+**A key design goal and unique demonstrated capability of `rzmq` is achieving efficient, exceptional performance on Linux with simultaneous use of `io_uring` alongside Tokio.** 
 
 ## Performance Highlights
 
 TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U with Adaptive Throttling enabled.
 
-- **2.2 M msg/s** — PushPull · 64 B · Linux · io\_uring + cork · 4 workers
-- **6.6 GB/s** — PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
+- **2.2 M msg/s** - PushPull · 64 B · Linux · io\_uring + cork · 4 workers
+- **6.6 GB/s** - PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
+
+**`rzmq` has shown superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a compelling choice for performance-critical distributed applications on Linux.
 
 ## Project Status: Beta ⚠️
 

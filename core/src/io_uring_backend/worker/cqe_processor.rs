@@ -815,7 +815,7 @@ pub(crate) fn process_all_cqes(
               fd = handler_fd,
               bytes_written,
               total_expected,
-              "Partial write — re-queuing remainder to front of work_map."
+              "Partial write: re-queuing remainder to front of work_map."
             );
             let requeue_blueprint = match op_details.payload {
               InternalOpPayload::SendBuffer { buffer, send_op_flags, app_op_ud, .. } => {
@@ -904,7 +904,7 @@ pub(crate) fn process_all_cqes(
               // try_into_mut only succeeds when InternalOpPayload holds the sole reference,
               // which is guaranteed here (CQE has fired, kernel is done). For non-coalesced
               // internal sends where the Bytes originated from a shared Arc, it returns Err
-              // and the bytes are simply dropped — correct in both cases.
+              // and the bytes are simply dropped.
               if app_op_ud == Some(HANDLER_INTERNAL_SEND_OP_UD) {
                 if let Ok(mut recovered) = buffer.try_into_mut() {
                   recovered.clear();

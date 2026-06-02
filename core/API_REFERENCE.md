@@ -111,9 +111,9 @@ Configuration for the per-connection adaptive I/O throttle. Pass to `Socket::wit
 Defines which I/O direction the throttle should favor.
 
 *   **Variants**:
-    *   `Egress` — Favor outbound traffic. Typical for server-role connections.
-    *   `Ingress` — Favor inbound traffic. Typical for client-role connections.
-    *   `None` — No preference; treat both directions equally (default).
+    *   `Egress`: Favor outbound traffic. Typical for server-role connections.
+    *   `Ingress`: Favor inbound traffic. Typical for client-role connections.
+    *   `None`: No preference; treat both directions equally (default).
 
 ## 3. Main Types and Their Public Methods
 
@@ -327,9 +327,9 @@ Represents significant events occurring within a socket or its connections, used
 ### In `rzmq::socket::options`:
 
 Constants for socket option integer IDs.
-*   `pub const SNDBUF: i32 = 11` — OS kernel send buffer size in bytes; value is `i32` (`0` = OS default); applies to TCP and IPC
-*   `pub const RCVBUF: i32 = 12` — OS kernel receive buffer size in bytes; value is `i32` (`0` = OS default); applies to TCP and IPC
-*   `pub const MAXMSGSIZE: i32 = 22` — maximum inbound frame size in bytes; value is `i64` (`-1` = unlimited, default)
+*   `pub const SNDBUF: i32 = 11` - OS kernel send buffer size in bytes; value is `i32` (`0` = OS default); applies to TCP and IPC
+*   `pub const RCVBUF: i32 = 12` - OS kernel receive buffer size in bytes; value is `i32` (`0` = OS default); applies to TCP and IPC
+*   `pub const MAXMSGSIZE: i32 = 22` - maximum inbound frame size in bytes; value is `i64` (`-1` = unlimited, default)
 *   `pub const SNDHWM: i32 = 23`
 *   `pub const RCVHWM: i32 = 24`
 *   `pub const LINGER: i32 = 17`
@@ -362,7 +362,7 @@ Constants for socket option integer IDs.
 *   `pub const NOISE_XX_STATIC_SECRET_KEY: i32 = 1200` (Requires `noise_xx` feature)
 *   `pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201` (Requires `noise_xx` feature)
 *   `pub const MAX_CONNECTIONS: i32 = 1000`
-*   `pub const ADAPTIVE_THROTTLE: i32 = 1210` — Enable (`1`) or disable (`0`) the adaptive I/O throttle; value is `i32`. Prefer `Socket::with_throttle_config()` for full configuration. Set before `bind`/`connect`.
+*   `pub const ADAPTIVE_THROTTLE: i32 = 1210` - Enable (`1`) or disable (`0`) the adaptive I/O throttle; value is `i32`. Prefer `Socket::with_throttle_config()` for full configuration. Set before `bind`/`connect`.
 *   `pub const IO_URING_SNDZEROCOPY: i32 = 1170` (Requires `io-uring` feature)
 *   `pub const IO_URING_RCVMULTISHOT: i32 = 1171` (Requires `io-uring` feature)
 *   `pub const TCP_CORK: i32 = 1172` (Requires `io-uring` feature, Linux only)

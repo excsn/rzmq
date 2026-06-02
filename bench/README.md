@@ -19,18 +19,18 @@ The bench tool now **disables the throttle by default** on all sockets (`ADAPTIV
 ## Quick Start
 
 ```bash
-# PUSH/PULL throughput — standard TCP, 4 workers
+# PUSH/PULL throughput - standard TCP, 4 workers
 cargo run --release --bin rzmq_bench -- \
   --role orchestrate --endpoint tcp://127.0.0.1:19876 \
   --pattern push-pull --concurrency 4 --duration 10
 
-# PUSH/PULL — Linux io_uring + cork + zerocopy + multishot, 8 workers, 32 KB messages
+# PUSH/PULL - Linux io_uring + cork + zerocopy + multishot, 8 workers, 32 KB messages
 cargo run --release --features io-uring --bin rzmq_bench -- \
   --role orchestrate --endpoint tcp://127.0.0.1:19876 \
   --pattern push-pull --msg-size 32768 --concurrency 8 --duration 10 \
   --use-io-uring --cork --uring-zerocopy --uring-multishot
 
-# REQ/REP latency — standard TCP
+# REQ/REP latency - standard TCP
 cargo run --release --bin rzmq_bench -- \
   --role orchestrate --endpoint tcp://127.0.0.1:19876 \
   --pattern req-rep --duration 10

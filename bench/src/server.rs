@@ -114,7 +114,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
       }
     }
     Pattern::DealerRouter => {
-      // Bidirectional Multipart Echo — decoupled read/write paths.
+      // Bidirectional Multipart Echo: decoupled read/write paths.
       //
       // A single dedicated sender task drains a lock-free MPSC queue in FIFO
       // order, guaranteeing sequential consistency for echoed replies. The main

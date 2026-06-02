@@ -3,16 +3,18 @@
 [![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 
-**rzmq** is a high-performance, asynchronous pure Rust implementation of the ZeroMQ (ØMQ) messaging library. It leverages the [Tokio](https://tokio.rs/) runtime for its asynchronous capabilities and aims to provide a familiar ZeroMQ API.
+**rzmq** is a high-performance, asynchronous pure Rust implementation of the ZeroMQ (ØMQ) messaging library. It leverages the [Tokio](https://tokio.rs/) runtime for its asynchronous capabilities alongside an optional io_uring worker and aims to provide a familiar ZeroMQ API.
 
-**The primary focus of `rzmq` is to deliver leading performance on Linux.** By integrating `io_uring` with TCP Cork, `rzmq` **has demonstrated superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput [benchmarks](#benchmarks) included in this repository.**
+**The primary focus of `rzmq` is to deliver leading performance on Linux.**
 
 ## Performance Highlights
 
  TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U with Adaptive Throttling enabled.
 
-- **2.2 M msg/s** — PushPull · 64 B · Linux · io\_uring + cork · 4 workers
-- **6.6 GB/s** — PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
+- **2.2 M msg/s** - PushPull · 64 B · Linux · io\_uring + cork · 4 workers
+- **6.6 GB/s** - PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
+
+ By integrating `io_uring` with TCP Cork, `rzmq` **has demonstrated superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput [benchmarks](#benchmarks) included in this repository.**
 
 ## Project Status: Beta ⚠️
 
@@ -27,14 +29,28 @@
 
 ## Notable Users
 
-[Hi Stakes Markets Game](https://www.histakesgame.com) -  The worlds most advanced financial simulator, available on iPhone and Android.
+[Hi Stakes Markets Game](https://www.histakesgame.com) -  The world's most advanced financial simulator, available on iPhone and Android.
 
 ## Motivation
 
 1.  **Pure Rust & Async Native:** Memory safety, seamless `async/await` integration with Tokio, and no C `libzmq` dependency.
-2.  **High Performance on Linux:** Specifically designed to leverage `io_uring` and TCP Cork for superior throughput and low latency, as demonstrated in benchmarks.
+2.  **High Performance on Linux:** Specifically designed to provide `io_uring` and TCP Cork for superior throughput and low latency, as demonstrated in benchmarks.
 3.  **Flexible & Modern Security:** Provides interoperable security with `libzmq`'s traditional **CURVE** mechanism, while also offering the modern **Noise_XX** protocol as a high-performance alternative for `rzmq`-to-`rzmq` communication.
-4.  **Learning & Innovation:** A platform to explore messaging system architecture in Rust.
+
+## Goals and Non-Goals
+
+**Goals:**
+
+*   **Stability and Robustness:** Achieve production-grade stability.
+*   **Leading Performance:** Continue to optimize, especially the `io_uring` path on Linux.
+*   **Ease of Use:** Provide a Rust-idiomatic and intuitive API.
+*   **Modern Security:** Offer strong, modern security options like Noise_XX.
+*   **Community and Documentation:** Foster an active community with clear documentation.
+
+**Non-Goals:**
+
+*   **Full `libzmq` Feature Parity:** Replicating every single feature and option of `libzmq` is not intended.
+*   **Support for ZAP:** The ZAP (ZeroMQ Authentication Protocol) is not planned for implementation. Authentication is handled directly by the supported security mechanisms.
 
 ## Current Features & Capabilities
 
@@ -63,21 +79,6 @@
     *   **PLAIN** (`plain` feature): Username/password authentication (interoperable).
     *   **CURVE** (`curve` feature): Public-key encryption, providing strong security and interoperability with `libzmq`.
     *   **Noise_XX** (`noise_xx` feature): A modern, high-performance security protocol for `rzmq`-to-`rzmq` communication (not interoperable with `libzmq`).
-
-## Goals and Non-Goals
-
-**Goals:**
-
-*   **Stability and Robustness:** Achieve production-grade stability.
-*   **Leading Performance:** Continue to optimize, especially the `io_uring` path on Linux.
-*   **Ease of Use:** Provide a Rust-idiomatic and intuitive API.
-*   **Modern Security:** Offer strong, modern security options like Noise_XX.
-*   **Community and Documentation:** Foster an active community with clear documentation.
-
-**Non-Goals:**
-
-*   **Full `libzmq` Feature Parity:** Replicating every single feature and option of `libzmq` is not intended.
-*   **Support for ZAP:** The ZAP (ZeroMQ Authentication Protocol) is not planned for implementation. Authentication is handled directly by the supported security mechanisms.
 
 ## When to Consider `rzmq` (Currently)
 
