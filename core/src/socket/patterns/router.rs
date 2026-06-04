@@ -169,6 +169,66 @@ impl RouterMap {
   }
 }
 
+#[cfg(test)]
+mod additional_router_map_tests {
+  use super::*;
+  use super::strategies::ReqPeerStrategy;
+  use crate::message::{Blob, Msg};
+  use crate::socket::patterns::framing::FramingLatch;
+
+  #[tokio::test]
+  async fn test_router_map_add_and_remove_peer() {
+    let map = RouterMap::new();
+    let identity = Blob::from_static(b"client-1");
+    let uri = "tcp://127.0.0.1:9000".to_string();
+
+    map.add_peer(identity.clone(), 5, uri.clone()).await;
+
+    let info = map.get_peer_info_for_identity(&identity).await.unwrap();
+    assert_eq!(info.uri, uri);
+
+    let reverse_id = map.get_identity_by_read_pipe(5).await.unwrap();
+    assert_eq!(reverse_id, identity);
+
+    map.remove_peer_by_read_pipe(5).await;
+    assert!(map.get_peer_info_for_identity(&identity).await.is_none());
+  }
+
+  #[tokio::test]
+  async fn test_router_map_identity_collision() {
+    let map = RouterMap::new();
+    let identity = Blob::from_static(b"client-shared");
+
+    map.add_peer(identity.clone(), 1, "tcp://client-a".into()).await;
+    map.add_peer(identity.clone(), 2, "tcp://client-b".into()).await;
+
+    // Pipe 1 reverse mapping still exists (add_peer on pipe 2 doesn't touch pipe 1)
+    let rev1 = map.get_identity_by_read_pipe(1).await;
+    assert_eq!(rev1, Some(identity.clone()));
+
+    // Forward mapping updated to the most recent registration
+    let info = map.get_peer_info_for_identity(&identity).await.unwrap();
+    assert_eq!(info.uri, "tcp://client-b");
+  }
+
+  #[test]
+  fn test_req_strategy_prepends_empty_delimiter() {
+    // FramingLatch::new takes fn pointers; closures that don't capture coerce to fn
+    let framing = FramingLatch::new(|_| {}, |_| {});
+    let req_strat = ReqPeerStrategy;
+
+    let id_msg = Msg::from_static(b"destination-identity");
+    let payload = vec![Msg::from_static(b"hello")];
+
+    let result = req_strat.prepare_wire_frames(id_msg, payload, &framing);
+
+    // REQ strategy: discard identity, prepend empty delimiter
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].size(), 0, "First frame must be empty delimiter");
+    assert_eq!(result[1].data().unwrap(), b"hello");
+  }
+}
+
 pub(crate) mod strategies {
   use crate::message::{Msg, MsgFlags};
   use crate::socket::patterns::framing::FramingLatch;

@@ -65,3 +65,70 @@ pub(crate) fn parse_endpoint(endpoint_str: &str) -> Result<Endpoint, ZmqError> {
 
 // Optional: Add methods to Endpoint enum?
 // impl Endpoint { pub fn scheme(&self) -> &'static str { ... } }
+
+#[cfg(test)]
+mod additional_endpoint_tests {
+  use super::*;
+
+  #[test]
+  fn test_parse_valid_tcp_endpoint() {
+    let uri = "tcp://127.0.0.1:5555";
+    let parsed = parse_endpoint(uri).expect("Should parse valid TCP URI");
+
+    match parsed {
+      Endpoint::Tcp(addr, original) => {
+        assert_eq!(addr, "127.0.0.1:5555");
+        assert_eq!(original, uri);
+      }
+      #[allow(unreachable_patterns)]
+      _ => panic!("Expected Endpoint::Tcp"),
+    }
+  }
+
+  #[test]
+  fn test_parse_invalid_format() {
+    assert!(matches!(
+      parse_endpoint("tcp:/127.0.0.1"),
+      Err(ZmqError::InvalidEndpoint(_))
+    ));
+    assert!(matches!(
+      parse_endpoint("tcp://"),
+      Err(ZmqError::InvalidEndpoint(_))
+    ));
+  }
+
+  #[test]
+  fn test_parse_unsupported_scheme() {
+    let result = parse_endpoint("udp://127.0.0.1:5555");
+    assert!(matches!(result, Err(ZmqError::UnsupportedTransport(_))));
+  }
+
+  #[test]
+  #[cfg(feature = "ipc")]
+  fn test_parse_valid_ipc_endpoint() {
+    let uri = "ipc:///tmp/rzmq.sock";
+    let parsed = parse_endpoint(uri).expect("Should parse valid IPC URI");
+
+    match parsed {
+      Endpoint::Ipc(path, original) => {
+        assert_eq!(path.to_str().unwrap(), "/tmp/rzmq.sock");
+        assert_eq!(original, uri);
+      }
+      _ => panic!("Expected Endpoint::Ipc"),
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "inproc")]
+  fn test_parse_valid_inproc_endpoint() {
+    let uri = "inproc://my-service";
+    let parsed = parse_endpoint(uri).expect("Should parse valid inproc URI");
+
+    match parsed {
+      Endpoint::Inproc(name) => {
+        assert_eq!(name, "my-service");
+      }
+      _ => panic!("Expected Endpoint::Inproc"),
+    }
+  }
+}

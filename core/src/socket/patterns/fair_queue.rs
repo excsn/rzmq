@@ -97,3 +97,53 @@ impl<T: Send + 'static> FairQueue<T> {
     self.sender.close();
   }
 }
+
+#[cfg(test)]
+mod additional_fair_queue_tests {
+  use super::*;
+
+  #[test]
+  fn test_fair_queue_try_push_and_pop() {
+    let queue = FairQueue::new(2);
+
+    queue.try_push_item("item-1").expect("Push 1 should succeed");
+    queue.try_push_item("item-2").expect("Push 2 should succeed");
+
+    assert_eq!(queue.len(), 2);
+
+    let item = queue
+      .try_pop_item()
+      .expect("Should not error")
+      .expect("Should return an item");
+    assert_eq!(item, "item-1");
+  }
+
+  #[test]
+  fn test_fair_queue_exhaustion() {
+    let queue = FairQueue::new(1);
+    queue.try_push_item("item-1").unwrap();
+
+    let res = queue.try_push_item("item-2");
+    assert!(matches!(res, Err(PushError::Full(_))));
+  }
+
+  #[tokio::test]
+  async fn test_fair_queue_close() {
+    let queue = FairQueue::new(2);
+    queue.try_push_item("item-1").unwrap();
+
+    queue.close();
+
+    // Writes after close must fail
+    let res = queue.try_push_item("item-2");
+    assert!(matches!(res, Err(PushError::Closed(_))));
+
+    // Existing items can still be drained
+    let item = queue.try_pop_item().expect("Should not error");
+    assert_eq!(item, Some("item-1"));
+
+    // Empty closed queue returns None
+    let drained = queue.pop_item().await.expect("Should not error on closed empty");
+    assert!(drained.is_none());
+  }
+}
