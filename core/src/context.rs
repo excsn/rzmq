@@ -435,9 +435,9 @@ mod additional_context_tests {
     }
   }
 
-  #[test]
+  #[tokio::test]
   #[cfg(feature = "inproc")]
-  fn test_context_inproc_registry() {
+  async fn test_context_inproc_registry() {
     let ctx = Context::new().unwrap();
     let inner = ctx.inner();
     let name = "shared-inproc-channel".to_string();
