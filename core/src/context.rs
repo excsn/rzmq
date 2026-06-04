@@ -404,3 +404,53 @@ impl fmt::Debug for Context {
 pub fn context() -> Result<Context, ZmqError> {
   Context::new()
 }
+
+#[cfg(test)]
+mod additional_context_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn test_context_next_handle_uniqueness() {
+    let ctx = Context::new().expect("Failed to create context");
+    let inner = ctx.inner().clone();
+
+    let mut tasks = vec![];
+    for _ in 0..10 {
+      let inner_clone = inner.clone();
+      tasks.push(tokio::spawn(async move {
+        let mut allocated = vec![];
+        for _ in 0..1000 {
+          allocated.push(inner_clone.next_handle());
+        }
+        allocated
+      }));
+    }
+
+    let mut all_ids = std::collections::HashSet::new();
+    for h in tasks {
+      let ids = h.await.unwrap();
+      for id in ids {
+        assert!(all_ids.insert(id), "Duplicate ID allocated: {}", id);
+      }
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "inproc")]
+  fn test_context_inproc_registry() {
+    let ctx = Context::new().unwrap();
+    let inner = ctx.inner();
+    let name = "shared-inproc-channel".to_string();
+
+    assert!(inner.register_inproc(name.clone(), 100).is_ok());
+
+    let dup = inner.register_inproc(name.clone(), 200);
+    assert!(matches!(dup, Err(ZmqError::AddrInUse(_))));
+
+    let binding = inner.lookup_inproc(&name).unwrap();
+    assert_eq!(binding.binder_core_id, 100);
+
+    inner.unregister_inproc(&name);
+    assert!(inner.lookup_inproc(&name).is_none());
+  }
+}

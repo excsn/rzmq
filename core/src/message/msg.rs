@@ -95,6 +95,48 @@ impl Msg {
   }
 }
 
+#[cfg(test)]
+mod additional_msg_tests {
+  use super::*;
+
+  #[test]
+  fn test_msg_zero_copy_clone() {
+    let payload = bytes::Bytes::from_static(b"shared-payload");
+    let msg_a = Msg::from_bytes(payload.clone());
+    let msg_b = msg_a.clone();
+
+    // Bytes is reference-counted: both messages share the same allocation.
+    assert_eq!(
+      msg_a.data().unwrap().as_ptr(),
+      msg_b.data().unwrap().as_ptr()
+    );
+    assert_eq!(msg_a.size(), msg_b.size());
+  }
+
+  #[test]
+  fn test_msg_flag_mutations() {
+    let mut msg = Msg::new();
+    assert!(!msg.is_more());
+    assert!(!msg.is_command());
+
+    msg.set_flags(MsgFlags::MORE);
+    assert!(msg.is_more());
+    assert!(!msg.is_command());
+
+    msg.set_flags(MsgFlags::COMMAND);
+    assert!(!msg.is_more());
+    assert!(msg.is_command());
+  }
+
+  #[test]
+  fn test_msg_empty_payload() {
+    let msg = Msg::new();
+    assert_eq!(msg.size(), 0);
+    assert!(msg.data().is_none());
+    assert!(msg.data_bytes().is_none());
+  }
+}
+
 impl fmt::Debug for Msg {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("Msg")

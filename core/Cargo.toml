@@ -74,6 +74,7 @@ serial_test = "^3"
 # For integration tests
 tokio-test = "^0.4"
 futures-intrusive = "^0"
+rstest = "0.26.1"
 
 # For fuzzing tests
 # cargo-fuzz = { version = "0.11", optional = true }

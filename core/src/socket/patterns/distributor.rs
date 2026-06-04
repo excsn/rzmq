@@ -190,3 +190,151 @@ impl Distributor {
     }
   }
 }
+
+#[cfg(test)]
+mod additional_distributor_tests {
+  use super::*;
+  use crate::message::Msg;
+  use crate::runtime::mailbox::mailbox;
+  use crate::socket::connection_iface::ISocketConnection;
+  use crate::socket::core::state::{CoreState, EndpointInfo, EndpointType};
+  use crate::socket::options::SocketOptions;
+  use crate::socket::types::SocketType;
+  use async_trait::async_trait;
+  use bytes::Bytes;
+  use std::any::Any;
+  use std::sync::Mutex;
+
+  #[derive(Debug)]
+  struct MockConnection {
+    sent_messages: Arc<Mutex<Vec<Msg>>>,
+    should_fail: bool,
+  }
+
+  #[async_trait]
+  impl ISocketConnection for MockConnection {
+    async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+      if self.should_fail {
+        return Err(ZmqError::ConnectionClosed);
+      }
+      self.sent_messages.lock().unwrap().extend(msgs);
+      Ok(())
+    }
+
+    async fn close_connection(&self) -> Result<(), ZmqError> {
+      Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+      self
+    }
+  }
+
+  fn make_endpoint_info(uri: &str, conn: Arc<dyn ISocketConnection>, id: usize) -> EndpointInfo {
+    let (mailbox_tx, _) = mailbox(1);
+    EndpointInfo {
+      mailbox: mailbox_tx,
+      task_handle: None,
+      endpoint_type: EndpointType::Session,
+      endpoint_uri: uri.to_string(),
+      pipe_ids: None,
+      handle_id: id,
+      target_endpoint_uri: None,
+      is_outbound_connection: false,
+      peer_socket_type: None,
+      connection_iface: conn,
+    }
+  }
+
+  #[tokio::test]
+  async fn test_distributor_fanout() {
+    let distributor = Distributor::new();
+    let core_state = parking_lot::RwLock::new(CoreState::new(1, SocketType::Pub, SocketOptions::default()));
+
+    let store1 = Arc::new(Mutex::new(Vec::new()));
+    let store2 = Arc::new(Mutex::new(Vec::new()));
+
+    let uri1 = "tcp://127.0.0.1:5555".to_string();
+    let uri2 = "tcp://127.0.0.1:5556".to_string();
+
+    let conn1: Arc<dyn ISocketConnection> =
+      Arc::new(MockConnection { sent_messages: store1.clone(), should_fail: false });
+    let conn2: Arc<dyn ISocketConnection> =
+      Arc::new(MockConnection { sent_messages: store2.clone(), should_fail: false });
+
+    {
+      let mut state = core_state.write();
+      state.endpoints.insert(uri1.clone(), make_endpoint_info(&uri1, conn1, 10));
+      state.endpoints.insert(uri2.clone(), make_endpoint_info(&uri2, conn2, 11));
+    }
+
+    distributor.add_peer_uri(uri1);
+    distributor.add_peer_uri(uri2);
+
+    let msg = Msg::from_bytes(Bytes::from_static(b"broadcast-payload"));
+    distributor
+      .send_to_all(&msg, 1, &core_state)
+      .await
+      .expect("Distribution should succeed");
+
+    assert_eq!(
+      store1.lock().unwrap()[0].data().unwrap(),
+      b"broadcast-payload"
+    );
+    assert_eq!(
+      store2.lock().unwrap()[0].data().unwrap(),
+      b"broadcast-payload"
+    );
+  }
+
+  #[tokio::test]
+  async fn test_distributor_error_isolation() {
+    let distributor = Distributor::new();
+    let core_state = parking_lot::RwLock::new(CoreState::new(1, SocketType::Pub, SocketOptions::default()));
+
+    let store_healthy = Arc::new(Mutex::new(Vec::new()));
+
+    let uri_broken = "tcp://127.0.0.1:9999".to_string();
+    let uri_healthy = "tcp://127.0.0.1:8888".to_string();
+
+    let conn_broken: Arc<dyn ISocketConnection> = Arc::new(MockConnection {
+      sent_messages: Arc::new(Mutex::new(Vec::new())),
+      should_fail: true,
+    });
+    let conn_healthy: Arc<dyn ISocketConnection> =
+      Arc::new(MockConnection { sent_messages: store_healthy.clone(), should_fail: false });
+
+    {
+      let mut state = core_state.write();
+      state.endpoints.insert(
+        uri_broken.clone(),
+        make_endpoint_info(&uri_broken, conn_broken, 20),
+      );
+      state.endpoints.insert(
+        uri_healthy.clone(),
+        make_endpoint_info(&uri_healthy, conn_healthy, 21),
+      );
+    }
+
+    distributor.add_peer_uri(uri_broken.clone());
+    distributor.add_peer_uri(uri_healthy.clone());
+
+    let msg = Msg::from_bytes(Bytes::from_static(b"isolated-payload"));
+    let res = distributor.send_to_all(&msg, 1, &core_state).await;
+
+    assert!(res.is_err(), "Expected error due to broken peer");
+    let failures = res.unwrap_err();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, uri_broken);
+    assert!(
+      matches!(failures[0].1, ZmqError::ConnectionClosed),
+      "Expected ConnectionClosed, got {:?}",
+      failures[0].1
+    );
+
+    assert_eq!(
+      store_healthy.lock().unwrap()[0].data().unwrap(),
+      b"isolated-payload"
+    );
+  }
+}

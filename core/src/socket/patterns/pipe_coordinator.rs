@@ -135,3 +135,66 @@ impl WritePipeCoordinator {
     }
   }
 }
+
+#[cfg(test)]
+mod coordinator_tests {
+  use super::*;
+  use std::sync::Arc;
+  use std::time::Duration;
+  use tokio::time::sleep;
+
+  #[tokio::test]
+  async fn test_concurrent_acquisitions() {
+    let coordinator = Arc::new(WritePipeCoordinator::new());
+    let pipe_id: PipeId = 42;
+    coordinator.add_pipe(pipe_id).await;
+
+    let mut tasks = vec![];
+    for _ in 0..5 {
+      let coord_clone = coordinator.clone();
+      tasks.push(tokio::spawn(async move {
+        let _permit = coord_clone
+          .acquire_send_permit(pipe_id, Some(Duration::from_secs(1)))
+          .await
+          .expect("Should successfully acquire permit");
+        sleep(Duration::from_millis(5)).await;
+      }));
+    }
+
+    for task in tasks {
+      task.await.expect("Task finished without panicking");
+    }
+  }
+
+  #[tokio::test]
+  async fn test_pipe_detachment_unblocks_waiters() {
+    let coordinator = Arc::new(WritePipeCoordinator::new());
+    let pipe_id: PipeId = 99;
+    coordinator.add_pipe(pipe_id).await;
+
+    // Hold the sole permit to block all subsequent acquisitions.
+    let _holder_permit = coordinator
+      .acquire_send_permit(pipe_id, None)
+      .await
+      .expect("First permit acquisition should succeed");
+
+    // Spawn a task that will block indefinitely waiting for the permit.
+    let coord_clone = coordinator.clone();
+    let waiter_task = tokio::spawn(async move {
+      coord_clone.acquire_send_permit(pipe_id, None).await
+    });
+
+    // Yield so the waiter task has a chance to block on the semaphore.
+    sleep(Duration::from_millis(10)).await;
+
+    // Remove the pipe — closes the semaphore and wakes all waiters.
+    coordinator.remove_pipe(pipe_id).await;
+
+    let res = waiter_task.await.expect("Waiter task panicked");
+    assert!(
+      matches!(res, Err(ZmqError::HostUnreachable(_))),
+      "Expected Err(HostUnreachable) due to pipe detachment, got {:?}",
+      res
+    );
+  }
+}

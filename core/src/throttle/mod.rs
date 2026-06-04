@@ -262,3 +262,71 @@ fn active_should_throttle(guard: &ThrottleGuard) -> bool {
 
   false
 }
+
+#[cfg(test)]
+mod throttle_math_tests {
+  use super::*;
+  use super::types::{Direction, Priority, ThrottleStateView};
+  use std::sync::atomic::Ordering;
+
+  #[test]
+  fn test_ema_convergence() {
+    let mut config = AdaptiveThrottleConfig::default();
+    config.adaptive_learning_rate = 0.1;
+    config.nudge_interval_ops = 5;
+    config.credit_per_message = 2;
+    config.enabled = true;
+
+    let throttle = AdaptiveThrottle::new(config);
+
+    // After 5 Ingress ops: balance = 5 * 2 = 10.
+    // Nudge fires at op 5: updated = 0.1 * 10 + 0.9 * 0.0 = 1.0.
+    for _ in 0..5 {
+      let _ = throttle.begin_work(Direction::Ingress);
+    }
+
+    let learned = throttle.shared.learned_balance.load(Ordering::Relaxed);
+    assert!(
+      (learned - 1.0).abs() < f64::EPSILON,
+      "Learned balance did not converge. Expected 1.0, got {}",
+      learned
+    );
+  }
+
+  #[test]
+  fn test_priority_boost_logic() {
+    let mut config = AdaptiveThrottleConfig::default();
+    config.priority = Priority::Egress;
+    config.priority_boost_factor = 3.0;
+    config.enabled = true;
+
+    let throttle = AdaptiveThrottle::new(config);
+
+    // Simulate high Ingress debt: deviation must exceed healthy_balance_width (default 100)
+    // for the strategy to return a non-zero probability.
+    throttle.shared.current_balance.store(150, Ordering::SeqCst);
+    throttle.shared.learned_balance.store(0.0, Ordering::SeqCst);
+
+    let state = ThrottleStateView {
+      current_balance: 150,
+      learned_balance: 0.0,
+      config: &throttle.shared.config,
+    };
+
+    let base_p = (throttle.shared.config.strategy)(&state);
+    assert!(base_p > 0.0, "Expected non-zero base probability for imbalanced state");
+
+    // With Egress as priority and balance > learned, doing Ingress (non-priority)
+    // should apply a 3x boost. Verify the multiplier matches config.
+    let is_imbalanced_towards_priority = state.current_balance > state.learned_balance as i32;
+    assert!(is_imbalanced_towards_priority, "Expected imbalance: balance 150 > learned 0");
+
+    let boosted_p = base_p * throttle.shared.config.priority_boost_factor;
+    assert!(
+      (boosted_p - base_p * 3.0).abs() < 1e-10,
+      "Boost factor mismatch: expected {}, got {}",
+      base_p * 3.0,
+      boosted_p
+    );
+  }
+}

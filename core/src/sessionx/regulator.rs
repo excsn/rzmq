@@ -31,3 +31,41 @@ impl SessionRegulator {
     }
   }
 }
+
+#[cfg(test)]
+mod additional_regulator_tests {
+  use super::*;
+  use std::time::Instant;
+
+  #[tokio::test]
+  async fn test_regulator_under_lifespan_penalty() {
+    let regulator = SessionRegulator::new(Duration::from_millis(100));
+
+    let start = Instant::now();
+    regulator.enforce_min_lifespan().await;
+    let elapsed = start.elapsed();
+
+    assert!(
+      elapsed >= Duration::from_millis(90),
+      "Should block for most of the penalty, got {:?}",
+      elapsed
+    );
+  }
+
+  #[tokio::test]
+  async fn test_regulator_over_lifespan_bypass() {
+    let regulator = SessionRegulator::new(Duration::from_millis(10));
+
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    let start = Instant::now();
+    regulator.enforce_min_lifespan().await;
+    let elapsed = start.elapsed();
+
+    assert!(
+      elapsed < Duration::from_millis(5),
+      "Should bypass wait, got {:?}",
+      elapsed
+    );
+  }
+}

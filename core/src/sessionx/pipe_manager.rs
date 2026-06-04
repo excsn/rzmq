@@ -61,3 +61,32 @@ impl CorePipeManagerX {
     self.state.rx_from_core.is_some()
   }
 }
+
+#[cfg(test)]
+mod additional_pipe_manager_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn test_pipe_manager_attach_and_detach() {
+    let mut manager = CorePipeManagerX::new();
+    assert!(!manager.is_attached());
+
+    let (tx, rx) = fibre::mpmc::bounded_async::<Vec<Msg>>(1);
+    let _ = tx; // keep sender alive
+    manager.attach(rx, 42);
+
+    assert!(manager.is_attached());
+    assert_eq!(manager.state.core_pipe_read_id_for_incoming_routing, Some(42));
+
+    manager.detach_and_clear_pipes();
+    assert!(!manager.is_attached());
+    assert!(manager.state.rx_from_core.is_none());
+  }
+
+  #[tokio::test]
+  async fn test_pipe_manager_read_on_detached_errors() {
+    let manager = CorePipeManagerX::new();
+    let res = manager.recv_from_core().await;
+    assert!(res.is_err());
+  }
+}

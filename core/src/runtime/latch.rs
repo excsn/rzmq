@@ -56,3 +56,72 @@ impl CountDownLatch {
     self.count.load(Ordering::Relaxed)
   }
 }
+
+#[cfg(test)]
+mod additional_latch_tests {
+  use super::*;
+  use std::sync::Arc;
+  use std::time::Duration;
+  use tokio::time::timeout;
+
+  #[tokio::test]
+  async fn test_latch_zero_initial_count() {
+    let latch = CountDownLatch::new(0);
+    let res = timeout(Duration::from_millis(50), latch.await_()).await;
+    assert!(res.is_ok(), "Zero-initialized latch should not block");
+  }
+
+  #[tokio::test]
+  async fn test_latch_countdown_synchronization() {
+    let latch = Arc::new(CountDownLatch::new(3));
+
+    let latch_clone = latch.clone();
+    let mut waiter = tokio::spawn(async move {
+      latch_clone.await_().await;
+    });
+
+    // Count = 3: waiter should still be blocked.
+    assert!(
+      timeout(Duration::from_millis(50), &mut waiter).await.is_err(),
+      "Waiter should be blocked while count > 0"
+    );
+
+    latch.count_down().await; // count → 2
+    latch.count_down().await; // count → 1
+
+    // Count = 1: still blocked.
+    assert!(
+      timeout(Duration::from_millis(50), &mut waiter).await.is_err(),
+      "Waiter should still be blocked at count = 1"
+    );
+
+    latch.count_down().await; // count → 0 → notifies waiters
+
+    let res = timeout(Duration::from_millis(200), waiter).await;
+    assert!(
+      res.is_ok(),
+      "Waiter should have resolved after final countdown"
+    );
+  }
+
+  #[tokio::test]
+  async fn test_latch_concurrent_countdown() {
+    let count = 10;
+    let latch = Arc::new(CountDownLatch::new(count));
+    let mut tasks = vec![];
+
+    for _ in 0..count {
+      let l = latch.clone();
+      tasks.push(tokio::spawn(async move {
+        l.count_down().await;
+      }));
+    }
+
+    let res = timeout(Duration::from_millis(200), latch.await_()).await;
+    assert!(res.is_ok(), "Concurrent countdown failed to unblock the latch");
+
+    for t in tasks {
+      assert!(t.await.is_ok());
+    }
+  }
+}

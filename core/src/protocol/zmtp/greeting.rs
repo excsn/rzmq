@@ -134,3 +134,72 @@ impl ZmtpGreeting {
     std::str::from_utf8(&self.mechanism[..first_null]).unwrap_or("<invalid_utf8>")
   }
 }
+
+#[cfg(test)]
+mod additional_greeting_tests {
+  use super::*;
+  use bytes::BytesMut;
+
+  #[test]
+  fn test_decode_valid_greeting() {
+    let mut buf = BytesMut::new();
+    let mechanism = [0u8; MECHANISM_LENGTH];
+    ZmtpGreeting::encode(&mechanism, true, &mut buf);
+
+    let result = ZmtpGreeting::decode(&mut buf)
+      .expect("Decoding valid greeting should succeed")
+      .expect("Should return Some(ZmtpGreeting)");
+
+    assert_eq!(result.version, (3, 0));
+    assert_eq!(result.mechanism, mechanism);
+    assert!(result.as_server);
+  }
+
+  #[test]
+  fn test_decode_invalid_signature() {
+    let mut buf = BytesMut::zeroed(64);
+    buf[0] = 0x00; // Invalid: must be 0xFF
+
+    let result = ZmtpGreeting::decode(&mut buf);
+    assert!(matches!(result, Err(ZmqError::ProtocolViolation(_))));
+  }
+
+  #[test]
+  fn test_decode_dirty_padding() {
+    let mut buf = BytesMut::new();
+    let mechanism = [0u8; MECHANISM_LENGTH];
+    ZmtpGreeting::encode(&mechanism, false, &mut buf);
+
+    // Corrupt a byte in the padding zone (PADDING_OFFSET=33 to 63)
+    buf[45] = 0xAA;
+
+    let result = ZmtpGreeting::decode(&mut buf);
+    assert!(matches!(result, Err(ZmqError::ProtocolViolation(_))));
+  }
+
+  #[test]
+  fn test_decode_unsupported_version() {
+    let mut buf = BytesMut::new();
+    let mechanism = [0u8; MECHANISM_LENGTH];
+    ZmtpGreeting::encode(&mechanism, false, &mut buf);
+
+    // Override major version at VERSION_MAJOR_OFFSET=10
+    buf[10] = 2;
+
+    let result = ZmtpGreeting::decode(&mut buf);
+    assert!(matches!(result, Err(ZmqError::ProtocolViolation(_))));
+  }
+
+  #[test]
+  fn test_decode_invalid_as_server_flag() {
+    let mut buf = BytesMut::new();
+    let mechanism = [0u8; MECHANISM_LENGTH];
+    ZmtpGreeting::encode(&mechanism, false, &mut buf);
+
+    // Override as-server byte at AS_SERVER_OFFSET=32 to invalid value
+    buf[32] = 0x02;
+
+    let result = ZmtpGreeting::decode(&mut buf);
+    assert!(matches!(result, Err(ZmqError::ProtocolViolation(_))));
+  }
+}

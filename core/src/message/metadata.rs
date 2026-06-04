@@ -80,3 +80,41 @@ pub struct PeerAddress(pub SocketAddr);
 pub struct ZapUserId(pub String);
 
 // Add other standard keys as needed (e.g., RoutingId)
+
+#[cfg(test)]
+mod additional_metadata_tests {
+  use super::*;
+  use std::net::SocketAddr;
+
+  #[tokio::test]
+  async fn test_metadata_concurrent_type_safety() {
+    let metadata = Metadata::new();
+
+    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    metadata.insert_typed(PeerAddress(addr)).await;
+
+    let meta_clone1 = metadata.clone();
+    let writer_task = tokio::spawn(async move {
+      for i in 0..100 {
+        meta_clone1
+          .insert_typed(ZapUserId(format!("user-{}", i)))
+          .await;
+        tokio::task::yield_now().await;
+      }
+    });
+
+    let meta_clone2 = metadata.clone();
+    let reader_task = tokio::spawn(async move {
+      for _ in 0..100 {
+        let addr_opt = meta_clone2.get::<PeerAddress>().await;
+        assert!(addr_opt.is_some(), "PeerAddress should always be present");
+        let _user_opt = meta_clone2.get::<ZapUserId>().await;
+        tokio::task::yield_now().await;
+      }
+    });
+
+    let (res_w, res_r) = tokio::join!(writer_task, reader_task);
+    assert!(res_w.is_ok());
+    assert!(res_r.is_ok());
+  }
+}

@@ -241,3 +241,54 @@ impl Decoder for ZmtpCodec {
     } // end loop
   } // end decode
 }
+
+#[cfg(test)]
+mod additional_codec_tests {
+  use super::*;
+  use bytes::{BufMut, Bytes, BytesMut};
+  use tokio_util::codec::{Decoder, Encoder};
+
+  #[test]
+  fn test_codec_encode_decode_roundtrip() {
+    let mut codec = ZmtpCodec::new();
+    let mut dest = BytesMut::new();
+
+    let payload = b"roundtrip-payload";
+    let mut msg = Msg::from_bytes(Bytes::from_static(payload));
+    msg.set_flags(MsgFlags::MORE);
+
+    codec.encode(msg, &mut dest).unwrap();
+
+    let decoded = codec
+      .decode(&mut dest)
+      .expect("Should decode successfully")
+      .expect("Should return Some(Msg)");
+
+    assert_eq!(decoded.data().unwrap(), payload.as_ref());
+    assert!(decoded.is_more());
+  }
+
+  #[test]
+  fn test_codec_prime_with_prefix() {
+    let mut codec = ZmtpCodec::new();
+    let payload = b"stitched-payload";
+
+    // Prime the codec with just the flags byte (0x00 = short, no flags set)
+    let mut prefix = BytesMut::new();
+    prefix.put_u8(0x00);
+    codec.prime_with_prefix(prefix);
+
+    // Feed the length byte + payload into decode — prefix will be prepended internally
+    let mut stream = BytesMut::new();
+    stream.put_u8(payload.len() as u8);
+    stream.put_slice(payload);
+
+    let decoded = codec
+      .decode(&mut stream)
+      .expect("Should decode with primed prefix")
+      .expect("Should yield stitched Msg");
+
+    assert_eq!(decoded.data().unwrap(), payload.as_ref());
+    assert!(!decoded.is_more());
+  }
+}
