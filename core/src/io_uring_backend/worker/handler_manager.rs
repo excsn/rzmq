@@ -9,6 +9,7 @@ use crate::io_uring_backend::{
   UserData,
 };
 use crate::runtime::MailboxSender;
+use crate::socket::connection_iface::ISocketConnection;
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -55,6 +56,9 @@ impl HandlerManager {
     protocol_config: &ProtocolConfig,
     is_server: bool,
     socket_mailbox: MailboxSender,
+    endpoint_uri: String,
+    target_endpoint_uri: String,
+    connection_iface: Arc<dyn ISocketConnection>,
     buffer_manager_for_interface: Option<&'a BufferRingManager>,
     default_bgid_val_from_worker: Option<u16>,
     originating_op_ud_for_connection: UserData,
@@ -75,7 +79,12 @@ impl HandlerManager {
       )
     })?;
 
-    let per_conn_config = Arc::new(WorkerIoConfig { socket_mailbox });
+    let per_conn_config = Arc::new(WorkerIoConfig {
+      socket_mailbox,
+      endpoint_uri,
+      target_endpoint_uri,
+      connection_iface,
+    });
 
     let mut handler_box = factory.create_handler(
       fd,

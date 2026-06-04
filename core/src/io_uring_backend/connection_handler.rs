@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use crate::runtime::MailboxSender;
+use crate::socket::connection_iface::ISocketConnection;
 
 pub use crate::io_uring_backend::ops::UserData;
 
@@ -99,8 +100,6 @@ impl HandlerIoOps {
 }
 
 // --- SubmissionQueueWriter Helper ---
-// This is still useful if the UringWorker itself needs to push many SQEs directly.
-// Not directly used by handlers in Alternative A.
 pub struct SubmissionQueueWriter<'sq_borrow> {
   sq: &'sq_borrow mut io_uring::squeue::SubmissionQueue<'sq_borrow>,
 }
@@ -118,7 +117,7 @@ impl<'sq_borrow> SubmissionQueueWriter<'sq_borrow> {
   }
 }
 
-// --- UringWorkerInterface (Lean Version for Alternative A) ---
+// --- UringWorkerInterface ---
 // 'iface_life: Lifetime of the UringWorkerInterface instance itself.
 // 'cfg_life: Lifetime of the borrowed configurations.
 pub struct UringWorkerInterface<'cfg_life> {
@@ -157,7 +156,7 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
   }
 }
 
-// --- UringConnectionHandler Trait (Modified for Alternative A) ---
+// --- UringConnectionHandler Trait ---
 pub trait UringConnectionHandler: Send {
   fn fd(&self) -> RawFd;
 
@@ -266,7 +265,6 @@ pub trait ProtocolHandlerFactory: Send + Sync + 'static {
 
   // This is now the primary method for the generic worker to call
   fn create_handler(
-    // Renamed from create_handler_from_enum_config for simplicity
     &self,
     fd: RawFd,
     worker_io_config: Arc<WorkerIoConfig>,
@@ -276,7 +274,6 @@ pub trait ProtocolHandlerFactory: Send + Sync + 'static {
 }
 
 /// A message sent from a socket actor to the io_uring worker over the per-FD mpsc channel.
-/// Using an enum avoids the `Arc<Vec<Msg>>` double-allocation on the single-part fast path.
 #[derive(Debug)]
 pub enum OutgoingMessage {
   Single(Msg),
@@ -287,4 +284,10 @@ pub enum OutgoingMessage {
 pub struct WorkerIoConfig {
   /// Direct mailbox of the parent SocketCore. Events are dispatched in a single hop.
   pub socket_mailbox: MailboxSender,
+  /// Logical endpoint URI for this connection (e.g. "tcp://1.2.3.4:5678").
+  pub endpoint_uri: String,
+  /// The original target URI requested by the user.
+  pub target_endpoint_uri: String,
+  /// The ISocketConnection interface for this connection, used in UringConnectionEstablished.
+  pub connection_iface: Arc<dyn ISocketConnection>,
 }

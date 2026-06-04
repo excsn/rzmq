@@ -6,8 +6,6 @@ use crate::socket::MonitorSender;
 #[cfg(feature = "io-uring")]
 use crate::Blob;
 
-#[cfg(feature = "io-uring")]
-use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
@@ -24,105 +22,84 @@ pub enum Command {
   // --- User Requests (from API Handle -> SocketCore's single command mailbox) ---
   /// Command to bind the socket to a local endpoint.
   UserBind {
-    endpoint: String,                                // The endpoint string to bind to.
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the bind result back.
+    endpoint: String,
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
   },
   /// Command to connect the socket to a remote endpoint.
   UserConnect {
-    endpoint: String,                                // The endpoint string to connect to.
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the connect result back.
+    endpoint: String,
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
   },
   /// Command to disconnect from a specific endpoint.
   UserDisconnect {
-    endpoint: String,                                // The endpoint string to disconnect from.
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the disconnect result back.
+    endpoint: String,
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
   },
   /// Command to unbind from a specific endpoint.
   UserUnbind {
-    endpoint: String,                                // The endpoint string to unbind from.
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the unbind result back.
+    endpoint: String,
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
   },
   /// Command to send a message.
   UserSend {
-    msg: Msg, // The message to send.
-              // No reply_tx here for PUSH/PUB simplicity; errors handled by options (SNDTIMEO) or pattern.
+    msg: Msg,
   },
   /// Command to receive a message.
   UserRecv {
-    reply_tx: oneshot::Sender<Result<Msg, ZmqError>>, // Channel to send the received message or error back.
+    reply_tx: oneshot::Sender<Result<Msg, ZmqError>>,
   },
   /// Command to set a socket option.
   UserSetOpt {
-    option: i32,                                     // The integer ID of the option to set.
-    value: Vec<u8>,                                  // The new value for the option, as raw bytes.
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Channel to send the set option result back.
+    option: i32,
+    value: Vec<u8>,
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
   },
   /// Command to get a socket option's value.
   UserGetOpt {
-    option: i32,                                          // The integer ID of the option to get.
-    reply_tx: oneshot::Sender<Result<Vec<u8>, ZmqError>>, // Channel to send the option value or error back.
+    option: i32,
+    reply_tx: oneshot::Sender<Result<Vec<u8>, ZmqError>>,
   },
   /// Command to register a monitor channel for socket events.
   UserMonitor {
-    monitor_tx: MonitorSender, // The sender end of the channel where monitor events will be sent.
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>, // Confirms registration.
+    monitor_tx: MonitorSender,
+    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
   },
   /// Command to initiate the closing sequence for the socket.
   UserClose {
-    // Reply confirms that the close process has been initiated, not necessarily completed.
     reply_tx: oneshot::Sender<Result<(), ZmqError>>,
   },
 
   // --- Lifecycle ---
-  /// Universal signal to gracefully shut down an actor task.
-  /// Can be sent directly to an actor's mailbox if needed, bypassing the event bus
-  /// for very targeted shutdown scenarios (though event bus is preferred for general lifecycle).
   Stop,
 
-  // --- Pipe Management (PipeReaderTask -> SocketCore, direct commands for performance) ---
-  /// Sent from PipeReaderTask -> SocketCore when a message arrives from a session's data pipe.
+  // --- Pipe Management ---
   PipeMessageReceived {
-    /// The ID of the pipe (from SocketCore's perspective, its read pipe ID) that received the message.
     pipe_id: usize,
-    msg: Msg, // The message received from the pipe.
+    msg: Msg,
   },
-  /// Coalesced batch of messages from the io_uring upstream processor.
-  /// Delivered to ISocket::handle_pipe_event as a single call to eliminate per-message scheduler yields.
   PipeMessageBatchReceived {
     pipe_id: usize,
     msgs: Vec<Msg>,
   },
-  /// Sent from PipeReaderTask -> SocketCore when the session closes its *sending* end of the data pipe.
   PipeClosedByPeer {
-    /// The ID of the pipe (from SocketCore's perspective, its read pipe ID) that was closed.
     pipe_id: usize,
   },
 
-  // --- SocketCore -> Session (Direct command for initial pipe setup) ---
-  /// Sent from SocketCore -> Session to provide its ends of the inter-actor data pipe.
+  // --- SocketCore -> Session ---
   AttachPipe {
-    /// The channel receiver for the Session to read messages from the SocketCore.
     rx_from_core: AsyncReceiver<Msg>,
-    /// The channel sender for the Session to send messages to the SocketCore.
     tx_to_core: AsyncSender<Msg>,
-    /// The ID the Session uses to read from its pipe (SocketCore writes to this ID).
     pipe_read_id: usize,
-    /// The ID the Session uses to write to its pipe (SocketCore reads from this ID).
     pipe_write_id: usize,
   },
 
-  /// Sent from SocketCore -> SessionConnectionActorX to provide its pipes and routing info.
   ScaInitializePipes {
-    /// The unique handle of the target SessionConnectionActorX.
     sca_handle_id: usize,
-    /// Channel for SCA to receive Msgs (outgoing data) from SocketCore.
     rx_from_core: AsyncReceiver<Vec<Msg>>,
-    /// The ID the SCA should use in the `pipe_id` field when calling `ISocket::handle_pipe_event`.
     core_pipe_read_id_for_incoming_routing: usize,
   },
-  /// Sent directly from a TCP/IPC connecter or acceptor to SocketCore's command mailbox
-  /// when a new connection is fully established. Replaces the old SystemEvent broadcast
-  /// to enforce strict FIFO ordering with subsequent UringFdHandshakeComplete commands.
+
+  /// Sent from a TCP/IPC connecter or acceptor directly to SocketCore for ViaSca connections.
   NewConnectionEstablished {
     endpoint_uri: String,
     target_endpoint_uri: String,
@@ -130,16 +107,27 @@ pub enum Command {
     interaction_model: ConnectionInteractionModel,
     managing_actor_task_id: Option<TaskId>,
   },
+
+  // --- io_uring path: unified, URI-keyed commands ---
+
+  /// Sent from the UringWorker to SocketCore when an io_uring connection's ZMTP handshake
+  /// completes. Carries the URI, peer identity, and connection interface atomically, replacing
+  /// the old two-step NewConnectionEstablished + UringFdHandshakeComplete flow.
   #[cfg(feature = "io-uring")]
-  UringFdMessage { fd: RawFd, msgs: Vec<Msg> },
-  #[cfg(feature = "io-uring")]
-  UringFdError { fd: RawFd, error: ZmqError },
-  #[cfg(feature = "io-uring")]
-  UringFdHandshakeComplete {
-    // Used by uring::global_state processor to inform SocketCore
-    fd: RawFd,
+  UringConnectionEstablished {
+    endpoint_uri: String,
+    target_endpoint_uri: String,
+    connection_iface: Arc<dyn ISocketConnection>,
     peer_identity: Option<Blob>,
   },
+
+  /// Batched incoming data from an io_uring connection, keyed by URI.
+  #[cfg(feature = "io-uring")]
+  UringFdMessage { endpoint_uri: String, msgs: Vec<Msg> },
+
+  /// Fatal error or connection closure from an io_uring connection, keyed by URI.
+  #[cfg(feature = "io-uring")]
+  UringFdError { endpoint_uri: String, error: ZmqError },
 }
 
 impl Command {
@@ -164,11 +152,11 @@ impl Command {
       Command::ScaInitializePipes { .. } => "ScaInitializePipes",
       Command::NewConnectionEstablished { .. } => "NewConnectionEstablished",
       #[cfg(feature = "io-uring")]
+      Command::UringConnectionEstablished { .. } => "UringConnectionEstablished",
+      #[cfg(feature = "io-uring")]
       Command::UringFdMessage { .. } => "UringFdMessage",
       #[cfg(feature = "io-uring")]
       Command::UringFdError { .. } => "UringFdError",
-      #[cfg(feature = "io-uring")]
-      Command::UringFdHandshakeComplete { .. } => "UringFdHandshakeComplete",
     }
   }
 }

@@ -187,21 +187,7 @@ pub(crate) async fn cleanup_stopped_child_resources(
       tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, uri=%ep_info.endpoint_uri, "Removed pipe state for stopped child.");
     }
 
-    // Clean up io_uring specific mappings if this was a uring connection.
-    #[cfg(feature = "io-uring")]
-    if ep_info
-      .connection_iface
-      .as_any()
-      .is::<crate::socket::connection_iface::UringFdConnection>()
-    {
-      let fd = ep_info.handle_id as std::os::unix::io::RawFd;
-      core_arc
-        .core_state
-        .write()
-        .uring_fd_to_endpoint_uri
-        .remove(&fd);
-      tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, %fd, "Removed UringFD endpoint state for stopped child.");
-    }
+    // uring_fd_to_endpoint_uri removed — UringFd commands are now URI-keyed.
 
     // Send monitor event for the disconnection/closure.
     let monitor_event = match (ep_info.endpoint_type, error_opt) {
@@ -314,15 +300,7 @@ pub(crate) async fn cleanup_session_state_by_uri(
     }
 
     #[cfg(feature = "io-uring")]
-    if removed_info
-      .connection_iface
-      .as_any()
-      .is::<crate::socket::connection_iface::UringFdConnection>()
-    {
-      let fd = removed_info.handle_id as RawFd;
-      core_s_write.uring_fd_to_endpoint_uri.remove(&fd);
-      tracing::debug!(handle = core_handle, uri=%endpoint_uri, %fd, "Removed UringFD endpoint state.");
-    }
+    // uring_fd_to_endpoint_uri removed — no per-FD map cleanup needed.
 
     core_s_write.send_monitor_event(SocketEvent::Disconnected {
       endpoint: endpoint_uri.to_string(),
@@ -373,9 +351,6 @@ pub(crate) async fn cleanup_session_state_by_pipe(
   let mut removed_ep_uri_for_event: Option<String> = None;
   let mut task_handle_to_abort: Option<JoinHandle<()>> = None;
   let mut pipe_ids_of_removed: Option<(usize, usize)> = None;
-  #[cfg(feature = "io-uring")]
-  let mut fd_to_unregister_opt: Option<RawFd> = None;
-
   {
     let core_s_read = core_arc.core_state.read();
     if let Some(uri) = core_s_read.pipe_read_id_to_endpoint_uri.get(&pipe_read_id) {
@@ -385,14 +360,6 @@ pub(crate) async fn cleanup_session_state_by_pipe(
         removed_ep_type = Some(ep_info.endpoint_type);
         removed_ep_uri_for_event = Some(ep_info.endpoint_uri.clone());
         pipe_ids_of_removed = ep_info.pipe_ids;
-        #[cfg(feature = "io-uring")]
-        if ep_info
-          .connection_iface
-          .as_any()
-          .is::<crate::socket::connection_iface::UringFdConnection>()
-        {
-          fd_to_unregister_opt = Some(ep_info.handle_id as RawFd);
-        }
       }
     }
   }
@@ -405,12 +372,7 @@ pub(crate) async fn cleanup_session_state_by_pipe(
       if let Some((write_id, _read_id_from_epinfo)) = pipe_ids_of_removed {
         core_s_write.remove_pipe_state(write_id, pipe_read_id);
       }
-      #[cfg(feature = "io-uring")]
-      if let Some(fd_to_unregister) = fd_to_unregister_opt {
-        core_s_write
-          .uring_fd_to_endpoint_uri
-          .remove(&fd_to_unregister);
-      }
+      // uring_fd_to_endpoint_uri removed.
       if let (Some(ep_type), Some(ep_uri_event)) = (removed_ep_type, removed_ep_uri_for_event) {
         let event = match ep_type {
           EndpointType::Session => SocketEvent::Disconnected {

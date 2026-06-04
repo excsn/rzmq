@@ -156,7 +156,7 @@ impl ZmtpUringHandler {
     ) {
       warn!(fd = self.fd, "Signaling handshake failure upstream due to error: {}", error);
       let _ = self.worker_io_config.socket_mailbox.try_send(Command::UringFdError {
-        fd: self.fd,
+        endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
         error,
       });
     }
@@ -201,12 +201,14 @@ impl ZmtpUringHandler {
     self
       .worker_io_config
       .socket_mailbox
-      .try_send(Command::UringFdHandshakeComplete {
-        fd: self.fd,
+      .try_send(Command::UringConnectionEstablished {
+        endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
+        target_endpoint_uri: self.worker_io_config.target_endpoint_uri.clone(),
+        connection_iface: self.worker_io_config.connection_iface.clone(),
         peer_identity: self.final_peer_identity.clone(),
       })
       .map_err(|e| {
-        error!(fd = self.fd, "Failed to send HandshakeComplete directly to socket mailbox: {:?}", e);
+        error!(fd = self.fd, "Failed to send UringConnectionEstablished to socket mailbox: {:?}", e);
         ZmqError::Internal("Failed to signal handshake completion".into())
       })
       .map(|_| ())
@@ -734,7 +736,7 @@ impl ZmtpUringHandler {
           // Dispatch accumulated message batch directly to the parent socket mailbox
           if !data_batch.is_empty() {
             match self.worker_io_config.socket_mailbox.try_send(Command::UringFdMessage {
-              fd: self.fd,
+              endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
               msgs: data_batch,
             }) {
               Ok(()) => {
@@ -1047,7 +1049,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
       // Also ensure the error is sent upstream if transition_to_error didn't send it (e.g., if already in DataPhase)
       if matches!(original_phase_eof, ZmtpHandlerPhase::DataPhase) {
         let _ = self.worker_io_config.socket_mailbox.try_send(Command::UringFdError {
-          fd: self.fd,
+          endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
           error: eof_err,
         });
       }

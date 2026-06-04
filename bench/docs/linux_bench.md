@@ -25,6 +25,7 @@
 | **PushPull** | `io-uring` + `--cork` | 4 | 21,996,956 | 2,199,792.54 | 134.26 | — | — |
 | **PushPull** | `io-uring` + `--uring-multishot` | 1 | 1,814,016 | 181,408.70 | 11.07 | — | — |
 | **PushPull** | `io-uring` + `--uring-multishot` | 4 | 6,970,714 | 697,117.52 | 42.55 | — | — |
+| **PushPull** | `--cork` (32 KB msg) | 8 | 2,438,218 | 243,785.88 | 7,618.31 | — | — |
 | **PushPull** | `io-uring` + `--cork` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 8 | 2,118,477 | 211,594.15 | 6,612.32 | — | — |
 
 ---
@@ -275,8 +276,23 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 ---
 
-### 9. Bonus Round: PushPull (io-uring with Multishot and ZeroCopy), Msg Size 32KB, Concurrency 8
+### 9. Bonus Round: PushPull, Msg Size 32KB, Concurrency 8, Cork
 
+#### Standard
+**Command:**
+```bash
+cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --cork --concurrency 8
+```
+
+**Metrics:**
+* **Pattern:** PushPull
+* **Elapsed Time:** 10.0015 seconds
+* **Total Messages:** 2,438,218
+* **Total Data:** 76,194.31 MB
+* **Throughput:** 243,785.88 msg/s
+* **Throughput Rate:** 7,618.31 MB/s
+
+#### io-uring with Multishot and ZeroCopy
 **Command:**
 ```bash
 cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --cork --uring-multishot --uring-zerocopy --concurrency 8

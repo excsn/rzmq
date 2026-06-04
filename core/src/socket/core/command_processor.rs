@@ -61,34 +61,30 @@ pub(crate) async fn process_socket_command(
       // These events can arrive from the UringWorker after we've already initiated a shutdown.
       // It's safe to ignore them as the shutdown process will clean up the corresponding FD.
       #[cfg(feature = "io-uring")]
-      Command::UringFdError { fd, error } => {
-        // This is the key insight: A UringFdError is functionally identical to an
-        // ActorStopping event for a session. It signifies the termination of a "child" connection.
-        // By calling the same handler, we unify the cleanup logic and ensure the
-        // ShutdownCoordinator is always updated correctly, regardless of timing.
-        tracing::debug!(handle=core_handle, %fd, %error, "UringFdError received. Treating as ActorStopping event.");
-
-        let endpoint_uri_opt = core_arc
+      Command::UringFdError { endpoint_uri, error } => {
+        tracing::debug!(handle=core_handle, %endpoint_uri, %error, "UringFdError during shutdown — treating as ActorStopping.");
+        let handle_id_opt = core_arc
           .core_state
           .read()
-          .uring_fd_to_endpoint_uri
-          .get(&fd)
-          .cloned();
-
-        // We pass the FD as the `stopped_actor_id` and ActorType::Session.
+          .endpoints
+          .get(&endpoint_uri)
+          .map(|ep| ep.handle_id);
         shutdown::handle_actor_stopping_event(
           core_arc.clone(),
           socket_logic_strong,
-          fd as usize,
+          handle_id_opt.unwrap_or(0),
           ActorType::Session,
-          endpoint_uri_opt.as_deref(),
+          Some(&endpoint_uri),
           Some(&error),
         )
         .await;
       }
       #[cfg(feature = "io-uring")]
-      Command::UringFdHandshakeComplete { fd, .. } => {
-        tracing::debug!(handle = core_handle, %fd, "Ignoring UringFdHandshakeComplete during shutdown.");
+      Command::UringConnectionEstablished { connection_iface, endpoint_uri, .. } => {
+        tracing::warn!(handle = core_handle, %endpoint_uri, "UringConnectionEstablished during shutdown — closing orphaned connection.");
+        if let Err(e) = connection_iface.close_connection().await {
+          tracing::error!(handle = core_handle, %endpoint_uri, "Error closing orphaned UringFd connection: {}", e);
+        }
       }
       // Connection arrived while shutting down — clean up the orphaned connection immediately.
       Command::NewConnectionEstablished {
@@ -213,159 +209,114 @@ pub(crate) async fn process_socket_command(
       shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
     }
 
-    // --- Uring Specific Commands ---
-    #[cfg(feature = "io-uring")]
-    Command::UringFdMessage { fd, msgs } => {
-      let endpoint_uri_opt = core_arc
-        .core_state
-        .read()
-        .uring_fd_to_endpoint_uri
-        .get(&fd)
-        .cloned();
-      if let Some(uri) = endpoint_uri_opt {
-        let synthetic_read_id_opt = core_arc
-          .core_state
-          .read()
-          .endpoints
-          .get(&uri)
-          .and_then(|ep_info| ep_info.pipe_ids.map(|pids| pids.1)); // pids.1 is the read_id
+    // --- io_uring Specific Commands (URI-keyed, FD-agnostic) ---
 
-        if let Some(s_read_id) = synthetic_read_id_opt {
-          let batch_cmd = Command::PipeMessageBatchReceived { pipe_id: s_read_id, msgs };
-          if let Err(e) = socket_logic_strong
-            .handle_pipe_event(s_read_id, batch_cmd)
-            .await
-          {
-            tracing::error!(handle=core_handle, %fd, "Error from ISocket::handle_pipe_event for UringFdMessage batch: {}", e);
-          }
-        } else {
-          tracing::warn!(handle=core_handle, %fd, %uri, "No synthetic_read_id found for UringFdMessage. Inconsistent state?");
+    /// Emitted by the UringWorker when the ZMTP handshake completes. Atomically registers
+    /// the connection and attaches the pipes — no prior NewConnectionEstablished needed.
+    #[cfg(feature = "io-uring")]
+    Command::UringConnectionEstablished {
+      endpoint_uri,
+      target_endpoint_uri,
+      connection_iface,
+      peer_identity,
+    } => {
+      let is_outbound = {
+        let cs = core_arc.core_state.read();
+        !cs.endpoints.values().any(|ep| {
+          ep.endpoint_type == EndpointType::Listener && ep.endpoint_uri == target_endpoint_uri
+        })
+      };
+
+      let synthetic_read_id = core_arc.context.inner().next_handle();
+      let synthetic_write_id = core_arc.context.inner().next_handle();
+
+      let endpoint_info = EndpointInfo {
+        mailbox: core_arc.command_sender(),
+        task_handle: None,
+        endpoint_type: EndpointType::Session,
+        endpoint_uri: endpoint_uri.clone(),
+        pipe_ids: Some((synthetic_write_id, synthetic_read_id)),
+        handle_id: synthetic_read_id, // Use read_id as the stable handle
+        target_endpoint_uri: Some(target_endpoint_uri),
+        is_outbound_connection: is_outbound,
+        connection_iface,
+        peer_socket_type: None,
+      };
+
+      {
+        let mut cs = core_arc.core_state.write();
+        if let Some(old) = cs.endpoints.insert(endpoint_uri.clone(), endpoint_info) {
+          tracing::warn!(handle=core_handle, %endpoint_uri, "Overwrote existing EndpointInfo on UringConnectionEstablished.");
+          if let Some(h) = old.task_handle { h.abort(); }
         }
-      } else {
-        tracing::warn!(handle=core_handle, %fd, "Received UringFdMessage for unknown FD. Messages dropped.");
+        cs.pipe_read_id_to_endpoint_uri.insert(synthetic_read_id, endpoint_uri.clone());
       }
-    }
-    #[cfg(feature = "io-uring")]
-    Command::UringFdError { fd, error } => {
-      let endpoint_uri_opt = core_arc
-        .core_state
-        .read()
-        .uring_fd_to_endpoint_uri
-        .get(&fd)
-        .cloned();
 
-      if let Some(uri) = endpoint_uri_opt {
-        let conn_iface_opt;
-        let synthetic_read_id_opt;
-        {
-          let cs = core_arc.core_state.read();
-          let ep_info_opt = cs.endpoints.get(&uri);
-          conn_iface_opt = ep_info_opt.map(|ep| ep.connection_iface.clone());
-          synthetic_read_id_opt = ep_info_opt.and_then(|ep| ep.pipe_ids.map(|pids| pids.1));
-        }
-        tracing::warn!(handle=core_handle, %fd, %uri, %error, "Processing UringFdError. Initiating close and cleanup.");
+      tracing::info!(
+        handle=core_handle, %endpoint_uri, synth_r=synthetic_read_id, synth_w=synthetic_write_id,
+        ?peer_identity, "UringConnectionEstablished: pipes attached, handshake complete."
+      );
 
-        // 1. Initiate close of the underlying connection via ISocketConnection
-        if let Some(iface) = conn_iface_opt {
-          if let Err(close_err) = iface.close_connection().await {
-            tracing::warn!(handle=core_handle, %fd, "Error calling close_connection() for UringFdError: {}", close_err);
-          }
-        } else {
-          tracing::warn!(handle=core_handle, %fd, "No ISocketConnection found to close for UringFdError on URI {}.", uri);
-        }
-
-        // 2. Notify ISocket logic that its "pipe" is detached
-        if let Some(s_read_id) = synthetic_read_id_opt {
-          socket_logic_strong.pipe_detached(s_read_id).await;
-        }
-
-        // 3. Clean up SocketCore's state for this endpoint/FD
-        //    This will remove EndpointInfo, pipe_read_id_to_uri, uring_fd_to_uri,
-        //    and unregister from uring::global_state.
-        //    The 'stopped_child_actor_id' is fd as usize.
-        //    'actor_type' is conceptually Session.
-        //    'error_opt' is Some(&error).
-        //    'is_full_core_shutdown' depends on SocketCore's current state.
-        pipe_manager::cleanup_stopped_child_resources(
-          core_arc.clone(),
-          socket_logic_strong,
-          fd as usize,        // The "child_id" is the FD
-          ActorType::Session, // Treat as a session for cleanup
-          Some(&uri),
-          Some(&error),
-          current_shutdown_phase != ShutdownPhase::Running,
-        )
+      socket_logic_strong
+        .pipe_attached(synthetic_read_id, synthetic_write_id, peer_identity.as_ref().map(|b| b.as_ref()))
         .await;
-      } else {
-        tracing::warn!(handle=core_handle, %fd, %error, "Received UringFdError for unknown FD (URI not found in uring_fd_to_endpoint_uri map).");
-      }
+      socket_logic_strong.update_peer_identity(synthetic_read_id, peer_identity).await;
+
+      core_arc.core_state.read().send_monitor_event(SocketEvent::HandshakeSucceeded {
+        endpoint: endpoint_uri,
+      });
     }
+
     #[cfg(feature = "io-uring")]
-    Command::UringFdHandshakeComplete { fd, peer_identity } => {
-      // Find the endpoint URI associated with this FD
-      let endpoint_uri_opt = core_arc
+    Command::UringFdMessage { endpoint_uri, msgs } => {
+      let synthetic_read_id_opt = core_arc
         .core_state
         .read()
-        .uring_fd_to_endpoint_uri
-        .get(&fd)
-        .cloned();
-      if let Some(uri) = endpoint_uri_opt {
-        // Find the synthetic pipe_read_id for this connection
-        // This ID is what ISocket uses to identify the "pipe" to this peer.
-        let synthetic_read_id_opt = core_arc
-          .core_state
-          .read()
-          .endpoints
-          .get(&uri) // Get EndpointInfo using the URI
-          .and_then(|ep_info| ep_info.pipe_ids.map(|pids| pids.1)); // pids.1 is synthetic_read_id
+        .endpoints
+        .get(&endpoint_uri)
+        .and_then(|ep| ep.pipe_ids.map(|pids| pids.1));
 
-        if let Some(s_read_id) = synthetic_read_id_opt {
-          tracing::debug!(
-              handle = core_handle, %fd, %uri, synth_pipe_id = s_read_id, ?peer_identity,
-              "SocketCore: Processing UringFdHandshakeComplete. Attaching pipes and notifying ISocket."
-          );
-
-          let synthetic_write_id = core_arc
-            .core_state
-            .read()
-            .endpoints
-            .get(&uri)
-            .and_then(|ep_info| ep_info.pipe_ids.map(|pids| pids.0))
-            .unwrap_or(0);
-
-          // Complete the deferred pipe attachment now that the handshake has succeeded
-          socket_logic_strong
-            .pipe_attached(
-              s_read_id,
-              synthetic_write_id,
-              peer_identity.as_ref().map(|b| b.as_ref()),
-            )
-            .await;
-
-          // Notify the ISocket pattern logic (e.g., RouterSocket) about the identity.
-          socket_logic_strong
-            .update_peer_identity(s_read_id, peer_identity)
-            .await;
-
-          // Emit HandshakeSucceeded monitor event for io_uring path
-          core_arc
-            .core_state
-            .read()
-            .send_monitor_event(SocketEvent::HandshakeSucceeded {
-              endpoint: uri.clone(),
-            });
-        } else {
-          tracing::warn!(
-              handle = core_handle, %fd, %uri,
-              "SocketCore: No synthetic_read_id found for UringFdHandshakeComplete. ISocket not notified."
-          );
+      if let Some(s_read_id) = synthetic_read_id_opt {
+        let batch_cmd = Command::PipeMessageBatchReceived { pipe_id: s_read_id, msgs };
+        if let Err(e) = socket_logic_strong.handle_pipe_event(s_read_id, batch_cmd).await {
+          tracing::error!(handle=core_handle, %endpoint_uri, "ISocket::handle_pipe_event error for UringFdMessage: {}", e);
         }
       } else {
-        tracing::warn!(
-            handle = core_handle, %fd,
-            "SocketCore: Received UringFdHandshakeComplete for an FD not mapped to a URI. Ignoring."
-        );
+        tracing::warn!(handle=core_handle, %endpoint_uri, "UringFdMessage for unknown endpoint — dropped.");
       }
+    }
+
+    #[cfg(feature = "io-uring")]
+    Command::UringFdError { endpoint_uri, error } => {
+      let (conn_iface_opt, synthetic_read_id_opt, handle_id_opt) = {
+        let cs = core_arc.core_state.read();
+        let ep = cs.endpoints.get(&endpoint_uri);
+        (
+          ep.map(|e| e.connection_iface.clone()),
+          ep.and_then(|e| e.pipe_ids.map(|pids| pids.1)),
+          ep.map(|e| e.handle_id),
+        )
+      };
+      tracing::warn!(handle=core_handle, %endpoint_uri, %error, "UringFdError — closing connection.");
+
+      if let Some(iface) = conn_iface_opt {
+        if let Err(e) = iface.close_connection().await {
+          tracing::warn!(handle=core_handle, %endpoint_uri, "close_connection error: {}", e);
+        }
+      }
+      if let Some(s_read_id) = synthetic_read_id_opt {
+        socket_logic_strong.pipe_detached(s_read_id).await;
+      }
+      pipe_manager::cleanup_stopped_child_resources(
+        core_arc.clone(),
+        socket_logic_strong,
+        handle_id_opt.unwrap_or(0),
+        ActorType::Session,
+        Some(&endpoint_uri),
+        Some(&error),
+        current_shutdown_phase != ShutdownPhase::Running,
+      )
+      .await;
     }
 
     Command::NewConnectionEstablished {
@@ -1077,66 +1028,21 @@ async fn handle_new_connection_established(
         .await;
     }
 
+    // ViaUringFd connections are now handled atomically via Command::UringConnectionEstablished,
+    // emitted by the worker only after the ZMTP handshake completes. NewConnectionEstablished
+    // is only dispatched for ViaSca connections by the transport layer.
     #[cfg(feature = "io-uring")]
-    ConnectionInteractionModel::ViaUringFd { fd } => {
-      tracing::debug!(
+    ConnectionInteractionModel::ViaUringFd { .. } => {
+      tracing::warn!(
         handle = core_handle,
         conn_uri = %endpoint_uri_from_event,
-        raw_fd = fd,
-        "NewConnectionEstablished: io_uring FD path."
+        "Unexpected ViaUringFd in NewConnectionEstablished — ignored (UringConnectionEstablished handles this path)."
       );
-
-      let connection_iface = connection_iface_from_event_opt.ok_or_else(|| {
-        ZmqError::Internal("UringFdConnection missing from NewConnectionEstablished command".into())
-      })?;
-
-      let uring_fd_as_endpoint_handle_id = fd as usize;
-
-      let synthetic_read_id = core_arc.context.inner().next_handle();
-      let synthetic_write_id = core_arc.context.inner().next_handle();
-
-      let endpoint_info = EndpointInfo {
-        mailbox: core_arc.command_sender(),
-        task_handle: None,
-        endpoint_type: EndpointType::Session,
-        endpoint_uri: endpoint_uri_from_event.clone(),
-        pipe_ids: Some((synthetic_write_id, synthetic_read_id)),
-        handle_id: uring_fd_as_endpoint_handle_id,
-        target_endpoint_uri: Some(target_endpoint_uri_from_event),
-        is_outbound_connection: is_outbound_this_core_initiated,
-        connection_iface: connection_iface.clone(),
-        peer_socket_type: None,
-      };
-
-      {
-        let mut core_s = core_arc.core_state.write();
-        if let Some(old_info) = core_s
-          .endpoints
-          .insert(endpoint_uri_from_event.clone(), endpoint_info)
-        {
-          tracing::warn!(handle=core_handle, uri=%endpoint_uri_from_event, "Overwrote existing EndpointInfo for NewConnectionEstablished (io_uring).");
-          if let Some(old_task_handle) = old_info.task_handle {
-            old_task_handle.abort();
-          }
-        }
-        core_s
-          .pipe_read_id_to_endpoint_uri
-          .insert(synthetic_read_id, endpoint_uri_from_event.clone());
-        core_s
-          .uring_fd_to_endpoint_uri
-          .insert(fd, endpoint_uri_from_event.clone());
-      }
-      tracing::info!(handle=core_handle, raw_fd=fd, conn_uri=%endpoint_uri_from_event, "UringFd-based connection registered; awaiting handshake before pipe attachment.");
     }
     #[cfg(not(feature = "io-uring"))]
     ConnectionInteractionModel::ViaUringFd { _fd_placeholder } => {
-      tracing::error!(
-        handle = core_handle,
-        "FATAL: Received ViaUringFd model when io-uring feature is disabled."
-      );
-      return Err(ZmqError::Internal(
-        "Invalid connection model for build configuration".into(),
-      ));
+      tracing::error!(handle = core_handle, "FATAL: ViaUringFd model when io-uring is disabled.");
+      return Err(ZmqError::Internal("Invalid connection model for build configuration".into()));
     }
   }
   Ok(())

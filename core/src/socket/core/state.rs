@@ -8,8 +8,6 @@ use crate::socket::types::SocketType;
 
 use fibre::mpmc::AsyncSender;
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "io-uring")]
-use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::JoinHandle;
@@ -127,11 +125,6 @@ pub(crate) struct CoreState {
   /// Used to find the `EndpointInfo` when a message/event arrives on a "pipe" (actual or conceptual).
   pub pipe_read_id_to_endpoint_uri: HashMap<usize, String>,
 
-  /// For io_uring path: Maps a RawFd directly to the endpoint_uri.
-  /// Used when UringFd* commands/events (which carry RawFd) arrive at SocketCore.
-  #[cfg(feature = "io-uring")]
-  pub uring_fd_to_endpoint_uri: HashMap<RawFd, String>,
-
   #[cfg(feature = "inproc")]
   pub(crate) bound_inproc_names: HashSet<String>,
   pub(crate) monitor_tx: Option<MonitorSender>,
@@ -149,8 +142,6 @@ impl CoreState {
       endpoints: HashMap::new(),
       reconnect_states: HashMap::new(),
       pipe_read_id_to_endpoint_uri: HashMap::new(),
-      #[cfg(feature = "io-uring")]
-      uring_fd_to_endpoint_uri: HashMap::new(),
       #[cfg(feature = "inproc")]
       bound_inproc_names: HashSet::new(),
       monitor_tx: None,

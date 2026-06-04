@@ -9,6 +9,7 @@ use bytes::BufMut;
 use crate::io_uring_backend::ops::{HANDLER_INTERNAL_SEND_OP_UD, UringOpCompletion, UserData};
 use crate::io_uring_backend::worker::UringWorker;
 use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
+use crate::socket::connection_iface::DummyConnection;
 use crate::{Command, ZmqError, uring};
 
 use io_uring::cqueue::Entry;
@@ -418,6 +419,9 @@ pub(crate) fn process_all_cqes(
               let protocol_config = ext_op_ctx.protocol_config.as_ref().unwrap();
               let socket_mailbox = ext_op_ctx.socket_mailbox.take()
                 .expect("Connect op context missing socket_mailbox");
+              // The UringOpRequest::Connect path is not used by tcp.rs (which uses
+              // RegisterExternalFd). Use DummyConnection and derive URIs from peer addr.
+              let connect_endpoint_uri = format!("tcp://{}", peer_addr);
               let recv_buffer_manager = worker.buffer_manager.as_ref();
               let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
               match worker.handler_manager.create_and_add_handler(
@@ -426,6 +430,9 @@ pub(crate) fn process_all_cqes(
                 protocol_config,
                 false,
                 socket_mailbox,
+                connect_endpoint_uri,
+                String::new(),
+                std::sync::Arc::new(DummyConnection),
                 recv_buffer_manager,
                 default_bgid_val_from_worker,
                 cqe_user_data,
@@ -611,12 +618,19 @@ pub(crate) fn process_all_cqes(
             if let (Some(factory_id), Some(protocol_config), Some(socket_mailbox)) =
               (factory_id_opt, protocol_config_opt, mailbox_opt)
             {
+              // Derive peer URI from the accepted FD; use DummyConnection for the internal path.
+              let peer_uri = crate::io_uring_backend::worker::get_peer_local_addr(client_fd)
+                .map(|(peer, _)| format!("tcp://{}", peer))
+                .unwrap_or_else(|_| format!("tcp-accepted-fd-{}", client_fd));
               match worker.handler_manager.create_and_add_handler(
                 client_fd,
                 &factory_id,
                 &protocol_config,
                 true,
                 socket_mailbox,
+                peer_uri,
+                String::new(),
+                std::sync::Arc::new(DummyConnection),
                 worker.buffer_manager.as_ref(),
                 worker.default_buffer_ring_group_id_val,
                 0,
@@ -700,17 +714,22 @@ pub(crate) fn process_all_cqes(
               };
               let _ = ext_ctx.reply_tx.send(Ok(ack));
             }
-            // Clone mailbox BEFORE removing handler (handler drop would release the Arc).
-            let mailbox_for_close_notify = worker
+            // Clone mailbox and endpoint_uri BEFORE removing handler.
+            let (mailbox_for_close_notify, endpoint_uri_for_notify) = worker
               .handler_manager
               .get_mut(handler_fd)
-              .map(|h| h.io_config().socket_mailbox.clone());
+              .map(|h| (
+                h.io_config().socket_mailbox.clone(),
+                h.io_config().endpoint_uri.clone(),
+              ))
+              .unzip();
             if let Some(mut h) = worker.handler_manager.remove_handler(handler_fd) {
               h.fd_has_been_closed();
             }
             if let Some(mailbox) = mailbox_for_close_notify {
+              let endpoint_uri = endpoint_uri_for_notify.unwrap_or_default();
               let _ = mailbox.try_send(Command::UringFdError {
-                fd: handler_fd,
+                endpoint_uri,
                 error: ZmqError::ConnectionClosed,
               });
             }

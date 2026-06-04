@@ -412,32 +412,17 @@ impl TcpListener {
                           context_clone.clone(),
                         ));
 
-                        // Pre-register with SocketCore BEFORE sending RegisterExternalFd to the
-                        // worker. Because both messages flow through SocketCore's sequential FIFO
-                        // mailbox, this guarantees NewConnectionEstablished is processed before
-                        // UringFdHandshakeComplete, eliminating the local-map race.
-                        let pre_cmd = Command::NewConnectionEstablished {
-                          endpoint_uri: actual_connected_uri.clone(),
-                          target_endpoint_uri: logical_uri.clone(),
-                          connection_iface: Some(new_conn_iface.clone()),
-                          interaction_model: ConnectionInteractionModel::ViaUringFd { fd: raw_fd },
-                          managing_actor_task_id: None,
-                        };
-                        if socket_logic.mailbox().send(pre_cmd).await.is_err() {
-                          tracing::error!(
-                            "Failed to pre-register accepted FD {} with SocketCore — mailbox closed.",
-                            raw_fd
-                          );
-                          unsafe { let _ = libc::close(raw_fd); }
-                          setup_successful = false;
-                        } else {
-
+                        // Hand URIs and connection_iface to the worker; the worker emits
+                        // UringConnectionEstablished atomically on handshake completion.
                         let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
                           user_data: user_data_for_op,
                           fd: raw_fd,
                           protocol_handler_factory_id: "zmtp-uring/3.1".to_string(),
                           protocol_config,
                           is_server_role: true,
+                          endpoint_uri: actual_connected_uri.clone(),
+                          target_endpoint_uri: logical_uri.clone(),
+                          connection_iface: new_conn_iface,
                           socket_mailbox: socket_logic.mailbox(),
                           reply_tx: reply_tx_for_op,
                           mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
@@ -462,8 +447,8 @@ impl TcpListener {
                               if returned_fd == raw_fd =>
                             {
                               info!("Registered accepted FD {} with UringWorker.", raw_fd);
-                              // NewConnectionEstablished already sent pre-registration;
-                              // do not set interaction_model_for_event to avoid a duplicate send.
+                              // UringConnectionEstablished will be sent by the worker on handshake;
+                              // interaction_model_for_event is intentionally not set for UringFd.
                             }
                             Ok(Ok(other_completion)) => {
                               tracing::error!(
@@ -500,7 +485,6 @@ impl TcpListener {
                             }
                           }
                         }
-                        } // close: if mailbox.send(pre_cmd).is_err() { ... } else { ... }
                       }
                     }
                     Err(e) => {
@@ -858,10 +842,10 @@ impl TcpConnecter {
           // For the UringFd path, try_connect_once pre-sends NewConnectionEstablished before
           // registering with the worker (guaranteeing FIFO ordering in SocketCore's mailbox).
           // Detect that case by connection_iface_opt being None for a ViaUringFd model.
-          let already_pre_sent = connection_iface_opt.is_none()
+          let worker_handles_lifecycle = connection_iface_opt.is_none()
             && matches!(interaction_model, ConnectionInteractionModel::ViaUringFd { .. });
 
-          if !already_pre_sent {
+          if !worker_handles_lifecycle {
             let cmd = Command::NewConnectionEstablished {
               endpoint_uri: actual_peer_uri,
               target_endpoint_uri: endpoint_uri_clone.clone(),
@@ -1034,29 +1018,18 @@ impl TcpConnecter {
               self.context.clone(),
             ));
 
-            // Pre-register with SocketCore BEFORE sending RegisterExternalFd to the worker.
-            // This guarantees NewConnectionEstablished is enqueued in SocketCore's sequential
-            // FIFO mailbox before the worker can complete the handshake and enqueue
-            // UringFdHandshakeComplete, eliminating the local-map race.
+            // Hand URIs and connection_iface to the worker. The worker emits
+            // UringConnectionEstablished to SocketCore atomically on handshake completion.
             let actual_peer_uri_str = format!("tcp://{}", peer_addr_actual);
-            let pre_cmd = Command::NewConnectionEstablished {
-              endpoint_uri: actual_peer_uri_str.clone(),
-              target_endpoint_uri: endpoint_uri_original.to_string(),
-              connection_iface: Some(new_conn_iface.clone()),
-              interaction_model: ConnectionInteractionModel::ViaUringFd { fd: raw_fd },
-              managing_actor_task_id: None,
-            };
-            if self.socket_logic.mailbox().send(pre_cmd).await.is_err() {
-              unsafe { let _ = libc::close(raw_fd); }
-              return Err(ZmqError::Internal("Socket mailbox closed during pre-registration".into()));
-            }
-
             let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
               user_data: user_data_for_op,
               fd: raw_fd,
               protocol_handler_factory_id: "zmtp-uring/3.1".to_string(),
               protocol_config,
               is_server_role: false,
+              endpoint_uri: actual_peer_uri_str.clone(),
+              target_endpoint_uri: endpoint_uri_original.to_string(),
+              connection_iface: new_conn_iface,
               socket_mailbox: self.socket_logic.mailbox(),
               reply_tx: reply_tx_for_op,
               mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
@@ -1075,8 +1048,8 @@ impl TcpConnecter {
                   "Successfully registered connected FD {} with UringWorker.",
                   raw_fd
                 );
-                // NewConnectionEstablished was already pre-sent; return None for connection_iface
-                // so the connecter loop knows to skip the duplicate send.
+                // Worker handles the full lifecycle; return None for connection_iface so the
+                // connecter loop's worker_handles_lifecycle guard skips NewConnectionEstablished.
                 Ok((
                   None,
                   ConnectionInteractionModel::ViaUringFd { fd: raw_fd },

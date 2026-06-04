@@ -595,11 +595,7 @@ pub(crate) async fn perform_final_pipe_cleanup(
       .write()
       .pipe_read_id_to_endpoint_uri
       .clear();
-    #[cfg(feature = "io-uring")]
-    {
-      // Mailbox is held directly by each connection handler; no global map to unregister from.
-      core_arc.core_state.write().uring_fd_to_endpoint_uri.clear();
-    }
+    // uring_fd_to_endpoint_uri removed — UringFd commands are URI-keyed.
     if !core_arc.core_state.read().endpoints.is_empty() {
       tracing::warn!(
         handle = core_handle,
