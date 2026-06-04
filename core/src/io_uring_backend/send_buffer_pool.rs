@@ -186,3 +186,72 @@ impl SendBufferPool {
     })
   }
 }
+
+#[cfg(all(test, feature = "io-uring"))]
+mod pool_tests {
+  use super::*;
+  use bytes::Bytes;
+  use io_uring::IoUring;
+
+  fn create_test_ring_and_pool(count: usize, cap: usize) -> (IoUring, SendBufferPool) {
+    let ring = IoUring::new(16).expect("Failed to initialize test io_uring");
+    let pool =
+      SendBufferPool::new(&ring, count, cap).expect("Failed to initialize SendBufferPool");
+    (ring, pool)
+  }
+
+  #[test]
+  fn test_out_of_order_recycling() {
+    let (_ring, pool) = create_test_ring_and_pool(5, 128);
+    let mut acquired = Vec::new();
+
+    for i in 0..5usize {
+      let data = Bytes::from(format!("payload-data-for-buffer-{}", i));
+      let lease = pool
+        .acquire_and_prep_buffer(&data)
+        .expect("Should acquire successfully");
+      acquired.push(lease);
+    }
+
+    // Release in scrambled order.
+    for idx in [3usize, 1, 4, 0, 2] {
+      let (id, _, _) = acquired[idx];
+      pool.release_buffer(id);
+    }
+
+    // All slots should be recyclable — no corruption.
+    for i in 0..5usize {
+      let data = Bytes::from(format!("new-payload-{}", i));
+      let lease = pool.acquire_and_prep_buffer(&data);
+      assert!(lease.is_some(), "Buffer {} should be recycled and acquirable", i);
+    }
+  }
+
+  #[test]
+  fn test_pool_exhaustion_and_recovery() {
+    let (_ring, pool) = create_test_ring_and_pool(2, 64);
+
+    let data = Bytes::from_static(b"test-bytes");
+    let lease1 = pool.acquire_and_prep_buffer(&data);
+    let lease2 = pool.acquire_and_prep_buffer(&data);
+
+    assert!(lease1.is_some());
+    assert!(lease2.is_some());
+
+    // 3rd acquisition must fail — pool is exhausted.
+    let lease3 = pool.acquire_and_prep_buffer(&data);
+    assert!(lease3.is_none(), "Pool exhaustion should return None");
+
+    // Release one slot, then verify recovery.
+    let (id1, _, _) = lease1.unwrap();
+    pool.release_buffer(id1);
+
+    let lease_recovered = pool.acquire_and_prep_buffer(&data);
+    assert!(lease_recovered.is_some(), "Should recover one buffer from pool");
+    assert_eq!(
+      lease_recovered.unwrap().0,
+      id1,
+      "Should recycle the exact returned buffer id"
+    );
+  }
+}

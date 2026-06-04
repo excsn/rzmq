@@ -174,3 +174,74 @@ mod tests {
     assert_eq!(msg.data().unwrap(), payload);
   }
 }
+
+#[cfg(test)]
+mod additional_robustness_tests {
+  use super::*;
+
+  #[test]
+  fn test_fragmented_stream_parsing() {
+    let mut parser = ZmtpManualParser::new(1024);
+    let payload = b"stream-fragmentation-test-payload";
+
+    let mut raw_bytes = BytesMut::new();
+    raw_bytes.put_u8(0x00); // short frame, no flags
+    raw_bytes.put_u8(payload.len() as u8);
+    raw_bytes.put_slice(payload);
+
+    let mut accumulator = BytesMut::new();
+    let total_len = raw_bytes.len();
+
+    for i in 0..total_len {
+      accumulator.put_u8(raw_bytes[i]);
+      let res = parser.decode_from_buffer(&mut accumulator);
+
+      if i < total_len - 1 {
+        assert!(
+          matches!(res, Ok(None)),
+          "Expected Ok(None) for incomplete frame at byte {}",
+          i
+        );
+      } else {
+        let msg = res
+          .expect("Should parse successfully on final byte")
+          .expect("Should yield a Msg on final byte");
+        assert_eq!(msg.data().unwrap(), payload.as_ref());
+        assert!(!msg.is_more());
+      }
+    }
+  }
+
+  #[test]
+  fn test_adversarial_header_parsing() {
+    let mut parser = ZmtpManualParser::new(1024);
+
+    // A command frame with 0-byte body followed by trailing garbage.
+    // The parser treats this as a valid empty command and returns Ok(Some(msg));
+    // the trailing bytes remain unconsumed. Verify no panic occurs.
+    let mut bad_buf = BytesMut::new();
+    bad_buf.put_u8(ZMTP_FLAG_COMMAND);
+    bad_buf.put_u8(0);
+    bad_buf.put_slice(b"garbage");
+
+    let res = parser.decode_from_buffer(&mut bad_buf);
+    assert!(res.is_ok());
+  }
+
+  #[test]
+  fn test_integer_overflow_protection() {
+    let mut parser = ZmtpManualParser::new(1024);
+
+    // Long-frame header claiming u64::MAX bytes — must exceed max_msg_size check.
+    let mut bad_buf = BytesMut::new();
+    bad_buf.put_u8(ZMTP_FLAG_LONG);
+    bad_buf.put_u64(u64::MAX);
+
+    let res = parser.decode_from_buffer(&mut bad_buf);
+    assert!(
+      matches!(res, Err(ZmqError::ProtocolViolation(_))),
+      "Expected ProtocolViolation for u64::MAX frame size, got {:?}",
+      res
+    );
+  }
+}

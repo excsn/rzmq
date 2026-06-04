@@ -230,6 +230,60 @@ impl CoreState {
   }
 }
 
+#[cfg(test)]
+mod reconnect_tests {
+  use super::*;
+  use std::time::Duration;
+
+  #[test]
+  fn test_reconnect_backoff_doubling() {
+    let mut state = ReconnectState::default();
+    let base = Duration::from_millis(100);
+    let max = Duration::from_millis(1000);
+
+    // Call 1: 2^0 * 100ms = 100ms
+    let delay1 = state.on_connection_failure(base, max);
+    assert_eq!(delay1, Duration::from_millis(100));
+
+    // Call 2: 2^1 * 100ms = 200ms
+    let delay2 = state.on_connection_failure(base, max);
+    assert_eq!(delay2, Duration::from_millis(200));
+
+    // Call 3: 2^2 * 100ms = 400ms
+    let delay3 = state.on_connection_failure(base, max);
+    assert_eq!(delay3, Duration::from_millis(400));
+  }
+
+  #[test]
+  fn test_reconnect_backoff_ceiling() {
+    let mut state = ReconnectState::default();
+    let base = Duration::from_millis(100);
+    let max = Duration::from_millis(250);
+
+    let _ = state.on_connection_failure(base, max); // 100ms
+    let delay2 = state.on_connection_failure(base, max); // 200ms
+    let delay3 = state.on_connection_failure(base, max); // 400ms → capped at 250ms
+
+    assert_eq!(delay2, Duration::from_millis(200));
+    assert_eq!(delay3, max);
+  }
+
+  #[test]
+  fn test_reconnect_overflow_prevention() {
+    let mut state = ReconnectState::default();
+    let base = Duration::from_millis(100);
+    let max = Duration::from_secs(60);
+
+    for _ in 0..100 {
+      let delay = state.on_connection_failure(base, max);
+      // saturating_pow and saturating_mul prevent overflow; max cap keeps delay bounded
+      assert!(delay <= max, "Delay {:?} must not exceed max {:?}", delay, max);
+    }
+
+    assert_eq!(state.current_attempts, 100);
+  }
+}
+
 // --- Shutdown Coordinator ---
 // Stays here for now, can be moved to shutdown.rs later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -180,3 +180,56 @@ impl SubscriptionTrie {
     }
   }
 }
+
+#[cfg(test)]
+mod additional_trie_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn test_trie_empty_subscription_behavior() {
+    let trie = SubscriptionTrie::new();
+    trie.subscribe(b"").await;
+
+    assert!(trie.matches(b"sports/football").await);
+    assert!(trie.matches(b"news/weather").await);
+  }
+
+  #[tokio::test]
+  async fn test_trie_overlapping_subscriptions() {
+    let trie = SubscriptionTrie::new();
+    let topic = b"news";
+
+    trie.subscribe(topic).await;
+    trie.subscribe(topic).await; // Double subscribe → count = 2
+
+    // First unsubscribe: count 2 → 1, not the last reference
+    let removed = trie.unsubscribe(topic).await;
+    assert!(!removed, "Should not fully remove topic with count still at 1");
+    assert!(trie.matches(topic).await, "Topic should still match");
+
+    // Second unsubscribe: count 1 → 0, was the last reference
+    let removed_final = trie.unsubscribe(topic).await;
+    assert!(removed_final, "Topic should be fully removed on last unsubscribe");
+    assert!(!trie.matches(topic).await, "Topic should no longer match");
+  }
+
+  #[tokio::test]
+  async fn test_trie_recursive_topic_collection() {
+    let trie = SubscriptionTrie::new();
+    trie.subscribe(b"sports").await;
+    trie.subscribe(b"sports/football").await;
+    trie.subscribe(b"news/weather").await;
+
+    let mut topics = trie.get_all_topics().await;
+    topics.sort();
+
+    let mut expected = vec![
+      b"sports".to_vec(),
+      b"sports/football".to_vec(),
+      b"news/weather".to_vec(),
+    ];
+    expected.sort();
+
+    assert_eq!(topics, expected);
+  }
+}
