@@ -8,6 +8,7 @@ use crate::io_uring_backend::{
   ops::ProtocolConfig,
   UserData,
 };
+use crate::runtime::MailboxSender;
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -15,21 +16,22 @@ use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
 /// Metadata stored for active listener FDs.
-#[derive(Debug, Clone)] // ProtocolConfig needs to be Clone
+#[derive(Clone)]
 pub(crate) struct ListenerMetadata {
   pub(crate) factory_id_for_accepted_connections: String,
-  pub(crate) protocol_config_for_accepted: ProtocolConfig, // Stores the config for this listener
+  pub(crate) protocol_config_for_accepted: ProtocolConfig,
+  /// Mailbox of the parent SocketCore — propagated to each accepted connection.
+  pub(crate) socket_mailbox: MailboxSender,
 }
 
 pub(crate) struct HandlerManager {
   handlers: HashMap<RawFd, Box<dyn UringConnectionHandler + Send>>,
-  factories: Arc<HashMap<String, Arc<dyn ProtocolHandlerFactory>>>, // Stores Arc<dyn Trait>
-  worker_io_config: Arc<WorkerIoConfig>,                            // Passed to handlers via UringWorkerInterface
-  listener_metadata: HashMap<RawFd, ListenerMetadata>,              // Keyed by listener FD
+  factories: Arc<HashMap<String, Arc<dyn ProtocolHandlerFactory>>>,
+  listener_metadata: HashMap<RawFd, ListenerMetadata>,
 }
 
 impl HandlerManager {
-  pub fn new(factories_vec: Vec<Arc<dyn ProtocolHandlerFactory>>, worker_io_config: Arc<WorkerIoConfig>) -> Self {
+  pub fn new(factories_vec: Vec<Arc<dyn ProtocolHandlerFactory>>) -> Self {
     let mut factory_map = HashMap::new();
     for factory_arc in factories_vec {
       factory_map.insert(factory_arc.id().to_string(), factory_arc);
@@ -37,7 +39,6 @@ impl HandlerManager {
     Self {
       handlers: HashMap::new(),
       factories: Arc::new(factory_map),
-      worker_io_config,
       listener_metadata: HashMap::new(),
     }
   }
@@ -51,11 +52,12 @@ impl HandlerManager {
     &mut self,
     fd: RawFd,
     factory_id: &str,
-    protocol_config: &ProtocolConfig, // Passed as a reference from caller
-    is_server: bool,                  // Indicates if this handler is for server-side (accepted)
+    protocol_config: &ProtocolConfig,
+    is_server: bool,
+    socket_mailbox: MailboxSender,
     buffer_manager_for_interface: Option<&'a BufferRingManager>,
     default_bgid_val_from_worker: Option<u16>,
-    originating_op_ud_for_connection: UserData, // UD of Connect/RegisterExternalFd, or sentinel for accept
+    originating_op_ud_for_connection: UserData,
   ) -> Result<HandlerIoOps, String> {
     if self.handlers.contains_key(&fd) {
       let err_msg = format!(
@@ -73,13 +75,14 @@ impl HandlerManager {
       )
     })?;
 
-    // The factory's create_handler now takes &ProtocolConfig
+    let per_conn_config = Arc::new(WorkerIoConfig { socket_mailbox });
+
     let mut handler_box = factory.create_handler(
       fd,
-      self.worker_io_config.clone(), // For UringWorkerInterface construction later
-      protocol_config,               // Pass the reference to the enum variant
+      per_conn_config.clone(),
+      protocol_config,
       is_server,
-    )?; // Propagate error from factory creation
+    )?;
 
     info!(
       "HandlerManager: Created handler for FD {} using factory '{}'. Calling connection_ready...",
@@ -88,7 +91,7 @@ impl HandlerManager {
 
     let interface_for_ready = UringWorkerInterface::new(
       fd,
-      &self.worker_io_config,
+      &per_conn_config,
       buffer_manager_for_interface,
       default_bgid_val_from_worker,
       originating_op_ud_for_connection,
@@ -126,12 +129,13 @@ impl HandlerManager {
     default_bgid_val_from_worker: Option<u16>,
   ) -> Vec<(RawFd, HandlerIoOps)> {
     let mut all_ops = Vec::new();
-    const PREPARE_SQES_SENTINEL_UD: UserData = 0; // Sentinel for general polling
+    const PREPARE_SQES_SENTINEL_UD: UserData = 0;
 
     for (fd, handler) in self.handlers.iter_mut() {
+      let io_config = handler.io_config().clone();
       let interface = UringWorkerInterface::new(
         *fd,
-        &self.worker_io_config,
+        &io_config,
         buffer_manager_for_interface,
         default_bgid_val_from_worker,
         PREPARE_SQES_SENTINEL_UD,
@@ -145,12 +149,13 @@ impl HandlerManager {
     all_ops
   }
 
-  /// Stores metadata for a listener FD, including the factory ID and config for accepted connections.
+  /// Stores metadata for a listener FD, including the factory ID, config, and parent socket mailbox.
   pub fn add_listener_metadata(
     &mut self,
     listener_fd: RawFd,
     factory_id_for_accepted_connections: String,
-    protocol_config_for_accepted: ProtocolConfig, // Store the actual ProtocolConfig
+    protocol_config_for_accepted: ProtocolConfig,
+    socket_mailbox: MailboxSender,
   ) {
     info!(
       "HandlerManager: Adding listener metadata for FD {}. Accepted conns will use factory '{}' with specific config.",
@@ -161,6 +166,7 @@ impl HandlerManager {
       ListenerMetadata {
         factory_id_for_accepted_connections,
         protocol_config_for_accepted,
+        socket_mailbox,
       },
     );
   }

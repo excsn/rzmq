@@ -12,7 +12,7 @@ mod sqe_builder;
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
-  HandlerSqeBlueprint, HandlerUpstreamEvent, OutgoingMessage, ProtocolHandlerFactory, WorkerIoConfig
+  HandlerSqeBlueprint, OutgoingMessage, ProtocolHandlerFactory,
 };
 use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
@@ -45,9 +45,24 @@ pub(crate) use multishot_reader::MultishotReader;
 
 #[derive(Debug, Default)]
 struct FdWork {
-  pub(crate) pending_blueprints: VecDeque<HandlerSqeBlueprint>,
-  pub(crate) app_data: VecDeque<OutgoingMessage>,
+  /// Non-blocking ingress (read setup / cancel) blueprints — never gated by write_in_flight.
+  pub(crate) ingress_blueprints: VecDeque<HandlerSqeBlueprint>,
+  /// Sequential egress (data writes + cork + close) blueprints — write-serialized.
+  pub(crate) egress_blueprints: VecDeque<HandlerSqeBlueprint>,
+  /// Serialization gate: true while a write SQE has been submitted but its CQE not yet reaped.
   pub(crate) write_in_flight: bool,
+}
+
+impl FdWork {
+  pub(crate) fn route_blueprints(&mut self, blueprints: impl IntoIterator<Item = HandlerSqeBlueprint>) {
+    for bp in blueprints {
+      if bp.is_ingress() {
+        self.ingress_blueprints.push_back(bp);
+      } else {
+        self.egress_blueprints.push_back(bp);
+      }
+    }
+  }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +85,6 @@ pub struct UringWorker {
   external_op_tracker: ExternalOpTracker,
   internal_op_tracker: InternalOpTracker,
 
-  // WorkerIoConfig is Arc'd because it's shared with handlers created by HandlerManager
-  worker_io_config: Arc<WorkerIoConfig>,
   default_buffer_ring_group_id_val: Option<u16>,
   fds_needing_close_initiated_pass: VecDeque<RawFd>,
   pub(crate) event_fd_poller: EventFdPoller,
@@ -110,12 +123,9 @@ impl UringWorker {
   pub fn spawn_with_config(
     config: UringConfig,
     factories: Vec<Arc<dyn ProtocolHandlerFactory>>,
-    upstream_event_tx: SyncSender<(RawFd, HandlerUpstreamEvent)>,
   ) -> Result<(SignalingOpSender, std::thread::JoinHandle<Result<(), ZmqError>>), ZmqError> {
     let (op_tx_sync, op_rx) = unbounded::<UringOpRequest>();
     let op_tx_async_for_signaler: AsyncSender<UringOpRequest> = op_tx_sync.to_async();
-
-    let worker_io_config = Arc::new(WorkerIoConfig { upstream_event_tx });
 
     let event_fd_master_instance =
       eventfd::EventFD::new(0, eventfd::EfdFlags::EFD_CLOEXEC | eventfd::EfdFlags::EFD_NONBLOCK).map_err(|e| {
@@ -211,11 +221,10 @@ impl UringWorker {
               op_rx,
               work_map: HashMap::new(),
               buffer_manager: default_worker_buffer_manager,
-              handler_manager: HandlerManager::new(factories, worker_io_config.clone()),
+              handler_manager: HandlerManager::new(factories),
               external_op_tracker: ExternalOpTracker::new(),
               internal_op_tracker: internal_tracker,
               event_fd_poller: event_fd_poller_instance,
-              worker_io_config,
               default_buffer_ring_group_id_val: default_worker_bgid_val,
               fds_needing_close_initiated_pass: VecDeque::new(),
               send_buffer_pool: worker_send_buffer_pool,
@@ -255,14 +264,6 @@ impl UringWorker {
     info!("UringWorker: Transitioning to DRAINING state.");
     self.state = WorkerState::Draining;
     
-    // Instead of aborting, we take and drop the sender side of the
-    // upstream channel. The processor's `recv().await` will then return an
-    // error, causing its loop to terminate gracefully.
-    if let Some(tx) = global_state::get_global_parsed_msg_tx_mutex().lock().take() {
-        drop(tx);
-        debug!("UringWorker: Dropped upstream TX channel to signal processor shutdown.");
-    }
-
     let mut sq_for_shutdown = unsafe { self.ring.submission_shared() };
 
     // Cancel all in-flight internal kernel operations.

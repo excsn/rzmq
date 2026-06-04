@@ -597,9 +597,7 @@ pub(crate) async fn perform_final_pipe_cleanup(
       .clear();
     #[cfg(feature = "io-uring")]
     {
-      for fd_to_unreg in core_arc.core_state.read().uring_fd_to_endpoint_uri.keys() {
-        crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(*fd_to_unreg);
-      }
+      // Mailbox is held directly by each connection handler; no global map to unregister from.
       core_arc.core_state.write().uring_fd_to_endpoint_uri.clear();
     }
     if !core_arc.core_state.read().endpoints.is_empty() {

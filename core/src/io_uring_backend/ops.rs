@@ -1,6 +1,7 @@
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::connection_handler::OutgoingMessage;
+use crate::runtime::MailboxSender;
 use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
 
@@ -44,6 +45,7 @@ pub enum UringOpRequest {
     addr: SocketAddr,
     protocol_handler_factory_id: String,
     protocol_config: ProtocolConfig,
+    socket_mailbox: MailboxSender,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   Connect {
@@ -51,6 +53,7 @@ pub enum UringOpRequest {
     target_addr: SocketAddr,
     protocol_handler_factory_id: String,
     protocol_config: ProtocolConfig,
+    socket_mailbox: MailboxSender,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   RegisterExternalFd {
@@ -59,6 +62,7 @@ pub enum UringOpRequest {
     protocol_handler_factory_id: String,
     protocol_config: ProtocolConfig,
     is_server_role: bool, // True if this FD is from an accepted connection on server-side
+    socket_mailbox: MailboxSender,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
     mpsc_rx_for_worker: Arc<mpsc::BoundedReceiver<OutgoingMessage>>,
   },

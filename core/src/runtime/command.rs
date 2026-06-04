@@ -1,14 +1,18 @@
 use crate::error::ZmqError;
 use crate::message::Msg;
+use crate::runtime::system_events::ConnectionInteractionModel;
+use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::MonitorSender;
 #[cfg(feature = "io-uring")]
 use crate::Blob;
 
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
 use fibre::oneshot;
+use tokio::task::Id as TaskId;
 
 /// Defines messages exchanged between actors (Sockets, Sessions, Engines, etc.).
 /// These are primarily for direct, targeted communication, often expecting a reply,
@@ -116,6 +120,16 @@ pub enum Command {
     /// The ID the SCA should use in the `pipe_id` field when calling `ISocket::handle_pipe_event`.
     core_pipe_read_id_for_incoming_routing: usize,
   },
+  /// Sent directly from a TCP/IPC connecter or acceptor to SocketCore's command mailbox
+  /// when a new connection is fully established. Replaces the old SystemEvent broadcast
+  /// to enforce strict FIFO ordering with subsequent UringFdHandshakeComplete commands.
+  NewConnectionEstablished {
+    endpoint_uri: String,
+    target_endpoint_uri: String,
+    connection_iface: Option<Arc<dyn ISocketConnection>>,
+    interaction_model: ConnectionInteractionModel,
+    managing_actor_task_id: Option<TaskId>,
+  },
   #[cfg(feature = "io-uring")]
   UringFdMessage { fd: RawFd, msgs: Vec<Msg> },
   #[cfg(feature = "io-uring")]
@@ -148,6 +162,7 @@ impl Command {
       Command::PipeClosedByPeer { .. } => "PipeClosedByPeer",
       Command::AttachPipe { .. } => "AttachPipe",
       Command::ScaInitializePipes { .. } => "ScaInitializePipes",
+      Command::NewConnectionEstablished { .. } => "NewConnectionEstablished",
       #[cfg(feature = "io-uring")]
       Command::UringFdMessage { .. } => "UringFdMessage",
       #[cfg(feature = "io-uring")]

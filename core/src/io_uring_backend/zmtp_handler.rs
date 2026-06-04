@@ -3,9 +3,10 @@
 use super::buffer_manager::BufferRingManager;
 use super::worker::InternalOpTracker;
 use crate::io_uring_backend::connection_handler::{
-  HandlerIoOps, HandlerSqeBlueprint, HandlerUpstreamEvent, OutgoingMessage, ProtocolHandlerFactory,
+  HandlerIoOps, HandlerSqeBlueprint, OutgoingMessage, ProtocolHandlerFactory,
   UringConnectionHandler, UringWorkerInterface, UserData, WorkerIoConfig,
 };
+use crate::runtime::command::Command;
 use crate::io_uring_backend::ops::{HANDLER_INTERNAL_SEND_OP_UD, ProtocolConfig};
 use crate::io_uring_backend::worker::MultishotReader;
 use crate::message::{Msg, MsgFlags};
@@ -80,10 +81,14 @@ pub struct ZmtpUringHandler {
 
   last_sent_was_ping: bool,
   multishot_reader: Option<MultishotReader>,
+
+  worker_io_config: Arc<WorkerIoConfig>,
+  /// Set true when try_send to the socket mailbox returns Full; cleared on next successful send.
+  mailbox_full_throttled: bool,
 }
 
 impl ZmtpUringHandler {
-  pub fn new(fd: RawFd, zmtp_config_arg: Arc<ZmtpEngineConfig>, is_server: bool) -> Self {
+  pub fn new(fd: RawFd, zmtp_config_arg: Arc<ZmtpEngineConfig>, is_server: bool, worker_io_config: Arc<WorkerIoConfig>) -> Self {
     let handshake_timeout_duration = zmtp_config_arg
       .handshake_timeout
       .unwrap_or(Duration::from_secs(30));
@@ -118,6 +123,8 @@ impl ZmtpUringHandler {
       final_peer_identity: None,
       last_sent_was_ping: false,
       multishot_reader: None,
+      worker_io_config,
+      mailbox_full_throttled: false,
     }
   }
 
@@ -143,19 +150,15 @@ impl ZmtpUringHandler {
       ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestClose);
     }
 
-    // Signal error upstream using the new HandlerUpstreamEvent
     if !matches!(
       previous_phase,
       ZmtpHandlerPhase::DataPhase | ZmtpHandlerPhase::Error | ZmtpHandlerPhase::Closed
     ) {
-      warn!(
-        fd = self.fd,
-        "Signaling handshake failure upstream due to error: {}", error
-      );
-      let _ = interface
-        .worker_io_config
-        .upstream_event_tx
-        .try_send((self.fd, HandlerUpstreamEvent::Error(error)));
+      warn!(fd = self.fd, "Signaling handshake failure upstream due to error: {}", error);
+      let _ = self.worker_io_config.socket_mailbox.try_send(Command::UringFdError {
+        fd: self.fd,
+        error,
+      });
     }
   }
 
@@ -195,20 +198,15 @@ impl ZmtpUringHandler {
 
     info!(fd=self.fd, final_peer_id=?self.final_peer_identity, "ZmtpUringHandler: Signaling ZMTP handshake completion upstream.");
 
-    // Use the new HandlerUpstreamEvent to signal completion
-    let event = HandlerUpstreamEvent::HandshakeComplete {
-      peer_identity: self.final_peer_identity.clone(),
-    };
-
-    interface
+    self
       .worker_io_config
-      .upstream_event_tx
-      .try_send((self.fd, event))
+      .socket_mailbox
+      .try_send(Command::UringFdHandshakeComplete {
+        fd: self.fd,
+        peer_identity: self.final_peer_identity.clone(),
+      })
       .map_err(|e| {
-        error!(
-          fd = self.fd,
-          "Failed to send HandshakeComplete signal upstream: {:?}", e
-        );
+        error!(fd = self.fd, "Failed to send HandshakeComplete directly to socket mailbox: {:?}", e);
         ZmqError::Internal("Failed to signal handshake completion".into())
       })
       .map(|_| ())
@@ -733,21 +731,25 @@ impl ZmtpUringHandler {
             }
           }
 
-          // Dispatch accumulated message batch upstream in a single channel operation
+          // Dispatch accumulated message batch directly to the parent socket mailbox
           if !data_batch.is_empty() {
-            let upstream_event = HandlerUpstreamEvent::Data(data_batch);
-            if let Err(send_err) = interface
-              .worker_io_config
-              .upstream_event_tx
-              .try_send((self.fd, upstream_event))
-            {
-              error!(
-                fd = self.fd,
-                "DataPhase: Failed to send ZMTP data batch upstream: {:?}", send_err
-              );
-              let err = ZmqError::Internal("Upstream channel error for ZMTP data".into());
-              self.transition_to_error(ops, err.clone(), interface);
-              return Err(err);
+            match self.worker_io_config.socket_mailbox.try_send(Command::UringFdMessage {
+              fd: self.fd,
+              msgs: data_batch,
+            }) {
+              Ok(()) => {
+                self.mailbox_full_throttled = false;
+              }
+              Err(fibre::TrySendError::Full(_)) => {
+                warn!(fd = self.fd, "DataPhase: Socket mailbox full — throttling reads");
+                self.mailbox_full_throttled = true;
+              }
+              Err(e) => {
+                error!(fd = self.fd, "DataPhase: Socket mailbox closed (parent terminated): {:?}", e);
+                let err = ZmqError::Internal("Socket mailbox closed".into());
+                self.transition_to_error(ops, err.clone(), interface);
+                return Err(err);
+              }
             }
           }
 
@@ -951,8 +953,11 @@ impl UringConnectionHandler for ZmtpUringHandler {
     self.fd
   }
 
+  fn io_config(&self) -> &WorkerIoConfig {
+    &self.worker_io_config
+  }
+
   fn is_closing_or_closed(&self) -> bool {
-    // Delegate to the public helper method we already created.
     self.is_closing_or_closed()
   }
 
@@ -1041,10 +1046,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
       ops = temp_ops;
       // Also ensure the error is sent upstream if transition_to_error didn't send it (e.g., if already in DataPhase)
       if matches!(original_phase_eof, ZmtpHandlerPhase::DataPhase) {
-        let _ = interface
-          .worker_io_config
-          .upstream_event_tx
-          .try_send((self.fd, HandlerUpstreamEvent::Error(eof_err)));
+        let _ = self.worker_io_config.socket_mailbox.try_send(Command::UringFdError {
+          fd: self.fd,
+          error: eof_err,
+        });
       }
 
       return ops;
@@ -1249,6 +1254,12 @@ impl UringConnectionHandler for ZmtpUringHandler {
   }
 
   fn prepare_sqes(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
+    // Do not schedule new read operations when the connection is closing/closed/errored.
+    // This prevents the RecvMulti → EOF → re-submit CPU-spinning loop on teardown.
+    if self.is_closing_or_closed() {
+      return HandlerIoOps::default();
+    }
+
     let mut ops = HandlerIoOps::new();
 
     if Instant::now() > self.handshake_timeout_deadline
@@ -1461,25 +1472,30 @@ impl UringConnectionHandler for ZmtpUringHandler {
   }
 
   fn close_initiated(&mut self, _interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
-    info!(
-      fd = self.fd,
-      "ZmtpUringHandler: close_initiated called. Worker will handle cancellation and close."
-    );
+    info!(fd = self.fd, "ZmtpUringHandler: close_initiated called.");
 
-    // If already closing/closed, do nothing further.
     if self.is_closing_or_closed() {
       return HandlerIoOps::new();
     }
 
-    // Transition to the Closing state.
     self.phase = ZmtpHandlerPhase::Closing;
     self.outgoing_app_messages.clear();
     self.outgoing_multipart_app_messages.clear();
 
-    // The handler's job is done. It no longer needs to generate blueprints for close/cancel.
-    // The worker, upon receiving ShutdownConnectionHandler, now orchestrates the cancellation and close.
-    // Return empty ops.
-    HandlerIoOps::new()
+    let mut ops = HandlerIoOps::new();
+
+    // Cancel any active multishot read before closing the FD. Without this, the kernel may
+    // attempt to write incoming data to a buffer ring slot after the FD is released.
+    if let Some(ref reader) = self.multishot_reader {
+      if reader.is_active() {
+        if let Some(cancel_bp) = reader.prepare_cancel_intent() {
+          ops.sqe_blueprints.push(cancel_bp);
+        }
+      }
+    }
+
+    ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestClose);
+    ops
   }
 
   fn fd_has_been_closed(&mut self) {
@@ -1569,8 +1585,8 @@ impl UringConnectionHandler for ZmtpUringHandler {
   }
 
   fn should_throttle_reads(&self) -> bool {
-    // Throttle reads when the unparsed data in the accumulator exceeds 2 MB
-    self.network_read_accumulator.len() > 2 * 1024 * 1024
+    // Throttle when accumulator exceeds 2 MB OR when the socket mailbox was full last cycle.
+    self.network_read_accumulator.len() > 2 * 1024 * 1024 || self.mailbox_full_throttled
   }
 }
 
@@ -1584,7 +1600,7 @@ impl ProtocolHandlerFactory for ZmtpHandlerFactory {
   fn create_handler(
     &self,
     fd: RawFd,
-    _worker_io_config: Arc<WorkerIoConfig>,
+    worker_io_config: Arc<WorkerIoConfig>,
     protocol_config: &ProtocolConfig,
     is_server_role: bool,
   ) -> Result<Box<dyn UringConnectionHandler + Send>, String> {
@@ -1593,6 +1609,7 @@ impl ProtocolHandlerFactory for ZmtpHandlerFactory {
         fd,
         engine_config_arc.clone(),
         is_server_role,
+        worker_io_config,
       ))),
       #[allow(unreachable_patterns)]
       _ => Err(format!(

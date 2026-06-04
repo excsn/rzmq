@@ -416,6 +416,8 @@ pub(crate) fn process_all_cqes(
             });
             if let Some(ref factory_id) = ext_op_ctx.protocol_handler_factory_id {
               let protocol_config = ext_op_ctx.protocol_config.as_ref().unwrap();
+              let socket_mailbox = ext_op_ctx.socket_mailbox.take()
+                .expect("Connect op context missing socket_mailbox");
               let recv_buffer_manager = worker.buffer_manager.as_ref();
               let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
               match worker.handler_manager.create_and_add_handler(
@@ -423,6 +425,7 @@ pub(crate) fn process_all_cqes(
                 factory_id,
                 protocol_config,
                 false,
+                socket_mailbox,
                 recv_buffer_manager,
                 default_bgid_val_from_worker,
                 cqe_user_data,
@@ -520,9 +523,10 @@ pub(crate) fn process_all_cqes(
             .buffer_manager
             .as_ref()
             .expect("Recv BufferManager missing for multishot op");
+          let io_config = handler.io_config().clone();
           let interface = UringWorkerInterface::new(
             handler_fd_peeked,
-            &worker.worker_io_config,
+            &io_config,
             Some(recv_bm_ref),
             worker.default_buffer_ring_group_id_val,
             cqe_user_data,
@@ -596,20 +600,23 @@ pub(crate) fn process_all_cqes(
           if cqe_result >= 0 {
             let client_fd = cqe_result as RawFd;
             let listener_fd = handler_fd;
-            let (factory_id_opt, protocol_config_opt) = {
+            let (factory_id_opt, protocol_config_opt, mailbox_opt) = {
               let meta_opt = worker.handler_manager.get_listener_metadata(listener_fd);
               (
                 meta_opt.map(|m| m.factory_id_for_accepted_connections.clone()),
                 meta_opt.map(|m| m.protocol_config_for_accepted.clone()),
+                meta_opt.map(|m| m.socket_mailbox.clone()),
               )
             };
-            if let (Some(factory_id), Some(protocol_config)) = (factory_id_opt, protocol_config_opt)
+            if let (Some(factory_id), Some(protocol_config), Some(socket_mailbox)) =
+              (factory_id_opt, protocol_config_opt, mailbox_opt)
             {
               match worker.handler_manager.create_and_add_handler(
                 client_fd,
                 &factory_id,
                 &protocol_config,
                 true,
+                socket_mailbox,
                 worker.buffer_manager.as_ref(),
                 worker.default_buffer_ring_group_id_val,
                 0,
@@ -693,19 +700,19 @@ pub(crate) fn process_all_cqes(
               };
               let _ = ext_ctx.reply_tx.send(Ok(ack));
             }
+            // Clone mailbox BEFORE removing handler (handler drop would release the Arc).
+            let mailbox_for_close_notify = worker
+              .handler_manager
+              .get_mut(handler_fd)
+              .map(|h| h.io_config().socket_mailbox.clone());
             if let Some(mut h) = worker.handler_manager.remove_handler(handler_fd) {
               h.fd_has_been_closed();
             }
-            if let Some(map_arc) =
-              uring::global_state::get_uring_fd_to_socket_core_mailbox_map_oncecell().get()
-            {
-              if let Some(mailbox) = map_arc.read().get(&handler_fd).cloned() {
-                let _ = mailbox.try_send(Command::UringFdError {
-                  fd: handler_fd,
-                  error: ZmqError::ConnectionClosed,
-                });
-              }
-              uring::global_state::unregister_uring_fd_socket_core_mailbox(handler_fd);
+            if let Some(mailbox) = mailbox_for_close_notify {
+              let _ = mailbox.try_send(Command::UringFdError {
+                fd: handler_fd,
+                error: ZmqError::ConnectionClosed,
+              });
             }
           } else {
             // Handle close error
@@ -724,8 +731,10 @@ pub(crate) fn process_all_cqes(
           if cqe_result < 0 {
             let errno = -cqe_result;
 
-            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-              // Non-destructive recovery: move payload out and re-queue to front of work_map
+            if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOBUFS {
+              // Non-destructive recovery: move payload out and re-queue to front of work_map.
+              // ENOBUFS on writes means the kernel is temporarily out of lock/descriptor resources;
+              // releasing the ZC buffer and retrying as a standard copy-send is safe and sufficient.
               let blueprint_to_requeue = match op_details.payload {
                 InternalOpPayload::SendBuffer { buffer, send_op_flags, app_op_ud, .. } => {
                   Some(HandlerSqeBlueprint::RequestSend {
@@ -767,15 +776,15 @@ pub(crate) fn process_all_cqes(
               };
 
               if let Some(blueprint) = blueprint_to_requeue {
-                trace!(fd = handler_fd, "Send EAGAIN: re-queuing payload to front of work_map.");
+                trace!(fd = handler_fd, errno, "Send non-fatal error (EAGAIN/ENOBUFS): re-queuing payload to front of work_map.");
                 worker
                   .work_map
                   .entry(handler_fd)
                   .or_default()
-                  .pending_blueprints
+                  .egress_blueprints
                   .push_front(blueprint);
               } else {
-                error!(fd = handler_fd, "EAGAIN recovery: payload structure mismatch. Closing connection.");
+                error!(fd = handler_fd, errno, "Send recovery failed: payload structure mismatch. Closing connection.");
                 worker.fds_needing_close_initiated_pass.push_back(handler_fd);
               }
               continue;
@@ -867,7 +876,7 @@ pub(crate) fn process_all_cqes(
               .work_map
               .entry(handler_fd)
               .or_default()
-              .pending_blueprints
+              .egress_blueprints
               .push_front(requeue_blueprint);
             continue;
           }
@@ -918,9 +927,10 @@ pub(crate) fn process_all_cqes(
           if app_op_ud != HANDLER_INTERNAL_SEND_OP_UD {
             // Logic for notifying external operation completion
           } else if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+            let io_config = handler.io_config().clone();
             let interface = UringWorkerInterface::new(
               handler_fd,
-              &worker.worker_io_config,
+              &io_config,
               worker.buffer_manager.as_ref(),
               worker.default_buffer_ring_group_id_val,
               cqe_user_data,
@@ -940,10 +950,22 @@ pub(crate) fn process_all_cqes(
           }
         }
         InternalOpType::RingRead | InternalOpType::GenericHandlerOp => {
+          // Non-fatal: the kernel had no provided buffers available when the read completed.
+          // The op tracker entry is already reaped, so Phase 3 will re-submit a new Read SQE
+          // automatically on the next worker cycle once other connections release buffers.
+          if op_type == InternalOpType::RingRead
+            && cqe_result == -(libc::ENOBUFS as i32)
+            && cqueue::buffer_select(cqe_flags).is_none()
+          {
+            trace!(fd = handler_fd, "RingRead: ENOBUFS — buffer ring temporarily exhausted; deferring to next cycle.");
+            continue;
+          }
+
           if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+            let io_config = handler.io_config().clone();
             let interface = UringWorkerInterface::new(
               handler_fd,
-              &worker.worker_io_config,
+              &io_config,
               worker.buffer_manager.as_ref(),
               worker.default_buffer_ring_group_id_val,
               cqe_user_data,
@@ -998,6 +1020,16 @@ pub(crate) fn process_all_cqes(
                 .push_back(handler_fd);
             }
           }
+        }
+        InternalOpType::RingReadMultishot => {
+          // This arm is only reached when a multishot read CQE was NOT delegated to its
+          // registered handler — indicating state-tracking desynchronisation.
+          tracing::error!(
+            fd = handler_fd,
+            ud = cqe_user_data,
+            "Handshake Safety Gate: multishot CQE not delegated to handler — forcing close"
+          );
+          worker.fds_needing_close_initiated_pass.push_back(handler_fd);
         }
         _ => { /* Other op types handled by peek-logic or are errors */ }
       }

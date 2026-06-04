@@ -200,8 +200,7 @@ pub(crate) async fn cleanup_stopped_child_resources(
         .write()
         .uring_fd_to_endpoint_uri
         .remove(&fd);
-      crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd);
-      tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, %fd, "Unregistered UringFD state for stopped child.");
+      tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, %fd, "Removed UringFD endpoint state for stopped child.");
     }
 
     // Send monitor event for the disconnection/closure.
@@ -322,8 +321,7 @@ pub(crate) async fn cleanup_session_state_by_uri(
     {
       let fd = removed_info.handle_id as RawFd;
       core_s_write.uring_fd_to_endpoint_uri.remove(&fd);
-      crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd);
-      tracing::debug!(handle = core_handle, uri=%endpoint_uri, %fd, "Unregistered UringFD state.");
+      tracing::debug!(handle = core_handle, uri=%endpoint_uri, %fd, "Removed UringFD endpoint state.");
     }
 
     core_s_write.send_monitor_event(SocketEvent::Disconnected {
@@ -412,7 +410,6 @@ pub(crate) async fn cleanup_session_state_by_pipe(
         core_s_write
           .uring_fd_to_endpoint_uri
           .remove(&fd_to_unregister);
-        crate::uring::global_state::unregister_uring_fd_socket_core_mailbox(fd_to_unregister);
       }
       if let (Some(ep_type), Some(ep_uri_event)) = (removed_ep_type, removed_ep_uri_for_event) {
         let event = match ep_type {

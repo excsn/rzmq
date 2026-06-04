@@ -141,6 +141,21 @@ impl MultishotReader {
         return Ok((ops_to_return.set_error_close(), true));
       }
 
+      // Check for clean EOF before attempting buffer_select — the kernel does NOT set
+      // IORING_CQE_F_BUFFER on EOF (result == 0), so checking for the buffer first would
+      // produce a false "missing F_BUFFER" error and incorrectly treat EOF as fatal.
+      if cqe_res == 0 {
+        tracing::debug!(
+          "[MultishotReader FD={}] Clean EOF on multishot read (ud {}). Notifying handler.",
+          self.fd,
+          cqe_ud
+        );
+        self.active_op_user_data = None;
+        self.is_active = false;
+        ops_to_return = owner_handler.process_ring_read_data(&[], 0, worker_interface);
+        return Ok((ops_to_return, true));
+      }
+
       // Check for IORING_CQE_F_BUFFER using the public helper
       let buffer_id_opt = cqueue::buffer_select(cqe_flags);
       if buffer_id_opt.is_none() {
@@ -277,16 +292,14 @@ impl MultishotReader {
         user_data
       );
     } else {
-      // This can happen if a new multishot op is prepared (generating new active_op_user_data)
-      // but the worker calls set_active for the *old* UserData if a submit attempt failed and retried.
-      // Or if an old blueprint was processed.
-      tracing::warn!(
-        "[MultishotReader FD={}] set_active called with UserData {}, but current expected is {:?}. State unchanged unless matching.",
-        self.fd,
-        user_data,
-        self.active_op_user_data
+      // Tracking ID mismatch — indicates out-of-order state transitions or a stale blueprint
+      // being re-submitted. Log at error level so regressions surface immediately.
+      tracing::error!(
+        fd = self.fd,
+        expected = ?self.active_op_user_data,
+        got = user_data,
+        "MultishotReader set_active out-of-order: tracking ID mismatch"
       );
-      // Only set active if the UserData matches the one we are currently tracking for submission.
     }
   }
 

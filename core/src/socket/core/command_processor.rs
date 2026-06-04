@@ -1,7 +1,10 @@
 use crate::error::ZmqError;
+use crate::message::Msg;
 #[cfg(feature = "io-uring")]
 use crate::runtime::ActorType;
+use crate::runtime::system_events::ConnectionInteractionModel;
 use crate::runtime::{Command, MailboxSender, SystemEvent};
+use crate::sessionx::ScaConnectionIface;
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 #[cfg(feature = "io-uring")]
@@ -20,6 +23,7 @@ use crate::transport::tcp::{TcpConnecter, TcpListener};
 use fibre::oneshot;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::Id as TaskId;
 
 /// Processes a command received on SocketCore's command mailbox.
 /// Returns Ok(()) if processed, or Err(ZmqError) for fatal errors that should stop SocketCore.
@@ -85,6 +89,27 @@ pub(crate) async fn process_socket_command(
       #[cfg(feature = "io-uring")]
       Command::UringFdHandshakeComplete { fd, .. } => {
         tracing::debug!(handle = core_handle, %fd, "Ignoring UringFdHandshakeComplete during shutdown.");
+      }
+      // Connection arrived while shutting down — clean up the orphaned connection immediately.
+      Command::NewConnectionEstablished {
+        endpoint_uri,
+        connection_iface,
+        interaction_model,
+        ..
+      } => {
+        tracing::warn!(
+          handle = core_handle,
+          new_conn_uri = %endpoint_uri,
+          "SocketCore ignoring NewConnectionEstablished during shutdown. Closing orphaned connection."
+        );
+        if let Some(iface) = connection_iface {
+          if let Err(e) = iface.close_connection().await {
+            tracing::error!(handle = core_handle, uri = %endpoint_uri, "Error closing orphaned connection during shutdown: {}", e);
+          }
+        }
+        if let ConnectionInteractionModel::ViaSca { sca_mailbox, .. } = interaction_model {
+          let _ = sca_mailbox.try_send(Command::Stop);
+        }
       }
       // For other commands, if shutting down, reply with an error or ignore.
       Command::UserBind { reply_tx, .. }
@@ -343,12 +368,28 @@ pub(crate) async fn process_socket_command(
       }
     }
 
+    Command::NewConnectionEstablished {
+      endpoint_uri,
+      target_endpoint_uri,
+      connection_iface,
+      interaction_model,
+      managing_actor_task_id,
+    } => {
+      handle_new_connection_established(
+        core_arc,
+        socket_logic_strong,
+        endpoint_uri,
+        target_endpoint_uri,
+        connection_iface,
+        interaction_model,
+        managing_actor_task_id,
+      )
+      .await?;
+    }
+
     // Commands NOT expected by SocketCore's main mailbox:
-    // Attach, SessionPushCmd, EnginePushCmd, EngineReady, EngineError, EngineStopped,
-    // RequestZapAuth, ProcessZapReply, AttachPipe, PipeMessageReceived, PipeClosedByPeer (these last two are now events to ISocket)
     _ => {
       tracing::error!(handle = core_handle, cmd_name = %command_name_str, "SocketCore received UNEXPECTED command type on its mailbox!");
-      // This could be a ZmqError::Internal if it indicates a logic flaw.
     }
   }
   Ok(())
@@ -914,4 +955,189 @@ async fn handle_user_monitor(
 ) {
   core_arc.core_state.write().monitor_tx = Some(monitor_tx);
   let _ = reply_tx.send(Ok(()));
+}
+
+async fn handle_new_connection_established(
+  core_arc: Arc<SocketCore>,
+  socket_logic_strong: &Arc<dyn ISocket>,
+  endpoint_uri_from_event: String,
+  target_endpoint_uri_from_event: String,
+  connection_iface_from_event_opt: Option<Arc<dyn ISocketConnection>>,
+  interaction_model_from_event: ConnectionInteractionModel,
+  _managing_actor_task_id: Option<TaskId>,
+) -> Result<(), ZmqError> {
+  let core_handle = core_arc.handle;
+
+  let is_outbound_this_core_initiated = {
+    let core_s_guard = core_arc.core_state.read();
+    !core_s_guard.endpoints.values().any(|ep_info| {
+      ep_info.endpoint_type == EndpointType::Listener
+        && ep_info.endpoint_uri == target_endpoint_uri_from_event
+    })
+  };
+
+  match interaction_model_from_event {
+    ConnectionInteractionModel::ViaSca {
+      sca_mailbox,
+      sca_handle_id,
+    } => {
+      tracing::debug!(
+        handle = core_handle,
+        conn_uri = %endpoint_uri_from_event,
+        sca_actor_id = sca_handle_id,
+        "NewConnectionEstablished: SessionConnectionActorX path."
+      );
+
+      if connection_iface_from_event_opt.is_some() {
+        tracing::warn!(handle = core_handle, conn_uri = %endpoint_uri_from_event, "ViaSca received unexpected pre-existing ISocketConnection. Ignoring.");
+      }
+
+      let (tx_core_to_sca, rx_sca_from_core) =
+        fibre::mpmc::bounded_async::<Vec<Msg>>(core_arc.core_state.read().options.sndhwm.max(1));
+
+      let core_write_id = core_arc.context.inner().next_handle();
+      let core_read_id = core_arc.context.inner().next_handle();
+
+      let attach_cmd = Command::ScaInitializePipes {
+        sca_handle_id,
+        rx_from_core: rx_sca_from_core,
+        core_pipe_read_id_for_incoming_routing: core_read_id,
+      };
+
+      if sca_mailbox.send(attach_cmd).await.is_err() {
+        return Err(ZmqError::Internal(format!(
+          "Failed to send ScaInitializePipes to SCA {}",
+          sca_handle_id
+        )));
+      }
+
+      tracing::debug!(
+        handle = core_handle,
+        sca_id = sca_handle_id,
+        core_w_id = core_write_id,
+        core_r_id = core_read_id,
+        "Sent AttachPipesAndRoutingInfo to SessionConnectionActorX."
+      );
+
+      let sndtimeo_snapshot = core_arc.core_state.read().options.sndtimeo;
+
+      let sca_iface = Arc::new(ScaConnectionIface::new(
+        sca_mailbox.clone(),
+        sca_handle_id,
+        tx_core_to_sca.clone(),
+        core_write_id,
+        sndtimeo_snapshot,
+      ));
+
+      let endpoint_info = EndpointInfo {
+        mailbox: sca_mailbox,
+        task_handle: None,
+        endpoint_type: EndpointType::Session,
+        endpoint_uri: endpoint_uri_from_event.clone(),
+        pipe_ids: Some((core_write_id, core_read_id)),
+        handle_id: sca_handle_id,
+        target_endpoint_uri: Some(target_endpoint_uri_from_event),
+        is_outbound_connection: is_outbound_this_core_initiated,
+        peer_socket_type: None,
+        connection_iface: sca_iface,
+      };
+
+      {
+        core_arc
+          .core_state
+          .write()
+          .pipes_tx
+          .insert(core_write_id, tx_core_to_sca);
+
+        let old_info_result = core_arc
+          .core_state
+          .write()
+          .endpoints
+          .insert(endpoint_uri_from_event.clone(), endpoint_info);
+
+        if let Some(old_info) = old_info_result {
+          tracing::warn!(handle=core_handle, uri=%endpoint_uri_from_event, "Overwrote existing EndpointInfo for NewConnection (SCA).");
+          tokio::spawn(async move {
+            let _ = old_info.connection_iface.close_connection().await;
+            if let Some(h) = old_info.task_handle {
+              h.abort();
+            }
+          });
+        }
+        core_arc
+          .core_state
+          .write()
+          .pipe_read_id_to_endpoint_uri
+          .insert(core_read_id, endpoint_uri_from_event.clone());
+      }
+
+      tracing::debug!(handle=core_handle, sca_id=sca_handle_id, conn_uri=%endpoint_uri_from_event, "Notifying ISocket of pipe attachment for new SCA connection.");
+      socket_logic_strong
+        .pipe_attached(core_read_id, core_write_id, None)
+        .await;
+    }
+
+    #[cfg(feature = "io-uring")]
+    ConnectionInteractionModel::ViaUringFd { fd } => {
+      tracing::debug!(
+        handle = core_handle,
+        conn_uri = %endpoint_uri_from_event,
+        raw_fd = fd,
+        "NewConnectionEstablished: io_uring FD path."
+      );
+
+      let connection_iface = connection_iface_from_event_opt.ok_or_else(|| {
+        ZmqError::Internal("UringFdConnection missing from NewConnectionEstablished command".into())
+      })?;
+
+      let uring_fd_as_endpoint_handle_id = fd as usize;
+
+      let synthetic_read_id = core_arc.context.inner().next_handle();
+      let synthetic_write_id = core_arc.context.inner().next_handle();
+
+      let endpoint_info = EndpointInfo {
+        mailbox: core_arc.command_sender(),
+        task_handle: None,
+        endpoint_type: EndpointType::Session,
+        endpoint_uri: endpoint_uri_from_event.clone(),
+        pipe_ids: Some((synthetic_write_id, synthetic_read_id)),
+        handle_id: uring_fd_as_endpoint_handle_id,
+        target_endpoint_uri: Some(target_endpoint_uri_from_event),
+        is_outbound_connection: is_outbound_this_core_initiated,
+        connection_iface: connection_iface.clone(),
+        peer_socket_type: None,
+      };
+
+      {
+        let mut core_s = core_arc.core_state.write();
+        if let Some(old_info) = core_s
+          .endpoints
+          .insert(endpoint_uri_from_event.clone(), endpoint_info)
+        {
+          tracing::warn!(handle=core_handle, uri=%endpoint_uri_from_event, "Overwrote existing EndpointInfo for NewConnectionEstablished (io_uring).");
+          if let Some(old_task_handle) = old_info.task_handle {
+            old_task_handle.abort();
+          }
+        }
+        core_s
+          .pipe_read_id_to_endpoint_uri
+          .insert(synthetic_read_id, endpoint_uri_from_event.clone());
+        core_s
+          .uring_fd_to_endpoint_uri
+          .insert(fd, endpoint_uri_from_event.clone());
+      }
+      tracing::info!(handle=core_handle, raw_fd=fd, conn_uri=%endpoint_uri_from_event, "UringFd-based connection registered; awaiting handshake before pipe attachment.");
+    }
+    #[cfg(not(feature = "io-uring"))]
+    ConnectionInteractionModel::ViaUringFd { _fd_placeholder } => {
+      tracing::error!(
+        handle = core_handle,
+        "FATAL: Received ViaUringFd model when io-uring feature is disabled."
+      );
+      return Err(ZmqError::Internal(
+        "Invalid connection model for build configuration".into(),
+      ));
+    }
+  }
+  Ok(())
 }

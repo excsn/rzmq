@@ -412,12 +412,33 @@ impl TcpListener {
                           context_clone.clone(),
                         ));
 
+                        // Pre-register with SocketCore BEFORE sending RegisterExternalFd to the
+                        // worker. Because both messages flow through SocketCore's sequential FIFO
+                        // mailbox, this guarantees NewConnectionEstablished is processed before
+                        // UringFdHandshakeComplete, eliminating the local-map race.
+                        let pre_cmd = Command::NewConnectionEstablished {
+                          endpoint_uri: actual_connected_uri.clone(),
+                          target_endpoint_uri: logical_uri.clone(),
+                          connection_iface: Some(new_conn_iface.clone()),
+                          interaction_model: ConnectionInteractionModel::ViaUringFd { fd: raw_fd },
+                          managing_actor_task_id: None,
+                        };
+                        if socket_logic.mailbox().send(pre_cmd).await.is_err() {
+                          tracing::error!(
+                            "Failed to pre-register accepted FD {} with SocketCore — mailbox closed.",
+                            raw_fd
+                          );
+                          unsafe { let _ = libc::close(raw_fd); }
+                          setup_successful = false;
+                        } else {
+
                         let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
                           user_data: user_data_for_op,
                           fd: raw_fd,
                           protocol_handler_factory_id: "zmtp-uring/3.1".to_string(),
                           protocol_config,
                           is_server_role: true,
+                          socket_mailbox: socket_logic.mailbox(),
                           reply_tx: reply_tx_for_op,
                           mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
                         };
@@ -441,10 +462,8 @@ impl TcpListener {
                               if returned_fd == raw_fd =>
                             {
                               info!("Registered accepted FD {} with UringWorker.", raw_fd);
-                              connection_iface_for_event = Some(new_conn_iface);
-                              interaction_model_for_event =
-                                Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
-                              // managing_actor_task_id_for_event remains None for UringFd path
+                              // NewConnectionEstablished already sent pre-registration;
+                              // do not set interaction_model_for_event to avoid a duplicate send.
                             }
                             Ok(Ok(other_completion)) => {
                               tracing::error!(
@@ -481,6 +500,7 @@ impl TcpListener {
                             }
                           }
                         }
+                        } // close: if mailbox.send(pre_cmd).is_err() { ... } else { ... }
                       }
                     }
                     Err(e) => {
@@ -553,7 +573,7 @@ impl TcpListener {
                     actor_conf,
                     engine_conf,
                     command_receiver_for_sca,
-                    socket_logic,
+                    socket_logic.clone(),
                     Some(max_connection_permit),
                   );
 
@@ -568,29 +588,18 @@ impl TcpListener {
 
               if setup_successful {
                 if let Some(inter_model) = interaction_model_for_event {
-                  let event = SystemEvent::NewConnectionEstablished {
-                    parent_core_id: parent_socket_core_id,
+                  let cmd = Command::NewConnectionEstablished {
                     endpoint_uri: actual_connected_uri.clone(),
                     target_endpoint_uri: logical_uri.clone(),
                     connection_iface: connection_iface_for_event,
                     interaction_model: inter_model,
                     managing_actor_task_id: managing_actor_task_id_for_event,
                   };
-                  if context_clone.event_bus().publish(event).is_err() {
+                  if socket_logic.mailbox().send(cmd).await.is_err() {
                     tracing::error!(
-                      "Failed to publish NewConnectionEstablished for {}",
+                      "Failed to send NewConnectionEstablished to socket mailbox for {}",
                       actual_connected_uri
                     );
-                    // If session was spawned, it needs to be aborted
-                    if let Some(task_id) = managing_actor_task_id_for_event {
-                      // This is tricky, we don't have the JoinHandle here directly if it was session path.
-                      // The SessionBase will stop itself if its parent (SocketCore) doesn't attach pipes.
-                      // For UringFd, the FD might need explicit close if `connection_iface_for_event` was set.
-                      tracing::warn!(
-                        "NewConnectionEstablished publish failed, related session/FD for task_id {:?} might need manual cleanup if not handled by its own lifecycle.",
-                        task_id
-                      );
-                    }
                   }
                 } else {
                   tracing::error!(
@@ -600,7 +609,7 @@ impl TcpListener {
                 }
               } else {
                 tracing::warn!(
-                  "Connection setup failed for {}, NewConnectionEstablished not published.",
+                  "Connection setup failed for {}, NewConnectionEstablished not sent.",
                   actual_connected_uri
                 );
               }
@@ -845,22 +854,32 @@ impl TcpConnecter {
       match single_attempt_outcome {
         Ok((connection_iface_opt, interaction_model, managing_actor_task_id, actual_peer_uri)) => {
           tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, actual_peer = %actual_peer_uri, "Connecter: TCP connect successful.");
-          let event = SystemEvent::NewConnectionEstablished {
-            parent_core_id: self.parent_socket_id,
-            endpoint_uri: actual_peer_uri,
-            target_endpoint_uri: endpoint_uri_clone.clone(),
-            connection_iface: connection_iface_opt,
-            interaction_model,
-            managing_actor_task_id,
-          };
-          if self.context.event_bus().publish(event).is_err() {
-            tracing::error!(
-              "Connecter: Failed to publish NewConnectionEstablished for {}.",
-              endpoint_uri_clone
-            );
-            last_connect_attempt_error = Some(ZmqError::Internal(
-              "Failed to publish NewConnectionEstablished".into(),
-            ));
+
+          // For the UringFd path, try_connect_once pre-sends NewConnectionEstablished before
+          // registering with the worker (guaranteeing FIFO ordering in SocketCore's mailbox).
+          // Detect that case by connection_iface_opt being None for a ViaUringFd model.
+          let already_pre_sent = connection_iface_opt.is_none()
+            && matches!(interaction_model, ConnectionInteractionModel::ViaUringFd { .. });
+
+          if !already_pre_sent {
+            let cmd = Command::NewConnectionEstablished {
+              endpoint_uri: actual_peer_uri,
+              target_endpoint_uri: endpoint_uri_clone.clone(),
+              connection_iface: connection_iface_opt,
+              interaction_model,
+              managing_actor_task_id,
+            };
+            if self.socket_logic.mailbox().send(cmd).await.is_err() {
+              tracing::error!(
+                "Connecter: Failed to send NewConnectionEstablished to socket mailbox for {}.",
+                endpoint_uri_clone
+              );
+              last_connect_attempt_error = Some(ZmqError::Internal(
+                "Socket mailbox closed during NewConnectionEstablished".into(),
+              ));
+            } else {
+              last_connect_attempt_error = None;
+            }
           } else {
             last_connect_attempt_error = None;
           }
@@ -1014,12 +1033,31 @@ impl TcpConnecter {
               worker_asleep,
               self.context.clone(),
             ));
+
+            // Pre-register with SocketCore BEFORE sending RegisterExternalFd to the worker.
+            // This guarantees NewConnectionEstablished is enqueued in SocketCore's sequential
+            // FIFO mailbox before the worker can complete the handshake and enqueue
+            // UringFdHandshakeComplete, eliminating the local-map race.
+            let actual_peer_uri_str = format!("tcp://{}", peer_addr_actual);
+            let pre_cmd = Command::NewConnectionEstablished {
+              endpoint_uri: actual_peer_uri_str.clone(),
+              target_endpoint_uri: endpoint_uri_original.to_string(),
+              connection_iface: Some(new_conn_iface.clone()),
+              interaction_model: ConnectionInteractionModel::ViaUringFd { fd: raw_fd },
+              managing_actor_task_id: None,
+            };
+            if self.socket_logic.mailbox().send(pre_cmd).await.is_err() {
+              unsafe { let _ = libc::close(raw_fd); }
+              return Err(ZmqError::Internal("Socket mailbox closed during pre-registration".into()));
+            }
+
             let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
               user_data: user_data_for_op,
               fd: raw_fd,
               protocol_handler_factory_id: "zmtp-uring/3.1".to_string(),
               protocol_config,
               is_server_role: false,
+              socket_mailbox: self.socket_logic.mailbox(),
               reply_tx: reply_tx_for_op,
               mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
             };
@@ -1037,13 +1075,13 @@ impl TcpConnecter {
                   "Successfully registered connected FD {} with UringWorker.",
                   raw_fd
                 );
-                let connection_iface: Option<Arc<dyn ISocketConnection>> = Some(new_conn_iface);
-                let interaction_model = ConnectionInteractionModel::ViaUringFd { fd: raw_fd };
+                // NewConnectionEstablished was already pre-sent; return None for connection_iface
+                // so the connecter loop knows to skip the duplicate send.
                 Ok((
-                  connection_iface,
-                  interaction_model,
                   None,
-                  format!("tcp://{}", peer_addr_actual),
+                  ConnectionInteractionModel::ViaUringFd { fd: raw_fd },
+                  None,
+                  actual_peer_uri_str,
                 ))
               }
               Ok(Ok(other_completion)) => {

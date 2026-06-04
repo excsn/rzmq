@@ -78,27 +78,6 @@ pub enum SystemEvent {
     error: Option<ZmqError>,
   },
 
-  /// Published by a Listener's accept loop or a Connecter task when a new network
-  /// connection is fully established and its associated Session actor is ready.
-  /// The parent `SocketCore` (identified by `parent_core_id`) listens for this event.
-  NewConnectionEstablished {
-    /// The handle ID of the parent `SocketCore` that owns the Listener/Connecter.
-    parent_core_id: usize,
-    /// The actual network endpoint URI of the established connection (e.g., `tcp://<peer_ip>:<peer_port>`).
-    endpoint_uri: String,
-    /// The original target endpoint URI requested by the user for outgoing connections.
-    /// For listeners, this is usually the same as `endpoint_uri`.
-    target_endpoint_uri: String,
-    /// The actual interface SocketCore uses to send messages and close the connection.
-    connection_iface: Option<Arc<dyn ISocketConnection>>,
-    /// Describes the management model (Session actor or Uring FD).
-    /// SocketCore uses this to know *how* to expect incoming messages.
-    interaction_model: ConnectionInteractionModel,
-    /// A unique identifier for the spawned Session task (e.g., derived from `JoinHandle::id()`).
-    /// Used for tracking if needed, as `JoinHandle` itself is not `Clone`.
-    managing_actor_task_id: Option<TaskId>,
-  },
-
   /// Published by a `SessionBase` actor after its `ZmtpEngineCore` completes the handshake
   /// and establishes the peer's ZMTP identity.
   /// The parent `SocketCore` listens for this event to update its pattern logic (e.g., ROUTER map).
@@ -194,22 +173,6 @@ impl fmt::Debug for SystemEvent {
         .field("parent_id", parent_id)
         .field("endpoint_uri", endpoint_uri)
         .field("error", error)
-        .finish(),
-      SystemEvent::NewConnectionEstablished {
-        parent_core_id,
-        endpoint_uri,
-        target_endpoint_uri,
-        connection_iface, // Will use ISocketConnection's Debug impl
-        interaction_model,
-        managing_actor_task_id,
-      } => f
-        .debug_struct("NewConnectionEstablished")
-        .field("parent_core_id", parent_core_id)
-        .field("endpoint_uri", endpoint_uri)
-        .field("target_endpoint_uri", target_endpoint_uri)
-        .field("connection_iface_is_some", &connection_iface.is_some())
-        .field("interaction_model", interaction_model)
-        .field("managing_actor_task_id", managing_actor_task_id)
         .finish(),
       SystemEvent::PeerIdentityEstablished {
         parent_core_id,

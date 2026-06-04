@@ -7,7 +7,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use fibre::mpmc::Sender as UpstreamEventSender;
+use crate::runtime::MailboxSender;
 
 pub use crate::io_uring_backend::ops::UserData;
 
@@ -54,6 +54,15 @@ pub enum HandlerSqeBlueprint {
 }
 
 impl HandlerSqeBlueprint {
+  /// Returns true if this blueprint is an ingress (receive path) operation exempt from the
+  /// egress write-serialization gate.
+  pub fn is_ingress(&self) -> bool {
+    matches!(
+      self,
+      Self::RequestNewRingReadMultishot { .. } | Self::RequestNewAsyncCancel { .. }
+    )
+  }
+
   /// Returns `Some(total_bytes)` for write ops; `None` for control ops.
   pub fn write_len(&self) -> Option<usize> {
     match self {
@@ -152,6 +161,8 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
 pub trait UringConnectionHandler: Send {
   fn fd(&self) -> RawFd;
 
+  /// Returns a reference to the connection-specific I/O config (including the socket mailbox).
+  fn io_config(&self) -> &WorkerIoConfig;
 
   /// Checks if the handler is in a terminal (Closing, Closed, Error) state.
   fn is_closing_or_closed(&self) -> bool;
@@ -272,22 +283,8 @@ pub enum OutgoingMessage {
   Multipart(Vec<Msg>),
 }
 
-/// Events sent upstream from a UringConnectionHandler to the UringUpstreamProcessor.
-#[derive(Debug, Clone)] // Clone might be needed if it's ever peeked from a channel
-pub enum HandlerUpstreamEvent {
-  /// A batch of complete ZMTP data messages coalesced for high-performance thread transfer.
-  Data(Vec<Msg>),
-  /// ZMTP handshake (including security) completed successfully.
-  HandshakeComplete {
-    peer_identity: Option<Blob>,
-    // Could add local_addr/peer_addr if needed for ISocketConnection later
-  },
-  /// A non-recoverable error occurred in the handler.
-  Error(ZmqError),
-  // Potentially other signals like ConnectionClosedByPeer, etc.
-}
-
 #[derive(Clone)]
 pub struct WorkerIoConfig {
-  pub upstream_event_tx: UpstreamEventSender<(RawFd, HandlerUpstreamEvent)>,
+  /// Direct mailbox of the parent SocketCore. Events are dispatched in a single hop.
+  pub socket_mailbox: MailboxSender,
 }

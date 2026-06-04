@@ -3,6 +3,7 @@
 use fibre::oneshot;
 
 use crate::io_uring_backend::ops::{ProtocolConfig, UringOpCompletion, UserData};
+use crate::runtime::MailboxSender;
 use crate::ZmqError;
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -17,11 +18,12 @@ pub(crate) struct MultipartSendState {
 pub(crate) struct ExternalOpContext {
   pub reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   pub op_name: String,
-  pub protocol_handler_factory_id: Option<String>, // For Listen/Connect
+  pub protocol_handler_factory_id: Option<String>,
   pub protocol_config: Option<ProtocolConfig>,
-  pub fd_created_for_connect_op: Option<RawFd>, // For Connect, FD before CQE
-  pub listener_fd: Option<RawFd>,               // For Listen, the FD of the successfully created listener
-  pub target_fd_for_shutdown: Option<RawFd>,    // For ShutdownConnectionHandler
+  pub socket_mailbox: Option<MailboxSender>,         // For Listen/Connect/RegisterExternalFd
+  pub fd_created_for_connect_op: Option<RawFd>,      // For Connect, FD before CQE
+  pub listener_fd: Option<RawFd>,
+  pub target_fd_for_shutdown: Option<RawFd>,
   pub multipart_state: Option<MultipartSendState>,
 }
 

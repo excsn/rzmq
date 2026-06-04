@@ -329,35 +329,22 @@ impl IpcListener {
               managing_actor_task_id_for_event = Some(sca_task_handle.id());
               // connection_iface_for_event is None, SocketCore creates it
 
-              // Common event publishing logic
               if setup_successful {
-                // setup_successful is true unless an error occurred above
                 if let Some(inter_model) = interaction_model_for_event {
-                  let event = SystemEvent::NewConnectionEstablished {
-                    parent_core_id: parent_socket_core_id,
+                  let cmd = Command::NewConnectionEstablished {
                     endpoint_uri: actual_connected_uri.clone(),
                     target_endpoint_uri: logical_uri.clone(),
-                    connection_iface: None, // SocketCore creates the iface
+                    connection_iface: None,
                     interaction_model: inter_model,
                     managing_actor_task_id: managing_actor_task_id_for_event,
                   };
-                  if context_clone.event_bus().publish(event).is_err() {
+                  if socket_logic.mailbox().send(cmd).await.is_err() {
                     tracing::error!(
-                      "Failed to publish NewConnection(SCA/IPC) for {}",
+                      "Failed to send NewConnectionEstablished to socket mailbox for IPC {}",
                       actual_connected_uri
                     );
-                    // Abort spawned SCA if publish fails
-                    // Managing_actor_task_id_for_event holds the TaskId of SCA
-                    // Direct abort via TaskId isn't straightforward, SCA should handle lack of AttachPipes.
-                    if let Some(task_id) = managing_actor_task_id_for_event {
-                      tracing::warn!(
-                        "Pub NewConn failed for IPC. SCA task {:?} might self-terminate.",
-                        task_id
-                      );
-                    }
                   }
                 } else {
-                  // Should not happen if SCA path always sets the model
                   tracing::error!(
                     "IPC: Inconsistent state - setup_successful true but no interaction model for {}",
                     actual_connected_uri
@@ -365,7 +352,7 @@ impl IpcListener {
                 }
               } else {
                 tracing::warn!(
-                  "IPC Connection setup failed for {}, NewConnectionEstablished not published.",
+                  "IPC Connection setup failed for {}, NewConnectionEstablished not sent.",
                   actual_connected_uri
                 );
               }
@@ -604,25 +591,23 @@ impl IpcConnecter {
     // Process the connection_outcome
     match connection_outcome {
       Ok((interaction_model, managing_actor_task_id, actual_uri)) => {
-        let event = SystemEvent::NewConnectionEstablished {
-          parent_core_id: self.parent_socket_id,
+        let cmd = Command::NewConnectionEstablished {
           endpoint_uri: actual_uri,
           target_endpoint_uri: endpoint_uri_original.clone(),
-          connection_iface: None, // SocketCore creates the iface
+          connection_iface: None,
           interaction_model,
           managing_actor_task_id,
         };
-        if self.context.event_bus().publish(event).is_err() {
+        if self.socket_logic.mailbox().send(cmd).await.is_err() {
           tracing::error!(
-            "IPC Connecter: Failed to publish NewConnectionEstablished for {}.",
+            "IPC Connecter: Failed to send NewConnectionEstablished to socket mailbox for {}.",
             endpoint_uri_original
           );
           actor_drop_guard.set_error(ZmqError::Internal(
-            "IPC Failed to publish NewConnection".into(),
+            "IPC: Socket mailbox closed during NewConnectionEstablished".into(),
           ));
-          // TODO: Abort SCA if spawned and publish failed. SCA should self-terminate if AttachPipes not received.
         } else {
-          actor_drop_guard.waive(); // Successful connection and event publish
+          actor_drop_guard.waive();
         }
       }
       Err(err) => {

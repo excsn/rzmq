@@ -131,6 +131,7 @@ impl UringWorker {
         addr,
         protocol_handler_factory_id,
         protocol_config,
+        socket_mailbox,
         reply_tx,
       } => {
         let socket_fd = match addr {
@@ -168,6 +169,7 @@ impl UringWorker {
         target_addr,
         protocol_handler_factory_id,
         protocol_config,
+        socket_mailbox,
         reply_tx,
       } => {
         if unsafe { self.ring.submission_shared().is_full() } {
@@ -224,6 +226,7 @@ impl UringWorker {
             op_name: op_name_str.clone(),
             protocol_handler_factory_id: Some(protocol_handler_factory_id),
             protocol_config: Some(protocol_config),
+            socket_mailbox: Some(socket_mailbox),
             fd_created_for_connect_op: Some(socket_fd),
             listener_fd: None,
             target_fd_for_shutdown: None,
@@ -263,6 +266,7 @@ impl UringWorker {
             op_name: op_name_str.clone(),
             protocol_handler_factory_id: None,
             protocol_config: None,
+            socket_mailbox: None,
             fd_created_for_connect_op: None,
             listener_fd: None,
             target_fd_for_shutdown: None,
@@ -286,6 +290,7 @@ impl UringWorker {
         protocol_handler_factory_id,
         protocol_config,
         is_server_role,
+        socket_mailbox,
         reply_tx,
         mpsc_rx_for_worker,
       } => {
@@ -297,6 +302,7 @@ impl UringWorker {
             op_name: op_name_str.clone(),
             protocol_handler_factory_id: Some(protocol_handler_factory_id.clone()),
             protocol_config: Some(protocol_config.clone()),
+            socket_mailbox: None, // Already consumed below
             fd_created_for_connect_op: None,
             listener_fd: None,
             target_fd_for_shutdown: Some(fd),
@@ -309,6 +315,7 @@ impl UringWorker {
           &protocol_handler_factory_id,
           &protocol_config,
           is_server_role,
+          socket_mailbox,
           self.buffer_manager.as_ref(),
           self.default_buffer_ring_group_id_val,
           user_data,
@@ -319,8 +326,7 @@ impl UringWorker {
                 .work_map
                 .entry(fd)
                 .or_default()
-                .pending_blueprints
-                .extend(initial_ops.sqe_blueprints);
+                .route_blueprints(initial_ops.sqe_blueprints);
             }
 
             if initial_ops.initiate_close_due_to_error {
@@ -367,7 +373,15 @@ impl UringWorker {
         fd,
         reply_tx,
       } => {
-        // This logic is also safe as it adds work to the work_map, not directly submitting.
+        // Fast path: if the handler is already gone (closed by a prior teardown), reply
+        // with success immediately. Without this guard, SocketCore would block for 5 seconds
+        // waiting for a CloseFd CQE that will never arrive.
+        if !self.handler_manager.contains_handler_for(fd) {
+          let ack = UringOpCompletion::ShutdownConnectionHandlerComplete { user_data, fd };
+          let _ = reply_tx.send(Ok(ack));
+          return;
+        }
+
         self.external_op_tracker.add_op(
           user_data,
           ExternalOpContext {
@@ -375,6 +389,7 @@ impl UringWorker {
             op_name: op_name_str,
             protocol_handler_factory_id: None,
             protocol_config: None,
+            socket_mailbox: None,
             fd_created_for_connect_op: None,
             listener_fd: None,
             target_fd_for_shutdown: Some(fd),
@@ -417,24 +432,40 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           worker.process_external_op_request(request);
         }
 
-        // 1b. Drain application data into the work_map
+        // 1b. Drain application data — convert to blueprints immediately so egress ordering
+        //     is preserved when close_initiated appends RequestClose in Phase 1d.
         let fds_to_drain: Vec<_> = worker.fd_to_mpsc_rx.keys().copied().collect();
         for fd in &fds_to_drain {
-          // Limit user-space buffering to propagate backpressure back to the socket's mpsc_tx channel
           let pending_count = worker
             .work_map
             .get(fd)
-            .map_or(0, |w| w.pending_blueprints.len() + w.app_data.len());
+            .map_or(0, |w| w.ingress_blueprints.len() + w.egress_blueprints.len());
           if pending_count >= 16 {
-            continue; // Leave messages in the bounded channel to block the sender
+            continue; // Backpressure: leave messages in the bounded channel
           }
-          if let Some(rx) = worker.fd_to_mpsc_rx.get(fd) {
-            while let Ok(msg_parts) = rx.try_recv() {
-              work_was_available = true;
-              let work = worker.work_map.entry(*fd).or_default();
-              work.app_data.push_back(msg_parts);
-              if work.app_data.len() >= 16 {
-                break; // Stop draining once our local buffer has sufficient work
+          if let Some(handler) = worker.handler_manager.get_mut(*fd) {
+            let io_config = handler.io_config().clone();
+            if let Some(rx) = worker.fd_to_mpsc_rx.get(fd) {
+              let mut converted = 0usize;
+              while let Ok(msg_parts) = rx.try_recv() {
+                work_was_available = true;
+                let interface = UringWorkerInterface::new(
+                  *fd,
+                  &io_config,
+                  worker.buffer_manager.as_ref(),
+                  worker.default_buffer_ring_group_id_val,
+                  0,
+                );
+                let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
+                worker
+                  .work_map
+                  .entry(*fd)
+                  .or_default()
+                  .route_blueprints(ops_output.sqe_blueprints);
+                converted += 1;
+                if converted >= 16 {
+                  break;
+                }
               }
             }
           }
@@ -454,8 +485,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               .work_map
               .entry(fd)
               .or_default()
-              .pending_blueprints
-              .extend(ops.sqe_blueprints);
+              .route_blueprints(ops.sqe_blueprints);
           }
           if ops.initiate_close_due_to_error
             && !worker.fds_needing_close_initiated_pass.contains(&fd)
@@ -468,9 +498,10 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         while let Some(fd_to_close) = worker.fds_needing_close_initiated_pass.pop_front() {
           work_was_available = true;
           if let Some(handler) = worker.handler_manager.get_mut(fd_to_close) {
+            let io_config = handler.io_config().clone();
             let interface = UringWorkerInterface::new(
               fd_to_close,
-              &worker.worker_io_config,
+              &io_config,
               worker.buffer_manager.as_ref(),
               worker.default_buffer_ring_group_id_val,
               0,
@@ -481,8 +512,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 .work_map
                 .entry(fd_to_close)
                 .or_default()
-                .pending_blueprints
-                .extend(close_io_ops.sqe_blueprints);
+                .route_blueprints(close_io_ops.sqe_blueprints);
             }
           }
         }
@@ -506,25 +536,27 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           // This moves ownership of the `FdWork` struct and releases the mutable borrow on the map.
           let mut work = worker.work_map.remove(&fd).unwrap_or_default();
 
-          // Convert all pending app_data into the flat blueprint queue.
-          if let Some(handler) = worker.handler_manager.get_mut(fd) {
-            while let Some(msg_parts) = work.app_data.pop_front() {
-              let interface = UringWorkerInterface::new(
-                fd,
-                &worker.worker_io_config,
-                worker.buffer_manager.as_ref(),
-                worker.default_buffer_ring_group_id_val,
-                0,
-              );
-              let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
-              work.pending_blueprints.extend(ops_output.sqe_blueprints);
+          let mut stop_processing_this_fd = false;
+
+          // --- Pass 1: Ingress Pipeline (un-gated, non-blocking) ---
+          while let Some(ingress_bp) = work.ingress_blueprints.pop_front() {
+            if unsafe { worker.ring.submission_shared().is_full() } {
+              work.ingress_blueprints.push_front(ingress_bp);
+              break;
             }
+            if let Err(returned_bp) =
+              cqe_processor::process_handler_blueprint(worker, fd, ingress_bp)
+            {
+              work.ingress_blueprints.push_front(returned_bp);
+              break;
+            }
+            batches_processed_this_iteration += 1;
           }
 
-          let mut stop_processing_this_fd = false;
-          while let Some(first_blueprint) = work.pending_blueprints.pop_front() {
+          // --- Pass 2: Egress Pipeline (write-serialized) ---
+          while let Some(first_blueprint) = work.egress_blueprints.pop_front() {
             if unsafe { worker.ring.submission_shared().is_full() } {
-              work.pending_blueprints.push_front(first_blueprint);
+              work.egress_blueprints.push_front(first_blueprint);
               stop_processing_this_fd = true;
               break;
             }
@@ -532,12 +564,12 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             if let Some(first_write_len) = first_blueprint.write_len() {
               // --- Write op path ---
               if work.write_in_flight {
-                work.pending_blueprints.push_front(first_blueprint);
+                work.egress_blueprints.push_front(first_blueprint);
                 break; // Serialization gate: wait for in-flight CQE
               }
 
               // Coalesce if the next pending item is also a write that fits within 64KB.
-              let next_is_write_and_fits = work.pending_blueprints.front()
+              let next_is_write_and_fits = work.egress_blueprints.front()
                 .and_then(|bp| bp.write_len())
                 .map_or(false, |next_len| first_write_len + next_len <= 65536);
 
@@ -559,12 +591,12 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                   _ => unreachable!(),
                 }
 
-                while let Some(next_bp) = work.pending_blueprints.front() {
+                while let Some(next_bp) = work.egress_blueprints.front() {
                   if let Some(next_len) = next_bp.write_len() {
                     if coalesce_buf.len() + next_len > 65536 {
                       break;
                     }
-                    let bp = work.pending_blueprints.pop_front().unwrap();
+                    let bp = work.egress_blueprints.pop_front().unwrap();
                     match bp {
                       HandlerSqeBlueprint::RequestSend { data, .. }
                       | HandlerSqeBlueprint::RequestSendZeroCopy { data_to_send: data, .. } => {
@@ -593,8 +625,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               if let Err(returned_bp) =
                 cqe_processor::process_handler_blueprint(worker, fd, blueprint_to_submit)
               {
-                // Push back for retry. Buffer is reclaimed on CQE success, not here.
-                work.pending_blueprints.push_front(returned_bp);
+                work.egress_blueprints.push_front(returned_bp);
                 stop_processing_this_fd = true;
                 break;
               }
@@ -604,10 +635,11 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               break; // One physical write per cycle
             } else {
               // --- Control op path (RequestSetCork, RequestClose, etc.) ---
+              // Control ops are never write-gated; batch them freely.
               if let Err(returned_bp) =
                 cqe_processor::process_handler_blueprint(worker, fd, first_blueprint)
               {
-                work.pending_blueprints.push_front(returned_bp);
+                work.egress_blueprints.push_front(returned_bp);
                 stop_processing_this_fd = true;
                 break;
               }
@@ -616,9 +648,10 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           }
 
           // Keep FdWork in the map if there is pending work OR a write is in-flight.
-          // write_in_flight=true with no pending blueprints must still be preserved so
-          // new app_data arriving before the CQE sees the correct lock state.
-          if !work.app_data.is_empty() || !work.pending_blueprints.is_empty() || work.write_in_flight {
+          if !work.ingress_blueprints.is_empty()
+            || !work.egress_blueprints.is_empty()
+            || work.write_in_flight
+          {
             worker.work_map.insert(fd, work);
           }
 
@@ -748,8 +781,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               .work_map
               .entry(fd)
               .or_default()
-              .pending_blueprints
-              .extend(blueprints);
+              .route_blueprints(blueprints);
           }
         }
 
