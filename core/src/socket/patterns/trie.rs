@@ -182,6 +182,95 @@ impl SubscriptionTrie {
 }
 
 #[cfg(test)]
+mod concurrent_trie_tests {
+  use super::*;
+  use std::sync::Arc;
+  use std::time::Duration;
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn test_concurrent_subscribe_100k_unique_topics() {
+    let trie = Arc::new(SubscriptionTrie::new());
+    const NUM_TASKS: usize = 20;
+    const TOPICS_PER_TASK: usize = 5_000;
+
+    let mut handles = Vec::new();
+    for task_id in 0..NUM_TASKS {
+      let trie = trie.clone();
+      handles.push(tokio::spawn(async move {
+        for i in 0..TOPICS_PER_TASK {
+          let topic = format!("topic/{}/{}", task_id, i);
+          trie.subscribe(topic.as_bytes()).await;
+        }
+      }));
+    }
+    for h in handles {
+      h.await.unwrap();
+    }
+
+    let all_topics = trie.get_all_topics().await;
+    assert_eq!(
+      all_topics.len(),
+      NUM_TASKS * TOPICS_PER_TASK,
+      "Expected {} subscriptions, got {}",
+      NUM_TASKS * TOPICS_PER_TASK,
+      all_topics.len()
+    );
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn test_get_all_topics_under_write_contention() {
+    let trie = Arc::new(SubscriptionTrie::new());
+
+    // Pre-populate with some topics
+    for i in 0..100 {
+      trie.subscribe(format!("base/topic/{}", i).as_bytes()).await;
+    }
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut handles = Vec::new();
+
+    // 5 writer tasks: subscribe/unsubscribe continuously
+    for task_id in 0..5usize {
+      let trie = trie.clone();
+      let stop = stop.clone();
+      handles.push(tokio::spawn(async move {
+        let mut i = 0u64;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+          let topic = format!("dynamic/{}/{}", task_id, i % 50);
+          trie.subscribe(topic.as_bytes()).await;
+          trie.unsubscribe(topic.as_bytes()).await;
+          i += 1;
+        }
+      }));
+    }
+
+    // 5 reader tasks: get_all_topics() continuously
+    for _ in 0..5usize {
+      let trie = trie.clone();
+      let stop = stop.clone();
+      handles.push(tokio::spawn(async move {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+          let topics = trie.get_all_topics().await;
+          // At minimum, the 100 base topics are always present
+          assert!(
+            topics.len() >= 100,
+            "get_all_topics() returned less than base topics: {}",
+            topics.len()
+          );
+        }
+      }));
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    for h in handles {
+      h.await.unwrap();
+    }
+  }
+}
+
+#[cfg(test)]
 mod additional_trie_tests {
   use super::*;
 

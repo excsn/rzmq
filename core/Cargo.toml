@@ -135,6 +135,10 @@ name = "inproc_minimal"
 required-features = ["inproc"]
 
 [[test]]
+name = "io_uring_resource_exhaustion"
+required-features = ["io-uring"]
+
+[[test]]
 name = "security_curve"
 required-features = ["curve"]
 
