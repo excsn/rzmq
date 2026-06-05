@@ -258,6 +258,13 @@ pub trait UringConnectionHandler: Send {
   fn should_throttle_reads(&self) -> bool {
     false
   }
+
+  /// Called by the worker when it receives a `UringOpRequest::ResumeConnection` for this
+  /// handler's FD. Clears the backpressure throttle and re-submits a new `RECV_MULTISHOT`.
+  /// The default is a no-op; handlers that use multishot recv should override this.
+  fn on_resume_connection(&mut self, _interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
+    HandlerIoOps::default()
+  }
 }
 
 pub trait ProtocolHandlerFactory: Send + Sync + 'static {
@@ -268,8 +275,11 @@ pub trait ProtocolHandlerFactory: Send + Sync + 'static {
     &self,
     fd: RawFd,
     worker_io_config: Arc<WorkerIoConfig>,
-    protocol_config: &ProtocolConfig, // Takes a reference to the enum
+    protocol_config: &ProtocolConfig,
     is_server: bool,
+    // Dedicated inbound data channel receiver. Stored in the handler and taken once
+    // at handshake completion to be forwarded in UringConnectionEstablished.
+    inbound_data_rx: fibre::mpmc::AsyncReceiver<Vec<Msg>>,
   ) -> Result<Box<dyn UringConnectionHandler + Send>, String>;
 }
 
@@ -285,6 +295,9 @@ pub struct WorkerIoConfig {
   /// Synchronous sender to the parent SocketCore mailbox.
   /// Must be the sync variant so the UringWorker OS-thread can wake Tokio tasks correctly.
   pub socket_mailbox: MailboxSyncSender,
+  /// Dedicated data plane: sync sender used by the UringWorker OS thread to push decoded
+  /// message batches directly to the per-connection reader task, bypassing the control mailbox.
+  pub inbound_data_tx: fibre::mpmc::Sender<Vec<Msg>>,
   /// Logical endpoint URI for this connection (e.g. "tcp://1.2.3.4:5678").
   pub endpoint_uri: String,
   /// The original target URI requested by the user.

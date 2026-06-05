@@ -81,7 +81,7 @@ impl EventFdPoller {
       // So, returning true as "the desired state of being submitted is met".
       return true;
     }
-    if unsafe { sq.is_full() } {
+    if sq.is_full() {
       tracing::warn!("[EventFdPoller] SQ full, cannot submit eventfd poll SQE now.");
       return false; // Caller (main_loop) might retry later.
     }

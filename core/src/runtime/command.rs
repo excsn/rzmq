@@ -6,6 +6,7 @@ use crate::socket::MonitorSender;
 #[cfg(feature = "io-uring")]
 use crate::Blob;
 
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
@@ -119,11 +120,13 @@ pub enum Command {
     target_endpoint_uri: String,
     connection_iface: Arc<dyn ISocketConnection>,
     peer_identity: Option<Blob>,
+    /// Dedicated per-connection inbound data channel. Taken once by command_processor
+    /// to spawn the UringPipeReader task, bypassing the control mailbox for data delivery.
+    inbound_data_rx: Option<AsyncReceiver<Vec<Msg>>>,
+    /// Raw file descriptor for this connection. Passed to UringPipeReader so it can send
+    /// `ResumeConnection { fd }` when the inbound channel drains below the LWM.
+    fd: RawFd,
   },
-
-  /// Batched incoming data from an io_uring connection, keyed by URI.
-  #[cfg(feature = "io-uring")]
-  UringFdMessage { endpoint_uri: String, msgs: Vec<Msg> },
 
   /// Fatal error or connection closure from an io_uring connection, keyed by URI.
   #[cfg(feature = "io-uring")]
@@ -153,8 +156,6 @@ impl Command {
       Command::NewConnectionEstablished { .. } => "NewConnectionEstablished",
       #[cfg(feature = "io-uring")]
       Command::UringConnectionEstablished { .. } => "UringConnectionEstablished",
-      #[cfg(feature = "io-uring")]
-      Command::UringFdMessage { .. } => "UringFdMessage",
       #[cfg(feature = "io-uring")]
       Command::UringFdError { .. } => "UringFdError",
     }

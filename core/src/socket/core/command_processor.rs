@@ -8,7 +8,11 @@ use crate::sessionx::ScaConnectionIface;
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 #[cfg(feature = "io-uring")]
+use crate::io_uring_backend::ops::UringOpRequest;
+#[cfg(feature = "io-uring")]
 use crate::socket::core::pipe_manager;
+#[cfg(feature = "io-uring")]
+use std::os::unix::io::RawFd;
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
 use crate::socket::core::{SocketCore, shutdown};
 use crate::socket::events::{MonitorSender, SocketEvent};
@@ -219,6 +223,8 @@ pub(crate) async fn process_socket_command(
       target_endpoint_uri,
       connection_iface,
       peer_identity,
+      inbound_data_rx,
+      fd,
     } => {
       let is_outbound = {
         let cs = core_arc.core_state.read();
@@ -262,28 +268,24 @@ pub(crate) async fn process_socket_command(
         .await;
       socket_logic_strong.update_peer_identity(synthetic_read_id, peer_identity).await;
 
+      // Spawn a dedicated reader task for this connection's data plane. The task owns the
+      // async receiver and calls handle_pipe_event directly, so SocketCore's command mailbox
+      // is never blocked by data delivery backpressure.
+      if let Some(rx) = inbound_data_rx {
+        let task = tokio::spawn(run_uring_pipe_reader(
+          Arc::downgrade(&socket_logic_strong),
+          synthetic_read_id,
+          rx,
+          fd,
+        ));
+        core_arc.core_state.write()
+          .pipe_reader_task_handles
+          .insert(synthetic_read_id, task);
+      }
+
       core_arc.core_state.read().send_monitor_event(SocketEvent::HandshakeSucceeded {
         endpoint: endpoint_uri,
       });
-    }
-
-    #[cfg(feature = "io-uring")]
-    Command::UringFdMessage { endpoint_uri, msgs } => {
-      let synthetic_read_id_opt = core_arc
-        .core_state
-        .read()
-        .endpoints
-        .get(&endpoint_uri)
-        .and_then(|ep| ep.pipe_ids.map(|pids| pids.1));
-
-      if let Some(s_read_id) = synthetic_read_id_opt {
-        let batch_cmd = Command::PipeMessageBatchReceived { pipe_id: s_read_id, msgs };
-        if let Err(e) = socket_logic_strong.handle_pipe_event(s_read_id, batch_cmd).await {
-          tracing::error!(handle=core_handle, %endpoint_uri, "ISocket::handle_pipe_event error for UringFdMessage: {}", e);
-        }
-      } else {
-        tracing::warn!(handle=core_handle, %endpoint_uri, "UringFdMessage for unknown endpoint — dropped.");
-      }
     }
 
     #[cfg(feature = "io-uring")]
@@ -1046,4 +1048,61 @@ async fn handle_new_connection_established(
     }
   }
   Ok(())
+}
+
+/// Dedicated per-connection reader task for io_uring connections.
+///
+/// Drains the inbound data channel and dispatches each batch to the socket pattern logic
+/// via `handle_pipe_event`. This is the UringFd equivalent of `PipeReadTask` — it keeps
+/// the control mailbox entirely free of data messages, so SocketCore remains responsive
+/// to Stop/Close commands regardless of application-level backpressure.
+///
+/// The task exits naturally when the sender side (ZmtpUringHandler) is dropped, i.e.,
+/// when the connection is closed or encounters a fatal error.
+/// Channel occupancy (%) below which the reader task signals the worker to resume reads.
+#[cfg(feature = "io-uring")]
+const INBOUND_RESUME_LWM_PCT: usize = 20;
+
+#[cfg(feature = "io-uring")]
+async fn run_uring_pipe_reader(
+  socket_logic: std::sync::Weak<dyn ISocket>,
+  pipe_read_id: usize,
+  inbound_rx: fibre::mpmc::AsyncReceiver<Vec<Msg>>,
+  fd: RawFd,
+) {
+  // capacity() returns None for unbounded channels; treat as infinite (no HWM/LWM).
+  let cap = inbound_rx.capacity().unwrap_or(usize::MAX);
+  // True while occupancy has been at or above HWM (80%) — cleared after signalling resume.
+  let mut needs_resume = false;
+
+  while let Ok(msgs) = inbound_rx.recv().await {
+    let Some(sl) = socket_logic.upgrade() else {
+      break;
+    };
+
+    // Sample occupancy before processing to detect HWM crossing.
+    let len_before = inbound_rx.len();
+    if cap > 0 && len_before * 100 / cap >= 80 {
+      needs_resume = true;
+    }
+
+    let cmd = Command::PipeMessageBatchReceived {
+      pipe_id: pipe_read_id,
+      msgs,
+    };
+    if sl.handle_pipe_event(pipe_read_id, cmd).await.is_err() {
+      break;
+    }
+
+    // After draining one item: check if we've recovered below LWM and need to resume.
+    if needs_resume {
+      let len_after = inbound_rx.len();
+      if cap == 0 || len_after * 100 / cap <= INBOUND_RESUME_LWM_PCT {
+        needs_resume = false;
+        if let Ok(op_tx) = crate::uring::global_state::get_global_uring_worker_op_tx() {
+          let _ = op_tx.try_send(UringOpRequest::ResumeConnection { fd });
+        }
+      }
+    }
+  }
 }

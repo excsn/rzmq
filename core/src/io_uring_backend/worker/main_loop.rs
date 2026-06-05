@@ -296,6 +296,8 @@ impl UringWorker {
         socket_mailbox,
         reply_tx,
         mpsc_rx_for_worker,
+        inbound_data_tx,
+        inbound_data_rx,
       } => {
         // This logic doesn't submit an SQE, so it's safe.
         self.external_op_tracker.add_op(
@@ -322,6 +324,8 @@ impl UringWorker {
           endpoint_uri,
           target_endpoint_uri,
           connection_iface,
+          inbound_data_tx,
+          inbound_data_rx,
           self.buffer_manager.as_ref(),
           self.default_buffer_ring_group_id_val,
           user_data,
@@ -403,6 +407,31 @@ impl UringWorker {
           },
         );
         self.fds_needing_close_initiated_pass.push_back(fd);
+      }
+
+      UringOpRequest::ResumeConnection { fd } => {
+        // UringPipeReader drained below LWM — re-open kernel-side reads for this FD.
+        // Use a scoped block so the mutable borrow of handler_manager ends before
+        // we access work_map.
+        let resume_ops = {
+          let buffer_manager = self.buffer_manager.as_ref();
+          let default_bgid = self.default_buffer_ring_group_id_val;
+          if let Some(handler) = self.handler_manager.get_mut(fd) {
+            // Clone the config so the immutable borrow of `handler` ends before
+            // `on_resume_connection` takes `&mut self`.
+            let io_config = handler.io_config().clone();
+            let interface = UringWorkerInterface::new(fd, &io_config, buffer_manager, default_bgid, 0);
+            Some(handler.on_resume_connection(&interface))
+          } else {
+            None
+          }
+        };
+        if let Some(ops) = resume_ops {
+          if !ops.sqe_blueprints.is_empty() {
+            self.work_map.entry(fd).or_default().route_blueprints(ops.sqe_blueprints);
+          }
+        }
+        // No reply_tx — fire-and-forget
       }
     }
   }

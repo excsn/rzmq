@@ -33,6 +33,10 @@ use tracing::{debug, error, info, trace, warn};
 
 const ZC_SEND_THRESHOLD: usize = 1024;
 
+/// Channel occupancy (%) at which the handler proactively cancels the kernel multishot read.
+/// The remaining 20% headroom absorbs in-flight CQEs already committed to the ring buffer.
+const INBOUND_PAUSE_HWM_PCT: usize = 80;
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ZmtpHandlerPhase {
   Initial,
@@ -83,12 +87,21 @@ pub struct ZmtpUringHandler {
   multishot_reader: Option<MultishotReader>,
 
   worker_io_config: Arc<WorkerIoConfig>,
-  /// Set true when try_send to the socket mailbox returns Full; cleared on next successful send.
+  /// Dedicated inbound data channel receiver. Taken once at handshake completion and
+  /// forwarded in UringConnectionEstablished so command_processor can spawn the reader task.
+  inbound_data_rx: Option<fibre::mpmc::AsyncReceiver<Vec<Msg>>>,
+  /// Set true when try_send to the inbound_data_tx channel returns Full; cleared on success.
   mailbox_full_throttled: bool,
 }
 
 impl ZmtpUringHandler {
-  pub fn new(fd: RawFd, zmtp_config_arg: Arc<ZmtpEngineConfig>, is_server: bool, worker_io_config: Arc<WorkerIoConfig>) -> Self {
+  pub fn new(
+    fd: RawFd,
+    zmtp_config_arg: Arc<ZmtpEngineConfig>,
+    is_server: bool,
+    worker_io_config: Arc<WorkerIoConfig>,
+    inbound_data_rx: fibre::mpmc::AsyncReceiver<Vec<Msg>>,
+  ) -> Self {
     let handshake_timeout_duration = zmtp_config_arg
       .handshake_timeout
       .unwrap_or(Duration::from_secs(30));
@@ -124,6 +137,7 @@ impl ZmtpUringHandler {
       last_sent_was_ping: false,
       multishot_reader: None,
       worker_io_config,
+      inbound_data_rx: Some(inbound_data_rx),
       mailbox_full_throttled: false,
     }
   }
@@ -198,6 +212,7 @@ impl ZmtpUringHandler {
 
     info!(fd=self.fd, final_peer_id=?self.final_peer_identity, "ZmtpUringHandler: Signaling ZMTP handshake completion upstream.");
 
+    let inbound_data_rx = self.inbound_data_rx.take();
     self
       .worker_io_config
       .socket_mailbox
@@ -206,6 +221,8 @@ impl ZmtpUringHandler {
         target_endpoint_uri: self.worker_io_config.target_endpoint_uri.clone(),
         connection_iface: self.worker_io_config.connection_iface.clone(),
         peer_identity: self.final_peer_identity.clone(),
+        inbound_data_rx,
+        fd: self.fd,
       })
       .map_err(|e| {
         error!(fd = self.fd, "Failed to send UringConnectionEstablished to socket mailbox: {:?}", e);
@@ -733,22 +750,37 @@ impl ZmtpUringHandler {
             }
           }
 
-          // Dispatch accumulated message batch directly to the parent socket mailbox
+          // Push decoded batch directly to the per-connection data channel, bypassing the
+          // control mailbox entirely. Proactively cancel the kernel-side RECV_MULTISHOT if
+          // the channel reaches the 80% HWM, leaving 20% headroom for in-flight CQEs.
           if !data_batch.is_empty() {
-            match self.worker_io_config.socket_mailbox.try_send(Command::UringFdMessage {
-              endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
-              msgs: data_batch,
-            }) {
+            match self.worker_io_config.inbound_data_tx.try_send(data_batch) {
               Ok(()) => {
-                self.mailbox_full_throttled = false;
+                let len = self.worker_io_config.inbound_data_tx.len();
+                // capacity() returns None for unbounded channels; treat as no HWM.
+                let cap = self.worker_io_config.inbound_data_tx.capacity().unwrap_or(usize::MAX);
+                let hwm_hit = cap > 0 && len * 100 / cap >= INBOUND_PAUSE_HWM_PCT;
+                if hwm_hit {
+                  if !self.mailbox_full_throttled {
+                    warn!(fd = self.fd, occupancy = len, capacity = cap,
+                      "DataPhase: Inbound channel at HWM — initiating kernel-side pause");
+                    self.mailbox_full_throttled = true;
+                    self.emit_pause_cancel_blueprint(ops);
+                  }
+                } else {
+                  self.mailbox_full_throttled = false;
+                }
               }
               Err(fibre::TrySendError::Full(_)) => {
-                warn!(fd = self.fd, "DataPhase: Socket mailbox full — throttling reads");
-                self.mailbox_full_throttled = true;
+                if !self.mailbox_full_throttled {
+                  warn!(fd = self.fd, "DataPhase: Inbound data channel full — initiating kernel-side pause");
+                  self.mailbox_full_throttled = true;
+                  self.emit_pause_cancel_blueprint(ops);
+                }
               }
               Err(e) => {
-                error!(fd = self.fd, "DataPhase: Socket mailbox closed (parent terminated): {:?}", e);
-                let err = ZmqError::Internal("Socket mailbox closed".into());
+                error!(fd = self.fd, "DataPhase: Inbound data channel closed (reader task gone): {:?}", e);
+                let err = ZmqError::Internal("Inbound data channel closed".into());
                 self.transition_to_error(ops, err.clone(), interface);
                 return Err(err);
               }
@@ -1488,7 +1520,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
 
     // Cancel any active multishot read before closing the FD. Without this, the kernel may
     // attempt to write incoming data to a buffer ring slot after the FD is released.
-    if let Some(ref reader) = self.multishot_reader {
+    if let Some(ref mut reader) = self.multishot_reader {
       if reader.is_active() {
         if let Some(cancel_bp) = reader.prepare_cancel_intent() {
           ops.sqe_blueprints.push(cancel_bp);
@@ -1587,8 +1619,26 @@ impl UringConnectionHandler for ZmtpUringHandler {
   }
 
   fn should_throttle_reads(&self) -> bool {
-    // Throttle when accumulator exceeds 2 MB OR when the socket mailbox was full last cycle.
-    self.network_read_accumulator.len() > 2 * 1024 * 1024 || self.mailbox_full_throttled
+    self.network_read_accumulator.len() > 2 * 1024 * 1024
+      || self.mailbox_full_throttled
+      || self.multishot_reader.as_ref().map_or(false, |r| r.is_pausing())
+  }
+
+  fn on_resume_connection(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
+    self.mailbox_full_throttled = false;
+    self.prepare_sqes(interface)
+  }
+}
+
+impl ZmtpUringHandler {
+  /// Submits an ASYNC_CANCEL blueprint if the multishot reader is in `Reading` state.
+  /// Transitions the reader to `Pausing`. No-op if already pausing/paused or no multishot.
+  fn emit_pause_cancel_blueprint(&mut self, ops: &mut HandlerIoOps) {
+    if let Some(reader) = &mut self.multishot_reader {
+      if let Some(blueprint) = reader.prepare_cancel_intent() {
+        ops.sqe_blueprints.push(blueprint);
+      }
+    }
   }
 }
 
@@ -1605,6 +1655,7 @@ impl ProtocolHandlerFactory for ZmtpHandlerFactory {
     worker_io_config: Arc<WorkerIoConfig>,
     protocol_config: &ProtocolConfig,
     is_server_role: bool,
+    inbound_data_rx: fibre::mpmc::AsyncReceiver<Vec<Msg>>,
   ) -> Result<Box<dyn UringConnectionHandler + Send>, String> {
     match protocol_config {
       ProtocolConfig::Zmtp(engine_config_arc) => Ok(Box::new(ZmtpUringHandler::new(
@@ -1612,6 +1663,7 @@ impl ProtocolHandlerFactory for ZmtpHandlerFactory {
         engine_config_arc.clone(),
         is_server_role,
         worker_io_config,
+        inbound_data_rx,
       ))),
       #[allow(unreachable_patterns)]
       _ => Err(format!(

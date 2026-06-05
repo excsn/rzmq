@@ -236,7 +236,7 @@ impl IpcListener {
       Some(parent_socket_core_id),
     );
     tracing::debug!(handle = accept_loop_handle, uri = %endpoint_uri, "IPC Accept loop started.");
-    let mut loop_error_to_report: Option<ZmqError> = None;
+    let mut loop_error_to_report: Option<ZmqError>;
 
     loop {
       let permit = match connection_limiter.clone().acquire_owned().await {
@@ -290,8 +290,8 @@ impl IpcListener {
             async move {
               let max_connection_permit = _permit_guard;
               // Variables for the common event publishing logic
-              let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
-              let mut managing_actor_task_id_for_event: Option<TaskId> = None;
+              let mut interaction_model_for_event: Option<ConnectionInteractionModel>;
+              let mut managing_actor_task_id_for_event: Option<TaskId>;
               let mut setup_successful = true;
 
               // IPC doesn't have an io_uring path like TCP. It always uses an actor.
@@ -485,7 +485,7 @@ impl IpcConnecter {
     tracing::info!(handle = connecter_handle, uri = %endpoint_uri_original, path = ?self.path, "IPC Connecter actor started.");
 
     // Variables to hold the outcome of the connection attempt
-    let mut connection_outcome: Result<
+    let connection_outcome: Result<
       (
         ConnectionInteractionModel,
         Option<TaskId>,

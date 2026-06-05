@@ -13,6 +13,17 @@ use std::os::unix::io::RawFd;
 
 pub const IOURING_CQE_F_MORE: u32 = 1 << 1;
 
+/// Kernel-level backpressure state for a multishot recv operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MultishotFlowState {
+  /// RECV_MULTISHOT is active in the kernel — CQEs are being delivered.
+  Reading,
+  /// ASYNC_CANCEL has been submitted; in-flight data CQEs may still arrive.
+  Pausing,
+  /// Kernel-side read is confirmed stopped. Waiting for ResumeConnection signal.
+  Paused,
+}
+
 #[derive(Debug)]
 pub(crate) struct MultishotReader {
   fd: RawFd,
@@ -22,6 +33,8 @@ pub(crate) struct MultishotReader {
   is_active: bool,
 
   cancel_op_user_data: Option<UserData>,
+  /// Flow control state for kernel-level backpressure.
+  flow_state: MultishotFlowState,
 }
 
 impl MultishotReader {
@@ -32,7 +45,36 @@ impl MultishotReader {
       active_op_user_data: None,
       is_active: false,
       cancel_op_user_data: None,
+      flow_state: MultishotFlowState::Paused,
     }
+  }
+
+  /// True only when a RECV_MULTISHOT is live in the kernel (not mid-cancel).
+  pub fn is_reading(&self) -> bool {
+    matches!(self.flow_state, MultishotFlowState::Reading) && self.is_active
+  }
+
+  /// True while an ASYNC_CANCEL is in-flight (headroom absorption window).
+  pub fn is_pausing(&self) -> bool {
+    matches!(self.flow_state, MultishotFlowState::Pausing)
+  }
+
+  /// True when the kernel-side read is confirmed stopped.
+  pub fn is_paused(&self) -> bool {
+    matches!(self.flow_state, MultishotFlowState::Paused)
+  }
+
+  /// Transition to `Paused` state. Called when the cancel CQE (or -ECANCELED on the
+  /// original multishot CQE) is reaped.
+  fn acknowledge_pause(&mut self) {
+    tracing::debug!(
+      "[MultishotReader FD={}] Kernel-side read confirmed stopped — flow state: Paused.",
+      self.fd
+    );
+    self.flow_state = MultishotFlowState::Paused;
+    self.is_active = false;
+    self.active_op_user_data = None;
+    self.cancel_op_user_data = None;
   }
 
   pub fn buffer_group_id(&self) -> u16 {
@@ -54,19 +96,27 @@ impl MultishotReader {
   pub fn mark_operation_submitted(&mut self, op_user_data: UserData) {
     self.active_op_user_data = Some(op_user_data);
     self.is_active = true;
-    self.cancel_op_user_data = None; // Clear any prior cancellation attempt for this new op
+    self.cancel_op_user_data = None;
+    self.flow_state = MultishotFlowState::Reading;
     tracing::debug!(
-      "[MultishotReader FD={}] Marked as active in kernel with UserData {}.",
+      "[MultishotReader FD={}] Marked as active in kernel with UserData {} — flow state: Reading.",
       self.fd,
       op_user_data
     );
   }
 
-  /// Called by handler to signal intent to cancel the active multishot read.
-  pub fn prepare_cancel_intent(&self) -> Option<HandlerSqeBlueprint> {
-    if !self.is_active || self.active_op_user_data.is_none() || self.cancel_op_user_data.is_some() {
-      return None; // Not active, or no UserData to target, or already cancelling
+  /// Transitions to `Pausing` and returns an `ASYNC_CANCEL` blueprint targeting the active
+  /// multishot operation. Returns `None` if already pausing/paused or not active.
+  pub fn prepare_cancel_intent(&mut self) -> Option<HandlerSqeBlueprint> {
+    if !self.is_reading() || self.active_op_user_data.is_none() {
+      return None;
     }
+    self.flow_state = MultishotFlowState::Pausing;
+    tracing::debug!(
+      "[MultishotReader FD={}] Transitioning to Pausing — submitting ASYNC_CANCEL for UserData {:?}.",
+      self.fd,
+      self.active_op_user_data
+    );
     Some(HandlerSqeBlueprint::RequestNewAsyncCancel {
       fd: self.fd,
       target_user_data: self.active_op_user_data.unwrap(),
@@ -116,6 +166,17 @@ impl MultishotReader {
 
       if cqe_res < 0 {
         let errno = -cqe_res;
+        if errno == libc::ECANCELED as i32 {
+          // The original multishot CQE arrived with -ECANCELED (from our ASYNC_CANCEL).
+          // Transition to Paused and clean up — this is not an error.
+          tracing::debug!(
+            "[MultishotReader FD={}] Original multishot (ud {}) received -ECANCELED; confirming Paused.",
+            self.fd,
+            cqe_ud
+          );
+          self.acknowledge_pause();
+          return Ok((ops_to_return, true));
+        }
         if errno == libc::ENOBUFS {
           // Non-fatal: the kernel ran out of buffers in the ring.
           // Terminate the active operation so the worker can resubmit a new read
@@ -135,7 +196,6 @@ impl MultishotReader {
           cqe_ud,
           errno
         );
-        // Worker needs to take details for self.active_op_user_data.
         self.active_op_user_data = None;
         self.is_active = false;
         return Ok((ops_to_return.set_error_close(), true));
@@ -231,39 +291,26 @@ impl MultishotReader {
         // internal_op_tracker entry for cqe_ud is NOT taken by cqe_processor.
       }
     } else if Some(cqe_ud) == self.cancel_op_user_data {
-      // This CQE is for our cancellation request for the multishot op.
-      tracing::debug!(
-        "[MultishotReader FD={}] AsyncCancel CQE (ud {}) received for multishot op (target_ud: {:?}). Res: {}",
-        self.fd,
-        cqe_ud,
-        self.active_op_user_data,
-        cqe_res
-      );
-      if cqe_res < 0 && cqe_res != -libc::ECANCELED && cqe_res != -libc::ENOENT {
-        // ENOENT means op already completed
+      // This CQE is for our ASYNC_CANCEL request.
+      // -ENOENT means the target op had already completed by the time the cancel was processed —
+      // treat it identically to success (0): the operation is gone, proceed to Paused.
+      let is_cancel_success = cqe_res == 0 || cqe_res == -libc::ENOENT;
+      if !is_cancel_success {
         tracing::warn!(
-          "[MultishotReader FD={}] AsyncCancel for multishot op failed with error: {}",
+          "[MultishotReader FD={}] ASYNC_CANCEL (ud {}) returned unexpected result {}; proceeding to Paused anyway.",
           self.fd,
+          cqe_ud,
+          cqe_res
+        );
+      } else {
+        tracing::debug!(
+          "[MultishotReader FD={}] ASYNC_CANCEL (ud {}) confirmed (res {}). Transitioning to Paused.",
+          self.fd,
+          cqe_ud,
           cqe_res
         );
       }
-
-      // The worker/cqe_processor will take internal_op_details for cqe_ud (the cancel op).
-      // It also needs to take internal_op_details for self.active_op_user_data (the original multishot op)
-      // because the cancellation means the original op is now definitely finished.
-      if let Some(original_multishot_ud) = self.active_op_user_data.take() {
-        tracing::trace!(
-          "[MultishotReader FD={}] Original multishot op (ud {}) is now considered terminated due to cancel CQE.",
-          self.fd,
-          original_multishot_ud
-        );
-        // The cqe_processor, when it sees an AsyncCancel CQE, will look at its payload
-        // (CancelTarget { target_user_data }) and also remove that target_user_data from internal_op_tracker.
-      }
-
-      self.active_op_user_data = None;
-      self.cancel_op_user_data = None;
-      self.is_active = false;
+      self.acknowledge_pause();
       return Ok((ops_to_return, true));
     } else {
       // This CQE was not for this MultishotReader. This should ideally not be reached
@@ -317,6 +364,7 @@ impl MultishotReader {
     );
     self.is_active = false;
     self.active_op_user_data = None;
-    self.cancel_op_user_data = None; // Clear any pending cancellation state too
+    self.cancel_op_user_data = None;
+    self.flow_state = MultishotFlowState::Paused;
   }
 }

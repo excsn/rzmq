@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 #[cfg(feature = "io-uring")]
-use rzmq::socket::{IO_URING_SESSION_ENABLED, IO_URING_SNDZEROCOPY};
+use rzmq::socket::{IO_URING_RCVMULTISHOT, IO_URING_SESSION_ENABLED, IO_URING_SNDZEROCOPY};
 
 pub async fn run(args: Cli) -> Result<(), ZmqError> {
   let context = Context::new()?;
@@ -44,6 +44,10 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
       if args.uring_zerocopy {
         info!("Enabling io_uring Send Zero-Copy on client FD.");
         socket.set_option(IO_URING_SNDZEROCOPY, true).await?;
+      }
+      if args.uring_multishot {
+        info!("Enabling io_uring multishot recv on client FD.");
+        socket.set_option(IO_URING_RCVMULTISHOT, true).await?;
       }
     }
   }
@@ -105,9 +109,10 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
 
   // Extract io_uring flags once; fall back to false when the feature is disabled.
   #[cfg(feature = "io-uring")]
-  let (use_io_uring, uring_zerocopy) = (args.use_io_uring, args.uring_zerocopy);
+  let (use_io_uring, uring_zerocopy, uring_multishot) =
+    (args.use_io_uring, args.uring_zerocopy, args.uring_multishot);
   #[cfg(not(feature = "io-uring"))]
-  let (use_io_uring, uring_zerocopy) = (false, false);
+  let (use_io_uring, uring_zerocopy, uring_multishot) = (false, false, false);
 
   let mut join_set: JoinSet<Result<(), ZmqError>> = JoinSet::new();
 
@@ -126,6 +131,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
           args.cork,
           use_io_uring,
           uring_zerocopy,
+          uring_multishot,
           Arc::clone(&collector),
           Arc::clone(&shutdown),
           Arc::clone(&msg_counter),
@@ -149,6 +155,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
           args.cork,
           use_io_uring,
           uring_zerocopy,
+          uring_multishot,
           Arc::clone(&collector),
           Arc::clone(&shutdown),
           Arc::clone(&payload),
@@ -255,6 +262,7 @@ async fn run_throughput_worker(
   cork: bool,
   use_io_uring: bool,
   uring_zerocopy: bool,
+  uring_multishot: bool,
   collector: Arc<BenchmarkCollector>,
   shutdown: Arc<AtomicBool>,
   msg_counter: Arc<AtomicUsize>,
@@ -275,9 +283,12 @@ async fn run_throughput_worker(
     if uring_zerocopy {
       socket.set_option(IO_URING_SNDZEROCOPY, true).await?;
     }
+    if uring_multishot {
+      socket.set_option(IO_URING_RCVMULTISHOT, true).await?;
+    }
   }
   #[cfg(not(feature = "io-uring"))]
-  let _ = (use_io_uring, uring_zerocopy);
+  let _ = (use_io_uring, uring_zerocopy, uring_multishot);
 
   socket.connect(&endpoint).await?;
   info!("[Throughput Worker {}] Connected. Loop started.", id);
@@ -358,6 +369,7 @@ async fn run_reqrep_worker(
   cork: bool,
   use_io_uring: bool,
   uring_zerocopy: bool,
+  uring_multishot: bool,
   collector: Arc<BenchmarkCollector>,
   shutdown: Arc<AtomicBool>,
   payload: Arc<Vec<u8>>,
@@ -377,9 +389,12 @@ async fn run_reqrep_worker(
     if uring_zerocopy {
       socket.set_option(IO_URING_SNDZEROCOPY, true).await?;
     }
+    if uring_multishot {
+      socket.set_option(IO_URING_RCVMULTISHOT, true).await?;
+    }
   }
   #[cfg(not(feature = "io-uring"))]
-  let _ = (use_io_uring, uring_zerocopy);
+  let _ = (use_io_uring, uring_zerocopy, uring_multishot);
 
   socket.connect(&endpoint).await?;
   info!("[ReqRep Worker {}] Connected. Loop started.", id);

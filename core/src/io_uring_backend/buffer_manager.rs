@@ -63,14 +63,16 @@ impl BufferRingManager {
     buffer_id: u16,
     available_len: usize,
   ) -> Result<BorrowedBuffer<BytesMut>, ZmqError> {
-    self
-      .buf_ring_instance
-      .get_buf(buffer_id, available_len)
-      .ok_or_else(|| {
-        ZmqError::Internal(format!(
-          "Failed to borrow buffer ID {} from ring",
-          buffer_id
-        ))
-      })
+    unsafe {
+      self
+        .buf_ring_instance
+        .get_buf(buffer_id, available_len)
+        .ok_or_else(|| {
+          ZmqError::Internal(format!(
+            "Failed to borrow buffer ID {} from ring",
+            buffer_id
+          ))
+        })
+    }
   }
 }

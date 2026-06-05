@@ -321,7 +321,7 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 * **Total Messages:** 3,040,601
 * **Total Data:** 95,018.78 MB
 * **Throughput:** 303,788.72 msg/s
-* **Throughput Rate:** 9493.40 MB/s
+* **Throughput Rate:** 9,493.40 MB/s
 
 #### io-uring with Multishot and ZeroCopy
 **Command:**

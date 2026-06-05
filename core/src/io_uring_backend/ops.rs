@@ -1,6 +1,7 @@
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::connection_handler::OutgoingMessage;
+use crate::message::Msg;
 use crate::runtime::MailboxSyncSender;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::ZmtpEngineConfig;
@@ -11,7 +12,7 @@ use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use fibre::{mpsc, oneshot};
+use fibre::{mpmc, mpsc, oneshot};
 
 pub const HANDLER_INTERNAL_SEND_OP_UD: UserData = 0;
 
@@ -69,6 +70,10 @@ pub enum UringOpRequest {
     socket_mailbox: MailboxSyncSender,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
     mpsc_rx_for_worker: Arc<mpsc::BoundedReceiver<OutgoingMessage>>,
+    /// Sync sender for the dedicated inbound data channel (UringWorker OS-thread side).
+    inbound_data_tx: fibre::mpmc::Sender<Vec<Msg>>,
+    /// Async receiver for the dedicated inbound data channel (Tokio reader-task side).
+    inbound_data_rx: fibre::mpmc::AsyncReceiver<Vec<Msg>>,
   },
   StartFdReadLoop {
     user_data: UserData,
@@ -80,6 +85,9 @@ pub enum UringOpRequest {
     fd: RawFd,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
+  /// Fire-and-forget: signal the worker to re-submit a RECV_MULTISHOT for a paused
+  /// connection. Sent by the UringPipeReader task when channel occupancy drops below LWM.
+  ResumeConnection { fd: RawFd },
 }
 
 impl UringOpRequest {
@@ -94,6 +102,7 @@ impl UringOpRequest {
       | Self::RegisterExternalFd { user_data, .. }
       | Self::StartFdReadLoop { user_data, .. }
       | Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
+      Self::ResumeConnection { .. } => 0, // fire-and-forget: no user_data
     }
   }
 
@@ -107,10 +116,11 @@ impl UringOpRequest {
       Self::RegisterExternalFd { .. } => "RegisterExternalFd".to_string(),
       Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
       Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
+      Self::ResumeConnection { .. } => "ResumeConnection".to_string(),
     }
   }
 
-  pub(crate) fn get_reply_tx_ref(&self) -> &oneshot::Sender<Result<UringOpCompletion, ZmqError>> {
+  pub(crate) fn get_reply_tx_ref(&self) -> Option<&oneshot::Sender<Result<UringOpCompletion, ZmqError>>> {
     match self {
       Self::Nop { reply_tx, .. }
       | Self::InitializeBufferRing { reply_tx, .. }
@@ -119,7 +129,8 @@ impl UringOpRequest {
       | Self::RegisterExternalFd { reply_tx, .. }
       | Self::Connect { reply_tx, .. }
       | Self::StartFdReadLoop { reply_tx, .. }
-      | Self::ShutdownConnectionHandler { reply_tx, .. } => reply_tx,
+      | Self::ShutdownConnectionHandler { reply_tx, .. } => Some(reply_tx),
+      Self::ResumeConnection { .. } => None, // fire-and-forget: no reply channel
     }
   }
 }
@@ -194,6 +205,10 @@ impl fmt::Debug for UringOpRequest {
         .field("user_data", user_data)
         .field("fd", fd)
         .finish_non_exhaustive(),
+      UringOpRequest::ResumeConnection { fd } => f
+        .debug_struct("ResumeConnection")
+        .field("fd", fd)
+        .finish(),
     }
   }
 }

@@ -22,6 +22,8 @@ use crate::socket::connection_iface::UringFdConnection;
 #[cfg(feature = "io-uring")]
 use crate::uring;
 #[cfg(feature = "io-uring")]
+use crate::message::Msg as RzmqMsg;
+#[cfg(feature = "io-uring")]
 use fibre::mpsc;
 #[cfg(feature = "io-uring")]
 use fibre::oneshot::oneshot;
@@ -303,7 +305,7 @@ impl TcpListener {
       Some(parent_socket_core_id),
     );
     tracing::debug!(handle = accept_loop_handle, uri = %endpoint_uri, "TCP Accept loop (unified) started.");
-    let mut loop_error_to_report: Option<ZmqError> = None;
+    let mut loop_error_to_report: Option<ZmqError>;
 
     loop {
       let permit = match connection_limiter.clone().acquire_owned().await {
@@ -402,6 +404,11 @@ impl TcpListener {
                         let hwm = socket_options_clone.sndhwm.max(1); // TODO Needs bounded mpsc fibre to respect this
                         let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::bounded(hwm);
 
+                        let inbound_hwm = socket_options_clone.rcvhwm.max(1);
+                        let (inbound_data_tx_sync, inbound_data_rx_sync) =
+                          fibre::mpmc::bounded::<Vec<RzmqMsg>>(inbound_hwm);
+                        let inbound_data_rx = inbound_data_rx_sync.to_async();
+
                         let event_fd = worker_op_tx.clone_event_fd();
                         let worker_asleep = worker_op_tx.clone_worker_asleep();
                         let new_conn_iface = Arc::new(UringFdConnection::new(
@@ -426,6 +433,8 @@ impl TcpListener {
                           socket_mailbox: socket_logic.mailbox().to_sync(),
                           reply_tx: reply_tx_for_op,
                           mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
+                          inbound_data_tx: inbound_data_tx_sync,
+                          inbound_data_rx,
                         };
 
                         if let Err(e) = worker_op_tx.send(register_fd_req).await {
@@ -1007,6 +1016,10 @@ impl TcpConnecter {
             let (reply_tx_for_op, reply_rx_for_op) = oneshot();
             let hwm = self.socket_options.sndhwm.max(1);
             let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::bounded(hwm);
+            let inbound_hwm = self.socket_options.rcvhwm.max(1);
+            let (inbound_data_tx_sync, inbound_data_rx_sync) =
+              fibre::mpmc::bounded::<Vec<RzmqMsg>>(inbound_hwm);
+            let inbound_data_rx = inbound_data_rx_sync.to_async();
             let event_fd = worker_op_tx.clone_event_fd();
             let worker_asleep = worker_op_tx.clone_worker_asleep();
 
@@ -1033,6 +1046,8 @@ impl TcpConnecter {
               socket_mailbox: self.socket_logic.mailbox().to_sync(),
               reply_tx: reply_tx_for_op,
               mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
+              inbound_data_tx: inbound_data_tx_sync,
+              inbound_data_rx,
             };
             worker_op_tx.send(register_fd_req).await.map_err(|e| {
               ZmqError::Internal(format!("Send RegisterExternalFd to UringWorker: {}", e))
