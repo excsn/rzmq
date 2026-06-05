@@ -9,7 +9,7 @@ pub mod system_events;
 pub mod waitgroup;
 
 pub use command::Command;
-pub(crate) use mailbox::{mailbox, MailboxReceiver, MailboxSender};
+pub(crate) use mailbox::{mailbox, MailboxReceiver, MailboxSender, MailboxSyncSender};
 
 // System Coordination
 pub use event_bus::EventBus;

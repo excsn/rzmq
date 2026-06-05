@@ -103,6 +103,12 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
     }
   });
 
+  // Extract io_uring flags once; fall back to false when the feature is disabled.
+  #[cfg(feature = "io-uring")]
+  let (use_io_uring, uring_zerocopy) = (args.use_io_uring, args.uring_zerocopy);
+  #[cfg(not(feature = "io-uring"))]
+  let (use_io_uring, uring_zerocopy) = (false, false);
+
   let mut join_set: JoinSet<Result<(), ZmqError>> = JoinSet::new();
 
   match args.pattern {
@@ -118,6 +124,8 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
           args.endpoint.clone(),
           args.hwm,
           args.cork,
+          use_io_uring,
+          uring_zerocopy,
           Arc::clone(&collector),
           Arc::clone(&shutdown),
           Arc::clone(&msg_counter),
@@ -139,6 +147,8 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
           args.endpoint.clone(),
           args.hwm,
           args.cork,
+          use_io_uring,
+          uring_zerocopy,
           Arc::clone(&collector),
           Arc::clone(&shutdown),
           Arc::clone(&payload),
@@ -243,6 +253,8 @@ async fn run_throughput_worker(
   endpoint: String,
   hwm: usize,
   cork: bool,
+  use_io_uring: bool,
+  uring_zerocopy: bool,
   collector: Arc<BenchmarkCollector>,
   shutdown: Arc<AtomicBool>,
   msg_counter: Arc<AtomicUsize>,
@@ -256,6 +268,17 @@ async fn run_throughput_worker(
   socket.set_option(SNDHWM, hwm as i32).await?;
   socket.set_option(TCP_CORK, cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
+
+  #[cfg(feature = "io-uring")]
+  if use_io_uring {
+    socket.set_option(IO_URING_SESSION_ENABLED, true).await?;
+    if uring_zerocopy {
+      socket.set_option(IO_URING_SNDZEROCOPY, true).await?;
+    }
+  }
+  #[cfg(not(feature = "io-uring"))]
+  let _ = (use_io_uring, uring_zerocopy);
+
   socket.connect(&endpoint).await?;
   info!("[Throughput Worker {}] Connected. Loop started.", id);
 
@@ -333,6 +356,8 @@ async fn run_reqrep_worker(
   endpoint: String,
   hwm: usize,
   cork: bool,
+  use_io_uring: bool,
+  uring_zerocopy: bool,
   collector: Arc<BenchmarkCollector>,
   shutdown: Arc<AtomicBool>,
   payload: Arc<Vec<u8>>,
@@ -345,6 +370,17 @@ async fn run_reqrep_worker(
   socket.set_option(SNDHWM, hwm as i32).await?;
   socket.set_option(TCP_CORK, cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
+
+  #[cfg(feature = "io-uring")]
+  if use_io_uring {
+    socket.set_option(IO_URING_SESSION_ENABLED, true).await?;
+    if uring_zerocopy {
+      socket.set_option(IO_URING_SNDZEROCOPY, true).await?;
+    }
+  }
+  #[cfg(not(feature = "io-uring"))]
+  let _ = (use_io_uring, uring_zerocopy);
+
   socket.connect(&endpoint).await?;
   info!("[ReqRep Worker {}] Connected. Loop started.", id);
 

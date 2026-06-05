@@ -8,9 +8,15 @@ use fibre::mpmc;
 /// It can be tuned based on expected load and performance characteristics.
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 512;
 
-/// The sending end of an actor's mailbox.
-/// It is cloneable, allowing multiple actors or tasks to send commands to the same mailbox.
+/// The async sending end of an actor's mailbox.
+/// Cloneable; used by Tokio tasks to send commands to `SocketCore`.
 pub type MailboxSender = mpmc::AsyncSender<Command>;
+
+/// The sync sending end of an actor's mailbox.
+/// Cloneable; used by OS threads (e.g. the io_uring worker) to send commands to `SocketCore`
+/// across the sync/async boundary. The `fibre` runtime activates the correct cross-thread
+/// waker when this variant is used, ensuring the Tokio task wakes up.
+pub type MailboxSyncSender = mpmc::Sender<Command>;
 
 /// The receiving end of an actor's mailbox.
 /// Only one task should typically own and receive from a `MailboxReceiver` to process commands sequentially.

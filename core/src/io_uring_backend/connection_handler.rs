@@ -7,7 +7,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use crate::runtime::MailboxSender;
+use crate::runtime::MailboxSyncSender;
 use crate::socket::connection_iface::ISocketConnection;
 
 pub use crate::io_uring_backend::ops::UserData;
@@ -282,8 +282,9 @@ pub enum OutgoingMessage {
 
 #[derive(Clone)]
 pub struct WorkerIoConfig {
-  /// Direct mailbox of the parent SocketCore. Events are dispatched in a single hop.
-  pub socket_mailbox: MailboxSender,
+  /// Synchronous sender to the parent SocketCore mailbox.
+  /// Must be the sync variant so the UringWorker OS-thread can wake Tokio tasks correctly.
+  pub socket_mailbox: MailboxSyncSender,
   /// Logical endpoint URI for this connection (e.g. "tcp://1.2.3.4:5678").
   pub endpoint_uri: String,
   /// The original target URI requested by the user.

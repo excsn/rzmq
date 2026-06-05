@@ -423,7 +423,7 @@ impl TcpListener {
                           endpoint_uri: actual_connected_uri.clone(),
                           target_endpoint_uri: logical_uri.clone(),
                           connection_iface: new_conn_iface,
-                          socket_mailbox: socket_logic.mailbox(),
+                          socket_mailbox: socket_logic.mailbox().to_sync(),
                           reply_tx: reply_tx_for_op,
                           mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
                         };
@@ -1030,7 +1030,7 @@ impl TcpConnecter {
               endpoint_uri: actual_peer_uri_str.clone(),
               target_endpoint_uri: endpoint_uri_original.to_string(),
               connection_iface: new_conn_iface,
-              socket_mailbox: self.socket_logic.mailbox(),
+              socket_mailbox: self.socket_logic.mailbox().to_sync(),
               reply_tx: reply_tx_for_op,
               mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
             };

@@ -93,11 +93,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9991 seconds
-* **Total Messages:** 1,932,309
-* **Total Data:** 117.94 MB
-* **Throughput:** 193,247.55 msg/s
-* **Throughput Rate:** 11.79 MB/s
+* **Elapsed Time:** 9.9992 seconds
+* **Total Messages:** 13,693,316
+* **Total Data:** 835.77 MB
+* **Throughput:** 1,369,444.79 msg/s
+* **Throughput Rate:** 83.58 MB/s
 
 #### Concurrency 4
 
@@ -108,11 +108,27 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9993 seconds
-* **Total Messages:** 5,928,231
-* **Total Data:** 361.83 MB
-* **Throughput:** 592,867.56 msg/s
-* **Throughput Rate:** 36.19 MB/s
+* **Elapsed Time:** 10.0180 seconds
+* **Total Messages:** 23,402,817
+* **Total Data:** 1428.39 MB
+* **Throughput:** 2,336,078.05 msg/s
+* **Throughput Rate:** 142.58 MB/s
+
+
+#### Concurrency 4, Msg Size 32KB
+
+**Command:**
+```bash
+cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --concurrency 4
+```
+
+**Metrics:**
+* **Pattern:** PushPull
+* **Elapsed Time:** 10.0000 seconds
+* **Total Messages:** 3,008,939
+* **Total Data:** 94,029.34 MB
+* **Throughput:** 300,893.90 msg/s
+* **Throughput Rate:** 9402.93 MB/s
 
 ---
 
@@ -125,11 +141,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PubSub
-* **Elapsed Time:** 10.0031 seconds
-* **Total Messages:** 1,438,614
-* **Total Data:** 87.81 MB
-* **Throughput:** 143,816.81 msg/s
-* **Throughput Rate:** 8.78 MB/s
+* **Elapsed Time:** 10.0024 seconds
+* **Total Messages:** 12,752,722
+* **Total Data:** 778.36 MB
+* **Throughput:** 1,274,969.70 msg/s
+* **Throughput Rate:** 77.82 MB/s
 
 ---
 
@@ -142,11 +158,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9989 seconds
-* **Total Messages:** 7,733,889
-* **Total Data:** 472.04 MB
-* **Throughput:** 773,470.23 msg/s
-* **Throughput Rate:** 47.21 MB/s
+* **Elapsed Time:** 9.9992 seconds
+* **Total Messages:** 13,623,742
+* **Total Data:** 831.53 MB
+* **Throughput:** 1,362,489.43 msg/s
+* **Throughput Rate:** 83.16 MB/s
 
 #### Concurrency 4
 
@@ -157,11 +173,26 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9997 seconds
-* **Total Messages:** 21,306,074
-* **Total Data:** 1,300.42 MB
-* **Throughput:** 2,130,681.48 msg/s
-* **Throughput Rate:** 130.05 MB/s
+* **Elapsed Time:** 10.0176 seconds
+* **Total Messages:** 23,618,160
+* **Total Data:** 1,441.54 MB
+* **Throughput:** 2,357,658.84 msg/s
+* **Throughput Rate:** 143.90 MB/s
+
+#### Concurrency 4, Msg Size 32KB
+
+**Command:**
+```bash
+cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --cork --concurrency 4
+```
+
+**Metrics:**
+* **Pattern:** PushPull
+* **Elapsed Time:** 10.0031 seconds
+* **Total Messages:** 3,009,107
+* **Total Data:** 94,034.59 MB
+* **Throughput:** 300,818.72 msg/s
+* **Throughput Rate:** 9,400.59 MB/s
 
 ---
 
@@ -174,11 +205,11 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9987 seconds
-* **Total Messages:** 1,887,233
-* **Total Data:** 115.19 MB
-* **Throughput:** 188,747.10 msg/s
-* **Throughput Rate:** 11.52 MB/s
+* **Elapsed Time:** 10.0431 seconds
+* **Total Messages:** 14,349,214
+* **Total Data:** 875.81 MB
+* **Throughput:** 1,428,757.75 msg/s
+* **Throughput Rate:** 87.20 MB/s
 
 #### Concurrency 4
 
@@ -189,11 +220,11 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9998 seconds
-* **Total Messages:** 7,072,464
-* **Total Data:** 431.67 MB
-* **Throughput:** 707,257.90 msg/s
-* **Throughput Rate:** 43.17 MB/s
+* **Elapsed Time:** 10.3518 seconds
+* **Total Messages:** 13,313,464
+* **Total Data:** 812.59 MB
+* **Throughput:** 1,286,098.82 msg/s
+* **Throughput Rate:** 78.50 MB/s
 
 ---
 
@@ -206,11 +237,11 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9996 seconds
-* **Total Messages:** 7,735,178
-* **Total Data:** 472.12 MB
-* **Throughput:** 773,548.59 msg/s
-* **Throughput Rate:** 47.21 MB/s
+* **Elapsed Time:** 9.9995 seconds
+* **Total Messages:** 22,383,879
+* **Total Data:** 1,366.20 MB
+* **Throughput:** 2,238,510.98 msg/s
+* **Throughput Rate:** 136.63 MB/s
 
 #### Concurrency 2
 
@@ -221,11 +252,11 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9996 seconds
-* **Total Messages:** 13,479,571
-* **Total Data:** 822.73 MB
-* **Throughput:** 1,348,032.03 msg/s
-* **Throughput Rate:** 82.28 MB/s
+* **Elapsed Time:** 10.2676 seconds
+* **Total Messages:** 21,642,618
+* **Total Data:** 1320.96 MB
+* **Throughput:** 2,107,855.48 msg/s
+* **Throughput Rate:** 128.65 MB/s
 
 #### Concurrency 4
 
@@ -253,11 +284,11 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9996 seconds
-* **Total Messages:** 1,814,016
-* **Total Data:** 110.72 MB
-* **Throughput:** 181,408.70 msg/s
-* **Throughput Rate:** 11.07 MB/s
+* **Elapsed Time:** 10.0488 seconds
+* **Total Messages:** 14,501,283
+* **Total Data:** 885.09 MB
+* **Throughput:** 1,443,085.89 msg/s
+* **Throughput Rate:** 88.08 MB/s
 
 #### Concurrency 4
 
@@ -281,16 +312,16 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 #### Standard
 **Command:**
 ```bash
-cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --cork --concurrency 8
+cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --cork --concurrency 4
 ```
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 10.0015 seconds
-* **Total Messages:** 2,438,218
-* **Total Data:** 76,194.31 MB
-* **Throughput:** 243,785.88 msg/s
-* **Throughput Rate:** 7,618.31 MB/s
+* **Elapsed Time:** 10.0089 seconds
+* **Total Messages:** 3,040,601
+* **Total Data:** 95,018.78 MB
+* **Throughput:** 303,788.72 msg/s
+* **Throughput Rate:** 9493.40 MB/s
 
 #### io-uring with Multishot and ZeroCopy
 **Command:**

@@ -8,7 +8,7 @@ use crate::io_uring_backend::{
   ops::ProtocolConfig,
   UserData,
 };
-use crate::runtime::MailboxSender;
+use crate::runtime::MailboxSyncSender;
 use crate::socket::connection_iface::ISocketConnection;
 
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ pub(crate) struct ListenerMetadata {
   pub(crate) factory_id_for_accepted_connections: String,
   pub(crate) protocol_config_for_accepted: ProtocolConfig,
   /// Mailbox of the parent SocketCore — propagated to each accepted connection.
-  pub(crate) socket_mailbox: MailboxSender,
+  pub(crate) socket_mailbox: MailboxSyncSender,
 }
 
 pub(crate) struct HandlerManager {
@@ -55,7 +55,7 @@ impl HandlerManager {
     factory_id: &str,
     protocol_config: &ProtocolConfig,
     is_server: bool,
-    socket_mailbox: MailboxSender,
+    socket_mailbox: MailboxSyncSender,
     endpoint_uri: String,
     target_endpoint_uri: String,
     connection_iface: Arc<dyn ISocketConnection>,
@@ -164,7 +164,7 @@ impl HandlerManager {
     listener_fd: RawFd,
     factory_id_for_accepted_connections: String,
     protocol_config_for_accepted: ProtocolConfig,
-    socket_mailbox: MailboxSender,
+    socket_mailbox: MailboxSyncSender,
   ) {
     info!(
       "HandlerManager: Adding listener metadata for FD {}. Accepted conns will use factory '{}' with specific config.",
