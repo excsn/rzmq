@@ -147,6 +147,60 @@ pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
   write_result
 }
 
+/// Frames, coalesces, and writes an entire batch of logical ZMQ messages in a single
+/// network operation. Applies dynamic TCP corking around the write when appropriate.
+pub(crate) async fn write_data_batch_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+  batch: &[Vec<Msg>],
+) -> Result<(), ZmqError> {
+  if batch.is_empty() {
+    return Ok(());
+  }
+
+  let stream = handler
+    .stream
+    .as_mut()
+    .ok_or_else(|| ZmqError::Internal("Stream unavailable for batch write".into()))?;
+
+  let operation_timeout = handler.config.sndtimeo.unwrap_or(Duration::from_secs(300));
+
+  let socket_type = handler.config.socket_type_name.as_str();
+  let is_latency_pattern = matches!(socket_type, "REQ" | "REP" | "DEALER" | "ROUTER");
+  let should_dynamic_cork =
+    is_latency_pattern && (batch.len() > 1 || batch.iter().any(|msgs| msgs.len() > 1));
+
+  let wire_bytes = handler.framer.write_msg_batch(batch)?;
+
+  #[cfg(target_os = "linux")]
+  {
+    if should_dynamic_cork {
+      if let Some(ci) = handler.cork_info.as_mut() {
+        ci.apply_cork_state(true, handler.actor_handle).await;
+      }
+    }
+  }
+
+  let write_result = tokio::time::timeout(operation_timeout, stream.write_all(&wire_bytes))
+    .await
+    .map_err(|_| ZmqError::Timeout)?
+    .map_err(|e| ZmqError::from_io_endpoint(e, "data batch write"));
+
+  handler.heartbeat_state.record_activity();
+
+  #[cfg(target_os = "linux")]
+  {
+    if should_dynamic_cork {
+      if let Some(ci) = handler.cork_info.as_mut() {
+        if ci.is_corked() {
+          ci.apply_cork_state(false, handler.actor_handle).await;
+        }
+      }
+    }
+  }
+
+  write_result
+}
+
 /// A wrapper for sending a single message part, which is now just a special case of sending a multipart message.
 pub(crate) async fn write_data_msg_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,

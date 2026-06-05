@@ -190,6 +190,12 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     data_io::write_data_msgs_impl(self, msgs).await
   }
 
+  /// Frames, coalesces, and writes an entire batch of logical ZMQ messages in a
+  /// single network call, amortizing syscall and context-switch overhead.
+  pub(crate) async fn write_data_batch(&mut self, batch: &[Vec<Msg>]) -> Result<(), ZmqError> {
+    data_io::write_data_batch_impl(self, batch).await
+  }
+
   /// Processes an incoming ZMTP command frame received during the data phase,
   /// primarily for handling PING/PONG.
   ///

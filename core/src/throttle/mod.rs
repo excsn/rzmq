@@ -105,6 +105,12 @@ impl AdaptiveThrottle {
   /// state, reflecting the work that is about to happen. The returned guard
   /// must be used to complete the work cycle.
   pub fn begin_work(&self, dir: Direction) -> ThrottleGuard {
+    self.begin_work_bulk(dir, 1)
+  }
+
+  /// Records the intent to perform `weight` operations simultaneously,
+  /// debiting the balance and EMA proportionally to the entire batch.
+  pub fn begin_work_bulk(&self, dir: Direction, weight: u32) -> ThrottleGuard {
     if !self.shared.config.enabled {
       return ThrottleGuard {
         shared: None,
@@ -113,7 +119,7 @@ impl AdaptiveThrottle {
       };
     }
 
-    let delta = self.shared.config.credit_per_message;
+    let delta = self.shared.config.credit_per_message * (weight as i32);
     let new_balance = match dir {
       Direction::Ingress => {
         self
@@ -132,7 +138,7 @@ impl AdaptiveThrottle {
     };
 
     // Periodic EMA nudge
-    let since = self.shared.ops_since_nudge.fetch_add(1, Ordering::Relaxed) + 1;
+    let since = self.shared.ops_since_nudge.fetch_add(weight, Ordering::Relaxed) + weight;
     if since >= self.shared.config.nudge_interval_ops {
       let α = self.shared.config.adaptive_learning_rate;
       let old_learned = self.shared.learned_balance.load(Ordering::Relaxed);
@@ -144,20 +150,20 @@ impl AdaptiveThrottle {
       self.shared.ops_since_nudge.store(0, Ordering::Relaxed);
     }
 
-    // Track direction-specific streaks
+    // Track direction-specific streaks proportionally
     match dir {
       Direction::Ingress => {
         self
           .shared
           .consecutive_ingress
-          .fetch_add(1, Ordering::Relaxed);
+          .fetch_add(weight, Ordering::Relaxed);
         self.shared.consecutive_egress.store(0, Ordering::Relaxed);
       }
       Direction::Egress => {
         self
           .shared
           .consecutive_egress
-          .fetch_add(1, Ordering::Relaxed);
+          .fetch_add(weight, Ordering::Relaxed);
         self.shared.consecutive_ingress.store(0, Ordering::Relaxed);
       }
     }

@@ -13,6 +13,10 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
   /// Frames and encrypts a multi-part ZMTP message into a single byte buffer for the wire.
   fn write_msg_multipart(&mut self, msgs: Vec<Msg>) -> Result<Bytes, ZmqError>;
 
+  /// Frames and coalesces a batch of multiple logical ZMQ messages into a single wire buffer.
+  /// This eliminates per-message allocation and enables single-syscall transmission.
+  fn write_msg_batch(&mut self, batch: &[Vec<Msg>]) -> Result<Bytes, ZmqError>;
+
   /// Frames a single Msg and returns `(header, Some(payload))` for vectored I/O, the
   /// header contains only the ZMTP frame prefix (≤9 bytes) and payload is a zero-copy
   /// ref to the message data. Encrypted framers fall back to `(merged_bytes, None)`.
@@ -24,12 +28,14 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
 
 pub(crate) struct NullFramer {
   parser: ZmtpManualParser,
+  coalesce_buffer: BytesMut,
 }
 
 impl NullFramer {
   pub(crate) fn new(max_msg_size: i64) -> Self {
     Self {
       parser: ZmtpManualParser::new(max_msg_size),
+      coalesce_buffer: BytesMut::with_capacity(65536),
     }
   }
 }
@@ -46,6 +52,17 @@ impl ISecureFramer for NullFramer {
       codec.encode(msg, &mut buffer)?;
     }
     Ok(buffer.freeze())
+  }
+
+  fn write_msg_batch(&mut self, batch: &[Vec<Msg>]) -> Result<Bytes, ZmqError> {
+    self.coalesce_buffer.clear();
+    let mut codec = ZmtpCodec::new();
+    for msgs in batch {
+      for msg in msgs {
+        codec.encode(msg.clone(), &mut self.coalesce_buffer)?;
+      }
+    }
+    Ok(self.coalesce_buffer.split().freeze())
   }
 
   fn write_msg_split(&mut self, msg: Msg) -> Result<(Bytes, Option<Bytes>), ZmqError> {
@@ -71,6 +88,7 @@ pub(crate) struct LengthPrefixedFramer {
   cipher: Box<dyn IDataCipher>,
   parser: ZmtpManualParser,
   decrypted_buffer: BytesMut,
+  coalesce_buffer: BytesMut,
 }
 
 impl LengthPrefixedFramer {
@@ -79,6 +97,7 @@ impl LengthPrefixedFramer {
       cipher,
       parser: ZmtpManualParser::new(max_msg_size),
       decrypted_buffer: BytesMut::with_capacity(65536 * 2),
+      coalesce_buffer: BytesMut::with_capacity(65536),
     }
   }
 }
@@ -126,5 +145,20 @@ impl ISecureFramer for LengthPrefixedFramer {
     final_buffer.extend_from_slice(&ciphertext);
 
     Ok(final_buffer.freeze())
+  }
+
+  fn write_msg_batch(&mut self, batch: &[Vec<Msg>]) -> Result<Bytes, ZmqError> {
+    self.coalesce_buffer.clear();
+    let mut codec = ZmtpCodec::new();
+    for msgs in batch {
+      for msg in msgs {
+        codec.encode(msg.clone(), &mut self.coalesce_buffer)?;
+      }
+    }
+    let ciphertext = self.cipher.encrypt(&self.coalesce_buffer)?;
+    let mut out = BytesMut::with_capacity(2 + ciphertext.len());
+    out.put_u16(ciphertext.len() as u16);
+    out.extend_from_slice(&ciphertext);
+    Ok(out.freeze())
   }
 }

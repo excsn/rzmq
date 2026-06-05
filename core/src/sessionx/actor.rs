@@ -156,6 +156,10 @@ where
       AdaptiveThrottle::new(config)
     };
 
+    // Reusable batch buffer — allocated once, cleared on each wakeup
+    let mut outgoing_batch: Vec<Vec<Msg>> =
+      Vec::with_capacity(self.zmtp_handler.config.sndbatch_count);
+
     // --- Main Loop ---
     while self.current_phase != ConnectionPhaseX::Terminating {
       if self.current_phase == ConnectionPhaseX::ShuttingDownStream {
@@ -260,10 +264,33 @@ where
         maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
           if self.current_phase == ConnectionPhaseX::Operational && self.core_pipe_manager.is_attached() => {
           match maybe_msgs_from_core {
-            Ok(msgs) => {
-              let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Egress);
+            Ok(first_msgs) => {
+              outgoing_batch.clear();
+              let mut total_bytes = first_msgs.iter().map(|m| m.size()).sum::<usize>();
+              let mut total_msgs = 1usize;
+              outgoing_batch.push(first_msgs);
 
-              if let Err(e) = self.zmtp_handler.write_data_msgs(msgs).await {
+              let max_count = self.zmtp_handler.config.sndbatch_count;
+              let max_bytes = self.zmtp_handler.config.sndbatch_bytes;
+
+              // Greedily drain additional queued messages up to batch limits
+              while total_msgs < max_count && total_bytes < max_bytes {
+                match self.core_pipe_manager.try_recv_from_core() {
+                  Ok(next_msgs) => {
+                    total_bytes += next_msgs.iter().map(|m| m.size()).sum::<usize>();
+                    total_msgs += 1;
+                    outgoing_batch.push(next_msgs);
+                  }
+                  Err(_) => break, // Empty or disconnected — stop draining
+                }
+              }
+
+              let throttle_guard = adaptive_throttle.begin_work_bulk(
+                crate::throttle::Direction::Egress,
+                total_msgs as u32,
+              );
+
+              if let Err(e) = self.zmtp_handler.write_data_batch(&outgoing_batch).await {
                 self.set_fatal_error(e).await;
               }
 
@@ -273,7 +300,7 @@ where
             },
             Err(_) => {
               tracing::info!(sca_handle = self.handle, "Pipe from SocketCore closed.");
-              self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await; // Or Internal error
+              self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
             }
           }
         }

@@ -65,6 +65,9 @@ pub const IO_URING_SESSION_ENABLED: i32 = 1175;
 
 pub const ADAPTIVE_THROTTLE: i32 = 1210;
 
+pub const SNDBATCH_COUNT: i32 = 50; // Max logical messages to coalesce per write
+pub const SNDBATCH_BYTES: i32 = 51; // Max bytes to coalesce per write
+
 pub const DEFAULT_RECONNECT_IVL_MS: u64 = 1000;
 
 /// Holds parsed and validated socket options.
@@ -118,6 +121,8 @@ pub(crate) struct SocketOptions {
   #[cfg(feature = "noise_xx")]
   pub noise_xx_options: NoiseXxSocketOptions,
   pub throttle_config: AdaptiveThrottleConfig,
+  pub sndbatch_count: usize,
+  pub sndbatch_bytes: usize,
 }
 
 impl Default for SocketOptions {
@@ -164,6 +169,8 @@ impl Default for SocketOptions {
         c.priority_boost_factor = 5.0;
         c
       },
+      sndbatch_count: 128,
+      sndbatch_bytes: 512 * 1024, // 512 KB
     }
   }
 }
@@ -258,6 +265,8 @@ pub(crate) struct ZmtpEngineConfig {
   /// Maximum inbound frame size in bytes. -1 means unlimited.
   pub max_msg_size: i64,
   pub throttle_config: AdaptiveThrottleConfig,
+  pub sndbatch_count: usize,
+  pub sndbatch_bytes: usize,
 }
 
 impl From<&SocketOptions> for ZmtpEngineConfig {
@@ -306,6 +315,8 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       plain_password_for_engine: options.plain_options.password.clone(),
       max_msg_size: options.maxmsgsize,
       throttle_config: options.throttle_config.clone(),
+      sndbatch_count: options.sndbatch_count,
+      sndbatch_bytes: options.sndbatch_bytes,
     }
   }
 }
@@ -587,6 +598,8 @@ pub(crate) fn apply_core_option_value(
         IO_URING_RCVMULTISHOT => options.io_uring.recv_multishot = parse_bool_option(value)?,
 
         ADAPTIVE_THROTTLE => options.throttle_config.enabled = parse_bool_option(value)?,
+        SNDBATCH_COUNT => options.sndbatch_count = parse_i32_option(value)?.max(1) as usize,
+        SNDBATCH_BYTES => options.sndbatch_bytes = parse_i32_option(value)?.max(1) as usize,
 
         // Options handled by pattern logic (ISocket) or read-only, or not applicable for set_option
         SUBSCRIBE | UNSUBSCRIBE | LAST_ENDPOINT  /* Pattern specific */ | ROUTER_MANDATORY |
@@ -648,6 +661,8 @@ pub(crate) fn retrieve_core_option_value(
         IO_URING_RCVMULTISHOT => Ok((options.io_uring.recv_multishot as i32).to_ne_bytes().to_vec()),
 
         ADAPTIVE_THROTTLE => Ok((options.throttle_config.enabled as i32).to_ne_bytes().to_vec()),
+        SNDBATCH_COUNT => Ok((options.sndbatch_count as i32).to_ne_bytes().to_vec()),
+        SNDBATCH_BYTES => Ok((options.sndbatch_bytes as i32).to_ne_bytes().to_vec()),
 
         // Options handled by pattern logic or read-only by nature
         16 /* ZMQ_TYPE */ => Ok((core_s_reader.socket_type as i32).to_ne_bytes().to_vec()),

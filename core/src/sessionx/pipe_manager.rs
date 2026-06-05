@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::Msg;
-use fibre::RecvError;
+use fibre::{RecvError, TryRecvError};
 use fibre::mpmc::AsyncReceiver;
 
 // Import the state struct we defined earlier
@@ -54,6 +54,17 @@ impl CorePipeManagerX {
     let _ = self.state.rx_from_core.take();
     self.state.core_pipe_read_id_for_incoming_routing = None;
     self.state.is_attached = false;
+  }
+
+  /// Non-blocking check for a queued outbound message batch from SocketCore.
+  /// Returns `Err(TryRecvError::Empty)` when the pipe is empty, or
+  /// `Err(TryRecvError::Disconnected)` when not attached or the channel is closed.
+  pub(crate) fn try_recv_from_core(&self) -> Result<Vec<Msg>, TryRecvError> {
+    if let Some(ref rx) = self.state.rx_from_core {
+      rx.try_recv()
+    } else {
+      Err(TryRecvError::Disconnected)
+    }
   }
 
   #[cfg(test)]
