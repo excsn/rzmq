@@ -60,7 +60,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
 
   let collector = Arc::new(BenchmarkCollector::new(is_latency_test));
   let shutdown = Arc::new(AtomicBool::new(false));
-  let payload = Arc::new(vec![0u8; args.msg_size]);
+  let payload = bytes::Bytes::from(vec![0u8; args.msg_size]);
   let max_messages = args.messages.unwrap_or(usize::MAX);
 
   let start_time = Instant::now();
@@ -135,7 +135,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
           Arc::clone(&collector),
           Arc::clone(&shutdown),
           Arc::clone(&msg_counter),
-          Arc::clone(&payload),
+          payload.clone(),
           args.msg_size,
           max_messages,
           deadline,
@@ -158,7 +158,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
           uring_multishot,
           Arc::clone(&collector),
           Arc::clone(&shutdown),
-          Arc::clone(&payload),
+          payload.clone(),
           args.msg_size,
           max_messages,
           deadline,
@@ -186,7 +186,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
           Arc::clone(&shutdown),
           worker_semaphore.clone(),
           Arc::clone(&msg_counter),
-          Arc::clone(&payload),
+          payload.clone(),
           args.msg_size,
           max_messages,
           deadline,
@@ -266,7 +266,7 @@ async fn run_throughput_worker(
   collector: Arc<BenchmarkCollector>,
   shutdown: Arc<AtomicBool>,
   msg_counter: Arc<AtomicUsize>,
-  payload: Arc<Vec<u8>>,
+  payload: bytes::Bytes,
   msg_size: usize,
   max_messages: usize,
   deadline: Instant,
@@ -329,7 +329,7 @@ async fn run_throughput_worker(
       break;
     }
 
-    match socket.send(Msg::from_vec((*payload).clone())).await {
+    match socket.send(Msg::from_bytes(payload.clone())).await {
       Ok(()) => {
         if !warming_up.load(Ordering::Relaxed) {
           collector.record_message(msg_size);
@@ -372,7 +372,7 @@ async fn run_reqrep_worker(
   uring_multishot: bool,
   collector: Arc<BenchmarkCollector>,
   shutdown: Arc<AtomicBool>,
-  payload: Arc<Vec<u8>>,
+  payload: bytes::Bytes,
   msg_size: usize,
   max_messages: usize,
   deadline: Instant,
@@ -430,7 +430,7 @@ async fn run_reqrep_worker(
     }
 
     let start = Instant::now();
-    match socket.send(Msg::from_vec((*payload).clone())).await {
+    match socket.send(Msg::from_bytes(payload.clone())).await {
       Ok(()) => {}
       Err(ZmqError::ConnectionClosed) | Err(ZmqError::InvalidState(_)) => {
         info!(
@@ -484,7 +484,7 @@ async fn run_dealer_sender(
   shutdown: Arc<AtomicBool>,
   semaphore: Arc<Semaphore>,
   msg_counter: Arc<AtomicUsize>,
-  payload: Arc<Vec<u8>>,
+  payload: bytes::Bytes,
   msg_size: usize,
   max_messages: usize,
   deadline: Instant,
@@ -546,7 +546,7 @@ async fn run_dealer_sender(
     // the original send instant without any shared state.
     let elapsed_nanos = Instant::now().duration_since(start_time).as_nanos() as u64;
     local_bytes.clear();
-    local_bytes.extend_from_slice(&*payload);
+    local_bytes.extend_from_slice(&payload);
     local_bytes[..8].copy_from_slice(&elapsed_nanos.to_le_bytes());
     let frozen = local_bytes.split().freeze();
 
