@@ -10,16 +10,9 @@ use rzmq::{
 use serial_test::serial;
 use tokio::time::sleep;
 
-// Assuming 'common' module exists and provides at least:
-// - test_context()
-// - recv_timeout()
-// - wait_for_monitor_event()
 mod common;
 
 // --- Test Configuration Constants ---
-const TEST_ENDPOINT_BASE_MULTI_RECONNECT: &str = "tcp://127.0.0.1";
-const DEFAULT_PORT_MULTI_RECONNECT: u16 = 6000;
-
 const CLIENT_SNDTIMEO_MS_MR: i32 = 500;
 const CLIENT_RCVTIMEO_MS_MR: i32 = 500;
 const SERVER_SNDTIMEO_MS_MR: i32 = 500;
@@ -32,12 +25,15 @@ const MONITOR_REACTION_TIMEOUT_MR: Duration =
 const MONITOR_POLL_INTERVAL_MR: Duration = Duration::from_millis(50);
 const SERVER_DOWNTIME_MR: Duration = Duration::from_millis(RECONNECT_IVL_MS_MR as u64 * 4);
 
-fn generate_multi_reconnect_endpoint(test_case_offset: u16) -> String {
-  format!(
-    "{}:{}",
-    TEST_ENDPOINT_BASE_MULTI_RECONNECT,
-    DEFAULT_PORT_MULTI_RECONNECT + test_case_offset
-  )
+/// Bind a standard library TcpListener to port 0, let the OS assign an ephemeral
+/// port, then immediately drop the listener and return the address. The probe-and-
+/// release window is tiny; in practice this is reliable for test use.
+fn free_tcp_endpoint() -> String {
+  let listener = std::net::TcpListener::bind("127.0.0.1:0")
+    .expect("failed to bind probe listener for ephemeral port");
+  let port = listener.local_addr().unwrap().port();
+  drop(listener);
+  format!("tcp://127.0.0.1:{}", port)
 }
 
 // --- Local Helper Functions for this test file ---
@@ -98,7 +94,7 @@ async fn configure_server_socket_for_test(
 #[tokio::test]
 #[serial]
 async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
-  let endpoint = generate_multi_reconnect_endpoint(0); // Changed function name
+  let endpoint = free_tcp_endpoint();
   println!(
     "\n--- Starting test_push_pull_reconnect_advanced_style on {} ---",
     endpoint
@@ -212,7 +208,7 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
 #[tokio::test]
 #[serial]
 async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
-  let endpoint = generate_multi_reconnect_endpoint(1); // Changed function name
+  let endpoint = free_tcp_endpoint();
   println!(
     "\n--- Starting test_req_rep_reconnect_advanced_style on {} ---",
     endpoint
@@ -351,7 +347,7 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
 #[tokio::test]
 #[serial]
 async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), ZmqError> {
-  let endpoint = generate_multi_reconnect_endpoint(0); // Re-used offset 0, ensure it's unique if running all tests
+  let endpoint = free_tcp_endpoint();
   let cycles = 10;
   println!(
     "\n--- Starting test_dealer_router_multiple_disconnect_reconnect_cycle on {} for {} cycles ---",

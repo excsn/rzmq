@@ -992,12 +992,13 @@ impl TcpConnecter {
             let std_stream: std::net::TcpStream = tokio::task::spawn_blocking({
               let addr_clone = target_socket_addr;
               move || {
-                let _ = socket.connect(&addr_clone.into());
-                socket.into()
+                socket.connect(&addr_clone.into())?;
+                Ok::<std::net::TcpStream, std::io::Error>(socket.into())
               }
             })
             .await
-            .map_err(|je| ZmqError::Internal(format!("Blocking connect join error: {}", je)))?;
+            .map_err(|je| ZmqError::Internal(format!("Blocking connect join error: {}", je)))?
+            .map_err(|e| ZmqError::from_io_endpoint(e, endpoint_uri_original))?;
 
             let peer_addr_actual = std_stream.peer_addr().map_err(ZmqError::from)?;
 
