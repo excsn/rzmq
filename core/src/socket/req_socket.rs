@@ -244,7 +244,7 @@ impl ISocket for ReqSocket {
 
               if is_ready_to_send {
                 tracing::warn!("REQ recv: Notifier signaled, no immediate message. State is ReadyToSend (likely peer disconnect or request aborted).");
-                received_msg_result = Err(ZmqError::ConnectionClosed);
+                received_msg_result = Err(ZmqError::InvalidState("Socket state changed to ReadyToSend while waiting for reply".into()));
               } else {
                 tracing::error!("REQ recv: Notifier signaled, no immediate message, but still ExpectingReply. Treating as interruption.");
                 received_msg_result = Err(ZmqError::Internal("Receive operation interrupted by notification without immediate data.".into()));

@@ -365,7 +365,8 @@ async fn test_null_client_to_plain_server_fails() {
           ZmqError::ConnectionClosed
           | ZmqError::HostUnreachable(_)
           | ZmqError::SecurityError(_)
-          | ZmqError::ResourceLimitReached => {
+          | ZmqError::ResourceLimitReached
+          | ZmqError::InvalidState(_) => {
             println!(
               "Client task recv() failed as expected: {:?}",
               recv_res.as_ref().err().unwrap()
