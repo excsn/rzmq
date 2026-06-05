@@ -112,7 +112,22 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
       match self.main_incoming_queue.try_push_item(item) {
         Ok(()) => {}
         Err(PushError::Full(returned)) => {
-          self.queue_item(pipe_read_id, returned).await?;
+          if let Some(duration) = self.queue_push_timeout {
+            if duration.is_zero() {
+              tracing::warn!("Orchestrator queue_batch hit push timeout (0s). Dropping remaining items.");
+              break;
+            }
+            match tokio_timeout(duration, self.main_incoming_queue.push_item(returned)).await {
+              Ok(Ok(())) => {}
+              Ok(Err(e)) => return Err(e),
+              Err(_) => {
+                tracing::warn!("Orchestrator queue_batch hit push timeout. Dropping remaining items to avoid blocking.");
+                break;
+              }
+            }
+          } else {
+            self.main_incoming_queue.push_item(returned).await?;
+          }
         }
         Err(PushError::Closed(_)) => {
           return Err(ZmqError::Internal("FairQueue closed during batch push".into()));
@@ -152,9 +167,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     match rcvtimeo_opt {
       Some(duration) if !duration.is_zero() => match tokio_timeout(duration, pop_future).await {
         Ok(Ok(Some(item))) => Ok(item),
-        Ok(Ok(None)) => Err(ZmqError::Internal(
-          "Orchestrator: Main receive queue closed while popping item".into(),
-        )),
+        Ok(Ok(None)) => Err(ZmqError::InvalidState("Socket terminated".into())),
         Ok(Err(e)) => Err(e),
         Err(_timeout_elapsed) => Err(ZmqError::Timeout),
       },
@@ -163,15 +176,17 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
           match self.main_incoming_queue.try_pop_item() {
             Ok(Some(item)) => Ok(item),
             Ok(None) => Err(ZmqError::ResourceLimitReached),
+            Err(ZmqError::Internal(msg)) if msg.contains("closed") => {
+              Err(ZmqError::InvalidState("Socket terminated".into()))
+            }
             Err(e) => Err(e),
           }
         } else {
           // Infinite wait
-          match pop_future.await? {
-            Some(item) => Ok(item),
-            None => Err(ZmqError::Internal(
-              "Orchestrator: Main receive queue closed (inf wait)".into(),
-            )),
+          match pop_future.await {
+            Ok(Some(item)) => Ok(item),
+            Ok(None) => Err(ZmqError::InvalidState("Socket terminated".into())),
+            Err(e) => Err(e),
           }
         }
       }
