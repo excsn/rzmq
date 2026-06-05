@@ -367,6 +367,10 @@ Constants for socket option integer IDs.
 *   `pub const IO_URING_RCVMULTISHOT: i32 = 1171` (Requires `io-uring` feature)
 *   `pub const TCP_CORK: i32 = 1172` (Requires `io-uring` feature, Linux only)
 *   `pub const IO_URING_SESSION_ENABLED: i32 = 1175` (Requires `io-uring` feature)
+*   `pub const SNDBATCH_COUNT: i32 = 1215` - Maximum number of logical messages to coalesce into a single outbound write; value is `i32` (minimum 1; default `128`). Set before `bind`/`connect`.
+*   `pub const SNDBATCH_BYTES: i32 = 1216` - Maximum total payload bytes to coalesce into a single outbound write; value is `i32` (minimum 1; default `524288` / 512 KB). Set before `bind`/`connect`.
+*   `pub const RCVBATCH_COUNT: i32 = 1217` - Maximum number of logical messages to extract per inbound wakeup; value is `i32` (minimum 1; default `256`). Set before `bind`/`connect`.
+*   `pub const RCVBATCH_BYTES: i32 = 1218` - Maximum total payload bytes to extract per inbound wakeup; value is `i32` (minimum 1; default `524288` / 512 KB). Set before `bind`/`connect`.
 
 ### In `rzmq::socket::events`:
 

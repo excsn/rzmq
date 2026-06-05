@@ -370,6 +370,33 @@ reduce kernel context-switching overhead on high-throughput TCP and IPC connecti
 is applied when a connection is accepted or established; changing it after that has no effect on
 existing connections.
 
+### Outbound Write Batching (`SNDBATCH_COUNT` / `SNDBATCH_BYTES`)
+
+By default, each session actor issues one `write_all` syscall per logical ZMQ message. Under high message rates — telemetry pipelines, fan-out `PUB`/`SUB`, high-frequency `PUSH` senders — this means thousands of short syscalls per second and the corresponding context-switch overhead.
+
+**How it works**: after the actor wakes on the first available message, it synchronously drains additional queued messages from the pipe (using a non-blocking channel `try_recv`) until either the message count or the cumulative payload size hits the configured ceiling. All drained messages are encoded into a single coalesced buffer and sent with one `write_all` call. The adaptive throttle is debited for the full batch weight at once.
+
+**When to tune these**:
+
+| Workload | Recommendation |
+|---|---|
+| High-throughput fan-out (`PUB`/`PUSH`) with many small messages | Increase `SNDBATCH_COUNT` (e.g. 256–512) and `SNDBATCH_BYTES` to match your typical burst size |
+| Latency-sensitive request/reply (`REQ`/`REP`, `DEALER`/`ROUTER`) | Keep defaults or reduce `SNDBATCH_COUNT` to 1–4; each request is usually a single message and batching adds unnecessary latency |
+| Large message streams (video frames, bulk data) | Reduce `SNDBATCH_COUNT` to 1–2 but keep `SNDBATCH_BYTES` high; each message is already large enough to fill a TCP segment |
+
+```rust
+use rzmq::socket::{SNDBATCH_COUNT, SNDBATCH_BYTES};
+
+async fn configure_batching(socket: &rzmq::Socket) -> Result<(), rzmq::ZmqError> {
+    // Coalesce up to 256 messages or 1 MiB per write, whichever comes first.
+    socket.set_option_raw(SNDBATCH_COUNT, &(256i32).to_ne_bytes()).await?;   // option id 1215
+    socket.set_option_raw(SNDBATCH_BYTES, &(1024 * 1024i32).to_ne_bytes()).await?; // option id 1216
+    Ok(())
+}
+```
+
+Both options must be set **before** `bind`/`connect`. Defaults (`128` messages, `512 KB`) are tuned for general use and typically require no adjustment unless profiling shows syscall overhead in `write_all`.
+
 Example: Setting `SNDTIMEO` (send timeout)
 ```rust
 use rzmq::socket::SNDTIMEO;

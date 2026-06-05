@@ -134,16 +134,14 @@ impl ISocket for PullSocket {
         }
       }
       Command::PipeMessageBatchReceived { msgs, .. } => {
+        let mut assembled_batch = Vec::new();
         for msg in msgs {
-          if let Some(raw_zmtp_message_vec) = self
-            .incoming_orchestrator
-            .accumulate_pipe_frame(pipe_id, msg)?
-          {
-            self
-              .incoming_orchestrator
-              .queue_item(pipe_id, raw_zmtp_message_vec)
-              .await?;
+          if let Some(raw_zmtp_message_vec) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_id, msg)? {
+            assembled_batch.push(raw_zmtp_message_vec);
           }
+        }
+        if !assembled_batch.is_empty() {
+          self.incoming_orchestrator.queue_batch(pipe_id, assembled_batch).await?;
         }
       }
       _ => {}

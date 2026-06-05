@@ -242,14 +242,47 @@ where
             Ok(crate::sessionx::protocol_handler::NetworkActionX::HandshakeProgress(progress)) => {
               self.handle_handshake_progression(progress).await;
             }
-            Ok(crate::sessionx::protocol_handler::NetworkActionX::DataFrame(Some(msg))) => {
-              let throttle_guard = adaptive_throttle.begin_work(crate::throttle::Direction::Ingress);
-              self.handle_incoming_from_network(msg).await;
-              if throttle_guard.should_throttle() {
-                yield_now().await;
+            Ok(crate::sessionx::protocol_handler::NetworkActionX::DataBatch(msgs)) => {
+              if !msgs.is_empty() {
+                let pipe_read_id = self
+                  .core_pipe_manager
+                  .state
+                  .core_pipe_read_id_for_incoming_routing
+                  .expect("pipe_id required for incoming routing");
+
+                let mut data_msgs = Vec::with_capacity(msgs.len());
+                for msg in msgs {
+                  if msg.is_command() {
+                    if let Ok(Some(pong)) = self.zmtp_handler.process_incoming_data_command_frame(&msg) {
+                      if let Err(e) = self.zmtp_handler.write_data_msgs(vec![pong]).await {
+                        self.set_fatal_error(e).await;
+                        break;
+                      }
+                    }
+                  } else {
+                    data_msgs.push(msg);
+                  }
+                }
+
+                if !data_msgs.is_empty() {
+                  let weight = data_msgs.len() as u32;
+                  let throttle_guard = adaptive_throttle
+                    .begin_work_bulk(crate::throttle::Direction::Ingress, weight);
+
+                  let cmd = crate::runtime::Command::PipeMessageBatchReceived {
+                    pipe_id: pipe_read_id,
+                    msgs: data_msgs,
+                  };
+                  if let Err(e) = self.socket_logic.handle_pipe_event(pipe_read_id, cmd).await {
+                    self.set_fatal_error(e).await;
+                  }
+
+                  if throttle_guard.should_throttle() {
+                    yield_now().await;
+                  }
+                }
               }
             }
-            Ok(crate::sessionx::protocol_handler::NetworkActionX::DataFrame(None)) => { /* Not enough data yet */ }
             Err(ZmqError::ConnectionClosed) => {
               tracing::info!(sca_handle = self.handle, "Peer closed connection.");
               self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;

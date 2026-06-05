@@ -27,7 +27,7 @@ use heartbeat::ZmtpHandshakeStateX;
 
 pub(crate) enum NetworkActionX {
   HandshakeProgress(ZmtpHandshakeProgressX),
-  DataFrame(Option<Msg>),
+  DataBatch(Vec<Msg>),
 }
 
 pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
@@ -161,7 +161,7 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
         self.advance_handshake().await.map(NetworkActionX::HandshakeProgress)
       }
       ConnectionPhaseX::Operational => {
-        self.read_and_parse_data_frame().await.map(NetworkActionX::DataFrame)
+        self.read_and_parse_data_frames_batch().await.map(NetworkActionX::DataBatch)
       }
       _ => futures::future::pending().await,
     }
@@ -188,6 +188,11 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
   /// to the stream. This is the new, preferred method for sending data.
   pub(crate) async fn write_data_msgs(&mut self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
     data_io::write_data_msgs_impl(self, msgs).await
+  }
+
+  /// Greedy inbound read: one async kernel read + synchronous drain of all complete frames.
+  pub(crate) async fn read_and_parse_data_frames_batch(&mut self) -> Result<Vec<Msg>, ZmqError> {
+    data_io::read_data_frames_batch_impl(self).await
   }
 
   /// Frames, coalesces, and writes an entire batch of logical ZMQ messages in a

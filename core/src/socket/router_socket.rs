@@ -583,23 +583,17 @@ impl ISocket for RouterSocket {
         }
       }
       Command::PipeMessageBatchReceived { msgs, .. } => {
+        let mut assembled_batch = Vec::new();
         for msg in msgs {
-          if let Some(raw) = self
-            .incoming_orchestrator
-            .accumulate_pipe_frame(pipe_read_id, msg)?
-          {
+          if let Some(raw) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
             match self.process_incoming_zmtp_message(pipe_read_id, raw) {
-              Ok((identity_blob, payload_only_vec)) => {
-                self
-                  .incoming_orchestrator
-                  .queue_item(pipe_read_id, (identity_blob, payload_only_vec))
-                  .await?;
-              }
-              Err(e) => {
-                tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "Router batch: Error processing ZMTP message: {}. Dropped.", e);
-              }
+              Ok((identity_blob, payload_only_vec)) => assembled_batch.push((identity_blob, payload_only_vec)),
+              Err(e) => tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "Router batch: Error processing ZMTP message: {}. Dropped.", e),
             }
           }
+        }
+        if !assembled_batch.is_empty() {
+          self.incoming_orchestrator.queue_batch(pipe_read_id, assembled_batch).await?;
         }
       }
       _ => {}

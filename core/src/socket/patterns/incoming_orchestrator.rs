@@ -4,6 +4,7 @@ use crate::socket::patterns::fair_queue::{FairQueue, PushError};
 #[allow(unused_imports)]
 use crate::Blob;
 use dashmap::DashMap;
+use parking_lot::Mutex as ParkingMutex;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
@@ -17,6 +18,8 @@ pub(crate) struct IncomingMessageOrchestrator<QItem: Send + 'static> {
   partial_pipe_messages: DashMap<usize, Vec<Msg>>,
   // Buffer for delivering frames of a single QItem one-by-one via recv_message()
   current_recv_frames_buffer: TokioMutex<VecDeque<Msg>>,
+  // Cache of pre-fetched logical messages; serves recv()/recv_multipart() without channel waits
+  pending_logical_messages: ParkingMutex<VecDeque<QItem>>,
 }
 
 impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
@@ -27,6 +30,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
       queue_push_timeout: Some(Duration::from_millis(1000)),
       partial_pipe_messages: DashMap::new(),
       current_recv_frames_buffer: TokioMutex::new(VecDeque::new()),
+      pending_logical_messages: ParkingMutex::new(VecDeque::new()),
     }
   }
 
@@ -101,6 +105,47 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     }
   }
 
+  /// Pushes a batch of assembled logical messages to the FairQueue.
+  /// Uses synchronous try_push_item first; falls back to the async await path only on HWM.
+  pub async fn queue_batch(&self, pipe_read_id: usize, items: Vec<QItem>) -> Result<(), ZmqError> {
+    for item in items {
+      match self.main_incoming_queue.try_push_item(item) {
+        Ok(()) => {}
+        Err(PushError::Full(returned)) => {
+          self.queue_item(pipe_read_id, returned).await?;
+        }
+        Err(PushError::Closed(_)) => {
+          return Err(ZmqError::Internal("FairQueue closed during batch push".into()));
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// Shared fetch helper used by both recv_message and recv_logical_message.
+  /// Checks the local cache first; only awaits the channel when the cache is empty.
+  /// After a channel wait, drains all additional available items into the cache so
+  /// subsequent recv calls return without any async overhead.
+  pub(crate) async fn fetch_next_logical_item(
+    &self,
+    rcvtimeo_opt: Option<Duration>,
+  ) -> Result<QItem, ZmqError> {
+    // Fast path: serve from cache (pure sync, no async overhead)
+    if let Some(item) = self.pending_logical_messages.lock().pop_front() {
+      return Ok(item);
+    }
+    // Slow path: await the channel
+    let item = self.recv_item_from_main_queue(rcvtimeo_opt).await?;
+    // Drain all immediately available items into the cache (raw QItems — caller applies transform)
+    {
+      let mut cache = self.pending_logical_messages.lock();
+      while let Ok(Some(extra)) = self.main_incoming_queue.try_pop_item() {
+        cache.push_back(extra);
+      }
+    }
+    Ok(item)
+  }
+
   /// Helper to pop a QItem from the main FairQueue with timeout logic.
   pub(crate) async fn recv_item_from_main_queue(&self, rcvtimeo_opt: Option<Duration>) -> Result<QItem, ZmqError> {
     let pop_future = self.main_incoming_queue.pop_item();
@@ -154,7 +199,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     // Drop guard before await
     drop(buffer_guard);
 
-    let q_item = self.recv_item_from_main_queue(rcvtimeo_opt).await?;
+    let q_item = self.fetch_next_logical_item(rcvtimeo_opt).await?;
     let app_frames = qitem_to_app_frames(q_item);
     Ok(app_frames)
   }
@@ -179,10 +224,10 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     }
 
     // Buffer is empty, need to fetch and populate.
-    // Drop guard before await on recv_item_from_main_queue
+    // Drop guard before await
     drop(buffer_guard);
 
-    let q_item = self.recv_item_from_main_queue(rcvtimeo_opt).await?;
+    let q_item = self.fetch_next_logical_item(rcvtimeo_opt).await?;
     let app_frames_vec = qitem_to_app_frames(q_item);
 
     // Re-acquire lock to update buffer
@@ -241,10 +286,9 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
   }
 
   pub async fn close(&self) {
-    
     self.main_incoming_queue.close();
-    // Also clear the partial message buffers
     self.partial_pipe_messages.clear();
+    self.pending_logical_messages.lock().clear();
     let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
     *buffer_guard = VecDeque::new();
   }

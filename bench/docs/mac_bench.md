@@ -11,19 +11,19 @@
 
 | Pattern | Features / Flags | Total Messages | Throughput (msg/s) | Throughput Rate (MB/s) | p50 Latency | p99 Latency |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **ReqRep** | Standard | 217,423 | 21,742.20 | 1.33 | 44.00 µs | 64.00 µs |
-| **ReqRep** | Concurrency 4 | 812,804 | 81,286.29 | 4.96 | 48.03 µs | 80.32 µs |
-| **ReqRep** | Concurrency 8 | 1,125,903 | 112,586.98 | 6.87 | 69.31 µs | 114.30 µs |
+| **ReqRep** | Standard | 291,667 | 29,168.90 | 1.78 | 33.28 µs | 51.07 µs |
+| **ReqRep** | Concurrency 4 | 824,370 | 82,434.88 | 5.03 | 47.42 µs | 78.40 µs |
+| **ReqRep** | Concurrency 8 | 1,146,607 | 114,662.88 | 7.00 | 68.22 µs | 110.14 µs |
 | **DealerRouter**| Standard | 279,851 | 27,953.15 | 1.71 | 34.59 µs | 51.84 µs |
 | **DealerRouter**| Concurrency 2, Pipeline 4 | 862,548 | 86,246.83 | 5.26 | 43.26 µs | 66.43 µs |
 | **DealerRouter**| Concurrency 4, Pipeline 8 | 863,394 | 86,248.34 | 5.26 | 43.26 µs | 63.49 µs |
-| **PushPull** | Standard | 23,017,998 | 2,302,062.74 | 140.51 | — | — |
+| **PushPull** | Standard | 26,507,219 | 2,650,818.38 | 161.79 | — | — |
 | **PushPull** | Concurrency 2 | 26,549,866 | 2,654,677.67 | 162.03 | — | — |
 | **PushPull** | Concurrency 4, Msg Size 32KB | 4,209,965 | 421,013.45 | 13,156.67 | — | — |
-| **PubSub** | Standard | 18,359,371 | 1,835,924.27 | 112.06 | — | — |
+| **PubSub** | Standard | 20,557,796 | 2,055,867.02 | 125.48 | — | — |
 | **PubSub** | Concurrency 2 | 19,223,737 | 1,922,517.69 | 117.34 | — | — |
-| **PubSub** | Concurrency 4 | 20,763,329 | 2,075,031.37 | 126.65 | — | — |
-| **PubSub** | Concurrency 4, Msg Size 32KB | 3,974,567 | 397,468.95 | 12,420.90 | — | — |
+| **PubSub** | Concurrency 4 | 37,547,928 | 3,754,404.22 | 229.15 | — | — |
+| **PubSub** | Concurrency 4, Msg Size 32KB | 3,998,809 | 399,903.43 | 12,496.98 | — | — |
 
 ---
 
@@ -40,20 +40,20 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** ReqRep
-* **Elapsed Time:** 10.0000 seconds
-* **Total Messages:** 217,423
-* **Total Data:** 13.27 MB
-* **Throughput:** 21,742.20 msg/s
-* **Throughput Rate:** 1.33 MB/s
+* **Elapsed Time:** 9.9992 seconds
+* **Total Messages:** 291,667
+* **Total Data:** 17.80 MB
+* **Throughput:** 29,168.90 msg/s
+* **Throughput Rate:** 1.78 MB/s
 
 **Latency Distribution:**
-* **Min:** 29.00 µs
-* **p50 (Median):** 44.00 µs
-* **p90:** 50.00 µs
-* **p95:** 57.00 µs
-* **p99:** 64.00 µs
-* **p99.9:** 107.00 µs
-* **Max:** 1,205.00 µs
+* **Min:** 21.488 µs
+* **p50 (Median):** 33.279 µs
+* **p90:** 37.343 µs
+* **p95:** 44.319 µs
+* **p99:** 51.071 µs
+* **p99.9:** 72.767 µs
+* **Max:** 227.839 µs
 
 #### Concurrency 4
 
@@ -64,20 +64,20 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** ReqRep
-* **Elapsed Time:** 9.9993 seconds
-* **Total Messages:** 812,804
-* **Total Data:** 49.61 MB
-* **Throughput:** 81,286.29 msg/s
-* **Throughput Rate:** 4.96 MB/s
+* **Elapsed Time:** 10.0003 seconds
+* **Total Messages:** 824,370
+* **Total Data:** 50.32 MB
+* **Throughput:** 82,434.88 msg/s
+* **Throughput Rate:** 5.03 MB/s
 
 **Latency Distribution:**
-* **Min:** 15.87 µs
-* **p50 (Median):** 48.03 µs
-* **p90:** 64.03 µs
-* **p95:** 69.31 µs
-* **p99:** 80.32 µs
-* **p99.9:** 97.47 µs
-* **Max:** 609.28 µs
+* **Min:** 15.792 µs
+* **p50 (Median):** 47.423 µs
+* **p90:** 62.975 µs
+* **p95:** 67.967 µs
+* **p99:** 78.399 µs
+* **p99.9:** 93.311 µs
+* **Max:** 214.655 µs
 
 #### Concurrency 8
 
@@ -88,20 +88,20 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** ReqRep
-* **Elapsed Time:** 10.0003 seconds
-* **Total Messages:** 1,125,903
-* **Total Data:** 68.72 MB
-* **Throughput:** 112,586.98 msg/s
-* **Throughput Rate:** 6.87 MB/s
+* **Elapsed Time:** 9.9998 seconds
+* **Total Messages:** 1,146,607
+* **Total Data:** 69.98 MB
+* **Throughput:** 114,662.88 msg/s
+* **Throughput Rate:** 7.00 MB/s
 
 **Latency Distribution:**
-* **Min:** 23.62 µs
-* **p50 (Median):** 69.31 µs
-* **p90:** 91.01 µs
-* **p95:** 98.30 µs
-* **p99:** 114.30 µs
-* **p99.9:** 146.82 µs
-* **Max:** 1.04 ms (1,044 µs)
+* **Min:** 20.112 µs
+* **p50 (Median):** 68.223 µs
+* **p90:** 89.087 µs
+* **p95:** 95.807 µs
+* **p99:** 110.143 µs
+* **p99.9:** 133.375 µs
+* **Max:** 449.791 µs
 
 ---
 
@@ -192,11 +192,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9989 seconds
-* **Total Messages:** 23,017,998
-* **Total Data:** 1,404.91 MB
-* **Throughput:** 2,302,062.74 msg/s
-* **Throughput Rate:** 140.51 MB/s
+* **Elapsed Time:** 9.9996 seconds
+* **Total Messages:** 26,507,219
+* **Total Data:** 1,617.87 MB
+* **Throughput:** 2,650,818.38 msg/s
+* **Throughput Rate:** 161.79 MB/s
 
 #### Concurrency 2
 
@@ -241,11 +241,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PubSub
-* **Elapsed Time:** 10.0001 seconds
-* **Total Messages:** 18,359,371
-* **Total Data:** 1,120.57 MB
-* **Throughput:** 1,835,924.27 msg/s
-* **Throughput Rate:** 112.06 MB/s
+* **Elapsed Time:** 9.9996 seconds
+* **Total Messages:** 20,557,796
+* **Total Data:** 1,254.75 MB
+* **Throughput:** 2,055,867.02 msg/s
+* **Throughput Rate:** 125.48 MB/s
 
 #### Concurrency 2
 
@@ -271,11 +271,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PubSub
-* **Elapsed Time:** 10.0063 seconds
-* **Total Messages:** 20,763,329
-* **Total Data:** 1,267.29 MB
-* **Throughput:** 2,075,031.37 msg/s
-* **Throughput Rate:** 126.65 MB/s
+* **Elapsed Time:** 10.0010 seconds
+* **Total Messages:** 37,547,928
+* **Total Data:** 12,291.74 MB
+* **Throughput:** 3,754,404.22 msg/s
+* **Throughput Rate:** 229.15 MB/s
 
 #### Concurrency 4, Msg size 32KB
 
@@ -286,8 +286,8 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PubSub
-* **Elapsed Time:** 9.9997 seconds
-* **Total Messages:** 3,974,567
-* **Total Data:** 124,205.22 MB
-* **Throughput:** 397,468.95 msg/s
-* **Throughput Rate:** 12,420.90 MB/s
+* **Elapsed Time:** 9.9994 seconds
+* **Total Messages:** 3,998,809
+* **Total Data:** 124,962.78 MB
+* **Throughput:** 399,903.43 msg/s
+* **Throughput Rate:** 12,496.98 MB/s

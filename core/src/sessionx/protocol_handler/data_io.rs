@@ -90,6 +90,64 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
   }
 }
 
+/// Reads from the network and greedily extracts all complete ZMTP messages from the buffer,
+/// up to `rcvbatch_count` messages or `rcvbatch_bytes` total payload bytes.
+/// Returns an empty `Vec` when a read succeeded but no complete frame arrived yet.
+/// Returns `Err(ConnectionClosed)` on EOF.
+pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+) -> Result<Vec<Msg>, ZmqError> {
+  let max_count = handler.config.rcvbatch_count;
+  let max_bytes = handler.config.rcvbatch_bytes;
+  let mut batch: Vec<Msg> = Vec::new();
+  let mut total_bytes: usize = 0;
+
+  // Fast path: drain frames already in the buffer (leftover from a prior read)
+  loop {
+    if batch.len() >= max_count || total_bytes >= max_bytes {
+      break;
+    }
+    match handler.framer.try_read_msg(&mut handler.network_read_buffer)? {
+      Some(msg) => { total_bytes += msg.size(); batch.push(msg); }
+      None => break,
+    }
+  }
+  if !batch.is_empty() {
+    return Ok(batch);
+  }
+
+  // Slow path: buffer empty — do one async kernel read
+  if handler.network_read_buffer.len() > 16 * 1024 * 1024 {
+    return Err(ZmqError::ResourceLimitReached);
+  }
+  let stream = handler.stream.as_mut()
+    .ok_or_else(|| ZmqError::Internal("Stream unavailable for batch data read".into()))?;
+  let bytes_read = stream.read_buf(&mut handler.network_read_buffer).await
+    .map_err(|e| ZmqError::from_io_endpoint(e, "data batch read"))?;
+  if bytes_read == 0 {
+    tracing::debug!(sca_handle = handler.actor_handle, "Connection closed by peer (EOF in batch read).");
+    return Err(ZmqError::ConnectionClosed);
+  }
+  handler.heartbeat_state.record_activity();
+
+  // Synchronously drain all complete frames from what just arrived
+  loop {
+    if batch.len() >= max_count || total_bytes >= max_bytes {
+      break;
+    }
+    match handler.framer.try_read_msg(&mut handler.network_read_buffer)? {
+      Some(msg) => { total_bytes += msg.size(); batch.push(msg); }
+      None => break,
+    }
+  }
+
+  if handler.network_read_buffer.is_empty() && handler.network_read_buffer.capacity() > 65536 {
+    handler.network_read_buffer = BytesMut::with_capacity(16384);
+  }
+
+  Ok(batch)
+}
+
 /// Batches, frames, encrypts, and writes a full logical ZMQ message (one or more `Msg` parts).
 /// This is the optimal path for multipart messages.
 pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
