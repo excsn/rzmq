@@ -189,6 +189,13 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     self.framer.write_msg_batch(batch)
   }
 
+  pub(crate) fn frame_outgoing_batch_vectored(
+    &mut self,
+    batch: &[Vec<Msg>],
+  ) -> Result<Vec<bytes::Bytes>, ZmqError> {
+    self.framer.frame_vectored(batch)
+  }
+
   pub(crate) fn frame_outgoing_msgs(&mut self, msgs: Vec<Msg>) -> Result<bytes::Bytes, ZmqError> {
     self.framer.write_msg_multipart(msgs)
   }

@@ -67,6 +67,9 @@ impl AsyncWrite for InprocStream {
 
 impl crate::transport::ZmtpReadHalf for tokio::io::ReadHalf<InprocStream> {}
 
+// Empty impl — inproc uses EgressBuffer + AsyncWrite path (supports_owned_write = false).
+impl crate::transport::ZmtpWriteHalf for tokio::io::WriteHalf<InprocStream> {}
+
 impl crate::transport::ZmtpStdStream for InprocStream {
   type ReadHalf = tokio::io::ReadHalf<InprocStream>;
   type WriteHalf = tokio::io::WriteHalf<InprocStream>;

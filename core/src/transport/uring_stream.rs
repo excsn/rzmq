@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::io_uring_backend::byte_handler::EgressChunk;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
-use crate::transport::{ZmtpReadHalf, ZmtpStdStream};
+use crate::transport::{ZmtpReadHalf, ZmtpStdStream, ZmtpWriteHalf};
 
 // ─── Read Half ───────────────────────────────────────────────────────────────
 
@@ -37,7 +37,9 @@ pub(crate) struct UringReadHalf {
 
 impl std::fmt::Debug for UringReadHalf {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("UringReadHalf").field("fd", &self.fd).finish_non_exhaustive()
+    f.debug_struct("UringReadHalf")
+      .field("fd", &self.fd)
+      .finish_non_exhaustive()
   }
 }
 
@@ -164,7 +166,6 @@ impl ZmtpReadHalf for UringReadHalf {
   ) -> Poll<io::Result<Bytes>> {
     UringReadHalf::poll_recv_bytes(self, cx)
   }
-
 }
 
 // ─── Write Half ──────────────────────────────────────────────────────────────
@@ -178,8 +179,10 @@ pub(crate) struct UringWriteHalf {
   tx_to_worker_sync: fibre::mpsc::BoundedSender<EgressChunk>,
   tx_to_worker_async: fibre::mpsc::BoundedAsyncSender<EgressChunk>,
   /// Stored only when the egress channel was full on a prior `poll_write` call.
-  pending_write:
-    Option<(usize, Pin<Box<dyn Future<Output = Result<(), fibre::SendError>> + Send>>)>,
+  pending_write: Option<(
+    usize,
+    Pin<Box<dyn Future<Output = Result<(), fibre::SendError>> + Send>>,
+  )>,
   worker_asleep: Arc<AtomicBool>,
   event_fd: EventFD,
   pool: Option<Arc<SendBufferPool>>,
@@ -187,7 +190,9 @@ pub(crate) struct UringWriteHalf {
 
 impl std::fmt::Debug for UringWriteHalf {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("UringWriteHalf").field("fd", &self.fd).finish_non_exhaustive()
+    f.debug_struct("UringWriteHalf")
+      .field("fd", &self.fd)
+      .finish_non_exhaustive()
   }
 }
 
@@ -224,7 +229,12 @@ impl UringWriteHalf {
     }
   }
 
-  fn send_chunk(&mut self, cx: &mut Context<'_>, chunk: EgressChunk, n: usize) -> Poll<io::Result<usize>> {
+  fn send_chunk(
+    &mut self,
+    cx: &mut Context<'_>,
+    chunk: EgressChunk,
+    n: usize,
+  ) -> Poll<io::Result<usize>> {
     match self.tx_to_worker_sync.try_send(chunk) {
       Ok(()) => {
         self.wake_worker_if_asleep();
@@ -258,7 +268,9 @@ impl UringWriteHalf {
 
   /// Fire-and-forget TCP_CORK toggle.
   pub(crate) fn set_cork(&self, enable: bool) {
-    let _ = self.tx_to_worker_sync.try_send(EgressChunk::SetCork(enable));
+    let _ = self
+      .tx_to_worker_sync
+      .try_send(EgressChunk::SetCork(enable));
     self.wake_worker_if_asleep();
   }
 }
@@ -271,6 +283,9 @@ impl AsyncWrite for UringWriteHalf {
   ) -> Poll<io::Result<usize>> {
     let n = buf.len();
 
+    // VERY IMPORTANT: If we already failed to enqueue this exact buffer last time
+    // due to channel backpressure, we MUST resolve that pending future before doing
+    // anything else. `AsyncWrite` dictates the caller provides the *same* buffer on retry.
     if let Some(result) = self.poll_pending_write(cx) {
       return result;
     }
@@ -281,7 +296,14 @@ impl AsyncWrite for UringWriteHalf {
           if n <= lease.capacity {
             // SAFETY: lease.ptr is exclusively held by this lease, capacity verified above.
             unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), lease.ptr, n) };
-            return self.send_chunk(cx, EgressChunk::LeasedZeroCopy { lease, actual_len: n }, n);
+            return self.send_chunk(
+              cx,
+              EgressChunk::LeasedZeroCopy {
+                lease,
+                actual_len: n,
+              },
+              n,
+            );
           }
         }
       }
@@ -341,7 +363,10 @@ pub(crate) struct UringStream {
   current_lease: Option<Bytes>,
   tx_to_worker_sync: fibre::mpsc::BoundedSender<EgressChunk>,
   tx_to_worker_async: fibre::mpsc::BoundedAsyncSender<EgressChunk>,
-  pending_write: Option<(usize, Pin<Box<dyn Future<Output = Result<(), fibre::SendError>> + Send>>)>,
+  pending_write: Option<(
+    usize,
+    Pin<Box<dyn Future<Output = Result<(), fibre::SendError>> + Send>>,
+  )>,
   worker_asleep: Arc<AtomicBool>,
   event_fd: EventFD,
   pool: Option<Arc<SendBufferPool>>,
@@ -403,7 +428,12 @@ impl UringStream {
     }
   }
 
-  fn send_chunk(&mut self, cx: &mut Context<'_>, chunk: EgressChunk, n: usize) -> Poll<io::Result<usize>> {
+  fn send_chunk(
+    &mut self,
+    cx: &mut Context<'_>,
+    chunk: EgressChunk,
+    n: usize,
+  ) -> Poll<io::Result<usize>> {
     match self.tx_to_worker_sync.try_send(chunk) {
       Ok(()) => {
         self.wake_worker_if_asleep();
@@ -436,15 +466,18 @@ impl UringStream {
   }
 
   pub(crate) fn set_cork(&self, enable: bool) {
-    let _ = self.tx_to_worker_sync.try_send(EgressChunk::SetCork(enable));
+    let _ = self
+      .tx_to_worker_sync
+      .try_send(EgressChunk::SetCork(enable));
     self.wake_worker_if_asleep();
   }
-
 }
 
 impl std::fmt::Debug for UringStream {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("UringStream").field("fd", &self.fd).finish_non_exhaustive()
+    f.debug_struct("UringStream")
+      .field("fd", &self.fd)
+      .finish_non_exhaustive()
   }
 }
 
@@ -517,7 +550,14 @@ impl AsyncWrite for UringStream {
           if n <= lease.capacity {
             // SAFETY: lease.ptr is exclusively held, capacity verified above.
             unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), lease.ptr, n) };
-            return self.send_chunk(cx, EgressChunk::LeasedZeroCopy { lease, actual_len: n }, n);
+            return self.send_chunk(
+              cx,
+              EgressChunk::LeasedZeroCopy {
+                lease,
+                actual_len: n,
+              },
+              n,
+            );
           }
         }
       }
@@ -560,6 +600,54 @@ impl AsyncWrite for UringStream {
 
   fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
     Poll::Ready(Ok(()))
+  }
+}
+
+impl ZmtpWriteHalf for UringWriteHalf {
+  fn supports_owned_write(&self) -> bool {
+    true
+  }
+
+  fn write_owned(
+    &mut self,
+    bufs: Vec<bytes::Bytes>,
+  ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+    let non_empty: Vec<_> = bufs.into_iter().filter(|b| !b.is_empty()).collect();
+    let tx_sync = self.tx_to_worker_sync.clone();
+    let tx_async = self.tx_to_worker_async.clone();
+    let worker_asleep = self.worker_asleep.clone();
+    let event_fd = self.event_fd.clone();
+
+    async move {
+      if non_empty.is_empty() {
+        return Ok(());
+      }
+      let chunk = EgressChunk::Vectored(non_empty);
+      match tx_sync.try_send(chunk) {
+        Ok(()) => {
+          if worker_asleep.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = event_fd.write(1);
+          }
+          Ok(())
+        }
+        Err(fibre::TrySendError::Full(c)) => {
+          tx_async.send(c).await.map_err(|_| {
+            std::io::Error::new(
+              std::io::ErrorKind::ConnectionAborted,
+              "UringWriteHalf: worker channel closed",
+            )
+          })?;
+          if worker_asleep.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = event_fd.write(1);
+          }
+          Ok(())
+        }
+        Err(_) => Err(std::io::Error::new(
+          std::io::ErrorKind::ConnectionAborted,
+          "UringWriteHalf: worker channel closed",
+        )),
+      }
+    }
   }
 }
 

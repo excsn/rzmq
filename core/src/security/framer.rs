@@ -31,6 +31,16 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
     Ok((merged, None))
   }
 
+  /// Frames a batch of message groups and returns a flat list of owned `Bytes` objects
+  /// suitable for `ZmtpWriteHalf::write_owned` — no payload copying for null framers.
+  ///
+  /// Layout: `[hdr₁, payload₁, hdr₂, payload₂, ...]` where empty payloads are omitted.
+  /// `NullFramer` overrides this for true zero-copy (payload is an Arc refcount increment).
+  /// Encrypted framers use this default which falls back to a single encrypted buffer.
+  fn frame_vectored(&mut self, batch: &[Vec<Msg>]) -> Result<Vec<Bytes>, ZmqError> {
+    Ok(vec![self.write_msg_batch(batch)?])
+  }
+
   /// Parse as many complete ZMTP frames as possible from an owned `Bytes` buffer and return
   /// them as a batch. Frames are returned as `Msg` objects holding sub-slices of `data`
   /// (zero-copy for `NullFramer`; decrypted copy for encrypted framers).
@@ -56,6 +66,7 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
 pub(crate) struct NullFramer {
   parser: ZmtpManualParser,
   coalesce_buffer: BytesMut,
+  header_slab: BytesMut,
 }
 
 impl NullFramer {
@@ -63,6 +74,7 @@ impl NullFramer {
     Self {
       parser: ZmtpManualParser::new(max_msg_size),
       coalesce_buffer: BytesMut::with_capacity(65536),
+      header_slab: BytesMut::with_capacity(4096),
     }
   }
 }
@@ -112,6 +124,34 @@ impl ISecureFramer for NullFramer {
     }
 
     Ok((hdr.freeze(), Some(payload)))
+  }
+
+  fn frame_vectored(&mut self, batch: &[Vec<Msg>]) -> Result<Vec<Bytes>, ZmqError> {
+    let total_msgs: usize = batch.iter().map(|g| g.len()).sum();
+    let mut out = Vec::with_capacity(total_msgs * 2);
+    for group in batch {
+      for msg in group {
+        let payload = msg.data_bytes().unwrap_or_default();
+        let payload_len = payload.len();
+        let is_more = msg.flags().contains(MsgFlags::MORE);
+
+        // Carve ZMTP frame header from the slab — one allocation per slab refill, not per message.
+        self.header_slab.reserve(9);
+        if payload_len <= 255 {
+          self.header_slab.put_u8(if is_more { 0x01 } else { 0x00 });
+          self.header_slab.put_u8(payload_len as u8);
+        } else {
+          self.header_slab.put_u8(if is_more { 0x03 } else { 0x02 });
+          self.header_slab.put_u64(payload_len as u64);
+        }
+        out.push(self.header_slab.split().freeze());
+
+        if !payload.is_empty() {
+          out.push(payload); // zero-copy: Arc refcount increment from Msg
+        }
+      }
+    }
+    Ok(out)
   }
 }
 

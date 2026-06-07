@@ -3,7 +3,7 @@
 use super::ZmtpProtocolHandlerX;
 use crate::error::ZmqError;
 use crate::message::Msg;
-use crate::transport::{ZmtpReadHalf, ZmtpStdStream};
+use crate::transport::{ZmtpReadHalf, ZmtpStdStream, ZmtpWriteHalf};
 
 use bytes::BytesMut;
 use std::time::Duration;
@@ -195,18 +195,39 @@ pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
     return Ok(());
   }
 
-  let writer = handler
-    .write_half
-    .as_mut()
-    .ok_or_else(|| ZmqError::Internal("Write half unavailable for writing data message".into()))?;
-
   let operation_timeout = handler.config.sndtimeo.unwrap_or(Duration::from_secs(300));
 
+  // Extract capability flag without holding a mutable borrow into the match arms.
+  let use_owned = handler
+    .write_half
+    .as_ref()
+    .map(|w| w.supports_owned_write())
+    .ok_or_else(|| ZmqError::Internal("Write half unavailable for writing data message".into()))?;
+
+  if use_owned {
+    let batch = [msgs];
+    let bufs = handler.framer.frame_vectored(&batch)?;
+    let writer = handler.write_half.as_mut().unwrap();
+    tokio::time::timeout(operation_timeout, writer.write_owned(bufs))
+      .await
+      .map_err(|_| ZmqError::Timeout)?
+      .map_err(|e| ZmqError::from_io_endpoint(e, "data write"))?;
+    handler.heartbeat_state.record_activity();
+    return Ok(());
+  }
+
+  // TCP/IPC/inproc: cork + write_all path (cancel-safe via EgressBuffer in the hot path;
+  // here it's called for control messages where cancellation is not a concern).
   let socket_type = handler.config.socket_type_name.as_str();
   let is_latency_pattern = matches!(socket_type, "REQ" | "REP" | "DEALER" | "ROUTER");
   let should_dynamic_cork = is_latency_pattern && msgs.len() > 1;
 
   let wire_bytes_to_send = handler.framer.write_msg_multipart(msgs)?;
+
+  let writer = handler
+    .write_half
+    .as_mut()
+    .ok_or_else(|| ZmqError::Internal("Write half unavailable for writing data message".into()))?;
 
   #[cfg(target_os = "linux")]
   {

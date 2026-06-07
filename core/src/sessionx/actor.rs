@@ -7,7 +7,7 @@ use crate::sessionx::regulator::SessionRegulator;
 use crate::socket::ISocket;
 use crate::socket::options::ZmtpEngineConfig;
 use crate::throttle::AdaptiveThrottle;
-use crate::transport::ZmtpStdStream;
+use crate::transport::{ZmtpStdStream, ZmtpWriteHalf};
 use crate::{Blob, MailboxReceiver};
 
 use futures::FutureExt;
@@ -229,6 +229,10 @@ where
       let mut write_half = self.zmtp_handler.write_half.take()
         .expect("write_half must be present at operational start");
 
+      let use_owned_write = write_half.supports_owned_write();
+      let mut pending_vectored: std::collections::VecDeque<Vec<bytes::Bytes>> =
+        std::collections::VecDeque::new();
+
       'operational: while self.current_phase == ConnectionPhaseX::Operational {
         let mut pong_timeout_future = futures::future::pending().left_future();
         if self.zmtp_handler.heartbeat_state.waiting_for_pong {
@@ -333,14 +337,28 @@ where
             }
           }
 
-          // Egress: drains egress_buffer; no zmtp_handler borrow
-          egress_res = async {
+          // Unified write arm: priority egress (EgressBuffer pings/pongs) drains before
+          // zero-copy data. Only one arm borrows write_half so the borrow checker is happy.
+          // Some(n) = AsyncWrite bytes advanced; None = write_owned completed.
+          write_res = async {
             use tokio::io::AsyncWriteExt;
-            write_half.write(egress_buffer.current_slice().unwrap()).await
-          }, if egress_buffer.current_slice().is_some() => {
-            match egress_res {
-              Ok(n) => {
+            if egress_buffer.current_slice().is_some() {
+              let n = write_half.write(egress_buffer.current_slice().unwrap()).await?;
+              Ok::<Option<usize>, std::io::Error>(Some(n))
+            } else {
+              let bufs = pending_vectored.front().cloned().unwrap_or_default();
+              write_half.write_owned(bufs).await?;
+              Ok(None)
+            }
+          }, if egress_buffer.current_slice().is_some()
+              || (use_owned_write && pending_vectored.front().is_some()) => {
+            match write_res {
+              Ok(Some(n)) => {
                 egress_buffer.advance(n);
+                self.zmtp_handler.heartbeat_state.record_activity();
+              }
+              Ok(None) => {
+                pending_vectored.pop_front();
                 self.zmtp_handler.heartbeat_state.record_activity();
               }
               Err(e) => {
@@ -352,7 +370,11 @@ where
           // Outgoing from SocketCore
           maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
               if self.core_pipe_manager.is_attached()
-                && egress_buffer.total_pending_bytes() < EGRESS_BACKPRESSURE_BYTES => {
+                && if use_owned_write {
+                  pending_vectored.is_empty()
+                } else {
+                  egress_buffer.total_pending_bytes() < EGRESS_BACKPRESSURE_BYTES
+                } => {
             match maybe_msgs_from_core {
               Ok(first_msgs) => {
                 outgoing_batch.clear();
@@ -382,9 +404,16 @@ where
                   total_msgs as u32,
                 );
 
-                match self.zmtp_handler.frame_outgoing_batch(&outgoing_batch) {
-                  Ok(bytes) => egress_buffer.push(bytes),
-                  Err(e) => self.set_fatal_error(e).await,
+                if use_owned_write {
+                  match self.zmtp_handler.frame_outgoing_batch_vectored(&outgoing_batch) {
+                    Ok(bufs) => pending_vectored.push_back(bufs),
+                    Err(e) => self.set_fatal_error(e).await,
+                  }
+                } else {
+                  match self.zmtp_handler.frame_outgoing_batch(&outgoing_batch) {
+                    Ok(bytes) => egress_buffer.push(bytes),
+                    Err(e) => self.set_fatal_error(e).await,
+                  }
                 }
 
                 if throttle_guard.should_throttle() {
@@ -397,6 +426,7 @@ where
               }
             }
           }
+
         }
       }
 

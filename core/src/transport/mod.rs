@@ -39,7 +39,41 @@ pub(crate) trait ZmtpReadHalf: AsyncRead + Unpin + Send + std::fmt::Debug + 'sta
       "poll_recv_bytes not supported for this stream type",
     )))
   }
+}
 
+/// Extension trait for write halves that support ownership-transfer sends.
+///
+/// Transports that implement a Proactor I/O model (io_uring) can accept a
+/// `Vec<Bytes>` and hold the references alive in the kernel until the write
+/// completes — eliminating the memcpy that `AsyncWrite::poll_write` requires.
+///
+/// Standard transports (TCP, IPC, inproc) use the default `supports_owned_write`
+/// returning `false` and leave `write_owned` unimplemented; the session actor
+/// routes them through the cancel-safe `EgressBuffer` + `AsyncWrite` path instead.
+pub(crate) trait ZmtpWriteHalf: AsyncWrite + Unpin + Send + std::fmt::Debug + 'static {
+  /// Returns `true` only for transports that provide a cancel-safe zero-copy
+  /// `write_owned` implementation. TCP/IPC default to `false`.
+  fn supports_owned_write(&self) -> bool {
+    false
+  }
+
+  /// Transfers ownership of `bufs` to the transport without copying bytes.
+  /// Only called when `supports_owned_write()` is `true`.
+  ///
+  /// Cancel-safety: callers hold the original `Vec<Bytes>` outside this future
+  /// (passing a `.clone()`) so that if the future is dropped mid-await the data
+  /// is not lost — the caller retries on the next loop iteration.
+  fn write_owned(
+    &mut self,
+    _bufs: Vec<bytes::Bytes>,
+  ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+    async {
+      Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "write_owned not supported for this transport",
+      ))
+    }
+  }
 }
 
 /// Trait alias for full-duplex streams usable by ZMTP connection actors.
@@ -53,8 +87,9 @@ pub(crate) trait ZmtpStdStream:
 {
   /// The owned read half returned by `into_split`.
   type ReadHalf: ZmtpReadHalf;
-  /// The owned write half returned by `into_split`.
-  type WriteHalf: AsyncWrite + Unpin + Send + std::fmt::Debug + 'static;
+  /// The owned write half returned by `into_split`. Must also satisfy `ZmtpWriteHalf`
+  /// for capability-gated zero-copy egress on io_uring connections.
+  type WriteHalf: ZmtpWriteHalf;
 
   /// Consume the stream and produce independent, owned read and write halves.
   fn into_split(self) -> (Self::ReadHalf, Self::WriteHalf);
@@ -63,6 +98,9 @@ pub(crate) trait ZmtpStdStream:
 // --- TCP ---
 
 impl ZmtpReadHalf for tokio::net::tcp::OwnedReadHalf {}
+
+// Empty impl — TCP uses EgressBuffer + AsyncWrite path (supports_owned_write = false).
+impl ZmtpWriteHalf for tokio::net::tcp::OwnedWriteHalf {}
 
 impl ZmtpStdStream for tokio::net::TcpStream {
   type ReadHalf = tokio::net::tcp::OwnedReadHalf;
@@ -77,6 +115,10 @@ impl ZmtpStdStream for tokio::net::TcpStream {
 
 #[cfg(feature = "ipc")]
 impl ZmtpReadHalf for tokio::net::unix::OwnedReadHalf {}
+
+// Empty impl — IPC uses EgressBuffer + AsyncWrite path (supports_owned_write = false).
+#[cfg(feature = "ipc")]
+impl ZmtpWriteHalf for tokio::net::unix::OwnedWriteHalf {}
 
 #[cfg(feature = "ipc")]
 impl ZmtpStdStream for tokio::net::UnixStream {
