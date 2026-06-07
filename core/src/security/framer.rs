@@ -17,12 +17,39 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
   /// This eliminates per-message allocation and enables single-syscall transmission.
   fn write_msg_batch(&mut self, batch: &[Vec<Msg>]) -> Result<Bytes, ZmqError>;
 
+  /// Returns `true` when the framer performs no encryption — wire bytes ARE the message bytes.
+  /// `false` (default) gates off the zero-copy lease path for encrypted connections.
+  fn is_passthrough(&self) -> bool {
+    false
+  }
+
   /// Frames a single Msg and returns `(header, Some(payload))` for vectored I/O, the
   /// header contains only the ZMTP frame prefix (≤9 bytes) and payload is a zero-copy
   /// ref to the message data. Encrypted framers fall back to `(merged_bytes, None)`.
   fn write_msg_split(&mut self, msg: Msg) -> Result<(Bytes, Option<Bytes>), ZmqError> {
     let merged = self.write_msg_multipart(vec![msg])?;
     Ok((merged, None))
+  }
+
+  /// Parse as many complete ZMTP frames as possible from an owned `Bytes` buffer and return
+  /// them as a batch. Frames are returned as `Msg` objects holding sub-slices of `data`
+  /// (zero-copy for `NullFramer`; decrypted copy for encrypted framers).
+  ///
+  /// If a frame straddles the end of `data`, the partial header bytes (max 9) are appended
+  /// to `leftover` for assembly with the next incoming `Bytes`.
+  fn try_read_msgs_from_bytes(
+    &mut self,
+    data: Bytes,
+    accumulator: &mut BytesMut,
+  ) -> Result<Vec<Msg>, ZmqError> {
+    // Default: append to accumulator and parse via the existing try_read_msg path.
+    // NullFramer overrides this for zero-copy slice parsing within `data`.
+    accumulator.extend_from_slice(&data);
+    let mut msgs = Vec::new();
+    while let Some(msg) = self.try_read_msg(accumulator)? {
+      msgs.push(msg);
+    }
+    Ok(msgs)
   }
 }
 
@@ -41,6 +68,10 @@ impl NullFramer {
 }
 
 impl ISecureFramer for NullFramer {
+  fn is_passthrough(&self) -> bool {
+    true
+  }
+
   fn try_read_msg(&mut self, network_buffer: &mut BytesMut) -> Result<Option<Msg>, ZmqError> {
     self.parser.decode_from_buffer(network_buffer)
   }

@@ -60,8 +60,8 @@ impl HandlerManager {
     endpoint_uri: String,
     target_endpoint_uri: String,
     connection_iface: Arc<dyn ISocketConnection>,
-    inbound_data_tx: fibre::mpmc::Sender<Vec<Msg>>,
-    inbound_data_rx: fibre::mpmc::AsyncReceiver<Vec<Msg>>,
+    inbound_data_tx: fibre::mpsc::BoundedSender<Vec<Msg>>,
+    inbound_data_rx: fibre::mpsc::BoundedAsyncReceiver<Vec<Msg>>,
     buffer_manager_for_interface: Option<&'a BufferRingManager>,
     default_bgid_val_from_worker: Option<u16>,
     originating_op_ud_for_connection: UserData,
@@ -109,10 +109,33 @@ impl HandlerManager {
       buffer_manager_for_interface,
       default_bgid_val_from_worker,
       originating_op_ud_for_connection,
+      0,
     );
 
     let initial_ops = handler_box.connection_ready(&interface_for_ready);
     self.handlers.insert(fd, handler_box);
+    Ok(initial_ops)
+  }
+
+  /// Adds a pre-built handler (bypasses the factory), calls `connection_ready`, and stores it.
+  /// Used by `RegisterExternalByteFd` to inject a `UringByteHandler` directly.
+  pub(crate) fn add_handler_directly(
+    &mut self,
+    fd: RawFd,
+    mut handler: Box<dyn UringConnectionHandler + Send>,
+    buffer_manager: Option<&BufferRingManager>,
+    default_bgid: Option<u16>,
+    originating_op_ud: UserData,
+  ) -> Result<HandlerIoOps, String> {
+    if self.handlers.contains_key(&fd) {
+      return Err(format!("HandlerManager: FD {} already registered, cannot add_handler_directly", fd));
+    }
+    let config_clone = handler.io_config().clone();
+    let interface =
+      UringWorkerInterface::new(fd, &config_clone, buffer_manager, default_bgid, originating_op_ud, 0);
+    let initial_ops = handler.connection_ready(&interface);
+    self.handlers.insert(fd, handler);
+    info!("HandlerManager: Directly added handler for FD {} via add_handler_directly.", fd);
     Ok(initial_ops)
   }
 
@@ -141,11 +164,13 @@ impl HandlerManager {
     &mut self,
     buffer_manager_for_interface: Option<&'a BufferRingManager>,
     default_bgid_val_from_worker: Option<u16>,
+    get_pending_egress: impl Fn(RawFd) -> usize,
   ) -> Vec<(RawFd, HandlerIoOps)> {
     let mut all_ops = Vec::new();
     const PREPARE_SQES_SENTINEL_UD: UserData = 0;
 
     for (fd, handler) in self.handlers.iter_mut() {
+      let pending_egress = get_pending_egress(*fd);
       let io_config = handler.io_config().clone();
       let interface = UringWorkerInterface::new(
         *fd,
@@ -153,6 +178,7 @@ impl HandlerManager {
         buffer_manager_for_interface,
         default_bgid_val_from_worker,
         PREPARE_SQES_SENTINEL_UD,
+        pending_egress,
       );
       trace!("HandlerManager: Calling prepare_sqes for FD {}", fd);
       let handler_output = handler.prepare_sqes(&interface);

@@ -235,6 +235,12 @@ pub(crate) async fn initiate_core_shutdown(
 
   drop(coordinator); // Release coordinator lock before async calls
 
+  // Eagerly close the incoming queue so that any run_uring_pipe_reader tasks currently
+  // blocked on push_item().await are immediately unblocked and can exit cleanly.
+  // This must happen before we wait for connections to close, otherwise a full queue
+  // will deadlock: the reader task holds a ref the connection needs to drop.
+  let _ = socket_logic_strong.process_command(Command::Stop).await;
+
   stop_child_listener_actors(core_arc.clone(), child_actors_to_stop).await;
   close_active_connections(core_arc.clone(), connections_to_close).await;
 

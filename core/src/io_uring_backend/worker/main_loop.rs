@@ -4,10 +4,10 @@ use super::{ExternalOpContext, UringWorker, cqe_processor};
 use crate::ZmqError;
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{HandlerSqeBlueprint, UringWorkerInterface};
-use crate::io_uring_backend::ops::{HANDLER_INTERNAL_SEND_OP_UD, UringOpCompletion, UringOpRequest};
+use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest};
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerState};
+use crate::uring::UringPollingStrategy;
 
-use bytes::BufMut;
 use crate::profiler::LoopProfiler;
 use crate::transport::endpoint::parse_endpoint;
 
@@ -284,29 +284,21 @@ impl UringWorker {
           }
         }
       }
-      UringOpRequest::RegisterExternalFd {
+      UringOpRequest::RegisterExternalByteFd {
         user_data,
         fd,
-        protocol_handler_factory_id,
-        protocol_config,
-        is_server_role,
-        endpoint_uri,
-        target_endpoint_uri,
-        connection_iface,
         socket_mailbox,
         reply_tx,
-        mpsc_rx_for_worker,
-        inbound_data_tx,
-        inbound_data_rx,
+        raw_inbound_tx,
+        raw_egress_rx,
       } => {
-        // This logic doesn't submit an SQE, so it's safe.
         self.external_op_tracker.add_op(
           user_data,
           ExternalOpContext {
-            reply_tx: reply_tx.clone(),
+            reply_tx,
             op_name: op_name_str.clone(),
-            protocol_handler_factory_id: Some(protocol_handler_factory_id.clone()),
-            protocol_config: Some(protocol_config.clone()),
+            protocol_handler_factory_id: None,
+            protocol_config: None,
             socket_mailbox: None,
             fd_created_for_connect_op: None,
             listener_fd: None,
@@ -314,45 +306,39 @@ impl UringWorker {
             multipart_state: None,
           },
         );
-        self.fd_to_mpsc_rx.insert(fd, mpsc_rx_for_worker);
-        match self.handler_manager.create_and_add_handler(
+
+        let use_zc = self.cfg_send_zerocopy_enabled && self.send_buffer_pool.is_some();
+        let handler = crate::io_uring_backend::byte_handler::UringByteHandler::new(
           fd,
-          &protocol_handler_factory_id,
-          &protocol_config,
-          is_server_role,
           socket_mailbox,
-          endpoint_uri,
-          target_endpoint_uri,
-          connection_iface,
-          inbound_data_tx,
-          inbound_data_rx,
+          format!("fd:{}", fd),
+          String::new(),
+          raw_inbound_tx,
+          raw_egress_rx,
+          use_zc,
+        );
+
+        match self.handler_manager.add_handler_directly(
+          fd,
+          Box::new(handler),
           self.buffer_manager.as_ref(),
           self.default_buffer_ring_group_id_val,
           user_data,
         ) {
           Ok(initial_ops) => {
             if !initial_ops.sqe_blueprints.is_empty() {
-              self
-                .work_map
-                .entry(fd)
-                .or_default()
-                .route_blueprints(initial_ops.sqe_blueprints);
+              self.work_map.entry(fd).or_default().route_blueprints(initial_ops.sqe_blueprints);
             }
-
             if initial_ops.initiate_close_due_to_error {
               self.fds_needing_close_initiated_pass.push_back(fd);
             }
             if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
               let _ = ctx
                 .reply_tx
-                .send(Ok(UringOpCompletion::RegisterExternalFdSuccess {
-                  user_data,
-                  fd,
-                }));
+                .send(Ok(UringOpCompletion::RegisterExternalByteFdSuccess { user_data, fd }));
             }
           }
           Err(err_msg) => {
-            self.fd_to_mpsc_rx.remove(&fd);
             if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
               let _ = ctx.reply_tx.send(Ok(UringOpCompletion::OpError {
                 user_data,
@@ -409,6 +395,15 @@ impl UringWorker {
         self.fds_needing_close_initiated_pass.push_back(fd);
       }
 
+      UringOpRequest::RecycleRecvBuffer { id } => {
+        if let Some(ref bm) = self.buffer_manager {
+          if let Err(e) = unsafe { bm.reprovide_buffer(id) } {
+            warn!("UringWorker: reprovide_buffer({}) failed: {:?}", id, e);
+          }
+        }
+        // fire-and-forget: no reply_tx
+      }
+
       UringOpRequest::ResumeConnection { fd } => {
         // UringPipeReader drained below LWM — re-open kernel-side reads for this FD.
         // Use a scoped block so the mutable borrow of handler_manager ends before
@@ -420,7 +415,8 @@ impl UringWorker {
             // Clone the config so the immutable borrow of `handler` ends before
             // `on_resume_connection` takes `&mut self`.
             let io_config = handler.io_config().clone();
-            let interface = UringWorkerInterface::new(fd, &io_config, buffer_manager, default_bgid, 0);
+            let pending_egress = self.work_map.get(&fd).map_or(0, |w| w.egress_blueprints.len());
+            let interface = UringWorkerInterface::new(fd, &io_config, buffer_manager, default_bgid, 0, pending_egress);
             Some(handler.on_resume_connection(&interface))
           } else {
             None
@@ -435,6 +431,15 @@ impl UringWorker {
       }
     }
   }
+}
+
+/// Non-consuming check: true if any inbound channel or the CQ ring has pending work.
+/// Called from spinning phases — must never block or allocate.
+#[inline(always)]
+fn has_pending_work(worker: &UringWorker) -> bool {
+  !worker.op_rx.is_empty()
+    || worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty())
+    || unsafe { !worker.ring.completion_shared().is_empty() }
 }
 
 pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> {
@@ -484,12 +489,14 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               let mut converted = 0usize;
               while let Ok(msg_parts) = rx.try_recv() {
                 work_was_available = true;
+                let pending_egress = worker.work_map.get(fd).map_or(0, |w| w.egress_blueprints.len());
                 let interface = UringWorkerInterface::new(
                   *fd,
                   &io_config,
                   worker.buffer_manager.as_ref(),
                   worker.default_buffer_ring_group_id_val,
                   0,
+                  pending_egress,
                 );
                 let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
                 worker
@@ -510,6 +517,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         let handler_ops_list = worker.handler_manager.prepare_all_handler_io_ops(
           worker.buffer_manager.as_ref(),
           worker.default_buffer_ring_group_id_val,
+          |fd| worker.work_map.get(&fd).map_or(0, |w| w.egress_blueprints.len()),
         );
         if !handler_ops_list.is_empty() {
           work_was_available = true;
@@ -534,12 +542,14 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           work_was_available = true;
           if let Some(handler) = worker.handler_manager.get_mut(fd_to_close) {
             let io_config = handler.io_config().clone();
+            let pending_egress = worker.work_map.get(&fd_to_close).map_or(0, |w| w.egress_blueprints.len());
             let interface = UringWorkerInterface::new(
               fd_to_close,
               &io_config,
               worker.buffer_manager.as_ref(),
               worker.default_buffer_ring_group_id_val,
               0,
+              pending_egress,
             );
             let close_io_ops = handler.close_initiated(&interface);
             if !close_io_ops.sqe_blueprints.is_empty() {
@@ -603,59 +613,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 break; // Serialization gate: wait for in-flight CQE
               }
 
-              // Coalesce if the next pending item is also a write that fits within 64KB.
-              let next_is_write_and_fits = work.egress_blueprints.front()
-                .and_then(|bp| bp.write_len())
-                .map_or(false, |next_len| first_write_len + next_len <= 65536);
-
-              let blueprint_to_submit = if next_is_write_and_fits {
-                let mut coalesce_buf = worker.coalesce_buffer_pool
-                  .pop_front()
-                  .unwrap_or_else(|| bytes::BytesMut::with_capacity(65536));
-                coalesce_buf.clear();
-
-                match first_blueprint {
-                  HandlerSqeBlueprint::RequestSend { data, .. }
-                  | HandlerSqeBlueprint::RequestSendZeroCopy { data_to_send: data, .. } => {
-                    coalesce_buf.put(data);
-                  }
-                  HandlerSqeBlueprint::RequestSendVectored { header, payload, .. } => {
-                    coalesce_buf.put(header);
-                    coalesce_buf.put(payload);
-                  }
-                  _ => unreachable!(),
-                }
-
-                while let Some(next_bp) = work.egress_blueprints.front() {
-                  if let Some(next_len) = next_bp.write_len() {
-                    if coalesce_buf.len() + next_len > 65536 {
-                      break;
-                    }
-                    let bp = work.egress_blueprints.pop_front().unwrap();
-                    match bp {
-                      HandlerSqeBlueprint::RequestSend { data, .. }
-                      | HandlerSqeBlueprint::RequestSendZeroCopy { data_to_send: data, .. } => {
-                        coalesce_buf.put(data);
-                      }
-                      HandlerSqeBlueprint::RequestSendVectored { header, payload, .. } => {
-                        coalesce_buf.put(header);
-                        coalesce_buf.put(payload);
-                      }
-                      _ => unreachable!(),
-                    }
-                  } else {
-                    break; // Control op, stop coalescing
-                  }
-                }
-
-                HandlerSqeBlueprint::RequestSend {
-                  data: coalesce_buf.freeze(),
-                  send_op_flags: 0,
-                  originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
-                }
-              } else {
-                first_blueprint
-              };
+              let blueprint_to_submit = first_blueprint;
 
               if let Err(returned_bp) =
                 cqe_processor::process_handler_blueprint(worker, fd, blueprint_to_submit)
@@ -769,14 +727,95 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
         if sq_len > 0 || needs_wait {
           let submitted_count_res = if needs_wait {
-            let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
-            let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
-            worker.worker_asleep.store(true, Ordering::Release);
-            let res = worker.ring.submitter().submit_with_args(1, &submit_args);
-            worker.worker_asleep.store(false, Ordering::Release);
-            res
+            // --- User-space spinning before kernel sleep ---
+            // worker_asleep stays false during all spin phases, so UringStream
+            // never fires an EventFD write while the worker is actively spinning.
+            let mut spin_found_work = false;
+
+            match worker.cfg_polling_strategy {
+              UringPollingStrategy::ImmediateSleep => {
+                // Skip all spinning; fall straight through to deep sleep.
+              }
+              UringPollingStrategy::Tiered {
+                aggressive_spin_limit,
+                cooperative_spin_limit,
+                os_yield_limit,
+                ..
+              } => {
+                // Phase 1 — Aggressive: tight loop, no yield hints.
+                for _ in 0..aggressive_spin_limit {
+                  if has_pending_work(worker) { spin_found_work = true; break; }
+                }
+                // Phase 2 — Cooperative: CPU pipeline pause hints.
+                if !spin_found_work {
+                  for _ in 0..cooperative_spin_limit {
+                    if has_pending_work(worker) { spin_found_work = true; break; }
+                    std::hint::spin_loop();
+                  }
+                }
+                // Phase 3 — OS yield: cooperate with the scheduler.
+                if !spin_found_work {
+                  for _ in 0..os_yield_limit {
+                    if has_pending_work(worker) { spin_found_work = true; break; }
+                    std::thread::yield_now();
+                  }
+                }
+              }
+            }
+
+            if spin_found_work {
+              // Work detected during spinning — resume immediately without sleeping.
+              work_was_available = true;
+              Ok(0)
+            } else {
+              // All spin phases exhausted without finding work.
+              let should_sleep = match worker.cfg_polling_strategy {
+                UringPollingStrategy::ImmediateSleep => true,
+                UringPollingStrategy::Tiered { deep_sleep_fallback, .. } => deep_sleep_fallback,
+              };
+
+              if should_sleep {
+                let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
+                let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
+                // Double-check pattern: announce sleep, re-drain, then block.
+                // Closes the race: if a sender pushed after the Phase 1 drain, it either
+                // saw worker_asleep=true (wrote eventfd to wake us) or its message is
+                // now visible via is_empty() below.
+                worker.worker_asleep.store(true, Ordering::Release);
+                let late_work = worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty());
+                if late_work {
+                  worker.worker_asleep.store(false, Ordering::Release);
+                  work_was_available = true;
+                  Ok(0)
+                } else {
+                  let res = worker.ring.submitter().submit_with_args(1, &submit_args);
+                  worker.worker_asleep.store(false, Ordering::Release);
+                  res
+                }
+              } else {
+                // ultra_low_latency with deep_sleep_fallback=false: never sleep.
+                // Re-enter the loop immediately.
+                Ok(0)
+              }
+            }
           } else {
-            worker.ring.submitter().submit()
+            // Non-waiting path: pending SQEs to submit.
+            // With SQPOLL enabled, skip the syscall when the kernel polling thread is awake.
+            // A SeqCst fence is required before reading IORING_SQ_NEED_WAKEUP to guarantee
+            // the kernel has observed our SQ tail update (io_uring spec §5.2).
+            let needs_syscall = if worker.cfg_sqpoll_active {
+              std::sync::atomic::fence(Ordering::SeqCst);
+              unsafe { worker.ring.submission_shared().need_wakeup() }
+            } else {
+              true
+            };
+
+            if needs_syscall {
+              worker.ring.submitter().submit()
+            } else {
+              trace!("UringWorker: SQPOLL kernel thread active — bypassed submit() syscall.");
+              Ok(sq_len)
+            }
           };
           match submitted_count_res {
             Ok(count) => {

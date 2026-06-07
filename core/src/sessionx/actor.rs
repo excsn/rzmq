@@ -20,6 +20,7 @@ use tokio::sync::{OwnedSemaphorePermit, broadcast};
 use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
+use super::egress_buffer::EgressBuffer;
 use super::pipe_manager::CorePipeManagerX;
 use super::protocol_handler::ZmtpProtocolHandlerX;
 use super::states::ActorConfigX;
@@ -160,36 +161,30 @@ where
     let mut outgoing_batch: Vec<Vec<Msg>> =
       Vec::with_capacity(self.zmtp_handler.config.sndbatch_count);
 
-    // --- Main Loop ---
-    while self.current_phase != ConnectionPhaseX::Terminating {
+    let mut egress_buffer = EgressBuffer::new();
+    const EGRESS_BACKPRESSURE_BYTES: usize = 256 * 1024;
+
+    // ── HANDSHAKE LOOP ────────────────────────────────────────────────────────
+    // zmtp_handler owns both halves here; advance_handshake() drives all I/O.
+    // Exits when phase leaves HandshakeInProgress/WaitingForPipes, or on shutdown.
+    'handshake: while matches!(
+      self.current_phase,
+      ConnectionPhaseX::HandshakeInProgress | ConnectionPhaseX::WaitingForPipes
+    ) {
       if self.current_phase == ConnectionPhaseX::ShuttingDownStream {
         self.perform_graceful_shutdown().await;
-        continue;
-      }
-
-      let mut pong_timeout_future = futures::future::pending().left_future();
-      if self.current_phase == ConnectionPhaseX::Operational
-        && self.zmtp_handler.heartbeat_state.waiting_for_pong
-      {
-        if let Some(deadline_std) = self.zmtp_handler.heartbeat_state.get_pong_deadline() {
-          // Convert std::time::Instant to tokio::time::Instant
-          let deadline_tokio = TokioInstant::from_std(deadline_std);
-          pong_timeout_future = tokio::time::sleep_until(deadline_tokio).right_future();
-        }
+        break 'handshake;
       }
 
       let mut overall_handshake_timeout_future = futures::future::pending().left_future();
-      if self.current_phase == ConnectionPhaseX::HandshakeInProgress {
-        if let Some(deadline) = self.handshake_deadline {
-          overall_handshake_timeout_future = tokio::time::sleep_until(deadline).right_future();
-        }
+      if let Some(deadline) = self.handshake_deadline {
+        overall_handshake_timeout_future = tokio::time::sleep_until(deadline).right_future();
       }
 
       tokio::select! {
         biased;
 
-        // --- ARM 1: Control Commands (AttachPipes, Stop) ---
-        maybe_cmd = self.command_mailbox_receiver.recv(), if !matches!(self.current_phase, ConnectionPhaseX::Terminating) => {
+        maybe_cmd = self.command_mailbox_receiver.recv() => {
           match maybe_cmd {
             Ok(command) => self.process_command(command).await,
             Err(_) => {
@@ -199,8 +194,7 @@ where
           }
         }
 
-        // --- ARM 2: System Events (ContextTerminating, SocketClosing for parent) ---
-        maybe_event = self.system_event_receiver.recv(), if !matches!(self.current_phase, ConnectionPhaseX::Terminating) => {
+        maybe_event = self.system_event_receiver.recv() => {
           match maybe_event {
             Ok(event) => self.process_system_event(event).await,
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -212,38 +206,82 @@ where
           }
         }
 
-        // --- ARM 3: Overall Handshake Timeout ---
-        _ = overall_handshake_timeout_future, if self.current_phase == ConnectionPhaseX::HandshakeInProgress && self.handshake_deadline.is_some() => {
-            tracing::warn!(sca_handle = self.handle, uri = %self.actor_config.connected_endpoint_uri, "Overall ZMTP handshake timed out.");
-            self.set_fatal_error(ZmqError::Timeout).await; // Specific handshake timeout error if desired
+        _ = overall_handshake_timeout_future, if self.handshake_deadline.is_some() => {
+          tracing::warn!(sca_handle = self.handle, uri = %self.actor_config.connected_endpoint_uri, "Overall ZMTP handshake timed out.");
+          self.set_fatal_error(ZmqError::Timeout).await;
         }
 
-        // --- ARM 5: Ping Check Timer ---
-        _ = async { self.ping_check_timer.as_mut().map_or(futures::future::pending().left_future(), |t| t.tick().right_future()).await },
-            if self.current_phase == ConnectionPhaseX::Operational && self.ping_check_timer.is_some() => {
-            if let Err(e) = self.zmtp_handler.maybe_send_ping().await {
-                self.set_fatal_error(e).await;
-            }
+        handshake_res = self.zmtp_handler.advance_handshake(),
+            if self.current_phase == ConnectionPhaseX::HandshakeInProgress => {
+          match handshake_res {
+            Ok(p) => self.handle_handshake_progression(p).await,
+            Err(e) => self.set_fatal_error(e).await,
+          }
         }
+      }
+    }
 
-        // --- ARM 6: Pong Timeout ---
-        _ = pong_timeout_future,
-          if self.current_phase == ConnectionPhaseX::Operational && self.zmtp_handler.heartbeat_state.waiting_for_pong => {
-          if self.zmtp_handler.has_pong_timed_out() {
-            self.set_fatal_error(ZmqError::Timeout).await;
+    // ── OPERATIONAL LOOP ──────────────────────────────────────────────────────
+    // Split halves into local variables so ingress and egress arms are independent.
+    if self.current_phase == ConnectionPhaseX::Operational {
+      let mut read_half = self.zmtp_handler.read_half.take()
+        .expect("read_half must be present at operational start");
+      let mut write_half = self.zmtp_handler.write_half.take()
+        .expect("write_half must be present at operational start");
+
+      'operational: while self.current_phase == ConnectionPhaseX::Operational {
+        let mut pong_timeout_future = futures::future::pending().left_future();
+        if self.zmtp_handler.heartbeat_state.waiting_for_pong {
+          if let Some(deadline_std) = self.zmtp_handler.heartbeat_state.get_pong_deadline() {
+            let deadline_tokio = TokioInstant::from_std(deadline_std);
+            pong_timeout_future = tokio::time::sleep_until(deadline_tokio).right_future();
           }
         }
 
-        // --- ARM: Network I/O (Handshake or Data) ---
-        network_res = self.zmtp_handler.do_network_read_work(self.current_phase),
-          if matches!(self.current_phase, ConnectionPhaseX::HandshakeInProgress | ConnectionPhaseX::Operational)
-            && self.zmtp_handler.stream.is_some() => {
-          match network_res {
-            Ok(crate::sessionx::protocol_handler::NetworkActionX::HandshakeProgress(progress)) => {
-              self.handle_handshake_progression(progress).await;
+        tokio::select! {
+          biased;
+
+          maybe_cmd = self.command_mailbox_receiver.recv() => {
+            match maybe_cmd {
+              Ok(command) => self.process_command(command).await,
+              Err(_) => {
+                tracing::info!(sca_handle = self.handle, "SCA Command mailbox closed.");
+                self.transition_to_shutdown_stream(None).await;
+              }
             }
-            Ok(crate::sessionx::protocol_handler::NetworkActionX::DataBatch(msgs)) => {
-              if !msgs.is_empty() {
+          }
+
+          maybe_event = self.system_event_receiver.recv() => {
+            match maybe_event {
+              Ok(event) => self.process_system_event(event).await,
+              Err(broadcast::error::RecvError::Lagged(n)) => {
+                self.set_fatal_error(ZmqError::Internal(format!("System event lagged by {}", n))).await;
+              }
+              Err(broadcast::error::RecvError::Closed) => {
+                self.set_fatal_error(ZmqError::Internal("System event channel closed".into())).await;
+              }
+            }
+          }
+
+          _ = async { self.ping_check_timer.as_mut().map_or(futures::future::pending().left_future(), |t| t.tick().right_future()).await },
+              if self.ping_check_timer.is_some() => {
+            match self.zmtp_handler.maybe_build_ping() {
+              Ok(Some(bytes)) => egress_buffer.push_priority(bytes),
+              Ok(None) => {}
+              Err(e) => self.set_fatal_error(e).await,
+            }
+          }
+
+          _ = pong_timeout_future, if self.zmtp_handler.heartbeat_state.waiting_for_pong => {
+            if self.zmtp_handler.has_pong_timed_out() {
+              self.set_fatal_error(ZmqError::Timeout).await;
+            }
+          }
+
+          // Ingress: concurrent with egress — independent local borrow
+          ingress_res = self.zmtp_handler.read_and_parse_data_frames_batch(&mut read_half) => {
+            match ingress_res {
+              Ok(msgs) if !msgs.is_empty() => {
                 let pipe_read_id = self
                   .core_pipe_manager
                   .state
@@ -253,11 +291,15 @@ where
                 let mut data_msgs = Vec::with_capacity(msgs.len());
                 for msg in msgs {
                   if msg.is_command() {
-                    if let Ok(Some(pong)) = self.zmtp_handler.process_incoming_data_command_frame(&msg) {
-                      if let Err(e) = self.zmtp_handler.write_data_msgs(vec![pong]).await {
-                        self.set_fatal_error(e).await;
-                        break;
+                    match self.zmtp_handler.process_incoming_data_command_frame(&msg) {
+                      Ok(Some(pong)) => {
+                        match self.zmtp_handler.frame_outgoing_msgs(vec![pong]) {
+                          Ok(bytes) => egress_buffer.push_priority(bytes),
+                          Err(e) => { self.set_fatal_error(e).await; }
+                        }
                       }
+                      Ok(None) => {}
+                      Err(e) => { self.set_fatal_error(e).await; }
                     }
                   } else {
                     data_msgs.push(msg);
@@ -282,62 +324,86 @@ where
                   }
                 }
               }
-            }
-            Err(ZmqError::ConnectionClosed) => {
-              tracing::info!(sca_handle = self.handle, "Peer closed connection.");
-              self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
-            }
-            Err(e) => {
-              self.set_fatal_error(e).await;
+              Ok(_) => {}
+              Err(ZmqError::ConnectionClosed) => {
+                tracing::info!(sca_handle = self.handle, "Peer closed connection.");
+                self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
+              }
+              Err(e) => self.set_fatal_error(e).await,
             }
           }
-        }
 
-        // --- ARM 5: Outgoing Data (from SocketCore to Network) ---
-        maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
-          if self.current_phase == ConnectionPhaseX::Operational && self.core_pipe_manager.is_attached() => {
-          match maybe_msgs_from_core {
-            Ok(first_msgs) => {
-              outgoing_batch.clear();
-              let mut total_bytes = first_msgs.iter().map(|m| m.size()).sum::<usize>();
-              let mut total_msgs = 1usize;
-              outgoing_batch.push(first_msgs);
+          // Egress: drains egress_buffer; no zmtp_handler borrow
+          egress_res = async {
+            use tokio::io::AsyncWriteExt;
+            write_half.write(egress_buffer.current_slice().unwrap()).await
+          }, if egress_buffer.current_slice().is_some() => {
+            match egress_res {
+              Ok(n) => {
+                egress_buffer.advance(n);
+                self.zmtp_handler.heartbeat_state.record_activity();
+              }
+              Err(e) => {
+                self.set_fatal_error(ZmqError::from_io_endpoint(e, "egress write")).await;
+              }
+            }
+          }
 
-              let max_count = self.zmtp_handler.config.sndbatch_count;
-              let max_bytes = self.zmtp_handler.config.sndbatch_bytes;
+          // Outgoing from SocketCore
+          maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
+              if self.core_pipe_manager.is_attached()
+                && egress_buffer.total_pending_bytes() < EGRESS_BACKPRESSURE_BYTES => {
+            match maybe_msgs_from_core {
+              Ok(first_msgs) => {
+                outgoing_batch.clear();
+                let mut total_bytes = first_msgs.iter().map(|m| m.size()).sum::<usize>();
+                let mut total_msgs = 1usize;
+                outgoing_batch.push(first_msgs);
 
-              // Greedily drain additional queued messages up to batch limits
-              while total_msgs < max_count && total_bytes < max_bytes {
-                match self.core_pipe_manager.try_recv_from_core() {
-                  Ok(next_msgs) => {
-                    total_bytes += next_msgs.iter().map(|m| m.size()).sum::<usize>();
-                    total_msgs += 1;
-                    outgoing_batch.push(next_msgs);
+                let max_count = self.zmtp_handler.config.sndbatch_count;
+                let max_bytes = self.zmtp_handler.config.sndbatch_bytes;
+
+                while total_msgs < max_count && total_bytes < max_bytes {
+                  match self.core_pipe_manager.try_recv_from_core() {
+                    Ok(next_msgs) => {
+                      total_bytes += next_msgs.iter().map(|m| m.size()).sum::<usize>();
+                      total_msgs += 1;
+                      outgoing_batch.push(next_msgs);
+                    }
+                    Err(_) => break,
                   }
-                  Err(_) => break, // Empty or disconnected — stop draining
+                }
+
+                let throttle_guard = adaptive_throttle.begin_work_bulk(
+                  crate::throttle::Direction::Egress,
+                  total_msgs as u32,
+                );
+
+                match self.zmtp_handler.frame_outgoing_batch(&outgoing_batch) {
+                  Ok(bytes) => egress_buffer.push(bytes),
+                  Err(e) => self.set_fatal_error(e).await,
+                }
+
+                if throttle_guard.should_throttle() {
+                  yield_now().await;
                 }
               }
-
-              let throttle_guard = adaptive_throttle.begin_work_bulk(
-                crate::throttle::Direction::Egress,
-                total_msgs as u32,
-              );
-
-              if let Err(e) = self.zmtp_handler.write_data_batch(&outgoing_batch).await {
-                self.set_fatal_error(e).await;
+              Err(_) => {
+                tracing::info!(sca_handle = self.handle, "Pipe from SocketCore closed.");
+                self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
               }
-
-              if throttle_guard.should_throttle() {
-                yield_now().await;
-              }
-            },
-            Err(_) => {
-              tracing::info!(sca_handle = self.handle, "Pipe from SocketCore closed.");
-              self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
             }
           }
         }
       }
+
+      // Restore halves so initiate_stream_shutdown can shut down the write half.
+      self.zmtp_handler.read_half = Some(read_half);
+      self.zmtp_handler.write_half = Some(write_half);
+    }
+
+    if self.current_phase == ConnectionPhaseX::ShuttingDownStream {
+      self.perform_graceful_shutdown().await;
     }
 
     tracing::info!(
@@ -623,9 +689,11 @@ where
     // Explicitly shutdown and drop the stream NOW to free the OS File Descriptor.
     // We do this before the regulator sleep to prevent FD exhaustion attacks.
     // We ignore errors here as we are already handling a fatal error.
+    // NOTE: if halves were extracted to run_loop locals, zmtp_handler fields will
+    // be None here and this is a no-op — the loop's ShuttingDownStream branch
+    // restores them and calls perform_graceful_shutdown on the next tick.
     let _ = self.zmtp_handler.initiate_stream_shutdown().await;
 
-    // Mark state as shutting down so the main loop exits correctly after the sleep.
     self.transition_to_shutdown_stream(None).await;
   }
 
@@ -666,9 +734,8 @@ where
   }
 
   async fn perform_final_cleanup_actions(&mut self) {
-    // Ensure stream is none if not already handled by initiate_stream_shutdown
-    if self.zmtp_handler.stream.is_some() {
-      let _ = self.zmtp_handler.initiate_stream_shutdown().await; // Best effort
+    if self.zmtp_handler.read_half.is_some() || self.zmtp_handler.write_half.is_some() {
+      let _ = self.zmtp_handler.initiate_stream_shutdown().await;
     }
     self.core_pipe_manager.detach_and_clear_pipes();
     self.current_phase = ConnectionPhaseX::Terminating;

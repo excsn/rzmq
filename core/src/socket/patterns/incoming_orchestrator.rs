@@ -14,7 +14,6 @@ use tokio::time::timeout as tokio_timeout;
 pub(crate) struct IncomingMessageOrchestrator<QItem: Send + 'static> {
   socket_core_handle: usize,
   main_incoming_queue: FairQueue<QItem>,
-  queue_push_timeout: Option<Duration>,
   partial_pipe_messages: DashMap<usize, Vec<Msg>>,
   // Buffer for delivering frames of a single QItem one-by-one via recv_message()
   current_recv_frames_buffer: TokioMutex<VecDeque<Msg>>,
@@ -27,7 +26,6 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     Self {
       socket_core_handle: core_handle,
       main_incoming_queue: FairQueue::new(rcvhwm.max(1)),
-      queue_push_timeout: Some(Duration::from_millis(1000)),
       partial_pipe_messages: DashMap::new(),
       current_recv_frames_buffer: TokioMutex::new(VecDeque::new()),
       pending_logical_messages: ParkingMutex::new(VecDeque::new()),
@@ -58,42 +56,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
   }
 
   pub async fn queue_item(&self, pipe_read_id_for_logging: usize, item_to_queue: QItem) -> Result<(), ZmqError> {
-    let push_result = match self.queue_push_timeout {
-      None => self.main_incoming_queue.push_item(item_to_queue).await,
-      Some(duration) if duration.is_zero() => match self.main_incoming_queue.try_push_item(item_to_queue) {
-        Ok(()) => Ok(()),
-        Err(PushError::Full(_returned_item)) => {
-          tracing::warn!(
-            handle = self.socket_core_handle,
-            pipe_id = pipe_read_id_for_logging,
-            "Orchestrator try_push item to main queue failed: Full. Item dropped."
-          );
-          Ok(())
-        }
-        Err(PushError::Closed(_returned_item)) => {
-          tracing::error!(
-            handle = self.socket_core_handle,
-            pipe_id = pipe_read_id_for_logging,
-            "Orchestrator try_push item to main queue failed: Closed."
-          );
-          Err(ZmqError::Internal("Main incoming queue closed".into()))
-        }
-      },
-      Some(duration) => match tokio_timeout(duration, self.main_incoming_queue.push_item(item_to_queue)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(_timeout_elapsed) => {
-          tracing::warn!(
-            handle = self.socket_core_handle,
-            pipe_id = pipe_read_id_for_logging,
-            "Orchestrator timed push of item to main queue failed: Timeout. Item dropped."
-          );
-          Ok(())
-        }
-      },
-    };
-
-    match push_result {
+    match self.main_incoming_queue.push_item(item_to_queue).await {
       Ok(()) => Ok(()),
       Err(ZmqError::Internal(ref msg)) if msg.contains("FairQueue channel closed") => Err(ZmqError::Internal(
         "Main incoming queue channel unexpectedly closed".into(),
@@ -106,28 +69,13 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
   }
 
   /// Pushes a batch of assembled logical messages to the FairQueue.
-  /// Uses synchronous try_push_item first; falls back to the async await path only on HWM.
-  pub async fn queue_batch(&self, pipe_read_id: usize, items: Vec<QItem>) -> Result<(), ZmqError> {
+  /// Uses synchronous try_push_item first; falls back to blocking push_item on HWM.
+  pub async fn queue_batch(&self, _pipe_read_id: usize, items: Vec<QItem>) -> Result<(), ZmqError> {
     for item in items {
       match self.main_incoming_queue.try_push_item(item) {
         Ok(()) => {}
         Err(PushError::Full(returned)) => {
-          if let Some(duration) = self.queue_push_timeout {
-            if duration.is_zero() {
-              tracing::warn!("Orchestrator queue_batch hit push timeout (0s). Dropping remaining items.");
-              break;
-            }
-            match tokio_timeout(duration, self.main_incoming_queue.push_item(returned)).await {
-              Ok(Ok(())) => {}
-              Ok(Err(e)) => return Err(e),
-              Err(_) => {
-                tracing::warn!("Orchestrator queue_batch hit push timeout. Dropping remaining items to avoid blocking.");
-                break;
-              }
-            }
-          } else {
-            self.main_incoming_queue.push_item(returned).await?;
-          }
+          self.main_incoming_queue.push_item(returned).await?;
         }
         Err(PushError::Closed(_)) => {
           return Err(ZmqError::Internal("FairQueue closed during batch push".into()));

@@ -1067,11 +1067,10 @@ const INBOUND_RESUME_LWM_PCT: usize = 20;
 async fn run_uring_pipe_reader(
   socket_logic: std::sync::Weak<dyn ISocket>,
   pipe_read_id: usize,
-  inbound_rx: fibre::mpmc::AsyncReceiver<Vec<Msg>>,
+  inbound_rx: fibre::mpsc::BoundedAsyncReceiver<Vec<Msg>>,
   fd: RawFd,
 ) {
-  // capacity() returns None for unbounded channels; treat as infinite (no HWM/LWM).
-  let cap = inbound_rx.capacity().unwrap_or(usize::MAX);
+  let cap = inbound_rx.capacity();
   // True while occupancy has been at or above HWM (80%) — cleared after signalling resume.
   let mut needs_resume = false;
 
@@ -1082,7 +1081,10 @@ async fn run_uring_pipe_reader(
 
     // Sample occupancy before processing to detect HWM crossing.
     let len_before = inbound_rx.len();
-    if cap > 0 && len_before * 100 / cap >= 80 {
+    // 70% shadow-HWM: the writer sets mailbox_full_throttled at exactly 80% occupancy,
+    // but by the time the reader wakes and samples len_before a pop has already occurred,
+    // dropping occupancy just below 80%. Using 70% guarantees we capture every HWM crossing.
+    if cap > 0 && len_before * 100 / cap >= 70 {
       needs_resume = true;
     }
 
@@ -1094,14 +1096,18 @@ async fn run_uring_pipe_reader(
       break;
     }
 
-    // After draining one item: check if we've recovered below LWM and need to resume.
-    if needs_resume {
-      let len_after = inbound_rx.len();
-      if cap == 0 || len_after * 100 / cap <= INBOUND_RESUME_LWM_PCT {
-        needs_resume = false;
-        if let Ok(op_tx) = crate::uring::global_state::get_global_uring_worker_op_tx() {
-          let _ = op_tx.try_send(UringOpRequest::ResumeConnection { fd });
-        }
+    // After processing one batch: send ResumeConnection when the queue crosses back below LWM
+    // OR when the queue hits zero. The "queue empty" check is essential for the partial-drain
+    // scenario: if try_drain_spillover partially flushes, sets needs_resume=false early (at LWM),
+    // then stalls on Full, the reader must fire one final resume when it fully empties the channel
+    // to give the worker a guaranteed opportunity to flush the remainder of the spillover queue.
+    let len_after = inbound_rx.len();
+    let recovered_below_lwm = needs_resume && (cap == 0 || len_after * 100 / cap <= INBOUND_RESUME_LWM_PCT);
+    let queue_fully_empty = len_after == 0;
+    if recovered_below_lwm || queue_fully_empty {
+      needs_resume = false;
+      if let Ok(op_tx) = crate::uring::global_state::get_global_uring_worker_op_tx() {
+        let _ = op_tx.try_send(UringOpRequest::ResumeConnection { fd });
       }
     }
   }

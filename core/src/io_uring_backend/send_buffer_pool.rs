@@ -6,6 +6,8 @@ use io_uring::IoUring;
 use libc;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing::{error, info, trace, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,6 +47,42 @@ struct SendBufferPoolInner {
 #[derive(Debug)]
 pub(crate) struct SendBufferPool {
   inner: Mutex<SendBufferPoolInner>,
+}
+
+/// A leased slot from the `SendBufferPool`, giving the holder exclusive write access to a
+/// pre-registered kernel buffer. On drop, the slot is automatically recycled unless
+/// `released_to_worker` has been set (indicating the worker took ownership).
+pub(crate) struct SendBufferLease {
+  pub id: RegisteredSendBufferId,
+  /// Pointer into the registered buffer (stable for pool lifetime).
+  pub ptr: *mut u8,
+  pub capacity: usize,
+  pub released_to_worker: Arc<AtomicBool>,
+  pub pool: Arc<SendBufferPool>,
+}
+
+// SAFETY: ptr points into a pool buffer that is pinned for the worker's lifetime.
+// Only this lease holder writes to it until released_to_worker is set.
+unsafe impl Send for SendBufferLease {}
+unsafe impl Sync for SendBufferLease {}
+
+impl Drop for SendBufferLease {
+  fn drop(&mut self) {
+    if !self.released_to_worker.load(Ordering::Acquire) {
+      trace!("SendBufferLease {:?}: dropped before reaching worker — recycling.", self.id);
+      self.pool.release_buffer(self.id);
+    }
+  }
+}
+
+impl std::fmt::Debug for SendBufferLease {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SendBufferLease")
+      .field("id", &self.id)
+      .field("capacity", &self.capacity)
+      .field("released", &self.released_to_worker.load(Ordering::Relaxed))
+      .finish_non_exhaustive()
+  }
 }
 
 impl SendBufferPool {
@@ -135,6 +173,25 @@ impl SendBufferPool {
     } else {
       trace!("SendBufferPool: No free send buffers available.");
       None // No free buffers
+    }
+  }
+
+  /// Leases a free buffer slot, giving the caller exclusive write access without copying.
+  /// The returned `SendBufferLease` auto-recycles on drop if not handed to the worker.
+  pub fn acquire_lease(self: &Arc<Self>) -> Option<SendBufferLease> {
+    let mut inner = self.inner.lock();
+    if let Some(id) = inner.free_ids.pop_front() {
+      let slot = &mut inner.pool[id.0 as usize];
+      slot.in_kernel_use = true;
+      Some(SendBufferLease {
+        id,
+        ptr: slot.as_mut_slice().as_mut_ptr(),
+        capacity: slot.capacity(),
+        released_to_worker: Arc::new(AtomicBool::new(false)),
+        pool: self.clone(),
+      })
+    } else {
+      None
     }
   }
 

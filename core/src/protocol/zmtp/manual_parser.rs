@@ -27,6 +27,51 @@ impl ZmtpManualParser {
     }
   }
 
+  /// Parse one ZMTP frame from `src` without mutating parser state.
+  /// `src` must begin at a frame boundary (flags byte).
+  /// Returns `Ok(Some((msg, bytes_consumed)))` when a complete frame is available,
+  /// `Ok(None)` when more data is needed, or `Err` on protocol violation.
+  pub fn decode_frame_from_slice(&self, src: &[u8]) -> Result<Option<(Msg, usize)>, ZmqError> {
+    if src.len() < 2 {
+      return Ok(None);
+    }
+    let flags = src[0];
+    let is_long = (flags & ZMTP_FLAG_LONG) != 0;
+    let header_len = if is_long { 9 } else { 2 };
+    if src.len() < header_len {
+      return Ok(None);
+    }
+    let raw_size = if is_long {
+      let mut len_bytes = [0u8; 8];
+      len_bytes.copy_from_slice(&src[1..9]);
+      u64::from_be_bytes(len_bytes)
+    } else {
+      src[1] as u64
+    };
+    if self.max_msg_size >= 0 && raw_size > self.max_msg_size as u64 {
+      return Err(ZmqError::ProtocolViolation(format!(
+        "frame size {} exceeds ZMQ_MAXMSGSIZE {}",
+        raw_size, self.max_msg_size
+      )));
+    }
+    let size = raw_size as usize;
+    let total = header_len + size;
+    if src.len() < total {
+      return Ok(None);
+    }
+    // ONE copy: kernel ring buffer → final Msg payload allocation
+    let mut msg = Msg::from_vec(src[header_len..total].to_vec());
+    let mut rz_flags = MsgFlags::empty();
+    if (flags & ZMTP_FLAG_MORE) != 0 {
+      rz_flags |= MsgFlags::MORE;
+    }
+    if (flags & ZMTP_FLAG_COMMAND) != 0 {
+      rz_flags |= MsgFlags::COMMAND;
+    }
+    msg.set_flags(rz_flags);
+    Ok(Some((msg, total)))
+  }
+
   /// Attempts to decode a single ZMTP message from the provided buffer.
   ///
   /// The buffer `src` is modified by consuming bytes for any successfully decoded message.

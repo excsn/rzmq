@@ -97,4 +97,21 @@ pub struct Cli {
   #[cfg(feature = "io-uring")]
   #[arg(long, default_value_t = false)]
   pub uring_multishot: bool,
+
+  /// The io_uring polling and spinning strategy to utilize
+  #[cfg(feature = "io-uring")]
+  #[arg(long, value_enum, default_value_t = UringStrategy::Performance)]
+  pub uring_strategy: UringStrategy,
+}
+
+/// Polling strategy profile for the io_uring worker thread.
+#[cfg(feature = "io-uring")]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UringStrategy {
+  /// Maximum spinning, no kernel sleep. Lowest latency, pins the worker thread at 100% CPU.
+  Performance,
+  /// Moderate spinning before sleeping. Good general-purpose default.
+  Balanced,
+  /// No spinning; goes directly to kernel sleep. Lowest CPU usage, highest idle latency.
+  LowPower,
 }

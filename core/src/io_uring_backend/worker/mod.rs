@@ -18,7 +18,7 @@ use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::io_uring_backend::UserData;
-use crate::uring::{global_state, UringConfig};
+use crate::uring::{UringPollingStrategy, global_state, UringConfig};
 use crate::ZmqError;
 
 use std::collections::{HashMap, VecDeque};
@@ -39,7 +39,7 @@ use tracing::{debug, error, info, trace, warn};
 pub(crate) use eventfd_poller::EventFdPoller;
 pub(crate) use external_op_tracker::{ExternalOpContext, ExternalOpTracker};
 pub(crate) use handler_manager::HandlerManager;
-pub(crate) use internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType, PinnedIovecs};
+pub(crate) use internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType};
 pub(crate) use multishot_reader::MultishotReader;
 
 
@@ -94,13 +94,14 @@ pub struct UringWorker {
   cfg_send_zerocopy_enabled: bool,
   cfg_send_buffer_count: usize, //TODO revisit
   cfg_send_buffer_size: usize,
+  /// True when the io_uring ring was successfully initialized with `IORING_SETUP_SQPOLL`.
+  /// Controls whether the main loop bypasses `submit()` when the kernel polling thread is active.
+  pub(crate) cfg_sqpoll_active: bool,
+  /// User-space spinning strategy applied when `needs_wait` is true.
+  pub(crate) cfg_polling_strategy: UringPollingStrategy,
   // Shared flag: true while the worker is blocked in submit_with_args waiting for kernel events.
   // Connections check this before writing to eventfd to avoid redundant syscalls.
   pub(crate) worker_asleep: Arc<AtomicBool>,
-  // Pool of recycled iovec pairs for zero-allocation Writev submissions.
-  pub(crate) iovec_pool: VecDeque<PinnedIovecs>,
-  // Pool of pre-allocated buffers for coalescing multiple outgoing writes into one SQE.
-  pub(crate) coalesce_buffer_pool: VecDeque<bytes::BytesMut>,
 }
 
 impl fmt::Debug for UringWorker {
@@ -134,17 +135,50 @@ impl UringWorker {
       })?;
 
     let worker_asleep = Arc::new(AtomicBool::new(false));
+    let pool_slot: Arc<once_cell::sync::OnceCell<Arc<crate::io_uring_backend::send_buffer_pool::SendBufferPool>>> =
+      Arc::new(once_cell::sync::OnceCell::new());
     let signaling_op_sender = SignalingOpSender::new(
       op_tx_async_for_signaler,
       event_fd_master_instance.clone(),
       Arc::clone(&worker_asleep),
+      Arc::clone(&pool_slot),
     );
 
     let worker_thread_join_handle = std::thread::Builder::new()
       .name("rzmq-io-uring-worker".into())
       .spawn(move || { // config is moved here
-        match IoUring::new(config.ring_entries) {
+        // Build the ring, optionally with SQPOLL, with graceful privilege fallback.
+        let mut actual_sqpoll_enabled = config.sqpoll_enabled;
+        let ring_result: Result<IoUring, ZmqError> = {
+          let mut builder = io_uring::IoUring::builder();
+          if config.sqpoll_enabled {
+            builder.setup_sqpoll(config.sqpoll_idle_ms);
+          }
+          match builder.build(config.ring_entries) {
+            Ok(r) => Ok(r),
+            Err(e)
+              if config.sqpoll_enabled
+                && (e.raw_os_error() == Some(libc::EPERM)
+                  || e.raw_os_error() == Some(libc::EACCES)) =>
+            {
+              warn!(
+                "UringWorker: SQPOLL initialization failed (EPERM/EACCES — insufficient privileges \
+                 or kernel < 5.11). Falling back to standard non-SQPOLL mode."
+              );
+              actual_sqpoll_enabled = false;
+              io_uring::IoUring::builder()
+                .build(config.ring_entries)
+                .map_err(|e| ZmqError::Internal(format!("io_uring fallback build failed: {}", e)))
+            }
+            Err(e) => Err(ZmqError::Internal(format!("IoUring init failed: {}", e))),
+          }
+        };
+        match ring_result {
           Ok(ring) => {
+            info!(
+              "UringWorker: io_uring ring initialized. entries={}, sqpoll={}",
+              config.ring_entries, actual_sqpoll_enabled
+            );
             let mut internal_tracker = InternalOpTracker::new();
             let event_fd_poller_instance = EventFdPoller::new_with_fd(
                 event_fd_master_instance,
@@ -162,7 +196,9 @@ impl UringWorker {
                     match SendBufferPool::new(&ring, config.default_send_buffer_count, config.default_send_buffer_size) {
                         Ok(pool) => {
                             info!("UringWorker: SendBufferPool initialized (count: {}, size: {}). Zero-copy send enabled.", config.default_send_buffer_count, config.default_send_buffer_size);
-                            worker_send_buffer_pool = Some(Arc::new(pool));
+                            let pool_arc = Arc::new(pool);
+                            let _ = pool_slot.set(Arc::clone(&pool_arc));
+                            worker_send_buffer_pool = Some(pool_arc);
                         }
                         Err(e) => {
                             error!("UringWorker: Failed to initialize SendBufferPool from config: {}. Disabling ZC send for this worker.", e);
@@ -200,21 +236,6 @@ impl UringWorker {
                   info!("UringWorker: Default provided-buffer recv ring not configured (count/size is zero).");
             }
 
-            // Pre-populate the iovec pool to avoid per-message Box allocations on the vectored send path.
-            let mut iovec_pool = VecDeque::with_capacity(256);
-            for _ in 0..256 {
-              iovec_pool.push_back(PinnedIovecs(Box::new([
-                libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 },
-                libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 },
-              ])));
-            }
-
-            // Pre-allocate coalescing buffers (32 × 64KB = 2MB) to avoid per-send allocations.
-            let mut coalesce_buffer_pool = VecDeque::with_capacity(32);
-            for _ in 0..32 {
-              coalesce_buffer_pool.push_back(bytes::BytesMut::with_capacity(65536));
-            }
-
             let mut worker = UringWorker {
               state: WorkerState::Running,
               ring,
@@ -232,9 +253,9 @@ impl UringWorker {
               cfg_send_zerocopy_enabled: effective_send_zerocopy_enabled_for_worker,
               cfg_send_buffer_count: config.default_send_buffer_count,
               cfg_send_buffer_size: config.default_send_buffer_size,
+              cfg_sqpoll_active: actual_sqpoll_enabled,
+              cfg_polling_strategy: config.polling_strategy,
               worker_asleep,
-              iovec_pool,
-              coalesce_buffer_pool,
             };
 
             {
@@ -248,8 +269,8 @@ impl UringWorker {
             Ok(()) // The loop_result is no longer returned, just Ok(())
           }
           Err(e) => {
-            error!("Failed to initialize IoUring (entries: {}): {}. UringWorker thread cannot start.", config.ring_entries, e);
-            Err(ZmqError::Internal(format!("IoUring init failed: {}", e)))
+            error!("UringWorker: io_uring initialization failed — cannot start: {}", e);
+            Err(e)
           }
         }
       })

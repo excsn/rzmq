@@ -26,6 +26,17 @@ use tokio::sync::{Semaphore, broadcast};
 use tokio::task::{Id as TaskId, JoinHandle};
 use tokio::time::sleep;
 
+#[cfg(feature = "io-uring")]
+use {
+  crate::io_uring_backend::byte_handler::EgressChunk,
+  crate::io_uring_backend::ops::UringOpRequest as WorkerUringOpRequest,
+  crate::transport::uring_stream::UringStream,
+  crate::uring,
+  fibre::oneshot::oneshot as fibre_oneshot,
+  std::os::unix::io::IntoRawFd,
+  std::sync::atomic::Ordering as AtomicOrdering,
+};
+
 // --- IpcListener Actor ---
 pub(crate) struct IpcListener {
   handle: usize,
@@ -274,9 +285,13 @@ impl IpcListener {
             }
           }
 
-          // IPC always uses the standard SessionBase + ZmtpEngineCoreStd<UnixStream> path.
-          // The io_uring.session_enabled option from SocketOptions does not apply to IPC transport.
           let connection_specific_uri = format!("ipc://{}", peer_addr_str);
+
+          #[cfg(feature = "io-uring")]
+          let use_io_uring = socket_options.io_uring.session_enabled
+            && uring::URING_BACKEND_INITIALIZED.load(AtomicOrdering::SeqCst);
+          #[cfg(not(feature = "io-uring"))]
+          let use_io_uring = false;
 
           tokio::spawn({
             let context_clone = context.clone();
@@ -288,46 +303,127 @@ impl IpcListener {
             let socket_logic = socket_logic.clone();
 
             async move {
-              let max_connection_permit = _permit_guard;
-              // Variables for the common event publishing logic
-              let mut interaction_model_for_event: Option<ConnectionInteractionModel>;
-              let mut managing_actor_task_id_for_event: Option<TaskId>;
-              let mut setup_successful = true;
+              let mut permit_opt = Some(_permit_guard);
+              let mut interaction_model_for_event: Option<ConnectionInteractionModel> = None;
+              let mut managing_actor_task_id_for_event: Option<TaskId> = None;
+              let mut setup_successful = false;
+              // Wrap so either path can consume it without confusing the borrow checker.
+              let mut unix_stream_opt = Some(unix_stream);
 
-              // IPC doesn't have an io_uring path like TCP. It always uses an actor.
-              let sca_handle_id =
-                handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-              let actor_conf = ActorConfigX {
-                context: context_clone.clone(),
-                monitor_tx: monitor_tx_clone,
-                logical_target_endpoint_uri: logical_uri.clone(),
-                connected_endpoint_uri: actual_connected_uri.clone(),
-                is_server_role: true, // Accepted connections are server role
-              };
-              // Derive ZmtpEngineConfig from the full SocketOptions
-              let engine_conf = Arc::new(ZmtpEngineConfig::from(&*socket_options_clone));
+              // --- io_uring path ---
+              #[cfg(feature = "io-uring")]
+              if use_io_uring {
+                let stream = unix_stream_opt.take().unwrap();
+                match stream.into_std() {
+                  Ok(std_stream) => {
+                    let raw_fd = std_stream.into_raw_fd();
+                    let rcvhwm = socket_options_clone.rcvhwm.max(1);
+                    let sndhwm = socket_options_clone.sndhwm.max(1);
+                    let (raw_inbound_tx, raw_inbound_rx_sync) =
+                      fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::UringInboundLease>(rcvhwm);
+                    let (raw_egress_sync_tx, raw_egress_rx) =
+                      fibre::mpsc::bounded::<EgressChunk>(sndhwm);
 
-              let (command_sender_for_sca, command_receiver_for_sca) =
-                mailbox(context_clone.inner().get_actor_mailbox_capacity());
+                    match uring::global_state::get_global_uring_worker_op_tx() {
+                      Ok(worker_op_tx) => {
+                        let user_data = context_clone.inner().next_handle() as u64;
+                        let (reply_tx, reply_rx) = fibre_oneshot();
+                        let reg_ok = worker_op_tx.send(WorkerUringOpRequest::RegisterExternalByteFd {
+                          user_data,
+                          fd: raw_fd,
+                          socket_mailbox: socket_logic.mailbox().to_sync(),
+                          reply_tx,
+                          raw_inbound_tx,
+                          raw_egress_rx,
+                        }).await.is_ok();
 
-              // unix_stream is moved into SessionConnectionActorX
-              let sca_task_handle = SessionConnectionActorX::create_and_spawn(
-                sca_handle_id,
-                parent_socket_core_id,
-                unix_stream,
-                actor_conf,
-                engine_conf,
-                command_receiver_for_sca,
-                socket_logic.clone(),
-                Some(max_connection_permit),
-              );
+                        if reg_ok {
+                          match reply_rx.recv().await {
+                            Ok(Ok(_)) => {
+                              let event_fd = worker_op_tx.clone_event_fd();
+                              let worker_asleep = worker_op_tx.clone_worker_asleep();
+                              let send_pool = worker_op_tx.clone_send_buffer_pool();
+                              let uring_stream = UringStream::new(
+                                raw_fd,
+                                raw_inbound_rx_sync.to_async(),
+                                raw_egress_sync_tx,
+                                worker_asleep,
+                                event_fd,
+                                send_pool,
+                              );
+                              let sca_handle_id = handle_source_clone
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                              let actor_conf = ActorConfigX {
+                                context: context_clone.clone(),
+                                monitor_tx: monitor_tx_clone.clone(),
+                                logical_target_endpoint_uri: logical_uri.clone(),
+                                connected_endpoint_uri: actual_connected_uri.clone(),
+                                is_server_role: true,
+                              };
+                              let engine_conf =
+                                Arc::new(ZmtpEngineConfig::from(&*socket_options_clone));
+                              let (command_sender_for_sca, command_receiver_for_sca) =
+                                mailbox(context_clone.inner().get_actor_mailbox_capacity());
+                              let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+                                sca_handle_id,
+                                parent_socket_core_id,
+                                uring_stream,
+                                actor_conf,
+                                engine_conf,
+                                command_receiver_for_sca,
+                                socket_logic.clone(),
+                                permit_opt.take(),
+                              );
+                              interaction_model_for_event =
+                                Some(ConnectionInteractionModel::ViaSca {
+                                  sca_mailbox: command_sender_for_sca,
+                                  sca_handle_id,
+                                });
+                              managing_actor_task_id_for_event = Some(sca_task_handle.id());
+                              setup_successful = true;
+                            }
+                            _ => tracing::error!("IPC accept: RegisterExternalByteFd failed"),
+                          }
+                        }
+                      }
+                      Err(e) => tracing::error!("IPC accept: no uring worker: {}", e),
+                    }
+                  }
+                  Err(e) => tracing::error!("IPC accept: into_std failed: {}", e),
+                }
+              }
 
-              interaction_model_for_event = Some(ConnectionInteractionModel::ViaSca {
-                sca_mailbox: command_sender_for_sca,
-                sca_handle_id,
-              });
-              managing_actor_task_id_for_event = Some(sca_task_handle.id());
-              // connection_iface_for_event is None, SocketCore creates it
+              // --- Standard path (non-uring or not yet set up) ---
+              if let Some(unix_stream) = unix_stream_opt {
+                let sca_handle_id =
+                  handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let actor_conf = ActorConfigX {
+                  context: context_clone.clone(),
+                  monitor_tx: monitor_tx_clone,
+                  logical_target_endpoint_uri: logical_uri.clone(),
+                  connected_endpoint_uri: actual_connected_uri.clone(),
+                  is_server_role: true,
+                };
+                let engine_conf = Arc::new(ZmtpEngineConfig::from(&*socket_options_clone));
+                let (command_sender_for_sca, command_receiver_for_sca) =
+                  mailbox(context_clone.inner().get_actor_mailbox_capacity());
+                let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+                  sca_handle_id,
+                  parent_socket_core_id,
+                  unix_stream,
+                  actor_conf,
+                  engine_conf,
+                  command_receiver_for_sca,
+                  socket_logic.clone(),
+                  permit_opt.take(),
+                );
+                interaction_model_for_event = Some(ConnectionInteractionModel::ViaSca {
+                  sca_mailbox: command_sender_for_sca,
+                  sca_handle_id,
+                });
+                managing_actor_task_id_for_event = Some(sca_task_handle.id());
+                setup_successful = true;
+              }
 
               if setup_successful {
                 if let Some(inter_model) = interaction_model_for_event {
@@ -344,11 +440,6 @@ impl IpcListener {
                       actual_connected_uri
                     );
                   }
-                } else {
-                  tracing::error!(
-                    "IPC: Inconsistent state - setup_successful true but no interaction model for {}",
-                    actual_connected_uri
-                  );
                 }
               } else {
                 tracing::warn!(
@@ -537,46 +628,145 @@ impl IpcConnecter {
             });
             }
 
-            // Spawn SessionConnectionActorX
-            let sca_handle_id = self.context_handle_source.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let actor_conf = ActorConfigX {
-              context: self.context.clone(),
-              monitor_tx: monitor_tx.clone(), // Pass along the monitor
-              logical_target_endpoint_uri: endpoint_uri_original.clone(),
-              connected_endpoint_uri: actual_connected_uri.clone(),
-              is_server_role: false, // Outgoing connection is client role
-            };
-            {
-              let socket_ref = SockRef::from(&unix_stream);
-              if let Some(size) = self.context_options.sndbuf {
-                let _ = socket_ref.set_send_buffer_size(size);
-              }
-              if let Some(size) = self.context_options.rcvbuf {
-                let _ = socket_ref.set_recv_buffer_size(size);
+            #[cfg(feature = "io-uring")]
+            let connect_use_io_uring = self.context_options.io_uring.session_enabled
+              && uring::URING_BACKEND_INITIALIZED.load(AtomicOrdering::SeqCst);
+            #[cfg(not(feature = "io-uring"))]
+            let connect_use_io_uring = false;
+
+            let mut unix_stream_opt = Some(unix_stream);
+            let mut connect_interaction: Option<ConnectionInteractionModel> = None;
+            let mut connect_task_id: Option<TaskId> = None;
+
+            // --- io_uring connect path ---
+            #[cfg(feature = "io-uring")]
+            if connect_use_io_uring {
+              let stream = unix_stream_opt.take().unwrap();
+              match stream.into_std() {
+                Ok(std_stream) => {
+                  let raw_fd = std_stream.into_raw_fd();
+                  let rcvhwm = self.context_options.rcvhwm.max(1);
+                  let sndhwm = self.context_options.sndhwm.max(1);
+                  let (raw_inbound_tx, raw_inbound_rx_sync) =
+                    fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::UringInboundLease>(rcvhwm);
+                  let (raw_egress_sync_tx, raw_egress_rx) =
+                    fibre::mpsc::bounded::<EgressChunk>(sndhwm);
+
+                  match uring::global_state::get_global_uring_worker_op_tx() {
+                    Ok(worker_op_tx) => {
+                      let user_data = self.context.inner().next_handle() as u64;
+                      let (reply_tx, reply_rx) = fibre_oneshot();
+                      let reg_ok = worker_op_tx.send(WorkerUringOpRequest::RegisterExternalByteFd {
+                        user_data,
+                        fd: raw_fd,
+                        socket_mailbox: self.socket_logic.mailbox().to_sync(),
+                        reply_tx,
+                        raw_inbound_tx,
+                        raw_egress_rx,
+                      }).await.is_ok();
+
+                      if reg_ok {
+                        match reply_rx.recv().await {
+                          Ok(Ok(_)) => {
+                            let event_fd = worker_op_tx.clone_event_fd();
+                            let worker_asleep = worker_op_tx.clone_worker_asleep();
+                            let send_pool = worker_op_tx.clone_send_buffer_pool();
+                            let uring_stream = UringStream::new(
+                              raw_fd,
+                              raw_inbound_rx_sync.to_async(),
+                              raw_egress_sync_tx,
+                              worker_asleep,
+                              event_fd,
+                              send_pool,
+                            );
+                            let sca_handle_id = self.context_handle_source
+                              .fetch_add(1, AtomicOrdering::Relaxed);
+                            let actor_conf = ActorConfigX {
+                              context: self.context.clone(),
+                              monitor_tx: monitor_tx.clone(),
+                              logical_target_endpoint_uri: endpoint_uri_original.clone(),
+                              connected_endpoint_uri: actual_connected_uri.clone(),
+                              is_server_role: false,
+                            };
+                            let engine_conf =
+                              Arc::new(ZmtpEngineConfig::from(&*self.context_options));
+                            let (command_sender_for_sca, command_receiver_for_sca) =
+                              mailbox(self.context.inner().get_actor_mailbox_capacity());
+                            let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+                              sca_handle_id,
+                              self.parent_socket_id,
+                              uring_stream,
+                              actor_conf,
+                              engine_conf,
+                              command_receiver_for_sca,
+                              self.socket_logic.clone(),
+                              None,
+                            );
+                            connect_interaction = Some(ConnectionInteractionModel::ViaSca {
+                              sca_mailbox: command_sender_for_sca,
+                              sca_handle_id,
+                            });
+                            connect_task_id = Some(sca_task_handle.id());
+                          }
+                          _ => tracing::error!("IPC connect: RegisterExternalByteFd failed"),
+                        }
+                      }
+                    }
+                    Err(e) => tracing::error!("IPC connect: no uring worker: {}", e),
+                  }
+                }
+                Err(e) => tracing::error!("IPC connect: into_std failed: {}", e),
               }
             }
 
-            let engine_conf = Arc::new(ZmtpEngineConfig::from(&*self.context_options));
-
-            let (command_sender_for_sca, command_receiver_for_sca) =
+            // --- Standard connect path ---
+            if let Some(unix_stream) = unix_stream_opt {
+              {
+                let socket_ref = SockRef::from(&unix_stream);
+                if let Some(size) = self.context_options.sndbuf {
+                  let _ = socket_ref.set_send_buffer_size(size);
+                }
+                if let Some(size) = self.context_options.rcvbuf {
+                  let _ = socket_ref.set_recv_buffer_size(size);
+                }
+              }
+              let sca_handle_id = self.context_handle_source
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              let actor_conf = ActorConfigX {
+                context: self.context.clone(),
+                monitor_tx: monitor_tx.clone(),
+                logical_target_endpoint_uri: endpoint_uri_original.clone(),
+                connected_endpoint_uri: actual_connected_uri.clone(),
+                is_server_role: false,
+              };
+              let engine_conf = Arc::new(ZmtpEngineConfig::from(&*self.context_options));
+              let (command_sender_for_sca, command_receiver_for_sca) =
                 mailbox(self.context.inner().get_actor_mailbox_capacity());
+              let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+                sca_handle_id,
+                self.parent_socket_id,
+                unix_stream,
+                actor_conf,
+                engine_conf,
+                command_receiver_for_sca,
+                self.socket_logic.clone(),
+                None,
+              );
+              connect_interaction = Some(ConnectionInteractionModel::ViaSca {
+                sca_mailbox: command_sender_for_sca,
+                sca_handle_id,
+              });
+              connect_task_id = Some(sca_task_handle.id());
+            }
 
-            let sca_task_handle = SessionConnectionActorX::create_and_spawn(
-              sca_handle_id,
-              self.parent_socket_id,
-              unix_stream, // Stream moved here
-              actor_conf,
-              engine_conf,
-              command_receiver_for_sca,
-              self.socket_logic.clone(),
-              None,
-            );
-
-            let interaction_model = ConnectionInteractionModel::ViaSca {
-              sca_mailbox: command_sender_for_sca,
-              sca_handle_id,
-            };
-            connection_outcome = Ok((interaction_model, Some(sca_task_handle.id()), actual_connected_uri));
+            if let Some(interaction_model) = connect_interaction {
+              let interaction_model = interaction_model;
+              connection_outcome = Ok((interaction_model, connect_task_id, actual_connected_uri));
+            } else {
+              connection_outcome = Err(ZmqError::Internal(
+                "IPC connect: failed to establish connection".into(),
+              ));
+            }
           }
           Ok(Err(e)) => { // Connect failed (not timeout related to tokio::time::timeout itself)
             connection_outcome = Err(ZmqError::from_io_endpoint(e, &endpoint_uri_original));

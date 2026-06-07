@@ -14,10 +14,11 @@ pub use crate::io_uring_backend::ops::UserData;
 
 use super::buffer_manager::BufferRingManager;
 use super::ops::ProtocolConfig;
+use super::send_buffer_pool::RegisteredSendBufferId;
 use super::worker::InternalOpTracker;
 
 // --- Blueprints for SQEs requested by handlers ---
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum HandlerSqeBlueprint {
   /// Request to send data. The UringWorker will build a Send SQE.
   RequestSend {
@@ -25,33 +26,38 @@ pub enum HandlerSqeBlueprint {
     send_op_flags: i32,
     originating_app_op_ud: UserData,
   },
+  /// Request to send data via kernel zero-copy (`IORING_OP_SEND_ZC`). Falls back to
+  /// a regular Send when the ZC pool is exhausted.
   RequestSendZeroCopy {
-    data_to_send: Bytes, // Data the handler wants to send via ZC
-    send_op_flags: i32,  // For MSG_MORE
-    originating_app_op_ud: UserData,
-  },
-  /// Vectored write: header (≤9 bytes of ZMTP framing) + payload (zero-copy Bytes ref).
-  /// Only valid for unencrypted (NullFramer) paths; encrypted framers emit RequestSend instead.
-  RequestSendVectored {
-    header: Bytes,
-    payload: Bytes,
+    data_to_send: Bytes,
     send_op_flags: i32,
     originating_app_op_ud: UserData,
+  },
+  /// Protocol-agnostic scatter-gather write — issued as a single `writev` SQE.
+  /// Emitted by `UringByteHandler` when the Tokio side sends a vectored `EgressChunk`.
+  RequestSendRawVectored {
+    bufs: Vec<Bytes>,
+    send_op_flags: i32,
   },
   /// Request to close the handler's FD. The UringWorker will build a Close SQE.
   RequestClose,
   /// Request a multishot ring-buffered read for the handler's FD.
-  /// Signals intent to start a multishot read. Worker will generate UserData.
   RequestNewRingReadMultishot { fd: RawFd, bgid: u16 },
-  /// Signals intent to cancel an operation. Worker will generate UserData for the cancel op.
+  /// Signals intent to cancel an operation.
   RequestNewAsyncCancel {
-    fd: RawFd,                  // For context, and to find the MultishotReader
-    target_user_data: UserData, // UserData of the operation to be cancelled
+    fd: RawFd,
+    target_user_data: UserData,
   },
-  /// Request to set the TCP_CORK option on the handler's FD. This is a direct
-  /// worker action, not an SQE submission.
+  /// Request to set the TCP_CORK option on the handler's FD.
   RequestSetCork(bool),
-  // Potentially others: RequestPollAdd, RequestTimeout, etc.
+  /// Submit a `SEND_ZC` SQE directly from a pre-registered buffer slot.
+  /// The slot was already written by the Tokio side; no copy needed here.
+  /// Stays on the worker thread — does NOT need to be `Send`.
+  RequestSendZeroCopyLeased {
+    id: RegisteredSendBufferId,
+    ptr: *const u8,
+    len: u32,
+  },
 }
 
 impl HandlerSqeBlueprint {
@@ -69,7 +75,8 @@ impl HandlerSqeBlueprint {
     match self {
       Self::RequestSend { data, .. } => Some(data.len()),
       Self::RequestSendZeroCopy { data_to_send, .. } => Some(data_to_send.len()),
-      Self::RequestSendVectored { header, payload, .. } => Some(header.len() + payload.len()),
+      Self::RequestSendRawVectored { bufs, .. } => Some(bufs.iter().map(|b| b.len()).sum()),
+      Self::RequestSendZeroCopyLeased { len, .. } => Some(*len as usize),
       _ => None,
     }
   }
@@ -113,7 +120,7 @@ impl<'sq_borrow> SubmissionQueueWriter<'sq_borrow> {
       .map_err(|e| format!("SQ push error: {:?}", e))
   }
   pub fn is_full(&self) -> bool {
-    unsafe { self.sq.is_full() }
+    self.sq.is_full()
   }
 }
 
@@ -129,6 +136,7 @@ pub struct UringWorkerInterface<'cfg_life> {
   // triggered the current handler action (e.g., handle_outgoing_app_data).
   // This is needed by the handler to correctly populate blueprints.
   pub current_external_op_ud: UserData,
+  pub pending_egress_count: usize,
 }
 
 impl<'cfg_life> UringWorkerInterface<'cfg_life> {
@@ -138,6 +146,7 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
     buffer_manager: Option<&'cfg_life super::buffer_manager::BufferRingManager>,
     default_bgid_for_handler_use: Option<u16>,
     current_external_op_ud: UserData,
+    pending_egress_count: usize,
   ) -> Self {
     Self {
       fd,
@@ -145,6 +154,7 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
       buffer_manager,
       default_bgid_for_handler_use,
       current_external_op_ud,
+      pending_egress_count,
     }
   }
   // Methods for handlers to get info, but not to directly queue ops.
@@ -171,12 +181,11 @@ pub trait UringConnectionHandler: Send {
   fn connection_ready(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps;
 
   /// Called when data is available from a completed ring-buffered read.
-  /// `buffer_slice` contains the data, `buffer_id` identifies the ring buffer slot.
+  /// `lease` is a zero-copy lease over the kernel buffer ring slot; it is recycled on drop.
   /// Handler processes data, may produce Msgs for upstream, and returns blueprints for next I/O.
   fn process_ring_read_data(
     &mut self,
-    buffer_slice: &[u8],
-    buffer_id: u16, // Still useful for the handler to know which buffer this was
+    lease: crate::io_uring_backend::byte_handler::UringInboundLease,
     interface: &UringWorkerInterface<'_>,
   ) -> HandlerIoOps;
 
@@ -265,6 +274,12 @@ pub trait UringConnectionHandler: Send {
   fn on_resume_connection(&mut self, _interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
     HandlerIoOps::default()
   }
+
+  /// Called when a multishot RECV_MULTISHOT CQE returns `-ENOBUFS` (kernel buffer ring
+  /// temporarily exhausted). The handler should set its throttle flag to prevent `prepare_sqes`
+  /// from immediately resubmitting, and queue a `ResumeConnection` signal so the worker
+  /// re-arms the read after the OS thread yields and buffers are replenished.
+  fn on_buffer_ring_exhausted(&mut self) {}
 }
 
 pub trait ProtocolHandlerFactory: Send + Sync + 'static {
@@ -279,7 +294,7 @@ pub trait ProtocolHandlerFactory: Send + Sync + 'static {
     is_server: bool,
     // Dedicated inbound data channel receiver. Stored in the handler and taken once
     // at handshake completion to be forwarded in UringConnectionEstablished.
-    inbound_data_rx: fibre::mpmc::AsyncReceiver<Vec<Msg>>,
+    inbound_data_rx: fibre::mpsc::BoundedAsyncReceiver<Vec<Msg>>,
   ) -> Result<Box<dyn UringConnectionHandler + Send>, String>;
 }
 
@@ -297,7 +312,7 @@ pub struct WorkerIoConfig {
   pub socket_mailbox: MailboxSyncSender,
   /// Dedicated data plane: sync sender used by the UringWorker OS thread to push decoded
   /// message batches directly to the per-connection reader task, bypassing the control mailbox.
-  pub inbound_data_tx: fibre::mpmc::Sender<Vec<Msg>>,
+  pub inbound_data_tx: fibre::mpsc::BoundedSender<Vec<Msg>>,
   /// Logical endpoint URI for this connection (e.g. "tcp://1.2.3.4:5678").
   pub endpoint_uri: String,
   /// The original target URI requested by the user.

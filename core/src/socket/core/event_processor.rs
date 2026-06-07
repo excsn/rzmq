@@ -164,10 +164,7 @@ pub(crate) async fn process_system_event(
     SystemEvent::InprocBindingRequest {
       target_inproc_name,
       connector_uri,
-      binder_pipe_tx_to_connector,
-      binder_pipe_rx_from_connector,
-      connector_pipe_write_id,
-      connector_pipe_read_id,
+      binder_stream_end,
       reply_tx,
     } => {
       let is_my_binding_name = core_arc
@@ -181,10 +178,7 @@ pub(crate) async fn process_system_event(
             core_arc,
             socket_logic_strong,
             connector_uri,
-            binder_pipe_rx_from_connector,
-            binder_pipe_tx_to_connector,
-            connector_pipe_read_id,
-            connector_pipe_write_id,
+            binder_stream_end,
             reply_tx,
           )
           .await?;
@@ -194,27 +188,6 @@ pub(crate) async fn process_system_event(
             "Binder socket is shutting down".into(),
           )));
         }
-      }
-    }
-
-    #[cfg(feature = "inproc")]
-    SystemEvent::InprocPipePeerClosed {
-      target_inproc_name,
-      closed_by_connector_pipe_read_id,
-    } => {
-      let is_my_binding_name = core_arc
-        .core_state
-        .read()
-        .bound_inproc_names
-        .contains(&target_inproc_name);
-      if is_my_binding_name {
-        tracing::debug!(handle = core_handle, binder_name=%target_inproc_name, id_closed = closed_by_connector_pipe_read_id, "SocketCore (binder) processing InprocPipePeerClosed.");
-        pipe_manager::handle_inproc_pipe_peer_closed_event(
-          core_arc,
-          socket_logic_strong,
-          closed_by_connector_pipe_read_id,
-        )
-        .await;
       }
     }
 

@@ -6,7 +6,6 @@ use crate::io_uring_backend::ops::UringOpRequest;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::message::Msg;
-use crate::runtime::SystemEvent;
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
 use crate::socket::SocketEvent;
@@ -120,9 +119,13 @@ impl UringFdConnection {
   async fn send_outgoing(&self, msg: OutgoingMessage) -> Result<(), ZmqError> {
     match self.mpsc_tx.send(msg).await {
       Ok(()) => {
-        // Only write to the eventfd when the queue was previously empty AND the worker
-        // is actually blocked waiting for kernel events. Skipping the syscall when the
-        // worker is already spinning eliminates ~200 ns of overhead per message.
+        // Memory ordering contract (spec §4.1):
+        //   Sender: mpsc_tx.send() [internal Release] → worker_asleep.load(Acquire)
+        //   Worker: worker_asleep.store(true, Release) → re-drain MPSC → block
+        // The Acquire load here pairs with the worker's Release store of `worker_asleep`.
+        // Together they ensure: if the worker set `worker_asleep = true` before this load,
+        // we will see it and write the eventfd. If we miss the store (false), the worker's
+        // double-check re-drain loop will see our enqueued message and stay awake.
         if self.mpsc_tx.len() <= 1 && self.worker_asleep.load(Ordering::Acquire) {
           if let Err(e) = self.event_fd.write(1) {
             tracing::error!("UringFdConnection: Failed to signal eventfd: {}", e);
@@ -296,24 +299,8 @@ impl ISocketConnection for InprocConnection {
       }
     }
 
-    let target_name_for_event = self
-      .peer_inproc_name_or_uri
-      .strip_prefix("inproc://")
-      .unwrap_or(&self.peer_inproc_name_or_uri)
-      .to_string();
-
-    let event = SystemEvent::InprocPipePeerClosed {
-      target_inproc_name: target_name_for_event,
-      closed_by_connector_pipe_read_id: self.local_pipe_read_id_from_peer,
-    };
-
-    if self.context.event_bus().publish(event).is_err() {
-      tracing::warn!(
-        conn_id = self.connection_id,
-        peer = %self.peer_inproc_name_or_uri,
-        "Failed to publish InprocPipePeerClosed event."
-      );
-    }
+    // SCAX-backed inproc connections handle teardown via EOF on the DuplexStream.
+    // No explicit peer-closed event needed.
     Ok(())
   }
   

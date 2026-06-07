@@ -1,9 +1,6 @@
 #![cfg(feature = "io-uring")]
 
-use crate::io_uring_backend::connection_handler::OutgoingMessage;
-use crate::message::Msg;
 use crate::runtime::MailboxSyncSender;
-use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
 
@@ -12,7 +9,7 @@ use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use fibre::{mpmc, mpsc, oneshot};
+use fibre::{mpsc, oneshot};
 
 pub const HANDLER_INTERNAL_SEND_OP_UD: UserData = 0;
 
@@ -24,7 +21,6 @@ pub(crate) enum ProtocolConfig {
 
 pub type UserData = u64;
 
-#[derive(Clone)]
 pub enum UringOpRequest {
   Nop {
     user_data: UserData,
@@ -58,23 +54,6 @@ pub enum UringOpRequest {
     socket_mailbox: MailboxSyncSender,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
-  RegisterExternalFd {
-    user_data: UserData,
-    fd: RawFd,
-    protocol_handler_factory_id: String,
-    protocol_config: ProtocolConfig,
-    is_server_role: bool,
-    endpoint_uri: String,
-    target_endpoint_uri: String,
-    connection_iface: Arc<dyn ISocketConnection>,
-    socket_mailbox: MailboxSyncSender,
-    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
-    mpsc_rx_for_worker: Arc<mpsc::BoundedReceiver<OutgoingMessage>>,
-    /// Sync sender for the dedicated inbound data channel (UringWorker OS-thread side).
-    inbound_data_tx: fibre::mpmc::Sender<Vec<Msg>>,
-    /// Async receiver for the dedicated inbound data channel (Tokio reader-task side).
-    inbound_data_rx: fibre::mpmc::AsyncReceiver<Vec<Msg>>,
-  },
   StartFdReadLoop {
     user_data: UserData,
     fd: RawFd,
@@ -85,9 +64,25 @@ pub enum UringOpRequest {
     fd: RawFd,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
+  /// Registers a pre-connected FD with the worker using `UringByteHandler` — a raw byte
+  /// forwarder that bypasses ZMTP framing. Used when `io_uring.session_enabled = true` so
+  /// that ZMTP processing happens inside a Tokio-side `SessionConnectionActorX<UringStream>`.
+  RegisterExternalByteFd {
+    user_data: UserData,
+    fd: RawFd,
+    socket_mailbox: MailboxSyncSender,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
+    /// Inbound: worker → Tokio (sync sender so the OS thread can push without blocking).
+    raw_inbound_tx: fibre::mpsc::BoundedSender<crate::io_uring_backend::byte_handler::UringInboundLease>,
+    /// Egress: Tokio → worker (sync receiver so the OS thread can drain without blocking).
+    raw_egress_rx: fibre::mpsc::BoundedReceiver<crate::io_uring_backend::byte_handler::EgressChunk>,
+  },
   /// Fire-and-forget: signal the worker to re-submit a RECV_MULTISHOT for a paused
   /// connection. Sent by the UringPipeReader task when channel occupancy drops below LWM.
   ResumeConnection { fd: RawFd },
+  /// Fire-and-forget: re-register a multishot recv buffer slot with the kernel ring after
+  /// the Tokio side has finished reading from a `UringInboundLease`.
+  RecycleRecvBuffer { id: u16 },
 }
 
 impl UringOpRequest {
@@ -99,10 +94,11 @@ impl UringOpRequest {
       | Self::RegisterRawBuffers { user_data, .. }
       | Self::Listen { user_data, .. }
       | Self::Connect { user_data, .. }
-      | Self::RegisterExternalFd { user_data, .. }
+      | Self::RegisterExternalByteFd { user_data, .. }
       | Self::StartFdReadLoop { user_data, .. }
       | Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
       Self::ResumeConnection { .. } => 0, // fire-and-forget: no user_data
+      Self::RecycleRecvBuffer { .. } => 0,
     }
   }
 
@@ -113,10 +109,11 @@ impl UringOpRequest {
       Self::RegisterRawBuffers { .. } => "RegisterRawBuffers".to_string(),
       Self::Listen { .. } => "Listen".to_string(),
       Self::Connect { .. } => "Connect".to_string(),
-      Self::RegisterExternalFd { .. } => "RegisterExternalFd".to_string(),
+      Self::RegisterExternalByteFd { .. } => "RegisterExternalByteFd".to_string(),
       Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
       Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
       Self::ResumeConnection { .. } => "ResumeConnection".to_string(),
+      Self::RecycleRecvBuffer { .. } => "RecycleRecvBuffer".to_string(),
     }
   }
 
@@ -126,11 +123,12 @@ impl UringOpRequest {
       | Self::InitializeBufferRing { reply_tx, .. }
       | Self::RegisterRawBuffers { reply_tx, .. }
       | Self::Listen { reply_tx, .. }
-      | Self::RegisterExternalFd { reply_tx, .. }
+      | Self::RegisterExternalByteFd { reply_tx, .. }
       | Self::Connect { reply_tx, .. }
       | Self::StartFdReadLoop { reply_tx, .. }
       | Self::ShutdownConnectionHandler { reply_tx, .. } => Some(reply_tx),
       Self::ResumeConnection { .. } => None, // fire-and-forget: no reply channel
+      Self::RecycleRecvBuffer { .. } => None,
     }
   }
 }
@@ -182,19 +180,6 @@ impl fmt::Debug for UringOpRequest {
         .field("target_addr", target_addr)
         .field("protocol_handler_factory_id", protocol_handler_factory_id)
         .finish_non_exhaustive(),
-      UringOpRequest::RegisterExternalFd {
-        user_data,
-        fd,
-        protocol_handler_factory_id,
-        is_server_role,
-        ..
-      } => f
-        .debug_struct("RegisterExternalFd")
-        .field("user_data", user_data)
-        .field("fd", fd)
-        .field("protocol_handler_factory_id", protocol_handler_factory_id)
-        .field("is_server_role", is_server_role)
-        .finish_non_exhaustive(),
       UringOpRequest::StartFdReadLoop { user_data, fd, .. } => f
         .debug_struct("StartFdReadLoop")
         .field("user_data", user_data)
@@ -205,9 +190,18 @@ impl fmt::Debug for UringOpRequest {
         .field("user_data", user_data)
         .field("fd", fd)
         .finish_non_exhaustive(),
+      UringOpRequest::RegisterExternalByteFd { user_data, fd, .. } => f
+        .debug_struct("RegisterExternalByteFd")
+        .field("user_data", user_data)
+        .field("fd", fd)
+        .finish_non_exhaustive(),
       UringOpRequest::ResumeConnection { fd } => f
         .debug_struct("ResumeConnection")
         .field("fd", fd)
+        .finish(),
+      UringOpRequest::RecycleRecvBuffer { id } => f
+        .debug_struct("RecycleRecvBuffer")
+        .field("id", id)
         .finish(),
     }
   }
@@ -235,7 +229,7 @@ pub enum UringOpCompletion {
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
   },
-  RegisterExternalFdSuccess {
+  RegisterExternalByteFdSuccess {
     user_data: UserData,
     fd: RawFd,
   },
@@ -295,8 +289,8 @@ impl fmt::Debug for UringOpCompletion {
         .field("peer_addr", peer_addr)
         .field("local_addr", local_addr)
         .finish(),
-      UringOpCompletion::RegisterExternalFdSuccess { user_data, fd } => f
-        .debug_struct("RegisterExternalFdSuccess")
+      UringOpCompletion::RegisterExternalByteFdSuccess { user_data, fd } => f
+        .debug_struct("RegisterExternalByteFdSuccess")
         .field("user_data", user_data)
         .field("fd", fd)
         .finish(),

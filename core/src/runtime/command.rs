@@ -10,6 +10,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
+use fibre::mpsc::BoundedAsyncReceiver;
 use fibre::oneshot;
 use tokio::task::Id as TaskId;
 
@@ -122,7 +123,7 @@ pub enum Command {
     peer_identity: Option<Blob>,
     /// Dedicated per-connection inbound data channel. Taken once by command_processor
     /// to spawn the UringPipeReader task, bypassing the control mailbox for data delivery.
-    inbound_data_rx: Option<AsyncReceiver<Vec<Msg>>>,
+    inbound_data_rx: Option<BoundedAsyncReceiver<Vec<Msg>>>,
     /// Raw file descriptor for this connection. Passed to UringPipeReader so it can send
     /// `ResumeConnection { fd }` when the inbound channel drains below the LWM.
     fd: RawFd,

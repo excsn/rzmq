@@ -6,23 +6,30 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 
-/// Heap-allocated pair of iovecs whose address is stable for the lifetime of an in-flight Writev.
-/// The `Box` ensures the array doesn't move even as `InternalOpPayload` is moved in the tracker.
-pub(crate) struct PinnedIovecs(pub Box<[libc::iovec; 2]>);
-// SAFETY: `libc::iovec` contains raw pointers, but they point into `Bytes` values held by the
-// same `InternalOpPayload`. The worker thread is the only accessor; no cross-thread sharing.
-unsafe impl Send for PinnedIovecs {}
-impl std::fmt::Debug for PinnedIovecs {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("PinnedIovecs")
-      .field("iov[0].len", &self.0[0].iov_len)
-      .field("iov[1].len", &self.0[1].iov_len)
-      .finish()
-  }
+/// Simple, protocol-agnostic scatter-gather batch for raw vectored writes.
+///
+/// Unlike `PinnedBatchWrite`, this has no ZMTP-specific fields (`header_slab`, `app_op_name`).
+/// Used exclusively by `UringByteHandler` for `EgressChunk::Vectored` writes.
+///
+/// Memory safety: `iovecs` contains raw pointers into `payloads` entries, owned together.
+/// Only the worker thread accesses this during the SQE→CQE window.
+pub(crate) struct PinnedEgressBatch {
+  pub iovecs: Box<[libc::iovec]>,
+  pub payloads: Vec<Bytes>,
+  pub total_len: usize,
+  pub send_op_flags: i32,
 }
-impl Clone for PinnedIovecs {
-  fn clone(&self) -> Self {
-    PinnedIovecs(Box::new(*self.0))
+
+// SAFETY: iovec contains raw pointers into payloads (owned by this struct).
+// Worker thread is the sole accessor during SQE→CQE window.
+unsafe impl Send for PinnedEgressBatch {}
+
+impl std::fmt::Debug for PinnedEgressBatch {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("PinnedEgressBatch")
+      .field("iovec_count", &self.iovecs.len())
+      .field("total_len", &self.total_len)
+      .finish()
   }
 }
 
@@ -31,44 +38,42 @@ pub(crate) enum InternalOpType {
   Accept,
   RingRead,
   Send,
-  SendVectored,
+  SendZeroCopy,
   CloseFd,
   GenericHandlerOp,
   EventFdPoll,
   RingReadMultishot,
   AsyncCancel,
-  SendZeroCopy,
+  /// Protocol-agnostic writev for `UringByteHandler` vectored egress.
+  SendRawVectored,
+  /// `SEND_ZC` from a pre-registered, pre-written buffer slot (Phase 3 zero-copy lease path).
+  SendZeroCopyLeased,
 }
 
 /// Payload associated with an internal operation, e.g., buffer for send.
-#[derive(Debug, Clone)] // Clone is needed if InternalOpDetails is Clone. Bytes is cheap to clone.
+#[derive(Debug)]
 pub(crate) enum InternalOpPayload {
   None,
   SendBuffer {
-    buffer: Bytes,               // Data being sent (if not ZC)
-    send_op_flags: i32,          // Stored flags for EAGAIN retries
-    app_op_ud: Option<UserData>, // UserData of the originating UringOpRequest (e.g., SendDataViaHandler)
-    app_op_name: Option<String>, // Name of the app-level operation
+    buffer: Bytes,
+    send_op_flags: i32,
+    app_op_ud: Option<UserData>,
+    app_op_name: Option<String>,
   },
   CancelTarget {
     target_user_data: UserData,
   },
   SendZeroCopy {
-    send_buf_id: RegisteredSendBufferId, // ID from SendBufferPool
-    original_data: Bytes,                // Stored original data for EAGAIN fallback to standard Send
-    send_op_flags: i32,                  // Stored flags for fallback
-    app_op_ud: UserData,                 // UserData of the originating UringOpRequest
-    app_op_name: String,                 // Name of the app-level operation
-  },
-  /// Header + payload submitted as a two-iovec Writev to avoid user-space payload copy.
-  SendVectored {
-    header: Bytes,
-    payload: Bytes,
-    iovecs: PinnedIovecs, // keeps *const iovec stable until the CQE is reaped
+    send_buf_id: RegisteredSendBufferId,
+    original_data: Bytes,
     send_op_flags: i32,
-    app_op_ud: Option<UserData>,
-    app_op_name: Option<String>,
+    app_op_ud: UserData,
+    app_op_name: String,
   },
+  /// Protocol-agnostic scatter-gather batch for `UringByteHandler` vectored egress.
+  RawVectored(PinnedEgressBatch),
+  /// Leased pre-registered buffer slot — only the buffer ID is needed for release on completion.
+  SendZeroCopyLeased { send_buf_id: RegisteredSendBufferId },
 }
 
 impl Default for InternalOpPayload {
@@ -78,11 +83,11 @@ impl Default for InternalOpPayload {
 }
 
 /// Details stored for an in-flight internal operation.
-#[derive(Debug, Clone)] // Must be Clone if InternalOpPayload is Clone
+#[derive(Debug)]
 pub(crate) struct InternalOpDetails {
   pub fd: RawFd,
   pub op_type: InternalOpType,
-  pub payload: InternalOpPayload, // Added to store data like send buffers
+  pub payload: InternalOpPayload,
 }
 
 #[derive(Debug)]

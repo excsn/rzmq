@@ -3,11 +3,18 @@ use crate::context::Context as RzmqContext;
 use crate::error::ZmqError;
 use crate::error::ZmqResult;
 use crate::message::Msg;
-use crate::runtime::ActorDropGuard;
-use crate::runtime::ActorType;
+use crate::runtime::{ActorDropGuard, ActorType, mailbox, system_events::ConnectionInteractionModel};
 use crate::socket::core::state::{EndpointInfo, EndpointType};
 use crate::socket::core::{SocketCore, command_processor};
 use crate::socket::{ISocket, SocketEvent};
+use crate::socket::options::ZmtpEngineConfig;
+
+#[cfg(feature = "inproc")]
+use crate::sessionx::actor::SessionConnectionActorX;
+#[cfg(feature = "inproc")]
+use crate::sessionx::states::ActorConfigX;
+#[cfg(feature = "inproc")]
+use crate::transport::inproc_stream::InprocStream;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
 #[cfg(feature = "inproc")]
@@ -421,177 +428,76 @@ pub(crate) async fn process_inproc_binding_request_event(
   core_arc: Arc<SocketCore>,
   socket_logic_strong: &Arc<dyn ISocket>,
   connector_uri: String,
-  pipe_rx_for_binder_to_receive_from_connector: AsyncReceiver<Vec<Msg>>,
-  pipe_tx_for_binder_to_send_to_connector: AsyncSender<Vec<Msg>>,
-  binder_write_id_for_this_connection: usize,
-  binder_read_id_for_this_connection: usize,
+  binder_stream_end: Arc<std::sync::Mutex<Option<tokio::io::DuplexStream>>>,
   reply_tx_to_connector: oneshot::Sender<ZmqResult<()>>,
 ) -> Result<(), ZmqError> {
-  use crate::socket::{
-    SocketEvent,
-    core::state::{EndpointInfo, EndpointType},
+  let binder_core_handle = core_arc.handle;
+  tracing::debug!(
+    binder_handle = binder_core_handle,
+    %connector_uri,
+    "SocketCore (binder) processing InprocBindingRequest — spawning SCAX."
+  );
+
+  // Take the binder's stream half out of the shared wrapper.
+  let stream = match binder_stream_end.lock().unwrap().take() {
+    Some(s) => s,
+    None => {
+      tracing::error!(binder_handle = binder_core_handle, "InprocBindingRequest: binder_stream_end already taken.");
+      let _ = reply_tx_to_connector.send(Err(ZmqError::Internal("binder_stream_end already taken".into())));
+      return Err(ZmqError::Internal("binder_stream_end already taken".into()));
+    }
   };
 
-  let binder_core_handle = core_arc.handle;
-  tracing::debug!(
-    binder_handle = binder_core_handle,
-    connector_uri = %connector_uri,
-    binder_write_pipe_id = binder_write_id_for_this_connection,
-    binder_read_pipe_id = binder_read_id_for_this_connection,
-    "SocketCore (binder) processing InprocBindingRequest event."
+  let sca_handle_id = core_arc.context.inner().next_handle();
+  let engine_conf = Arc::new(ZmtpEngineConfig::from(&*core_arc.core_state.read().options));
+  let actor_conf = ActorConfigX {
+    context: core_arc.context.clone(),
+    monitor_tx: core_arc.core_state.read().get_monitor_sender_clone(),
+    logical_target_endpoint_uri: connector_uri.clone(),
+    connected_endpoint_uri: connector_uri.clone(),
+    is_server_role: true,
+  };
+  let capacity = core_arc.context.inner().get_actor_mailbox_capacity();
+  let (command_sender_for_sca, command_receiver_for_sca) = mailbox(capacity);
+  let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+    sca_handle_id,
+    binder_core_handle,
+    InprocStream::new(stream),
+    actor_conf,
+    engine_conf,
+    command_receiver_for_sca,
+    socket_logic_strong.clone(),
+    None,
   );
 
-  let accept_result: Result<(), ZmqError> = Ok(());
+  // Tell the binder's SocketCore about the new connection so it sets up pipes.
+  let cmd = Command::NewConnectionEstablished {
+    endpoint_uri: connector_uri.clone(),
+    target_endpoint_uri: connector_uri.clone(),
+    connection_iface: None,
+    interaction_model: ConnectionInteractionModel::ViaSca {
+      sca_mailbox: command_sender_for_sca,
+      sca_handle_id,
+    },
+    managing_actor_task_id: Some(sca_task_handle.id()),
+  };
+  if socket_logic_strong.mailbox().send(cmd).await.is_err() {
+    tracing::error!(binder_handle = binder_core_handle, "Failed to send NewConnectionEstablished to binder socket core.");
+    let err = ZmqError::Internal("binder socket core closed".into());
+    let _ = reply_tx_to_connector.send(Err(err.clone()));
+    return Err(err);
+  }
 
-  if accept_result.is_ok() {
-    let socket_logic = socket_logic_strong.clone();
-    tokio::spawn(async move {
-      loop {
-        match pipe_rx_for_binder_to_receive_from_connector.recv().await {
-          Ok(msgs_vec) => {
-            let cmd_batch = Command::PipeMessageBatchReceived {
-              pipe_id: binder_read_id_for_this_connection,
-              msgs: msgs_vec,
-            };
-            if socket_logic
-              .handle_pipe_event(binder_read_id_for_this_connection, cmd_batch)
-              .await
-              .is_err()
-            {
-              break;
-            }
-          }
-          Err(_) => {
-            let cmd_closed = Command::PipeClosedByPeer {
-              pipe_id: binder_read_id_for_this_connection,
-            };
-            let _ = socket_logic
-              .handle_pipe_event(binder_read_id_for_this_connection, cmd_closed)
-              .await;
-            break;
-          }
-        }
-      }
+  if let Some(monitor_tx) = core_arc.core_state.read().get_monitor_sender_clone() {
+    let _ = monitor_tx.try_send(SocketEvent::Accepted {
+      endpoint: connector_uri.clone(),
+      peer_addr: format!("inproc-connector-{}", connector_uri),
     });
-
-    let inproc_endpoint_entry_handle_id = core_arc.context.inner().next_handle();
-
-    // InprocConnection for binder side
-    let binder_side_inproc_iface =
-      Arc::new(crate::socket::connection_iface::InprocConnection::new(
-        inproc_endpoint_entry_handle_id, // connection_id for this EndpointInfo
-        binder_write_id_for_this_connection, // Binder's local_pipe_write_id_to_peer (connector's read ID)
-        binder_read_id_for_this_connection, // Binder's local_pipe_read_id_from_peer (connector's write ID)
-        connector_uri.clone(),              // peer_inproc_name_or_uri is the connector's URI
-        core_arc.context.clone(),           // Binder's context
-        pipe_tx_for_binder_to_send_to_connector.clone(), // data_tx_to_peer is the sender to the connector
-        core_arc.core_state.read().get_monitor_sender_clone(), // Binder's monitor
-        core_arc.core_state.read().options.clone(),      // Binder's socket options
-      ));
-
-    let endpoint_info_for_binder = EndpointInfo {
-      mailbox: core_arc.command_sender(),
-      task_handle: None,
-      endpoint_type: EndpointType::Session,
-      endpoint_uri: connector_uri.clone(),
-      pipe_ids: Some((
-        binder_write_id_for_this_connection,
-        binder_read_id_for_this_connection,
-      )),
-      handle_id: inproc_endpoint_entry_handle_id,
-      target_endpoint_uri: Some(connector_uri.clone()),
-      is_outbound_connection: false,
-      peer_socket_type: None,
-      connection_iface: binder_side_inproc_iface,
-    };
-
-    {
-      let mut binder_core_state = core_arc.core_state.write();
-      binder_core_state.pipes_tx.insert(
-        binder_write_id_for_this_connection,
-        pipe_tx_for_binder_to_send_to_connector,
-      );
-      binder_core_state
-        .endpoints
-        .insert(connector_uri.clone(), endpoint_info_for_binder);
-      binder_core_state
-        .pipe_read_id_to_endpoint_uri
-        .insert(binder_read_id_for_this_connection, connector_uri.clone());
-    }
-
-    if let Some(monitor_tx) = core_arc.core_state.read().get_monitor_sender_clone() {
-      let _ = monitor_tx.try_send(SocketEvent::Accepted {
-        endpoint: connector_uri.clone(),
-        peer_addr: format!("inproc-connector-{}", connector_uri),
-      });
-    }
-
-    socket_logic_strong
-      .pipe_attached(
-        binder_read_id_for_this_connection,
-        binder_write_id_for_this_connection,
-        None,
-      )
-      .await;
-    tracing::info!(binder_handle = binder_core_handle, connector_uri = %connector_uri, "Inproc connection accepted by binder.");
   }
 
-  if reply_tx_to_connector.send(accept_result.clone()).is_err() {
-    tracing::warn!(binder_handle = binder_core_handle, connector_uri = %connector_uri, "Failed to send InprocBindingRequest reply to connector (already taken/dropped).");
-  }
-  accept_result
-}
-
-#[cfg(feature = "inproc")]
-pub(crate) async fn handle_inproc_pipe_peer_closed_event(
-  core_arc: Arc<SocketCore>,
-  socket_logic_strong: &Arc<dyn ISocket>,
-  // This is the ID the *binder* uses to WRITE to the (now closed) connector.
-  // It corresponds to the *connector's* `pipe_read_id`.
-  closed_connector_read_id_from_event: usize, // Renamed for clarity
-) {
-  let binder_core_handle = core_arc.handle;
-  tracing::debug!(
-    binder_handle = binder_core_handle,
-    id_connector_reads_on_this_is_closed = closed_connector_read_id_from_event,
-    "SocketCore (binder) handling InprocPipePeerClosed event."
-  );
-
-  let mut binder_read_pipe_id_to_cleanup: Option<usize> = None;
-  let mut endpoint_uri_of_closed_conn: Option<String> = None;
-
-  {
-    let core_s_read = core_arc.core_state.read();
-    for (uri, ep_info) in core_s_read.endpoints.iter() {
-      if ep_info.endpoint_type == EndpointType::Session {
-        if let Some((binder_writes_here, binder_reads_here)) = ep_info.pipe_ids {
-          // The event's closed_connector_read_id is what the *binder writes to*.
-          if binder_writes_here == closed_connector_read_id_from_event {
-            binder_read_pipe_id_to_cleanup = Some(binder_reads_here);
-            endpoint_uri_of_closed_conn = Some(uri.clone());
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  if let Some(read_id_to_clean) = binder_read_pipe_id_to_cleanup {
-    tracing::debug!(
-      binder_handle = binder_core_handle,
-      binder_read_pipe_id_to_clean = read_id_to_clean,
-      uri = %endpoint_uri_of_closed_conn.as_deref().unwrap_or("N/A"),
-      "Found binder's read pipe to clean up for closed inproc connection."
-    );
-    let _ =
-      cleanup_session_state_by_pipe(core_arc.clone(), read_id_to_clean, socket_logic_strong).await;
-  } else {
-    tracing::warn!(
-      binder_handle = binder_core_handle,
-      binder_write_id_that_peer_closed = closed_connector_read_id_from_event,
-      "SocketCore (binder) could not find its corresponding read pipe for InprocPipePeerClosed event. Cleanup may be incomplete or connection already gone."
-    );
-  }
+  tracing::info!(binder_handle = binder_core_handle, %connector_uri, "Inproc binder SCAX spawned; sending Ok to connector.");
+  let _ = reply_tx_to_connector.send(Ok(()));
+  Ok(())
 }
 
 pub(crate) async fn send_msg_with_timeout(

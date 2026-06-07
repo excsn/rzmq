@@ -11,7 +11,7 @@ use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
 use crate::security::framer::{ISecureFramer, NullFramer};
 use crate::security::{Mechanism, NullMechanism};
 use crate::socket::options::ZmtpEngineConfig;
-use crate::transport::ZmtpStdStream;
+use crate::transport::{ZmtpReadHalf, ZmtpStdStream};
 
 use bytes::BytesMut;
 use std::fmt;
@@ -31,18 +31,22 @@ pub(crate) enum NetworkActionX {
 }
 
 pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
-  // --- Shared State accessible by sub-module functions via &self or &mut self ---
   pub(crate) config: Arc<ZmtpEngineConfig>,
   pub(crate) is_server: bool,
-  pub(crate) stream: Option<S>,
+
+  /// The owned read half — `None` once the actor extracts it into a local variable
+  /// for use in the concurrent ingress `select!` arm.
+  pub(crate) read_half: Option<S::ReadHalf>,
+  /// The owned write half — `None` once the actor extracts it for the egress arm.
+  pub(crate) write_half: Option<S::WriteHalf>,
 
   pub(crate) network_read_buffer: BytesMut,
 
   pub(crate) handshake_state: ZmtpHandshakeStateX,
   pub(crate) security_mechanism: Box<dyn Mechanism>,
   pub(crate) pending_peer_greeting: Option<ZmtpGreeting>,
-  pub(crate) zmtp_manual_parser: ZmtpManualParser, // For the handshake phase
-  pub(crate) framer: Box<dyn ISecureFramer>,       // For the data phase
+  pub(crate) zmtp_manual_parser: ZmtpManualParser,
+  pub(crate) framer: Box<dyn ISecureFramer>,
 
   pub(crate) heartbeat_state: ZmtpHeartbeatStateX,
 
@@ -51,43 +55,36 @@ pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
   #[cfg(not(target_os = "linux"))]
   pub(crate) cork_info: Option<()>,
 
+  /// Partially-consumed kernel ring buffer lease held between `read_data_frames_batch_impl` calls.
+  /// Only active on io-uring connections with a NULL/PLAIN framer (no encryption).
+  #[cfg(feature = "io-uring")]
+  pub(crate) active_lease:
+    Option<(crate::io_uring_backend::byte_handler::UringInboundLease, usize)>,
+
   pub(crate) actor_handle: usize,
 }
 
 impl<S: ZmtpStdStream + fmt::Debug> fmt::Debug for ZmtpProtocolHandlerX<S> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let mut debug_struct = f.debug_struct("ZmtpProtocolHandlerX");
-    debug_struct
+    f.debug_struct("ZmtpProtocolHandlerX")
       .field("actor_handle", &self.actor_handle)
       .field("config", &self.config)
       .field("is_server", &self.is_server)
-      .field("stream_is_some", &self.stream.is_some());
-    debug_struct.field("network_read_buffer_len", &self.network_read_buffer.len());
-
-    // REMOVED old fields, ADDED framer (can't debug the trait object itself easily)
-    debug_struct.field("framer_active", &"true");
-
-    debug_struct
+      .field("read_half_is_some", &self.read_half.is_some())
+      .field("write_half_is_some", &self.write_half.is_some())
+      .field("network_read_buffer_len", &self.network_read_buffer.len())
+      .field("framer_active", &"true")
       .field("handshake_state", &self.handshake_state)
       .field("security_mechanism_name", &self.security_mechanism.name())
-      .field("pending_peer_greeting", &self.pending_peer_greeting);
-
-    debug_struct.field("heartbeat_state", &self.heartbeat_state);
-
-    #[cfg(target_os = "linux")]
-    debug_struct.field("cork_info", &self.cork_info);
-    #[cfg(not(target_os = "linux"))]
-    debug_struct.field("cork_info", &"None (Non-Linux)");
-
-    debug_struct.field("zmtp_manual_parser", &self.zmtp_manual_parser);
-
-    debug_struct.finish_non_exhaustive()
+      .field("pending_peer_greeting", &self.pending_peer_greeting)
+      .field("heartbeat_state", &self.heartbeat_state)
+      .finish_non_exhaustive()
   }
 }
 
 impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
   pub(crate) fn new(
-    stream: S, // Take ownership of the stream directly
+    stream: S,
     config: Arc<ZmtpEngineConfig>,
     is_server: bool,
     actor_handle: usize,
@@ -100,21 +97,25 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     });
     let max_msg_size = config.max_msg_size;
 
+    // Capture the raw fd for cork setup BEFORE consuming the stream via into_split.
     #[cfg(target_os = "linux")]
     let cork_info_val = {
-      // Assuming S: AsRawFd is handled by the caller passing an appropriate stream
-      // when config.use_cork is true.
+      use std::os::fd::AsRawFd;
       let stream_ref_for_cork: Option<&S> = if config.use_cork { Some(&stream) } else { None };
       try_create_cork_info(stream_ref_for_cork, config.use_cork)
     };
     #[cfg(not(target_os = "linux"))]
     let cork_info_val: Option<()> = None;
 
+    // Split the stream into independent owned halves.
+    let (read_half, write_half) = stream.into_split();
+
     Self {
       actor_handle,
       config,
       is_server,
-      stream: Some(stream),
+      read_half: Some(read_half),
+      write_half: Some(write_half),
       network_read_buffer: BytesMut::with_capacity(8192 * 2),
       handshake_state: ZmtpHandshakeStateX::new(),
       security_mechanism: Box::new(NullMechanism),
@@ -126,85 +127,54 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
         effective_timeout_corrected,
       ),
       cork_info: cork_info_val,
+      #[cfg(feature = "io-uring")]
+      active_lease: None,
     }
   }
 
-  /// Indicates if the ZMTP handshake (Greeting, Security, Ready) is fully completed.
   pub(crate) fn is_handshake_complete(&self) -> bool {
     self.handshake_state.sub_phase == HandshakeSubPhaseX::Done
   }
 
-  // --- Main Public Methods Delegating to Sub-Modules ---
+  // --- Main Public Methods ---
 
-  /// Advances the ZMTP handshake state machine by one step.
-  /// Called repeatedly by SessionConnectionActorX until handshake completes or fails.
   pub(crate) async fn advance_handshake(&mut self) -> Result<ZmtpHandshakeProgressX, ZmqError> {
     handshake::advance_handshake_step_impl(self).await
   }
 
-  /// Reads from the stream, decrypts (if applicable), and parses one full ZMTP message
-  /// (data or command) during the operational data phase.
+  /// Reads from the read half, decrypts (if applicable), and parses one full ZMTP message.
+  /// Used by legacy callers; the actor uses `read_and_parse_data_frames_batch` instead.
   pub(crate) async fn read_and_parse_data_frame(&mut self) -> Result<Option<Msg>, ZmqError> {
     data_io::read_data_frame_impl(self).await
   }
 
-  /// Unified network read future suitable for use in a single `select!` arm.
-  /// Dispatches to handshake or data-frame reads based on current connection phase.
-  /// Returns `futures::future::pending()` for phases where no network read is needed,
-  /// so the arm is safely ignored by the scheduler.
-  pub(crate) async fn do_network_read_work(
+  /// Greedy inbound read: one async kernel read + synchronous drain of all complete frames.
+  ///
+  /// `reader` is the extracted local read half from the actor's `run_loop`. The handler's
+  /// own `read_half` field will be `None` at this point (taken out by the actor).
+  pub(crate) async fn read_and_parse_data_frames_batch(
     &mut self,
-    phase: ConnectionPhaseX,
-  ) -> Result<NetworkActionX, ZmqError> {
-    match phase {
-      ConnectionPhaseX::HandshakeInProgress => {
-        self.advance_handshake().await.map(NetworkActionX::HandshakeProgress)
-      }
-      ConnectionPhaseX::Operational => {
-        self.read_and_parse_data_frames_batch().await.map(NetworkActionX::DataBatch)
-      }
-      _ => futures::future::pending().await,
-    }
+    reader: &mut S::ReadHalf,
+  ) -> Result<Vec<Msg>, ZmqError> {
+    data_io::read_data_frames_batch_impl(self, reader).await
   }
 
-  /// Frames, encrypts (if applicable), manages TCP_CORK, and writes a ZMTP message
-  /// to the stream during the operational data phase.
-  ///
-  /// `is_first_part_of_logical_zmq_msg`: True if this ZMTP frame is the first frame
-  /// of a (potentially multi-frame) logical ZMQ message. Used for TCP_CORK.
-  ///
-  /// Returns `Ok(true)` if this was the last ZMTP frame of the logical ZMQ message,
-  /// `Ok(false)` otherwise. This return value helps the caller manage its own
-  /// state for `is_first_part_of_logical_zmq_msg` for subsequent calls.
   pub(crate) async fn write_data_msg(
     &mut self,
     msg: Msg,
     is_first_part_of_logical_zmq_msg: bool,
-  ) -> Result<bool /* was_last_part_of_logical_zmq_msg */, ZmqError> {
+  ) -> Result<bool, ZmqError> {
     data_io::write_data_msg_impl(self, msg, is_first_part_of_logical_zmq_msg).await
   }
 
-  /// Frames, encrypts, and writes a full logical ZMQ message (one or more parts)
-  /// to the stream. This is the new, preferred method for sending data.
   pub(crate) async fn write_data_msgs(&mut self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
     data_io::write_data_msgs_impl(self, msgs).await
   }
 
-  /// Greedy inbound read: one async kernel read + synchronous drain of all complete frames.
-  pub(crate) async fn read_and_parse_data_frames_batch(&mut self) -> Result<Vec<Msg>, ZmqError> {
-    data_io::read_data_frames_batch_impl(self).await
-  }
-
-  /// Frames, coalesces, and writes an entire batch of logical ZMQ messages in a
-  /// single network call, amortizing syscall and context-switch overhead.
   pub(crate) async fn write_data_batch(&mut self, batch: &[Vec<Msg>]) -> Result<(), ZmqError> {
     data_io::write_data_batch_impl(self, batch).await
   }
 
-  /// Processes an incoming ZMTP command frame received during the data phase,
-  /// primarily for handling PING/PONG.
-  ///
-  /// Returns `Ok(Some(Msg))` if a PONG reply needs to be sent.
   pub(crate) fn process_incoming_data_command_frame(
     &mut self,
     cmd_msg: &Msg,
@@ -212,70 +182,60 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     heartbeat::process_heartbeat_command_impl(self, cmd_msg)
   }
 
-  /// Checks if a ZMTP PING should be sent due to inactivity and sends it if needed.
   pub(crate) async fn maybe_send_ping(&mut self) -> Result<(), ZmqError> {
     heartbeat::try_send_ping_impl(self).await
   }
 
-  /// Checks if the timeout for an expected PONG reply has been exceeded.
+  pub(crate) fn frame_outgoing_batch(&mut self, batch: &[Vec<Msg>]) -> Result<bytes::Bytes, ZmqError> {
+    self.framer.write_msg_batch(batch)
+  }
+
+  pub(crate) fn frame_outgoing_msgs(&mut self, msgs: Vec<Msg>) -> Result<bytes::Bytes, ZmqError> {
+    self.framer.write_msg_multipart(msgs)
+  }
+
+  pub(crate) fn maybe_build_ping(&mut self) -> Result<Option<bytes::Bytes>, ZmqError> {
+    heartbeat::try_build_ping_impl(self)
+  }
+
   pub(crate) fn has_pong_timed_out(&self) -> bool {
     heartbeat::check_pong_timeout_impl(&self.heartbeat_state, Instant::now())
   }
 
-  /// Initiates a graceful shutdown of the underlying stream.
-  /// This includes uncorking if TCP_CORK was active.
+  /// Graceful shutdown: uncork if needed, then shut down the write half.
+  /// The actor restores `write_half` before calling this if it had taken it out.
   pub(crate) async fn initiate_stream_shutdown(&mut self) -> Result<(), ZmqError> {
     tracing::debug!(
       sca_handle = self.actor_handle,
       "ZmtpProtocolHandlerX: Initiating stream shutdown."
     );
 
-    // Clear buffers BEFORE shutting down stream
     self.clear_handshake_state();
 
-    if let Some(stream_ref) = self.stream.as_mut() {
+    if let Some(mut w) = self.write_half.take() {
       #[cfg(target_os = "linux")]
       {
         if let Some(cork_info_ref) = self.cork_info.as_mut() {
           if cork_info_ref.is_corked() {
-            cork_info_ref
-              .apply_cork_state(false, self.actor_handle)
-              .await;
+            cork_info_ref.apply_cork_state(false, self.actor_handle).await;
           }
         }
       }
-      // Attempt graceful shutdown of the write side of the stream.
-      match stream_ref.shutdown().await {
-        Ok(()) => tracing::debug!(
-          sca_handle = self.actor_handle,
-          "Stream shutdown() successful."
-        ),
-        Err(e) => {
-          tracing::warn!(sca_handle = self.actor_handle, error = %e, "Error during stream shutdown().")
-        }
+      match w.shutdown().await {
+        Ok(()) => tracing::debug!(sca_handle = self.actor_handle, "Write half shutdown() successful."),
+        Err(e) => tracing::warn!(sca_handle = self.actor_handle, error = %e, "Error during write half shutdown()."),
       }
     }
-    self.stream = None; // Drop the stream, which should close it.
+    self.read_half = None;
     Ok(())
   }
 
-  /// Clears internal buffers and state to free memory on errors.
-  /// Called before stream shutdown to prevent memory leaks.
   fn clear_handshake_state(&mut self) {
-    tracing::trace!(
-      sca_handle = self.actor_handle,
-      "Clearing handshake state and buffers."
-    );
-
     self.pending_peer_greeting = None;
     self.network_read_buffer.clear();
-
-    // Reset security mechanism to free any internal buffers
     if self.security_mechanism.name() != NullMechanism::NAME {
       self.security_mechanism = Box::new(NullMechanism);
     }
-    
-    // Reset framer to free any internal state
     self.framer = Box::new(NullFramer::new(self.config.max_msg_size));
   }
 }

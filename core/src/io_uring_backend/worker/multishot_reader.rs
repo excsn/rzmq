@@ -2,6 +2,7 @@
 
 use crate::ZmqError;
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
+use crate::io_uring_backend::byte_handler::UringInboundLease;
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringConnectionHandler, UringWorkerInterface,
 };
@@ -84,7 +85,7 @@ impl MultishotReader {
   /// Called by handler to signal intent to start a multishot read.
   pub fn prepare_recv_multi_intent(&self) -> Option<HandlerSqeBlueprint> {
     if self.is_active || self.cancel_op_user_data.is_some() {
-      return None; // Already active or being cancelled
+      return None;
     }
     Some(HandlerSqeBlueprint::RequestNewRingReadMultishot {
       fd: self.fd,
@@ -178,15 +179,17 @@ impl MultishotReader {
           return Ok((ops_to_return, true));
         }
         if errno == libc::ENOBUFS {
-          // Non-fatal: the kernel ran out of buffers in the ring.
-          // Terminate the active operation so the worker can resubmit a new read
-          // on the next iteration once buffers are returned to the pool.
+          // Non-fatal: kernel buffer ring temporarily exhausted. Notify the handler to
+          // set its throttle flag so `prepare_sqes` won't immediately resubmit and spin.
+          // The handler also sends a `ResumeConnection` to the worker op channel so the
+          // read is re-armed after the worker sleeps and Tokio drains the receive queues.
           tracing::debug!(
-            "[MultishotReader FD={}] Buffer ring exhausted (ENOBUFS). Multishot read stopped; will resubmit.",
+            "[MultishotReader FD={}] Buffer ring exhausted (ENOBUFS). Notifying handler.",
             self.fd
           );
           self.active_op_user_data = None;
           self.is_active = false;
+          owner_handler.on_buffer_ring_exhausted();
           return Ok((ops_to_return, true));
         }
 
@@ -212,7 +215,9 @@ impl MultishotReader {
         );
         self.active_op_user_data = None;
         self.is_active = false;
-        ops_to_return = owner_handler.process_ring_read_data(&[], 0, worker_interface);
+        // EOF sentinel: len=0, ptr=null — no buffer slot was consumed, Drop is a no-op.
+        let eof_lease = UringInboundLease { id: 0, ptr: std::ptr::null(), len: 0 };
+        ops_to_return = owner_handler.process_ring_read_data(eof_lease, worker_interface);
         return Ok((ops_to_return, true));
       }
 
@@ -234,11 +239,16 @@ impl MultishotReader {
       let bytes_read = cqe_res as usize;
 
       if bytes_read > 0 {
+        // Zero-copy path: borrow the slot to extract a stable pointer, then mem::forget
+        // the guard so the slot is NOT auto-replenished. The worker recycles it later
+        // when UringInboundLease::drop fires RecycleRecvBuffer.
         match unsafe { buffer_manager.borrow_kernel_filled_buffer(buffer_id, bytes_read) } {
-          Ok(borrowed_buffer) => {
-            ops_to_return =
-              owner_handler.process_ring_read_data(&borrowed_buffer, buffer_id, worker_interface);
-            // BorrowedBuffer is dropped here, returning it to the pool.
+          Ok(borrowed) => {
+            let ptr = (*borrowed).as_ptr() as *const u8;
+            let len = (*borrowed).len();
+            std::mem::forget(borrowed); // Prevent auto-replenishment
+            let lease = UringInboundLease { id: buffer_id, ptr, len };
+            ops_to_return = owner_handler.process_ring_read_data(lease, worker_interface);
           }
           Err(e) => {
             tracing::error!(
@@ -255,13 +265,18 @@ impl MultishotReader {
           }
         }
       } else {
-        // bytes_read == 0 (EOF)
+        // bytes_read == 0 (EOF with buffer consumed — reprovide slot inline)
         tracing::info!(
           "[MultishotReader FD={}] EOF on multishot read (ud {}). Terminating multishot.",
           self.fd,
           cqe_ud
         );
-        ops_to_return = owner_handler.process_ring_read_data(&[], buffer_id, worker_interface);
+        // The buffer slot was consumed; reprovide it immediately (no lease needed for EOF).
+        if let Err(e) = unsafe { buffer_manager.reprovide_buffer(buffer_id) } {
+          tracing::warn!("[MultishotReader FD={}] reprovide_buffer({}) on EOF failed: {:?}", self.fd, buffer_id, e);
+        }
+        let eof_lease = UringInboundLease { id: 0, ptr: std::ptr::null(), len: 0 };
+        ops_to_return = owner_handler.process_ring_read_data(eof_lease, worker_interface);
         // Fall through to MORE flag check; EOF means the multishot op should terminate.
       }
 

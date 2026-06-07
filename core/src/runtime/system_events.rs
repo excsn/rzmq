@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use crate::message::Msg;
 use crate::runtime::mailbox::MailboxSender as SessionCommandMailboxSender;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::{error::ZmqError, Blob};
@@ -10,7 +9,6 @@ use std::fmt;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use fibre::mpmc::{AsyncReceiver, AsyncSender};
 use fibre::oneshot;
 use tokio::task::Id as TaskId;
 
@@ -110,35 +108,23 @@ pub enum SystemEvent {
   /// Published by an `inproc` connector's `SocketCore` to request a connection
   /// from an `inproc` binder `SocketCore`. The binder listens for events
   /// matching its `target_inproc_name`.
+  ///
+  /// Both sides create a `SessionConnectionActorX<InprocStream>` and run the full
+  /// ZMTP state machine over a `tokio::io::duplex` in-memory byte pipe.
+  #[cfg(feature = "inproc")]
   InprocBindingRequest {
     /// The logical name of the inproc endpoint to connect to (e.g., "my-service").
     target_inproc_name: String,
     /// The URI of the connector socket, for logging or identification purposes.
     connector_uri: String,
-    /// The channel sender the Binder uses to send messages TO the Connector.
-    binder_pipe_tx_to_connector: AsyncSender<Vec<Msg>>,
-    /// The channel receiver the Binder uses to get messages FROM the Connector.
-    binder_pipe_rx_from_connector: AsyncReceiver<Vec<Msg>>,
-    /// The ID the connector uses to write messages to the binder.
-    connector_pipe_write_id: usize,
-    /// The ID the connector uses to read messages from the binder.
-    connector_pipe_read_id: usize,
-    /// A oneshot sender for the binder to reply with `Ok(())` if the connection
-    /// is accepted, or `Err(ZmqError)` if rejected.
-    /// Note: `ZmqError` is used here as `oneshot::Sender` itself doesn't require the payload to be `Clone`.
+    /// The binder's half of the in-memory duplex pipe.
+    ///
+    /// Wrapped in `Arc<Mutex<Option<…>>>` because `SystemEvent` derives `Clone`
+    /// but `DuplexStream` is not `Clone`. The binder takes the stream exactly once
+    /// via `.lock().unwrap().take()`.
+    binder_stream_end: Arc<std::sync::Mutex<Option<tokio::io::DuplexStream>>>,
+    /// Reply channel: binder sends `Ok(())` on acceptance, `Err(…)` on rejection.
     reply_tx: oneshot::Sender<Result<(), ZmqError>>,
-  },
-
-  /// Published by an `inproc` connector's `SocketCore` when it closes its side
-  /// of an established inproc connection. This notifies the binder `SocketCore`
-  /// (identified by `target_inproc_name`) to clean up its corresponding pipe ends.
-  InprocPipePeerClosed {
-    /// The logical name of the inproc binder being notified.
-    target_inproc_name: String,
-    /// The pipe ID from the perspective of the *closing connector's read pipe*.
-    /// The binder uses this to identify which of its write pipes (to the connector)
-    /// should be closed and cleaned up.
-    closed_by_connector_pipe_read_id: usize,
   },
 }
 
@@ -196,11 +182,11 @@ impl fmt::Debug for SystemEvent {
         .field("target_endpoint_uri", target_endpoint_uri)
         .field("error", error)
         .finish(),
-      SystemEvent::InprocBindingRequest { .. } => f
+      #[cfg(feature = "inproc")]
+      SystemEvent::InprocBindingRequest { target_inproc_name, connector_uri, .. } => f
         .debug_struct("InprocBindingRequest")
-        .finish_non_exhaustive(),
-      SystemEvent::InprocPipePeerClosed { .. } => f
-        .debug_struct("InprocPipePeerClosed")
+        .field("target_inproc_name", target_inproc_name)
+        .field("connector_uri", connector_uri)
         .finish_non_exhaustive(),
     }
   }

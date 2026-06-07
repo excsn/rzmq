@@ -29,33 +29,6 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
     Pattern::PubSub => SocketType::Pub,
   };
 
-  let socket = context.socket(socket_type)?;
-
-  // Configure common socket options
-  socket.set_option(SNDHWM, args.hwm as i32).await?;
-  socket.set_option(TCP_CORK, args.cork).await?;
-  socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
-
-  #[cfg(feature = "io-uring")]
-  {
-    if args.use_io_uring {
-      info!("Enabling io_uring session backend on client FD.");
-      socket.set_option(IO_URING_SESSION_ENABLED, true).await?;
-      if args.uring_zerocopy {
-        info!("Enabling io_uring Send Zero-Copy on client FD.");
-        socket.set_option(IO_URING_SNDZEROCOPY, true).await?;
-      }
-      if args.uring_multishot {
-        info!("Enabling io_uring multishot recv on client FD.");
-        socket.set_option(IO_URING_RCVMULTISHOT, true).await?;
-      }
-    }
-  }
-
-  info!("Client connecting socket to: {}...", args.endpoint);
-  socket.connect(&args.endpoint).await?;
-  info!("Client connected. Starting workload execution.");
-
   let is_latency_test = matches!(args.pattern, Pattern::ReqRep | Pattern::DealerRouter);
 
   let collector = Arc::new(BenchmarkCollector::new(is_latency_test));
@@ -168,6 +141,31 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
     }
 
     Pattern::DealerRouter => {
+      let socket = context.socket(socket_type)?;
+      socket.set_option(SNDHWM, args.hwm as i32).await?;
+      socket.set_option(TCP_CORK, args.cork).await?;
+      socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
+      #[cfg(feature = "io-uring")]
+      if use_io_uring {
+        socket.set_option(IO_URING_SESSION_ENABLED, true).await?;
+        if uring_zerocopy { socket.set_option(IO_URING_SNDZEROCOPY, true).await?; }
+        if uring_multishot { socket.set_option(IO_URING_RCVMULTISHOT, true).await?; }
+      }
+      info!("Connecting DealerRouter socket to: {}...", args.endpoint);
+      socket.connect(&args.endpoint).await?;
+
+      {
+        let sd = Arc::clone(&shutdown);
+        let socket_for_close = socket.clone();
+        let total_duration = warmup_duration + duration_limit;
+        tokio::spawn(async move {
+          tokio::time::sleep(total_duration).await;
+          info!("Main duration timer expired. Triggering socket.close() to unblock DealerRouter workers.");
+          sd.store(true, Ordering::Release);
+          let _ = socket_for_close.close().await;
+        });
+      }
+
       let pipeline_depth = args.pipeline.max(1);
       let msg_counter = Arc::new(AtomicUsize::new(0));
       info!(
@@ -176,8 +174,6 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
       );
 
       for i in 0..args.concurrency {
-        // Each worker pair gets its own semaphore, eliminating cross-worker
-        // atomic contention on the shared semaphore counter.
         let worker_semaphore = Arc::new(Semaphore::new(pipeline_depth));
 
         join_set.spawn(run_dealer_sender(
@@ -204,19 +200,6 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
         ));
       }
     }
-  }
-
-  // Active Socket Closing Shutdown, fires after warmup + measurement window.
-  {
-    let sd = Arc::clone(&shutdown);
-    let socket_clone = socket.clone();
-    let total_duration = warmup_duration + duration_limit;
-    tokio::spawn(async move {
-      tokio::time::sleep(total_duration).await;
-      info!("Main duration timer expired. Triggering socket.close() to unblock all workers.");
-      sd.store(true, Ordering::Release);
-      let _ = socket_clone.close().await;
-    });
   }
 
   info!("All tasks spawned. Awaiting JoinSet completion...");
@@ -292,6 +275,17 @@ async fn run_throughput_worker(
 
   socket.connect(&endpoint).await?;
   info!("[Throughput Worker {}] Connected. Loop started.", id);
+
+  {
+    let socket_for_close = socket.clone();
+    let sd = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      tokio::time::sleep(remaining).await;
+      sd.store(true, Ordering::Release);
+      let _ = socket_for_close.close().await;
+    });
+  }
 
   let mut loop_counter = 0u32;
 
@@ -398,6 +392,17 @@ async fn run_reqrep_worker(
 
   socket.connect(&endpoint).await?;
   info!("[ReqRep Worker {}] Connected. Loop started.", id);
+
+  {
+    let socket_for_close = socket.clone();
+    let sd = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      tokio::time::sleep(remaining).await;
+      sd.store(true, Ordering::Release);
+      let _ = socket_for_close.close().await;
+    });
+  }
 
   let mut messages_sent = 0usize;
   let mut local_hist = Histogram::<u64>::new(3).expect("histogram");

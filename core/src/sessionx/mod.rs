@@ -1,4 +1,5 @@
 pub(crate) mod actor;
+pub(crate) mod egress_buffer;
 #[cfg(target_os = "linux")]
 pub(crate) mod cork;
 pub(crate) mod iface;

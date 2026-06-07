@@ -86,14 +86,21 @@ async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
   #[cfg(feature = "io-uring")]
   {
     if args.use_io_uring {
-      base_args.push("--use-io-uring".to_string()); // FIXED
+      base_args.push("--use-io-uring".to_string());
     }
     if args.uring_zerocopy {
-      base_args.push("--uring-zerocopy".to_string()); // FIXED
+      base_args.push("--uring-zerocopy".to_string());
     }
     if args.uring_multishot {
-      base_args.push("--uring-multishot".to_string()); // FIXED
+      base_args.push("--uring-multishot".to_string());
     }
+    // Always propagate the strategy so both child processes use the same profile.
+    let strategy_str = match args.uring_strategy {
+      crate::cli::UringStrategy::Performance => "performance",
+      crate::cli::UringStrategy::Balanced => "balanced",
+      crate::cli::UringStrategy::LowPower => "low-power",
+    };
+    base_args.push(format!("--uring-strategy={}", strategy_str));
   }
 
   // 2. Configure the Server Command

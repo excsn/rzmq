@@ -56,9 +56,9 @@ async fn read_handshake_command_frame_impl<S: ZmtpStdStream>(
   timeout_duration: Duration,
 ) -> Result<Msg, ZmqError> {
   let stream = handler
-    .stream
+    .read_half
     .as_mut()
-    .ok_or_else(|| ZmqError::Internal("Stream unavailable for reading handshake command".into()))?;
+    .ok_or_else(|| ZmqError::Internal("Read half unavailable for reading handshake command".into()))?;
 
   // Use an overall deadline for the entire operation of getting one command.
   let deadline = tokio::time::Instant::now() + timeout_duration;
@@ -128,9 +128,9 @@ async fn send_handshake_command_frame_impl<S: ZmtpStdStream>(
   temp_zmtp_encoder.encode(command_msg.clone(), &mut encoded_command_buffer)?;
 
   let stream = handler
-    .stream
+    .write_half
     .as_mut()
-    .ok_or_else(|| ZmqError::Internal("Stream unavailable for send".into()))?;
+    .ok_or_else(|| ZmqError::Internal("Write half unavailable for send".into()))?;
   tokio::time::timeout(timeout_duration, stream.write_all(&encoded_command_buffer))
     .await
     .map_err(|_| ZmqError::Timeout)?
@@ -148,9 +148,9 @@ async fn send_greeting_impl<S: ZmtpStdStream>(
 ) -> Result<ZmtpHandshakeProgressX, ZmqError> {
   let own_greeting_mechanism_bytes = determine_own_greeting_mechanism_impl(handler);
   let stream = handler
-    .stream
+    .write_half
     .as_mut()
-    .ok_or_else(|| ZmqError::Internal("Stream unavailable".into()))?;
+    .ok_or_else(|| ZmqError::Internal("Write half unavailable".into()))?;
   let mut greeting_buffer_to_send = BytesMut::with_capacity(GREETING_LENGTH);
   ZmtpGreeting::encode(
     own_greeting_mechanism_bytes,
@@ -190,9 +190,9 @@ async fn receive_greeting_impl<S: ZmtpStdStream>(
 ) -> Result<ZmtpHandshakeProgressX, ZmqError> {
   let deadline = Instant::now() + operation_timeout;
   let stream = handler
-    .stream
+    .read_half
     .as_mut()
-    .ok_or_else(|| ZmqError::Internal("Stream unavailable".into()))?;
+    .ok_or_else(|| ZmqError::Internal("Read half unavailable".into()))?;
   while handler.network_read_buffer.len() < GREETING_LENGTH {
     let remaining_time = deadline.saturating_duration_since(Instant::now());
     if remaining_time.is_zero() {

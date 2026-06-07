@@ -132,6 +132,20 @@ pub(crate) fn process_heartbeat_command_impl<S: ZmtpStdStream>(
   }
 }
 
+/// Builds a PING frame if one is due. Updates heartbeat state. Does not write to stream.
+pub(crate) fn try_build_ping_impl<S: ZmtpStdStream>(
+  handler: &mut ZmtpProtocolHandlerX<S>,
+) -> Result<Option<bytes::Bytes>, crate::ZmqError> {
+  if !handler.heartbeat_state.should_send_ping(Instant::now()) {
+    return Ok(None);
+  }
+  tracing::debug!(sca_handle = handler.actor_handle, "Heartbeat: building PING frame.");
+  let ping_msg = ZmtpCommand::create_ping(0, b"");
+  let wire_bytes = super::data_io::frame_single_msg_impl(handler, ping_msg)?;
+  handler.heartbeat_state.ping_sent();
+  Ok(Some(wire_bytes))
+}
+
 pub(crate) async fn try_send_ping_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
 ) -> Result<(), ZmqError> {

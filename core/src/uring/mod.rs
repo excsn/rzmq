@@ -5,7 +5,6 @@ pub mod global_state;
 use crate::error::ZmqError;
 use crate::io_uring_backend::connection_handler::ProtocolHandlerFactory;
 use crate::io_uring_backend::worker::UringWorker;
-use crate::io_uring_backend::zmtp_handler::ZmtpHandlerFactory;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,6 +25,59 @@ pub const DEFAULT_IO_URING_RECV_BUFFER_COUNT: usize = 16;
 #[cfg(feature = "io-uring")]
 pub const DEFAULT_IO_URING_RECV_BUFFER_SIZE: usize = 65536;
 
+/// Controls how the `UringWorker` thread behaves when there is no immediate work.
+///
+/// The tiered strategy inserts user-space spinning before entering a blocking kernel sleep,
+/// trading CPU cycles for reduced wakeup latency. During all spin phases, `worker_asleep`
+/// remains `false`, so `UringStream` never fires an expensive EventFD write.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UringPollingStrategy {
+  /// Skip all user-space spinning and go directly to a blocking `io_uring_enter` wait.
+  /// Lowest CPU usage; highest idle latency.
+  ImmediateSleep,
+  /// Execute sequential spin phases before sleeping.
+  Tiered {
+    /// Iterations of tight CPU spin with no yield hints (highest responsiveness).
+    aggressive_spin_limit: u32,
+    /// Iterations with `std::hint::spin_loop()` — notifies the CPU pipeline to relax.
+    cooperative_spin_limit: u32,
+    /// Iterations with `std::thread::yield_now()` — cooperates with the OS scheduler.
+    os_yield_limit: u32,
+    /// If `false`, never enter deep sleep (pins CPU at 100%); if `true`, fall through to
+    /// `submit_with_args` after all spin phases exhaust.
+    deep_sleep_fallback: bool,
+  },
+}
+
+impl UringPollingStrategy {
+  /// No spinning. Best for power-constrained or oversubscribed environments.
+  pub fn low_power() -> Self {
+    Self::ImmediateSleep
+  }
+
+  /// Moderate spinning before sleeping. Good general-purpose default.
+  pub fn balanced() -> Self {
+    Self::Tiered {
+      aggressive_spin_limit: 64,
+      cooperative_spin_limit: 32,
+      os_yield_limit: 16,
+      deep_sleep_fallback: true,
+    }
+  }
+
+  /// Maximum spinning, no kernel sleep. Best for sustained high-frequency bursts.
+  ///
+  /// **Warning**: pins the `UringWorker` OS thread at 100% CPU.
+  pub fn ultra_low_latency() -> Self {
+    Self::Tiered {
+      aggressive_spin_limit: 1000,
+      cooperative_spin_limit: 500,
+      os_yield_limit: 100,
+      deep_sleep_fallback: false,
+    }
+  }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct UringConfig {
   pub ring_entries: u32,
@@ -35,6 +87,16 @@ pub struct UringConfig {
   pub default_recv_buffer_size: usize,
   pub default_send_buffer_count: usize,
   pub default_send_buffer_size: usize,
+  /// Enable `IORING_SETUP_SQPOLL`: the kernel spawns a dedicated thread that polls
+  /// the submission queue, eliminating `io_uring_enter` syscalls under load.
+  /// Requires `CAP_SYS_ADMIN`/`CAP_SYS_NICE` or Linux ≥ 5.11 for unprivileged use.
+  /// Falls back to non-SQPOLL mode on `EPERM`/`EACCES`.
+  pub sqpoll_enabled: bool,
+  /// Milliseconds of inactivity before the SQPOLL kernel thread sleeps.
+  /// After sleeping, one wakeup syscall is needed before polling resumes.
+  pub sqpoll_idle_ms: u32,
+  /// Controls the user-space spinning behavior when the worker thread is idle.
+  pub polling_strategy: UringPollingStrategy,
 }
 
 impl Default for UringConfig {
@@ -47,7 +109,50 @@ impl Default for UringConfig {
       default_recv_buffer_size: DEFAULT_IO_URING_RECV_BUFFER_SIZE,
       default_send_buffer_count: DEFAULT_IO_URING_SND_BUFFER_COUNT,
       default_send_buffer_size: DEFAULT_IO_URING_SND_BUFFER_SIZE,
+      sqpoll_enabled: false,
+      sqpoll_idle_ms: 2000,
+      polling_strategy: UringPollingStrategy::balanced(),
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn balanced_preset_fields() {
+    assert!(matches!(
+      UringPollingStrategy::balanced(),
+      UringPollingStrategy::Tiered {
+        aggressive_spin_limit: 64,
+        cooperative_spin_limit: 32,
+        os_yield_limit: 16,
+        deep_sleep_fallback: true,
+      }
+    ));
+  }
+
+  #[test]
+  fn ultra_low_latency_never_sleeps() {
+    assert!(matches!(
+      UringPollingStrategy::ultra_low_latency(),
+      UringPollingStrategy::Tiered { deep_sleep_fallback: false, .. }
+    ));
+  }
+
+  #[test]
+  fn low_power_is_immediate_sleep() {
+    assert_eq!(UringPollingStrategy::low_power(), UringPollingStrategy::ImmediateSleep);
+  }
+
+  #[test]
+  fn default_config_uses_balanced() {
+    let cfg = UringConfig::default();
+    assert!(matches!(
+      cfg.polling_strategy,
+      UringPollingStrategy::Tiered { deep_sleep_fallback: true, .. }
+    ));
   }
 }
 
@@ -61,7 +166,7 @@ pub fn initialize_uring_backend(config: UringConfig) -> Result<(), ZmqError> {
     URING_INIT_RESULT.get_or_try_init(|| -> Result<Result<(), ZmqError>, ZmqError> {
       info!("Initializing global io_uring backend with config: {:?}", config);
 
-      let factories: Vec<Arc<dyn ProtocolHandlerFactory>> = vec![Arc::new(ZmtpHandlerFactory {})];
+      let factories: Vec<Arc<dyn ProtocolHandlerFactory>> = vec![];
       let (signaling_op_tx, worker_join_handle) =
         UringWorker::spawn_with_config(config, factories).map_err(|e| {
           error!("Failed to spawn UringWorker: {}", e);

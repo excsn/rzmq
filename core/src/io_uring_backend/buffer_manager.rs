@@ -1,7 +1,7 @@
 #![cfg(feature = "io-uring")]
 
 use crate::ZmqError;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use io_uring::IoUring;
 use io_uring_buf_ring::{BorrowedBuffer, IoUringBufRing};
 use std::fmt;
@@ -74,5 +74,60 @@ impl BufferRingManager {
           ))
         })
     }
+  }
+
+  /// Re-registers a buffer slot with the kernel ring after the Tokio side has finished reading
+  /// a `UringInboundLease`. Uses the `get_buf(id, 0)` + immediate drop trick to call
+  /// `release_borrowed_buffer` without touching any data.
+  ///
+  /// # Safety
+  /// No other `BorrowedBuffer` guard for `buffer_id` may be live when this is called.
+  pub unsafe fn reprovide_buffer(&self, buffer_id: u16) -> Result<(), ZmqError> {
+    let borrowed = unsafe {
+      self
+        .buf_ring_instance
+        .get_buf(buffer_id, 0)
+        .ok_or_else(|| ZmqError::Internal(format!("reprovide_buffer: invalid id {}", buffer_id)))?
+    };
+    drop(borrowed); // BorrowedBuffer::drop → release_borrowed_buffer → advances ring tail
+    Ok(())
+  }
+
+  /// Take the kernel-filled buffer at `buffer_id`, freeze it into an owned `Bytes`, and
+  /// automatically replenish the ring slot when the `BorrowedBuffer` guard drops.
+  ///
+  /// # Architecture note
+  /// The `io_uring_buf_ring` crate (v0.2) uses borrow semantics — it does not expose
+  /// `take_buf`. This implementation therefore copies the received data into a new allocation
+  /// (`Bytes::copy_from_slice`). When the crate is extended with a `take_buf` API, this
+  /// function can be updated to return the kernel buffer directly (zero copies).
+  ///
+  /// The returned `Bytes` supports cheap sub-slicing (`Bytes::slice`), so frame parsing
+  /// in the callers is already zero-copy within the returned allocation.
+  ///
+  /// # Safety
+  /// Same contract as `borrow_kernel_filled_buffer`.
+  pub unsafe fn take_and_replenish_buffer(
+    &self,
+    buffer_id: u16,
+    available_len: usize,
+  ) -> Result<Bytes, ZmqError> {
+    // Borrow the kernel-filled slot.
+    let borrowed = unsafe {
+      self
+        .buf_ring_instance
+        .get_buf(buffer_id, available_len)
+        .ok_or_else(|| {
+          ZmqError::Internal(format!(
+            "Failed to borrow buffer ID {} from ring",
+            buffer_id
+          ))
+        })?
+    };
+    // Copy the received bytes into an owned allocation.
+    // `BorrowedBuffer::drop` automatically re-registers the original slot with the kernel.
+    let data = Bytes::copy_from_slice(&*borrowed);
+    // `borrowed` drops here → slot re-offered to kernel for new incoming data.
+    Ok(data)
   }
 }

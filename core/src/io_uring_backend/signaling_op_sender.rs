@@ -1,16 +1,21 @@
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::ops::UringOpRequest;
+use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use fibre::{mpmc::AsyncSender, SendError, TrySendError};
+use once_cell::sync::OnceCell;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::{os::fd::AsRawFd, usize};
 
 #[derive(Clone)] // EventFD is Cloneable
 pub struct SignalingOpSender {
-  op_tx: AsyncSender<UringOpRequest>, // Store the async sender directly
-  event_fd: eventfd::EventFD,              // Clone of the UringWorker's EventFD
+  op_tx: AsyncSender<UringOpRequest>,
+  event_fd: eventfd::EventFD,
   worker_asleep: Arc<AtomicBool>,
+  /// Shared slot populated by the worker thread once the `SendBufferPool` is initialized.
+  /// `OnceCell` is lock-free for reads after the one-time write.
+  pool_slot: Arc<OnceCell<Arc<SendBufferPool>>>,
 }
 
 impl SignalingOpSender {
@@ -18,13 +23,19 @@ impl SignalingOpSender {
     op_tx: AsyncSender<UringOpRequest>,
     event_fd: eventfd::EventFD,
     worker_asleep: Arc<AtomicBool>,
+    pool_slot: Arc<OnceCell<Arc<SendBufferPool>>>,
   ) -> Self {
-    Self { op_tx, event_fd, worker_asleep }
+    Self { op_tx, event_fd, worker_asleep, pool_slot }
   }
 
   /// Clones the worker-asleep flag to share with data connections.
   pub fn clone_worker_asleep(&self) -> Arc<AtomicBool> {
     Arc::clone(&self.worker_asleep)
+  }
+
+  /// Returns a clone of the send-buffer pool, if one is initialized.
+  pub fn clone_send_buffer_pool(&self) -> Option<Arc<SendBufferPool>> {
+    self.pool_slot.get().cloned()
   }
 
   /// Asynchronously sends an operation request and signals the eventfd on success.

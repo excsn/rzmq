@@ -361,13 +361,11 @@ impl TcpListener {
                 {
                   match tokio_tcp_stream.into_std() {
                     Ok(std_stream) => {
-                      // Only apply permanent startup corking if the socket is a streaming type
                       #[cfg(target_os = "linux")]
                       {
                         let socket_type = socket_options_clone.socket_type_name.as_str();
                         let use_cork_at_startup = socket_options_clone.tcp_cork
                           && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB");
-
                         if use_cork_at_startup {
                           tracing::debug!(
                             handle = accept_loop_handle,
@@ -393,53 +391,30 @@ impl TcpListener {
                       } else {
                         let raw_fd = std_stream.into_raw_fd();
 
+                        let rcvhwm = socket_options_clone.rcvhwm.max(1);
+                        let sndhwm = socket_options_clone.sndhwm.max(1);
+                        let (raw_inbound_tx, raw_inbound_rx_sync) =
+                          fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::UringInboundLease>(rcvhwm);
+                        let (raw_egress_sync_tx, raw_egress_rx) =
+                          fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::EgressChunk>(sndhwm);
+
                         let worker_op_tx =
                           uring::global_state::get_global_uring_worker_op_tx().unwrap();
-                        let protocol_config = WorkerProtocolConfig::Zmtp(Arc::new(
-                          ZmtpEngineConfig::from(&*socket_options_clone),
-                        ));
                         let user_data_for_op = context_clone.inner().next_handle() as u64;
                         let (reply_tx_for_op, reply_rx_for_op) = oneshot();
 
-                        let hwm = socket_options_clone.sndhwm.max(1); // TODO Needs bounded mpsc fibre to respect this
-                        let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::bounded(hwm);
-
-                        let inbound_hwm = socket_options_clone.rcvhwm.max(1);
-                        let (inbound_data_tx_sync, inbound_data_rx_sync) =
-                          fibre::mpmc::bounded::<Vec<RzmqMsg>>(inbound_hwm);
-                        let inbound_data_rx = inbound_data_rx_sync.to_async();
-
-                        let event_fd = worker_op_tx.clone_event_fd();
-                        let worker_asleep = worker_op_tx.clone_worker_asleep();
-                        let new_conn_iface = Arc::new(UringFdConnection::new(
-                          raw_fd,
-                          mpsc_tx_for_conn.to_async(),
-                          event_fd,
-                          worker_asleep,
-                          context_clone.clone(),
-                        ));
-
-                        // Hand URIs and connection_iface to the worker; the worker emits
-                        // UringConnectionEstablished atomically on handshake completion.
-                        let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
+                        let register_req = WorkerUringOpRequest::RegisterExternalByteFd {
                           user_data: user_data_for_op,
                           fd: raw_fd,
-                          protocol_handler_factory_id: "zmtp-uring/3.1".to_string(),
-                          protocol_config,
-                          is_server_role: true,
-                          endpoint_uri: actual_connected_uri.clone(),
-                          target_endpoint_uri: logical_uri.clone(),
-                          connection_iface: new_conn_iface,
                           socket_mailbox: socket_logic.mailbox().to_sync(),
                           reply_tx: reply_tx_for_op,
-                          mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
-                          inbound_data_tx: inbound_data_tx_sync,
-                          inbound_data_rx,
+                          raw_inbound_tx,
+                          raw_egress_rx,
                         };
 
-                        if let Err(e) = worker_op_tx.send(register_fd_req).await {
+                        if let Err(e) = worker_op_tx.send(register_req).await {
                           tracing::error!(
-                            "Send RegisterExternalFd to UringWorker for fd {}: {}",
+                            "Send RegisterExternalByteFd to UringWorker for fd {}: {}",
                             raw_fd,
                             e
                           );
@@ -449,19 +424,62 @@ impl TcpListener {
                           setup_successful = false;
                         } else {
                           match reply_rx_for_op.recv().await {
-                            Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess {
+                            Ok(Ok(WorkerUringOpCompletion::RegisterExternalByteFdSuccess {
                               fd: returned_fd,
                               ..
-                            }))
-                              if returned_fd == raw_fd =>
-                            {
-                              info!("Registered accepted FD {} with UringWorker.", raw_fd);
-                              // UringConnectionEstablished will be sent by the worker on handshake;
-                              // interaction_model_for_event is intentionally not set for UringFd.
+                            })) if returned_fd == raw_fd => {
+                              info!(
+                                "Registered accepted FD {} with UringWorker (byte handler).",
+                                raw_fd
+                              );
+                              let event_fd = worker_op_tx.clone_event_fd();
+                              let worker_asleep = worker_op_tx.clone_worker_asleep();
+                              let send_pool = worker_op_tx.clone_send_buffer_pool();
+                              let uring_stream =
+                                crate::transport::uring_stream::UringStream::new(
+                                  raw_fd,
+                                  raw_inbound_rx_sync.to_async(),
+                                  raw_egress_sync_tx,
+                                  worker_asleep,
+                                  event_fd,
+                                  send_pool,
+                                );
+
+                              let sca_handle_id = handle_source_clone
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                              let actor_conf = ActorConfigX {
+                                context: context_clone.clone(),
+                                monitor_tx: monitor_tx_clone.clone(),
+                                logical_target_endpoint_uri: logical_uri.clone(),
+                                connected_endpoint_uri: actual_connected_uri.clone(),
+                                is_server_role: true,
+                              };
+                              let engine_conf =
+                                Arc::new(ZmtpEngineConfig::from(&*socket_options_clone));
+                              let (command_sender_for_sca, command_receiver_for_sca) =
+                                mailbox(context_clone.inner().get_actor_mailbox_capacity());
+
+                              let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+                                sca_handle_id,
+                                parent_socket_core_id,
+                                uring_stream,
+                                actor_conf,
+                                engine_conf,
+                                command_receiver_for_sca,
+                                socket_logic.clone(),
+                                Some(max_connection_permit),
+                              );
+
+                              interaction_model_for_event =
+                                Some(ConnectionInteractionModel::ViaSca {
+                                  sca_mailbox: command_sender_for_sca,
+                                  sca_handle_id,
+                                });
+                              managing_actor_task_id_for_event = Some(sca_task_handle.id());
                             }
                             Ok(Ok(other_completion)) => {
                               tracing::error!(
-                                "UringWorker bad success for RegisterExternalFd (fd {}): {:?}",
+                                "UringWorker bad completion for RegisterExternalByteFd (fd {}): {:?}",
                                 raw_fd,
                                 other_completion
                               );
@@ -472,7 +490,7 @@ impl TcpListener {
                             }
                             Ok(Err(worker_err)) => {
                               tracing::error!(
-                                "Register accepted FD {} with UringWorker failed (worker error): {:?}",
+                                "Register accepted FD {} with UringWorker failed: {:?}",
                                 raw_fd,
                                 worker_err
                               );
@@ -481,11 +499,11 @@ impl TcpListener {
                               }
                               setup_successful = false;
                             }
-                            Err(oneshot_recv_err) => {
+                            Err(recv_err) => {
                               tracing::error!(
-                                "Register accepted FD {} with UringWorker failed (reply channel error): {:?}",
+                                "Register accepted FD {} reply channel error: {:?}",
                                 raw_fd,
-                                oneshot_recv_err
+                                recv_err
                               );
                               unsafe {
                                 let _ = libc::close(raw_fd);
@@ -600,7 +618,7 @@ impl TcpListener {
                     actual_connected_uri
                   );
                 }
-              } else {
+              } else if !setup_successful {
                 tracing::warn!(
                   "Connection setup failed for {}, NewConnectionEstablished not sent.",
                   actual_connected_uri
@@ -1011,71 +1029,88 @@ impl TcpConnecter {
             apply_tcp_socket_options_to_std(&std_stream, &self.config)?;
             let raw_fd = std_stream.into_raw_fd();
             let worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
-            let protocol_config =
-              WorkerProtocolConfig::Zmtp(Arc::new(ZmtpEngineConfig::from(&*self.socket_options)));
+
+            let rcvhwm = self.socket_options.rcvhwm.max(1);
+            let sndhwm = self.socket_options.sndhwm.max(1);
+            let (raw_inbound_tx, raw_inbound_rx_sync) =
+              fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::UringInboundLease>(rcvhwm);
+            let (raw_egress_sync_tx, raw_egress_rx) =
+              fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::EgressChunk>(sndhwm);
+
             let user_data_for_op = self.context.inner().next_handle() as u64;
             let (reply_tx_for_op, reply_rx_for_op) = oneshot();
-            let hwm = self.socket_options.sndhwm.max(1);
-            let (mpsc_tx_for_conn, mpsc_rx_for_worker) = mpsc::bounded(hwm);
-            let inbound_hwm = self.socket_options.rcvhwm.max(1);
-            let (inbound_data_tx_sync, inbound_data_rx_sync) =
-              fibre::mpmc::bounded::<Vec<RzmqMsg>>(inbound_hwm);
-            let inbound_data_rx = inbound_data_rx_sync.to_async();
-            let event_fd = worker_op_tx.clone_event_fd();
-            let worker_asleep = worker_op_tx.clone_worker_asleep();
 
-            let new_conn_iface = Arc::new(UringFdConnection::new(
-              raw_fd,
-              mpsc_tx_for_conn.to_async(),
-              event_fd,
-              worker_asleep,
-              self.context.clone(),
-            ));
-
-            // Hand URIs and connection_iface to the worker. The worker emits
-            // UringConnectionEstablished to SocketCore atomically on handshake completion.
             let actual_peer_uri_str = format!("tcp://{}", peer_addr_actual);
-            let register_fd_req = WorkerUringOpRequest::RegisterExternalFd {
+            let register_req = WorkerUringOpRequest::RegisterExternalByteFd {
               user_data: user_data_for_op,
               fd: raw_fd,
-              protocol_handler_factory_id: "zmtp-uring/3.1".to_string(),
-              protocol_config,
-              is_server_role: false,
-              endpoint_uri: actual_peer_uri_str.clone(),
-              target_endpoint_uri: endpoint_uri_original.to_string(),
-              connection_iface: new_conn_iface,
               socket_mailbox: self.socket_logic.mailbox().to_sync(),
               reply_tx: reply_tx_for_op,
-              mpsc_rx_for_worker: Arc::new(mpsc_rx_for_worker),
-              inbound_data_tx: inbound_data_tx_sync,
-              inbound_data_rx,
+              raw_inbound_tx,
+              raw_egress_rx,
             };
-            worker_op_tx.send(register_fd_req).await.map_err(|e| {
-              ZmqError::Internal(format!("Send RegisterExternalFd to UringWorker: {}", e))
+            worker_op_tx.send(register_req).await.map_err(|e| {
+              ZmqError::Internal(format!("Send RegisterExternalByteFd to UringWorker: {}", e))
             })?;
             match reply_rx_for_op.recv().await {
-              Ok(Ok(WorkerUringOpCompletion::RegisterExternalFdSuccess {
+              Ok(Ok(WorkerUringOpCompletion::RegisterExternalByteFdSuccess {
                 fd: returned_fd,
                 ..
-              }))
-                if returned_fd == raw_fd =>
-              {
+              })) if returned_fd == raw_fd => {
                 info!(
-                  "Successfully registered connected FD {} with UringWorker.",
+                  "Registered connected FD {} with UringWorker (byte handler).",
                   raw_fd
                 );
-                // Worker handles the full lifecycle; return None for connection_iface so the
-                // connecter loop's worker_handles_lifecycle guard skips NewConnectionEstablished.
+                let event_fd = worker_op_tx.clone_event_fd();
+                let worker_asleep = worker_op_tx.clone_worker_asleep();
+                let send_pool = worker_op_tx.clone_send_buffer_pool();
+                let uring_stream = crate::transport::uring_stream::UringStream::new(
+                  raw_fd,
+                  raw_inbound_rx_sync.to_async(),
+                  raw_egress_sync_tx,
+                  worker_asleep,
+                  event_fd,
+                  send_pool,
+                );
+
+                let sca_handle_id = self
+                  .context_handle_source
+                  .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let actor_conf = ActorConfigX {
+                  context: self.context.clone(),
+                  monitor_tx: monitor_tx.clone(),
+                  logical_target_endpoint_uri: endpoint_uri_original.to_string(),
+                  connected_endpoint_uri: actual_peer_uri_str.clone(),
+                  is_server_role: false,
+                };
+                let engine_conf = Arc::new(ZmtpEngineConfig::from(&*self.socket_options));
+                let (command_sender_for_sca, command_receiver_for_sca) =
+                  mailbox(self.context.inner().get_actor_mailbox_capacity());
+
+                let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+                  sca_handle_id,
+                  self.parent_socket_id,
+                  uring_stream,
+                  actor_conf,
+                  engine_conf,
+                  command_receiver_for_sca,
+                  self.socket_logic.clone(),
+                  None,
+                );
+
                 Ok((
                   None,
-                  ConnectionInteractionModel::ViaUringFd { fd: raw_fd },
-                  None,
+                  ConnectionInteractionModel::ViaSca {
+                    sca_mailbox: command_sender_for_sca,
+                    sca_handle_id,
+                  },
+                  Some(sca_task_handle.id()),
                   actual_peer_uri_str,
                 ))
               }
               Ok(Ok(other_completion)) => {
                 tracing::error!(
-                  "UringWorker bad success for RegisterExternalFd (fd {}): {:?}",
+                  "UringWorker bad completion for RegisterExternalByteFd (fd {}): {:?}",
                   raw_fd,
                   other_completion
                 );
@@ -1083,13 +1118,13 @@ impl TcpConnecter {
                   let _ = libc::close(raw_fd);
                 }
                 Err(ZmqError::Internal(format!(
-                  "UringWorker unexpected success: {:?}",
+                  "UringWorker unexpected completion: {:?}",
                   other_completion
                 )))
               }
               Ok(Err(worker_err)) => {
                 tracing::error!(
-                  "Register FD {} with UringWorker failed (worker error): {:?}",
+                  "Register FD {} with UringWorker failed: {:?}",
                   raw_fd,
                   worker_err
                 );
@@ -1098,18 +1133,18 @@ impl TcpConnecter {
                 }
                 Err(worker_err)
               }
-              Err(oneshot_recv_err) => {
+              Err(recv_err) => {
                 tracing::error!(
-                  "Register FD {} with UringWorker failed (reply channel error): {:?}",
+                  "Register FD {} reply channel error: {:?}",
                   raw_fd,
-                  oneshot_recv_err
+                  recv_err
                 );
                 unsafe {
                   let _ = libc::close(raw_fd);
                 }
                 Err(ZmqError::Internal(format!(
                   "Register FD with UringWorker reply error: {:?}",
-                  oneshot_recv_err
+                  recv_err
                 )))
               }
             }

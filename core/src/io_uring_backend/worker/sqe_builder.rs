@@ -95,10 +95,11 @@ pub(crate) fn build_sqe_for_external_request(
     // Operations handled by worker state changes or delegated to handlers, not by direct SQE from this function:
     UringOpRequest::InitializeBufferRing { .. } |
     UringOpRequest::Listen { .. } | // Listen setup is complex, first Accept SQE is internal.
-    UringOpRequest::RegisterExternalFd { .. } |
+    UringOpRequest::RegisterExternalByteFd { .. } |
     UringOpRequest::StartFdReadLoop { .. } |
     UringOpRequest::ShutdownConnectionHandler { .. } |
-    UringOpRequest::ResumeConnection { .. } => {
+    UringOpRequest::ResumeConnection { .. } |
+    UringOpRequest::RecycleRecvBuffer { .. } => {
         tracing::trace!(
             "build_sqe_for_external_request: Op '{}' does not produce a direct SQE from this function.",
             request.op_name_str()
