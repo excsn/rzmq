@@ -2,11 +2,11 @@ use std::time::Duration;
 
 use rzmq::socket::options as rzmq_options;
 use rzmq::{
-  uring::{initialize_uring_backend, shutdown_uring_backend, UringConfig}, // Import new items
   Context,
   Msg,
   SocketType,
   ZmqError,
+  uring::{UringConfig, initialize_uring_backend, shutdown_uring_backend}, // Import new items
 }; // Alias for clarity
 
 #[tokio::main]
@@ -30,8 +30,9 @@ async fn main() -> Result<(), ZmqError> {
     default_recv_multishot: true,
     default_recv_buffer_count: 64,
     default_recv_buffer_size: 4096,
-    default_send_buffer_count: 64,  // For ZC pool if default_send_zerocopy is true
+    default_send_buffer_count: 64, // For ZC pool if default_send_zerocopy is true
     default_send_buffer_size: 4096, // For ZC pool
+    ..Default::default()
   };
   match initialize_uring_backend(uring_config) {
     Ok(_) => println!("io_uring backend initialized explicitly."),
@@ -39,7 +40,10 @@ async fn main() -> Result<(), ZmqError> {
       println!("io_uring backend was already initialized (perhaps by another test or context).");
     }
     Err(e) => {
-      eprintln!("Failed to initialize io_uring backend: {:?}. Falling back.", e);
+      eprintln!(
+        "Failed to initialize io_uring backend: {:?}. Falling back.",
+        e
+      );
       // Decide if to proceed without io_uring or exit.
       // For this example, we might choose to proceed, and sockets requesting io_uring
       // might fail or fallback gracefully if the library supports that.
@@ -87,7 +91,9 @@ async fn main() -> Result<(), ZmqError> {
   // Option to enable io_uring for this socket's sessions
   // This tells the socket that when it connects, it should attempt to
   // create a session that uses the io_uring backend.
-  req.set_option(rzmq_options::IO_URING_SESSION_ENABLED, true).await?;
+  req
+    .set_option(rzmq_options::IO_URING_SESSION_ENABLED, true)
+    .await?;
   // Potentially other io_uring options for this specific socket could be set here,
   // though global defaults are now handled by UringConfig. Socket-specific overrides
   // for ZC, multishot for *this specific socket* would be new options if desired.
@@ -101,7 +107,9 @@ async fn main() -> Result<(), ZmqError> {
     let request_payload = format!("Request-Payload-{}", i);
     println!("REQ: Sending '{}'", request_payload);
     // For REQ socket, send expects a single message part.
-    req.send(Msg::from_vec(request_payload.into_bytes())).await?;
+    req
+      .send(Msg::from_vec(request_payload.into_bytes()))
+      .await?;
 
     println!("REQ: Receiving reply for request {}...", i);
     match req.recv().await {

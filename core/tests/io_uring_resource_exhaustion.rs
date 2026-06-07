@@ -31,6 +31,7 @@ fn init_uring() -> bool {
       default_recv_buffer_size: 4096,
       default_send_buffer_count: 16,
       default_send_buffer_size: 65536,
+      ..Default::default()
     }) {
       Ok(()) => URING_AVAILABLE.store(true, Ordering::Relaxed),
       Err(e) => eprintln!("io_uring not available on this system, skipping tests: {}", e),

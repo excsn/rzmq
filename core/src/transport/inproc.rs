@@ -80,12 +80,15 @@ pub(crate) async fn connect_inproc(
 
   // Spawn connector-side SCAX
   let sca_handle_id = core_arc.context.inner().next_handle();
+  // Each connection gets a unique key so multiple connectors to the same inproc name
+  // don't collide in the endpoints map.
+  let connection_specific_uri = format!("inproc://{}#{}", name, sca_handle_id);
   let engine_conf = Arc::new(ZmtpEngineConfig::from(&*core_arc.core_state.read().options));
   let actor_conf = ActorConfigX {
     context: core_arc.context.clone(),
     monitor_tx: core_arc.core_state.read().get_monitor_sender_clone(),
     logical_target_endpoint_uri: connector_uri_str.clone(),
-    connected_endpoint_uri: connector_uri_str.clone(),
+    connected_endpoint_uri: connection_specific_uri.clone(),
     is_server_role: false,
   };
   let capacity = core_arc.context.inner().get_actor_mailbox_capacity();
@@ -101,11 +104,12 @@ pub(crate) async fn connect_inproc(
     None,
   );
 
-  // Publish InprocBindingRequest so the binder's SocketCore spawns its own SCAX
+  // Publish InprocBindingRequest so the binder's SocketCore spawns its own SCAX.
+  // connector_uri carries the unique URI so the binder registers a distinct endpoint key.
   let (reply_tx, reply_rx) = oneshot::oneshot();
   let request_event = SystemEvent::InprocBindingRequest {
     target_inproc_name: name.clone(),
-    connector_uri: connector_uri_str.clone(),
+    connector_uri: connection_specific_uri.clone(),
     binder_stream_end: Arc::new(Mutex::new(Some(binder_stream_end))),
     reply_tx,
   };
@@ -123,7 +127,7 @@ pub(crate) async fn connect_inproc(
       tracing::info!(connector_core_handle, inproc_name = %name, "Inproc connection accepted by binder; notifying connector socket core.");
 
       let cmd = Command::NewConnectionEstablished {
-        endpoint_uri: connector_uri_str.clone(),
+        endpoint_uri: connection_specific_uri.clone(),
         target_endpoint_uri: connector_uri_str.clone(),
         connection_iface: None, // SocketCore creates ScaConnectionIface
         interaction_model: ConnectionInteractionModel::ViaSca {

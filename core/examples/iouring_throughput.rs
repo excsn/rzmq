@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use rzmq::socket::options as zmq_opts; // For socket option constants
-use rzmq::uring::{initialize_uring_backend, shutdown_uring_backend, UringConfig};
+use rzmq::uring::{UringConfig, initialize_uring_backend, shutdown_uring_backend};
 use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
 use std::time::{Duration, Instant}; // For efficient Bytes cloning
 
@@ -13,7 +13,9 @@ const COMPACT_SEND_RECV_MESSAGES: bool = true;
 async fn main() -> Result<(), ZmqError> {
   // Initialize tracing (optional, but good for seeing rzmq logs)
   if std::env::var("RUST_LOG").is_err() {
-    unsafe { std::env::set_var("RUST_LOG", "info,rzmq=debug"); }
+    unsafe {
+      std::env::set_var("RUST_LOG", "info,rzmq=debug");
+    }
   }
 
   tracing_subscriber::fmt()
@@ -34,6 +36,7 @@ async fn main() -> Result<(), ZmqError> {
     default_recv_buffer_size: 4096,
     default_send_buffer_count: 64,
     default_send_buffer_size: 4096,
+    ..Default::default()
   };
   match initialize_uring_backend(uring_config) {
     Ok(_) => println!("io_uring backend initialized explicitly."),
@@ -41,7 +44,10 @@ async fn main() -> Result<(), ZmqError> {
       println!("io_uring backend was already initialized (perhaps by another test or context).");
     }
     Err(e) => {
-      eprintln!("Failed to initialize io_uring backend: {:?}. Falling back.", e);
+      eprintln!(
+        "Failed to initialize io_uring backend: {:?}. Falling back.",
+        e
+      );
     }
   }
 
@@ -108,7 +114,7 @@ async fn main() -> Result<(), ZmqError> {
           let mut reply_to_send = Vec::with_capacity(1 + received_parts.len());
 
           let mut id_reply_frame = client_identity_frame; // client_identity_frame already has its original flags
-                                                          // Ensure identity frame has MORE if payload follows
+          // Ensure identity frame has MORE if payload follows
           if !received_parts.is_empty() {
             id_reply_frame.set_flags(id_reply_frame.flags() | MsgFlags::MORE);
           } else {
@@ -140,12 +146,18 @@ async fn main() -> Result<(), ZmqError> {
           break;
         }
         Err(e) => {
-          eprintln!("ROUTER: recv_multipart error: {}, terminating echo task.", e);
+          eprintln!(
+            "ROUTER: recv_multipart error: {}, terminating echo task.",
+            e
+          );
           break;
         }
       }
     }
-    println!("ROUTER: Echo task finished after {} messages.", messages_echoed);
+    println!(
+      "ROUTER: Echo task finished after {} messages.",
+      messages_echoed
+    );
     (messages_echoed, bytes_echoed)
   });
 
@@ -166,7 +178,6 @@ async fn main() -> Result<(), ZmqError> {
   tokio::time::sleep(Duration::from_millis(250)).await;
   println!("DEALER: Assumed connected and handshake complete.");
 
-  
   // --- Throughput Test Logic ---
   let num_messages_to_send: u64 = 100_000; // Number of logical messages
   let payload_size_bytes: usize = 1024; // 1KB
@@ -233,7 +244,10 @@ async fn main() -> Result<(), ZmqError> {
         }
       }
       Err(ZmqError::InvalidState(ref msg)) if msg.contains("Socket is closing") => {
-        println!("DEALER: Socket closing during recv on message #{}. Stopping.", i);
+        println!(
+          "DEALER: Socket closing during recv on message #{}. Stopping.",
+          i
+        );
         break;
       }
       Err(e) => {
@@ -252,7 +266,10 @@ async fn main() -> Result<(), ZmqError> {
   let duration = start_time.elapsed();
   println!("\nDEALER: Test loop finished. Duration: {:?}", duration);
   println!("DEALER: Total logical messages sent: {}", messages_sent);
-  println!("DEALER: Total logical messages received: {}", messages_received);
+  println!(
+    "DEALER: Total logical messages received: {}",
+    messages_received
+  );
 
   // --- Calculate and Print Rates ---
   let seconds = duration.as_secs_f64();
@@ -285,10 +302,9 @@ async fn main() -> Result<(), ZmqError> {
   }
   println!("DEALER: Dealer socket closed.");
 
-
   println!("ROUTER: Closing router socket...");
   if let Err(e) = router_socket.close().await {
-      eprintln!("ROUTER: Error closing router socket: {}", e);
+    eprintln!("ROUTER: Error closing router socket: {}", e);
   }
   println!("ROUTER: Router socket closed.");
 
@@ -319,7 +335,6 @@ async fn main() -> Result<(), ZmqError> {
 
   println!("Terminating context...");
   ctx.term().await?;
-
 
   println!("Terminated context...");
   match shutdown_uring_backend().await {

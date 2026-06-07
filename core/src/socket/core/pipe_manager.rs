@@ -198,7 +198,6 @@ pub(crate) async fn cleanup_stopped_child_resources(
 
     // Send monitor event for the disconnection/closure.
     let monitor_event = match (ep_info.endpoint_type, error_opt) {
-      // A session terminated with a security-related error, which indicates a handshake failure.
       (EndpointType::Session, Some(e @ &ZmqError::SecurityError(_)))
       | (EndpointType::Session, Some(e @ &ZmqError::AuthenticationFailure(_))) => {
         SocketEvent::HandshakeFailed {
@@ -206,11 +205,9 @@ pub(crate) async fn cleanup_stopped_child_resources(
           error_msg: e.to_string(),
         }
       }
-      // A session terminated for any other reason (cleanly or non-security error).
       (EndpointType::Session, _) => SocketEvent::Disconnected {
         endpoint: ep_info.endpoint_uri.clone(),
       },
-      // A listener has terminated.
       (EndpointType::Listener, _) => SocketEvent::Closed {
         endpoint: ep_info.endpoint_uri.clone(),
       },
@@ -305,9 +302,6 @@ pub(crate) async fn cleanup_session_state_by_uri(
       detached_pipe_read_id = Some(core_read_id); // Store for later async call
       tracing::debug!(handle = core_handle, uri=%endpoint_uri, "Removed pipe state for session.");
     }
-
-    #[cfg(feature = "io-uring")]
-    // uring_fd_to_endpoint_uri removed — no per-FD map cleanup needed.
 
     core_s_write.send_monitor_event(SocketEvent::Disconnected {
       endpoint: endpoint_uri.to_string(),

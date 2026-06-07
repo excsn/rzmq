@@ -206,8 +206,42 @@ impl CoreState {
 
   pub(crate) fn send_monitor_event(&self, event: SocketEvent) {
     if let Some(ref tx) = self.monitor_tx {
+      // Strip internal `#<id>` uniqueness suffixes from URIs before exposing them.
+      // Inproc connections use `inproc://name#<handle>` as map keys internally;
+      // external observers always see the clean logical URI.
+      let clean = |s: String| -> String {
+        match s.find('#') {
+          Some(pos) => s[..pos].to_string(),
+          None => s,
+        }
+      };
+      let event = match event {
+        SocketEvent::Listening { endpoint } =>
+          SocketEvent::Listening { endpoint: clean(endpoint) },
+        SocketEvent::BindFailed { endpoint, error_msg } =>
+          SocketEvent::BindFailed { endpoint: clean(endpoint), error_msg },
+        SocketEvent::Accepted { endpoint, peer_addr } =>
+          SocketEvent::Accepted { endpoint: clean(endpoint), peer_addr: clean(peer_addr) },
+        SocketEvent::AcceptFailed { endpoint, error_msg } =>
+          SocketEvent::AcceptFailed { endpoint: clean(endpoint), error_msg },
+        SocketEvent::Connected { endpoint, peer_addr } =>
+          SocketEvent::Connected { endpoint: clean(endpoint), peer_addr: clean(peer_addr) },
+        SocketEvent::ConnectDelayed { endpoint, error_msg } =>
+          SocketEvent::ConnectDelayed { endpoint: clean(endpoint), error_msg },
+        SocketEvent::ConnectRetried { endpoint, interval } =>
+          SocketEvent::ConnectRetried { endpoint: clean(endpoint), interval },
+        SocketEvent::ConnectFailed { endpoint, error_msg } =>
+          SocketEvent::ConnectFailed { endpoint: clean(endpoint), error_msg },
+        SocketEvent::Closed { endpoint } =>
+          SocketEvent::Closed { endpoint: clean(endpoint) },
+        SocketEvent::Disconnected { endpoint } =>
+          SocketEvent::Disconnected { endpoint: clean(endpoint) },
+        SocketEvent::HandshakeFailed { endpoint, error_msg } =>
+          SocketEvent::HandshakeFailed { endpoint: clean(endpoint), error_msg },
+        SocketEvent::HandshakeSucceeded { endpoint } =>
+          SocketEvent::HandshakeSucceeded { endpoint: clean(endpoint) },
+      };
       if tx.clone().to_sync().send(event).is_err() {
-        // Non-blocking send
         tracing::warn!(
           socket_handle = self.handle,
           "Failed to send event to monitor channel (full or closed)"

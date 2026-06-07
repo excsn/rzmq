@@ -340,13 +340,9 @@ async fn close_active_connections(
   );
   let mut close_futs = Vec::new();
 
-  // Need to iterate carefully due to async and coordinator lock
-  // Collect IDs to modify coordinator after futures.
-  let mut inproc_connections_processed_ids = Vec::new();
-
   for (conn_id, (conn_uri, conn_iface)) in connections_to_close.iter() {
     let iface_clone = conn_iface.clone();
-    let id_clone = *conn_id; // This is the EndpointInfo.handle_id
+    let id_clone = *conn_id;
     let uri_clone = conn_uri.clone();
 
     close_futs.push(async move {
@@ -354,47 +350,10 @@ async fn close_active_connections(
       if let Err(e) = close_result {
         tracing::warn!(parent_handle = core_handle, conn_id = id_clone, uri = %uri_clone, "Error from ISocketConnection.close_connection(): {}", e);
       }
-      // Return the conn_id and uri if it was inproc, to process with coordinator later
-      if uri_clone.starts_with("inproc://") {
-        Some(id_clone)
-      } else {
-        None
-      }
     });
   }
 
-  let results = futures::future::join_all(close_futs).await;
-  for res_opt in results {
-    if let Some(inproc_conn_id) = res_opt {
-      inproc_connections_processed_ids.push(inproc_conn_id);
-    }
-  }
-
-  // Now, update the coordinator for all processed inproc connections
-  if !inproc_connections_processed_ids.is_empty() {
-    let mut coordinator = core_arc.shutdown_coordinator.lock().await;
-    let mut made_progress_to_linger = false;
-    for inproc_conn_id_val in inproc_connections_processed_ids {
-      // If record_connection_closed returns true, it means this was the last pending entity
-      // and the coordinator might have transitioned.
-      if coordinator.record_connection_closed(inproc_conn_id_val, core_handle) {
-        made_progress_to_linger = true;
-      }
-    }
-
-    // If coordinator state advanced to Lingering due to these inproc connections closing
-    if made_progress_to_linger && coordinator.state == ShutdownPhase::Lingering {
-      tracing::debug!(
-        handle = core_handle,
-        "close_active_connections: Inproc connections closed, last pending. Advancing linger/cleaning."
-      );
-      let linger_opt_val = core_arc.core_state.read().options.linger;
-      coordinator.start_linger_if_needed(linger_opt_val, core_handle); // Call the method on coordinator
-                                                                       // The check for linger expiry and advancing to cleaning will happen in the main command_loop's linger_check_interval.
-                                                                       // Or, we can replicate that check here if we want to be more proactive.
-                                                                       // For now, let linger_check_interval handle the next step.
-    }
-  }
+  futures::future::join_all(close_futs).await;
 }
 
 pub(crate) async fn handle_actor_stopping_event(
@@ -488,7 +447,7 @@ pub(crate) async fn handle_actor_stopping_event(
         coordinator.state = ShutdownPhase::Lingering;
         let linger_opt = core_arc.core_state.read().options.linger;
         coordinator.start_linger_if_needed(linger_opt, core_handle);
-        // The main loop's linger check will handle the rest.
+        // The main loop's check_and_advance_linger tick handles the rest.
       }
     }
     // If the event arrives while Lingering or later, it's a late arrival.
