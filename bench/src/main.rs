@@ -35,7 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       UringStrategy::Balanced => UringPollingStrategy::balanced(),
       UringStrategy::LowPower => UringPollingStrategy::low_power(),
     };
-    let config = UringConfig { polling_strategy, ..UringConfig::default() };
+    let config = UringConfig {
+      polling_strategy,
+      default_send_zerocopy: args.uring_zerocopy,
+      default_recv_multishot: args.uring_multishot,
+      ..UringConfig::default()
+    };
     if let Err(e) = initialize_uring_backend(config) {
       error!("Failed to initialize io_uring backend: {}", e);
       return Err(e.into());

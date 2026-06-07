@@ -87,45 +87,38 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
     return Ok(batch);
   }
 
-  // Zero-copy fast path: consume kernel ring buffer leases directly.
+  // Fast path: consume owned inbound chunks directly (no unsafe, no cross-thread recycling).
   // Active only on io-uring connections with no encryption (NULL/PLAIN framer).
   #[cfg(feature = "io-uring")]
   if handler.network_read_buffer.is_empty()
     && handler.config.use_recv_multishot
     && handler.framer.is_passthrough()
   {
-    // Steal any partially-consumed lease from the handshake→data transition (first call only).
+    // Steal any partially-consumed chunk from the handshake→data transition (first call only).
     if handler.active_lease.is_none() {
-      if let Some(stolen) = reader.steal_current_lease() {
+      if let Some(stolen) = reader.steal_current_bytes() {
         handler.active_lease = Some(stolen);
       }
     }
 
     loop {
       if handler.active_lease.is_none() {
-        let maybe = reader.try_recv_lease();
-        match maybe {
+        match reader.try_recv_bytes() {
           None => break,
-          Some(Ok(lease)) if lease.len == 0 => return Err(ZmqError::ConnectionClosed),
-          Some(Ok(lease)) => {
-            handler.active_lease = Some((lease, 0));
+          Some(Ok(bytes)) if bytes.is_empty() => return Err(ZmqError::ConnectionClosed),
+          Some(Ok(bytes)) => {
+            handler.active_lease = Some(bytes);
           }
           Some(Err(_)) => return Err(ZmqError::ConnectionClosed),
         }
       }
 
-      // SAFETY: ptr is stable kernel ring memory, exclusively owned by this lease.
-      let (lease, mut offset) = handler.active_lease.take().unwrap();
-      let remaining =
-        unsafe { std::slice::from_raw_parts(lease.ptr.add(offset), lease.len - offset) };
-      match handler.zmtp_manual_parser.decode_frame_from_slice(remaining)? {
+      let mut bytes = handler.active_lease.take().unwrap();
+      match handler.zmtp_manual_parser.decode_frame_from_slice(&bytes)? {
         Some((msg, consumed)) => {
-          offset += consumed;
-          if offset < lease.len {
-            handler.active_lease = Some((lease, offset));
-          } else {
-            // lease drops here → RecycleRecvBuffer sent
-            reader.notify_lease_consumed();
+          bytes = bytes.slice(consumed..); // zero-alloc slice advance
+          if !bytes.is_empty() {
+            handler.active_lease = Some(bytes);
           }
           handler.heartbeat_state.record_activity();
           let msg_size = msg.size();
@@ -136,10 +129,8 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
           }
         }
         None => {
-          // Frame straddles this lease boundary — copy remainder to network_read_buffer.
-          handler.network_read_buffer.extend_from_slice(remaining);
-          // lease drops here → RecycleRecvBuffer sent
-          reader.notify_lease_consumed();
+          // Frame straddles chunk boundary — copy remainder to network_read_buffer.
+          handler.network_read_buffer.extend_from_slice(&bytes);
           break;
         }
       }

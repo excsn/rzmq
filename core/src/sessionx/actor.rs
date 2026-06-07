@@ -356,7 +356,10 @@ where
             match maybe_msgs_from_core {
               Ok(first_msgs) => {
                 outgoing_batch.clear();
-                let mut total_bytes = first_msgs.iter().map(|m| m.size()).sum::<usize>();
+                // Count wire bytes (payload + 9 bytes ZMTP long-frame overhead per message)
+                // so the framed batch never exceeds sndbatch_bytes and busts the ZC slot.
+                let wire_size = |msgs: &Vec<Msg>| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
+                let mut total_bytes = wire_size(&first_msgs);
                 let mut total_msgs = 1usize;
                 outgoing_batch.push(first_msgs);
 
@@ -366,7 +369,7 @@ where
                 while total_msgs < max_count && total_bytes < max_bytes {
                   match self.core_pipe_manager.try_recv_from_core() {
                     Ok(next_msgs) => {
-                      total_bytes += next_msgs.iter().map(|m| m.size()).sum::<usize>();
+                      total_bytes += wire_size(&next_msgs);
                       total_msgs += 1;
                       outgoing_batch.push(next_msgs);
                     }

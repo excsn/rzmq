@@ -291,6 +291,7 @@ impl UringWorker {
         reply_tx,
         raw_inbound_tx,
         raw_egress_rx,
+        use_recv_multishot,
       } => {
         self.external_op_tracker.add_op(
           user_data,
@@ -316,6 +317,8 @@ impl UringWorker {
           raw_inbound_tx,
           raw_egress_rx,
           use_zc,
+          use_recv_multishot,
+          if use_zc { self.cfg_send_buffer_size } else { 0 },
         );
 
         match self.handler_manager.add_handler_directly(
@@ -395,40 +398,8 @@ impl UringWorker {
         self.fds_needing_close_initiated_pass.push_back(fd);
       }
 
-      UringOpRequest::RecycleRecvBuffer { id } => {
-        if let Some(ref bm) = self.buffer_manager {
-          if let Err(e) = unsafe { bm.reprovide_buffer(id) } {
-            warn!("UringWorker: reprovide_buffer({}) failed: {:?}", id, e);
-          }
-        }
-        // fire-and-forget: no reply_tx
-      }
 
-      UringOpRequest::ResumeConnection { fd } => {
-        // UringPipeReader drained below LWM — re-open kernel-side reads for this FD.
-        // Use a scoped block so the mutable borrow of handler_manager ends before
-        // we access work_map.
-        let resume_ops = {
-          let buffer_manager = self.buffer_manager.as_ref();
-          let default_bgid = self.default_buffer_ring_group_id_val;
-          if let Some(handler) = self.handler_manager.get_mut(fd) {
-            // Clone the config so the immutable borrow of `handler` ends before
-            // `on_resume_connection` takes `&mut self`.
-            let io_config = handler.io_config().clone();
-            let pending_egress = self.work_map.get(&fd).map_or(0, |w| w.egress_blueprints.len());
-            let interface = UringWorkerInterface::new(fd, &io_config, buffer_manager, default_bgid, 0, pending_egress);
-            Some(handler.on_resume_connection(&interface))
-          } else {
-            None
-          }
-        };
-        if let Some(ops) = resume_ops {
-          if !ops.sqe_blueprints.is_empty() {
-            self.work_map.entry(fd).or_default().route_blueprints(ops.sqe_blueprints);
-          }
-        }
-        // No reply_tx — fire-and-forget
-      }
+
     }
   }
 }
@@ -474,24 +445,27 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
         // 1b. Drain application data — convert to blueprints immediately so egress ordering
         //     is preserved when close_initiated appends RequestClose in Phase 1d.
-        let fds_to_drain: Vec<_> = worker.fd_to_mpsc_rx.keys().copied().collect();
-        for fd in &fds_to_drain {
+        worker.mpsc_fds_scratch.clear();
+        worker.mpsc_fds_scratch.extend(worker.fd_to_mpsc_rx.keys().copied());
+
+        for i in 0..worker.mpsc_fds_scratch.len() {
+          let fd = worker.mpsc_fds_scratch[i];
           let pending_count = worker
             .work_map
-            .get(fd)
+            .get(&fd)
             .map_or(0, |w| w.ingress_blueprints.len() + w.egress_blueprints.len());
           if pending_count >= 16 {
             continue; // Backpressure: leave messages in the bounded channel
           }
-          if let Some(handler) = worker.handler_manager.get_mut(*fd) {
+          if let Some(handler) = worker.handler_manager.get_mut(fd) {
             let io_config = handler.io_config().clone();
-            if let Some(rx) = worker.fd_to_mpsc_rx.get(fd) {
+            if let Some(rx) = worker.fd_to_mpsc_rx.get(&fd) {
               let mut converted = 0usize;
               while let Ok(msg_parts) = rx.try_recv() {
                 work_was_available = true;
-                let pending_egress = worker.work_map.get(fd).map_or(0, |w| w.egress_blueprints.len());
+                let pending_egress = worker.work_map.get(&fd).map_or(0, |w| w.egress_blueprints.len());
                 let interface = UringWorkerInterface::new(
-                  *fd,
+                  fd,
                   &io_config,
                   worker.buffer_manager.as_ref(),
                   worker.default_buffer_ring_group_id_val,
@@ -501,7 +475,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
                 worker
                   .work_map
-                  .entry(*fd)
+                  .entry(fd)
                   .or_default()
                   .route_blueprints(ops_output.sqe_blueprints);
                 converted += 1;
@@ -565,9 +539,11 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         // --- PHASE 2: PROCESS THE WORK MAP WITH A BUDGET ---
         profiler.mark_segment_end_and_start_new("process_work_map");
         let mut batches_processed_this_iteration = 0;
-        let fds_with_work: Vec<_> = worker.work_map.keys().copied().collect();
+        worker.active_fds_scratch.clear();
+        worker.active_fds_scratch.extend(worker.work_map.keys().copied());
 
-        for fd in fds_with_work {
+        for i in 0..worker.active_fds_scratch.len() {
+          let fd = worker.active_fds_scratch[i];
           if batches_processed_this_iteration >= MAX_BATCHES_PER_ITERATION {
             trace!("Work budget for this iteration consumed. Deferring remaining FDs.");
             break;
@@ -655,9 +631,11 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
         // --- PHASE 3: ENSURE READS ---
         profiler.mark_segment_end_and_start_new("ensure_reads");
-        let active_fds_for_read = worker.handler_manager.get_active_fds();
+        worker.handler_manager.fill_active_fds(&mut worker.active_fds_scratch);
+
         let mut sq = unsafe { worker.ring.submission_shared() };
-        for fd in active_fds_for_read {
+        for i in 0..worker.active_fds_scratch.len() {
+          let fd = worker.active_fds_scratch[i];
           // Skip standard reads if this connection manages its own multishot read pathway or is throttled
           if let Some(handler) = worker.handler_manager.get_mut(fd) {
             if handler.should_throttle_reads() || handler.prefers_multishot_read() {

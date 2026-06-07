@@ -15,38 +15,31 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Trait for the read half of a split ZMTP stream.
 ///
-/// Carries the io-uring zero-copy lease methods as default no-ops, allowing
-/// standard transports (TCP, IPC, inproc) to satisfy the bound without any
-/// io-uring awareness. Only `UringReadHalf` overrides these methods.
+/// Carries the io-uring fast-path methods as default no-ops, allowing standard
+/// transports (TCP, IPC, inproc) to satisfy the bound without any io-uring
+/// awareness. Only `UringReadHalf` overrides these methods.
 pub(crate) trait ZmtpReadHalf: AsyncRead + Unpin + Send + std::fmt::Debug + 'static {
   #[cfg(feature = "io-uring")]
-  fn try_recv_lease(
-    &mut self,
-  ) -> Option<std::io::Result<crate::io_uring_backend::byte_handler::UringInboundLease>> {
+  fn try_recv_bytes(&mut self) -> Option<std::io::Result<bytes::Bytes>> {
     None
   }
 
   #[cfg(feature = "io-uring")]
-  fn steal_current_lease(
-    &mut self,
-  ) -> Option<(crate::io_uring_backend::byte_handler::UringInboundLease, usize)> {
+  fn steal_current_bytes(&mut self) -> Option<bytes::Bytes> {
     None
   }
 
   #[cfg(feature = "io-uring")]
-  fn poll_recv_lease(
+  fn poll_recv_bytes(
     self: std::pin::Pin<&mut Self>,
     _cx: &mut std::task::Context<'_>,
-  ) -> std::task::Poll<std::io::Result<crate::io_uring_backend::byte_handler::UringInboundLease>>
-  {
+  ) -> std::task::Poll<std::io::Result<bytes::Bytes>> {
     std::task::Poll::Ready(Err(std::io::Error::new(
       std::io::ErrorKind::Unsupported,
-      "poll_recv_lease not supported for this stream type",
+      "poll_recv_bytes not supported for this stream type",
     )))
   }
 
-  #[cfg(feature = "io-uring")]
-  fn notify_lease_consumed(&self) {}
 }
 
 /// Trait alias for full-duplex streams usable by ZMTP connection actors.

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tracing::{error, info, trace, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct RegisteredSendBufferId(u16);
+pub(crate) struct RegisteredSendBufferId(pub(crate) u16);
 
 #[derive(Debug)]
 struct SendBufferSlot {

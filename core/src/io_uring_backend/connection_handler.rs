@@ -170,8 +170,8 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
 pub trait UringConnectionHandler: Send {
   fn fd(&self) -> RawFd;
 
-  /// Returns a reference to the connection-specific I/O config (including the socket mailbox).
-  fn io_config(&self) -> &WorkerIoConfig;
+  /// Returns a reference to the shared Arc of the connection-specific I/O config.
+  fn io_config(&self) -> &Arc<WorkerIoConfig>;
 
   /// Checks if the handler is in a terminal (Closing, Closed, Error) state.
   fn is_closing_or_closed(&self) -> bool;
@@ -181,11 +181,11 @@ pub trait UringConnectionHandler: Send {
   fn connection_ready(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps;
 
   /// Called when data is available from a completed ring-buffered read.
-  /// `lease` is a zero-copy lease over the kernel buffer ring slot; it is recycled on drop.
-  /// Handler processes data, may produce Msgs for upstream, and returns blueprints for next I/O.
-  fn process_ring_read_data(
+  /// `bytes` is owned data copied from the kernel ring slot; the slot is already replenished.
+  /// An empty `Bytes` is the EOF sentinel.
+  fn process_ring_read_bytes(
     &mut self,
-    lease: crate::io_uring_backend::byte_handler::UringInboundLease,
+    bytes: Bytes,
     interface: &UringWorkerInterface<'_>,
   ) -> HandlerIoOps;
 
@@ -268,17 +268,9 @@ pub trait UringConnectionHandler: Send {
     false
   }
 
-  /// Called by the worker when it receives a `UringOpRequest::ResumeConnection` for this
-  /// handler's FD. Clears the backpressure throttle and re-submits a new `RECV_MULTISHOT`.
-  /// The default is a no-op; handlers that use multishot recv should override this.
-  fn on_resume_connection(&mut self, _interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
-    HandlerIoOps::default()
-  }
-
   /// Called when a multishot RECV_MULTISHOT CQE returns `-ENOBUFS` (kernel buffer ring
-  /// temporarily exhausted). The handler should set its throttle flag to prevent `prepare_sqes`
-  /// from immediately resubmitting, and queue a `ResumeConnection` signal so the worker
-  /// re-arms the read after the OS thread yields and buffers are replenished.
+  /// temporarily exhausted). With immediate-copy, buffers replenish inline, so this is treated
+  /// as a transient event. The multishot op is marked inactive and re-armed next `prepare_sqes`.
   fn on_buffer_ring_exhausted(&mut self) {}
 }
 

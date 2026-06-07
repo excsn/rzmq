@@ -7,12 +7,10 @@ use crate::runtime::{Command, MailboxSender, SystemEvent};
 use crate::sessionx::ScaConnectionIface;
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
-#[cfg(feature = "io-uring")]
-use crate::io_uring_backend::ops::UringOpRequest;
+
 #[cfg(feature = "io-uring")]
 use crate::socket::core::pipe_manager;
-#[cfg(feature = "io-uring")]
-use std::os::unix::io::RawFd;
+
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
 use crate::socket::core::{SocketCore, shutdown};
 use crate::socket::events::{MonitorSender, SocketEvent};
@@ -224,7 +222,7 @@ pub(crate) async fn process_socket_command(
       connection_iface,
       peer_identity,
       inbound_data_rx,
-      fd,
+      ..
     } => {
       let is_outbound = {
         let cs = core_arc.core_state.read();
@@ -276,7 +274,6 @@ pub(crate) async fn process_socket_command(
           Arc::downgrade(&socket_logic_strong),
           synthetic_read_id,
           rx,
-          fd,
         ));
         core_arc.core_state.write()
           .pipe_reader_task_handles
@@ -1059,56 +1056,22 @@ async fn handle_new_connection_established(
 ///
 /// The task exits naturally when the sender side (ZmtpUringHandler) is dropped, i.e.,
 /// when the connection is closed or encounters a fatal error.
-/// Channel occupancy (%) below which the reader task signals the worker to resume reads.
-#[cfg(feature = "io-uring")]
-const INBOUND_RESUME_LWM_PCT: usize = 20;
-
 #[cfg(feature = "io-uring")]
 async fn run_uring_pipe_reader(
   socket_logic: std::sync::Weak<dyn ISocket>,
   pipe_read_id: usize,
   inbound_rx: fibre::mpsc::BoundedAsyncReceiver<Vec<Msg>>,
-  fd: RawFd,
 ) {
-  let cap = inbound_rx.capacity();
-  // True while occupancy has been at or above HWM (80%) — cleared after signalling resume.
-  let mut needs_resume = false;
-
   while let Ok(msgs) = inbound_rx.recv().await {
     let Some(sl) = socket_logic.upgrade() else {
       break;
     };
-
-    // Sample occupancy before processing to detect HWM crossing.
-    let len_before = inbound_rx.len();
-    // 70% shadow-HWM: the writer sets mailbox_full_throttled at exactly 80% occupancy,
-    // but by the time the reader wakes and samples len_before a pop has already occurred,
-    // dropping occupancy just below 80%. Using 70% guarantees we capture every HWM crossing.
-    if cap > 0 && len_before * 100 / cap >= 70 {
-      needs_resume = true;
-    }
-
     let cmd = Command::PipeMessageBatchReceived {
       pipe_id: pipe_read_id,
       msgs,
     };
     if sl.handle_pipe_event(pipe_read_id, cmd).await.is_err() {
       break;
-    }
-
-    // After processing one batch: send ResumeConnection when the queue crosses back below LWM
-    // OR when the queue hits zero. The "queue empty" check is essential for the partial-drain
-    // scenario: if try_drain_spillover partially flushes, sets needs_resume=false early (at LWM),
-    // then stalls on Full, the reader must fire one final resume when it fully empties the channel
-    // to give the worker a guaranteed opportunity to flush the remainder of the spillover queue.
-    let len_after = inbound_rx.len();
-    let recovered_below_lwm = needs_resume && (cap == 0 || len_after * 100 / cap <= INBOUND_RESUME_LWM_PCT);
-    let queue_fully_empty = len_after == 0;
-    if recovered_below_lwm || queue_fully_empty {
-      needs_resume = false;
-      if let Ok(op_tx) = crate::uring::global_state::get_global_uring_worker_op_tx() {
-        let _ = op_tx.try_send(UringOpRequest::ResumeConnection { fd });
-      }
     }
   }
 }

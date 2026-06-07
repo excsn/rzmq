@@ -73,16 +73,13 @@ pub enum UringOpRequest {
     socket_mailbox: MailboxSyncSender,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
     /// Inbound: worker → Tokio (sync sender so the OS thread can push without blocking).
-    raw_inbound_tx: fibre::mpsc::BoundedSender<crate::io_uring_backend::byte_handler::UringInboundLease>,
+    raw_inbound_tx: fibre::mpsc::BoundedSender<bytes::Bytes>,
     /// Egress: Tokio → worker (sync receiver so the OS thread can drain without blocking).
     raw_egress_rx: fibre::mpsc::BoundedReceiver<crate::io_uring_backend::byte_handler::EgressChunk>,
+    /// Whether to use kernel multishot recv (`IORING_OP_RECV_MULTISHOT`). When false the
+    /// handler uses single-shot reads, respecting the socket's `io_uring.recv_multishot` option.
+    use_recv_multishot: bool,
   },
-  /// Fire-and-forget: signal the worker to re-submit a RECV_MULTISHOT for a paused
-  /// connection. Sent by the UringPipeReader task when channel occupancy drops below LWM.
-  ResumeConnection { fd: RawFd },
-  /// Fire-and-forget: re-register a multishot recv buffer slot with the kernel ring after
-  /// the Tokio side has finished reading from a `UringInboundLease`.
-  RecycleRecvBuffer { id: u16 },
 }
 
 impl UringOpRequest {
@@ -97,8 +94,6 @@ impl UringOpRequest {
       | Self::RegisterExternalByteFd { user_data, .. }
       | Self::StartFdReadLoop { user_data, .. }
       | Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
-      Self::ResumeConnection { .. } => 0, // fire-and-forget: no user_data
-      Self::RecycleRecvBuffer { .. } => 0,
     }
   }
 
@@ -112,8 +107,6 @@ impl UringOpRequest {
       Self::RegisterExternalByteFd { .. } => "RegisterExternalByteFd".to_string(),
       Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
       Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
-      Self::ResumeConnection { .. } => "ResumeConnection".to_string(),
-      Self::RecycleRecvBuffer { .. } => "RecycleRecvBuffer".to_string(),
     }
   }
 
@@ -127,8 +120,6 @@ impl UringOpRequest {
       | Self::Connect { reply_tx, .. }
       | Self::StartFdReadLoop { reply_tx, .. }
       | Self::ShutdownConnectionHandler { reply_tx, .. } => Some(reply_tx),
-      Self::ResumeConnection { .. } => None, // fire-and-forget: no reply channel
-      Self::RecycleRecvBuffer { .. } => None,
     }
   }
 }
@@ -195,14 +186,6 @@ impl fmt::Debug for UringOpRequest {
         .field("user_data", user_data)
         .field("fd", fd)
         .finish_non_exhaustive(),
-      UringOpRequest::ResumeConnection { fd } => f
-        .debug_struct("ResumeConnection")
-        .field("fd", fd)
-        .finish(),
-      UringOpRequest::RecycleRecvBuffer { id } => f
-        .debug_struct("RecycleRecvBuffer")
-        .field("id", id)
-        .finish(),
     }
   }
 }

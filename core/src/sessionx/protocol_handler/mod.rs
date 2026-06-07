@@ -55,11 +55,10 @@ pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
   #[cfg(not(target_os = "linux"))]
   pub(crate) cork_info: Option<()>,
 
-  /// Partially-consumed kernel ring buffer lease held between `read_data_frames_batch_impl` calls.
+  /// Partially-consumed inbound chunk held between `read_data_frames_batch_impl` calls.
   /// Only active on io-uring connections with a NULL/PLAIN framer (no encryption).
   #[cfg(feature = "io-uring")]
-  pub(crate) active_lease:
-    Option<(crate::io_uring_backend::byte_handler::UringInboundLease, usize)>,
+  pub(crate) active_lease: Option<bytes::Bytes>,
 
   pub(crate) actor_handle: usize,
 }

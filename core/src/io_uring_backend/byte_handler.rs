@@ -10,35 +10,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tracing::{debug, error, info, trace, warn};
 
-/// Zero-copy lease over a kernel buffer ring slot.
-///
-/// Produced by the worker after a multishot recv CQE; forwarded to the Tokio-side `UringStream`
-/// via `raw_inbound_tx`. The lease's `Drop` sends `RecycleRecvBuffer` to re-register the slot
-/// with the kernel ring once the Tokio side has finished reading.
-pub(crate) struct UringInboundLease {
-  /// Buffer ring slot ID (index into `IoUringBufRing`).
-  pub id: u16,
-  /// Stable pointer to kernel-filled data. Valid until `reprovide_buffer` is called.
-  pub ptr: *const u8,
-  /// Number of bytes written by the kernel into this slot.
-  pub len: usize,
-}
-
-// SAFETY: The pointer is stable (ring buffers are pinned at init) and exclusively
-// owned by this lease between `mem::forget(BorrowedBuffer)` and `reprovide_buffer`.
-unsafe impl Send for UringInboundLease {}
-unsafe impl Sync for UringInboundLease {}
-
-impl Drop for UringInboundLease {
-  fn drop(&mut self) {
-    if self.len == 0 {
-      return; // EOF sentinel — no slot was consumed, nothing to recycle
-    }
-    if let Ok(op_tx) = crate::uring::global_state::get_global_uring_worker_op_tx() {
-      let _ = op_tx.try_send(UringOpRequest::RecycleRecvBuffer { id: self.id });
-    }
-  }
-}
 
 /// Channel message type for the Tokio → UringWorker egress pipe.
 ///
@@ -64,7 +35,7 @@ use crate::io_uring_backend::{
     HandlerIoOps, HandlerSqeBlueprint, OutgoingMessage, UringConnectionHandler, UringWorkerInterface,
     WorkerIoConfig,
   },
-  ops::{UringOpRequest, UserData, HANDLER_INTERNAL_SEND_OP_UD},
+  ops::{UserData, HANDLER_INTERNAL_SEND_OP_UD},
   send_buffer_pool::{RegisteredSendBufferId, SendBufferLease, SendBufferPool},
   worker::{InternalOpTracker, MultishotReader},
 };
@@ -96,14 +67,20 @@ impl ISocketConnection for DummySocketConnection {
 pub(crate) struct UringByteHandler {
   fd: RawFd,
   worker_io_config: Arc<WorkerIoConfig>,
-  raw_inbound_tx: fibre::mpsc::BoundedSender<UringInboundLease>,
+  raw_inbound_tx: fibre::mpsc::BoundedSender<Bytes>,
   raw_egress_rx: fibre::mpsc::BoundedReceiver<EgressChunk>,
   multishot_reader: Option<MultishotReader>,
   is_closing: bool,
-  spillover: VecDeque<UringInboundLease>,
-  mailbox_full_throttled: bool,
+  spillover: VecDeque<Bytes>,
   /// When true and payload exceeds `ZC_SEND_THRESHOLD`, emit `RequestSendZeroCopy`.
   use_send_zerocopy: bool,
+  /// When true, instantiate `MultishotReader` in `connection_ready`. Mirrors the
+  /// socket's `io_uring.recv_multishot` option passed through `RegisterExternalByteFd`.
+  use_recv_multishot: bool,
+  /// Capacity (bytes) of each pre-registered send buffer slot in the worker's `SendBufferPool`.
+  /// Zero means the pool was not initialized. Used in `connection_ready` to validate that
+  /// zero-copy sends can succeed without silent fallbacks.
+  send_buffer_slot_size: usize,
 }
 
 impl UringByteHandler {
@@ -112,9 +89,11 @@ impl UringByteHandler {
     socket_mailbox: MailboxSyncSender,
     endpoint_uri: String,
     target_endpoint_uri: String,
-    raw_inbound_tx: fibre::mpsc::BoundedSender<UringInboundLease>,
+    raw_inbound_tx: fibre::mpsc::BoundedSender<Bytes>,
     raw_egress_rx: fibre::mpsc::BoundedReceiver<EgressChunk>,
     use_send_zerocopy: bool,
+    use_recv_multishot: bool,
+    send_buffer_slot_size: usize,
   ) -> Self {
     let (dummy_tx, _dummy_rx) = fibre::mpsc::bounded::<Vec<Msg>>(1);
     let worker_io_config = Arc::new(WorkerIoConfig {
@@ -132,8 +111,9 @@ impl UringByteHandler {
       multishot_reader: None,
       is_closing: false,
       spillover: VecDeque::new(),
-      mailbox_full_throttled: false,
       use_send_zerocopy,
+      use_recv_multishot,
+      send_buffer_slot_size,
     }
   }
 
@@ -166,7 +146,7 @@ impl UringConnectionHandler for UringByteHandler {
     self.fd
   }
 
-  fn io_config(&self) -> &WorkerIoConfig {
+  fn io_config(&self) -> &Arc<WorkerIoConfig> {
     &self.worker_io_config
   }
 
@@ -176,44 +156,69 @@ impl UringConnectionHandler for UringByteHandler {
 
   fn connection_ready(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
     debug!(fd = self.fd, "UringByteHandler: connection_ready");
-    if let Some(bgid) = interface.default_buffer_group_id() {
-      self.multishot_reader = Some(MultishotReader::new(self.fd, bgid));
+
+    if self.use_send_zerocopy {
+      if self.send_buffer_slot_size == 0 {
+        warn!(
+          fd = self.fd,
+          "UringByteHandler: zero-copy send is enabled but the send buffer pool slot size is \
+           zero — all sends will fall back to heap-allocated copies. Ensure the io_uring backend \
+           was initialized with a non-zero default_send_buffer_size."
+        );
+      } else {
+        debug!(
+          fd = self.fd,
+          send_buffer_slot_size = self.send_buffer_slot_size,
+          "UringByteHandler: zero-copy send armed; writes exceeding {} bytes per call will \
+           fall back to heap-allocated copies",
+          self.send_buffer_slot_size
+        );
+      }
+    }
+
+    if self.use_recv_multishot {
+      if let Some(bgid) = interface.default_buffer_group_id() {
+        self.multishot_reader = Some(MultishotReader::new(self.fd, bgid));
+      } else {
+        warn!(
+          fd = self.fd,
+          "UringByteHandler: no default buffer group id — multishot reads disabled"
+        );
+      }
     } else {
-      warn!(
-        fd = self.fd,
-        "UringByteHandler: no default buffer group id — multishot reads disabled"
-      );
+      trace!(fd = self.fd, "UringByteHandler: multishot recv disabled by socket option");
     }
     HandlerIoOps::default()
   }
 
-  fn process_ring_read_data(
+  fn process_ring_read_bytes(
     &mut self,
-    lease: UringInboundLease,
+    bytes: Bytes,
     _interface: &UringWorkerInterface<'_>,
   ) -> HandlerIoOps {
-    trace!(fd = self.fd, len = lease.len, "UringByteHandler: process_ring_read_data");
-    if lease.len == 0 {
-      // EOF sentinel — Drop is a no-op (len == 0), no slot to recycle.
+    trace!(fd = self.fd, len = bytes.len(), "UringByteHandler: process_ring_read_bytes");
+    if bytes.is_empty() {
+      // EOF sentinel — peer closed the connection. Mark closing and request socket teardown
+      // to prevent prepare_sqes from re-arming a read that would immediately EOF again.
       info!(fd = self.fd, "UringByteHandler: EOF received from peer");
-      return HandlerIoOps::default();
+      self.is_closing = true;
+      let mut ops = HandlerIoOps::default();
+      ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestClose);
+      return ops;
     }
-    match self.raw_inbound_tx.try_send(lease) {
+    match self.raw_inbound_tx.try_send(bytes) {
       Ok(()) => {}
       Err(fibre::TrySendError::Full(returned)) => {
-        // Channel full: stash lease and cancel the active multishot read so the kernel
-        // stops delivering data until we drain the spillover queue.
+        // Channel full: stash bytes and cancel the active multishot read.
+        // The worker re-arms reads automatically once spillover drains in prepare_sqes.
         self.spillover.push_back(returned);
-        self.mailbox_full_throttled = true;
         let mut ops = HandlerIoOps::default();
         if let Some(cancel_bp) = self.prepare_multishot_cancel() {
           ops.sqe_blueprints.push(cancel_bp);
         }
         return ops;
       }
-      Err(_) => {
-        // Receiver dropped — lease's Drop fires RecycleRecvBuffer automatically.
-      }
+      Err(_) => {} // Receiver dropped; discard.
     }
     HandlerIoOps::default()
   }
@@ -242,8 +247,8 @@ impl UringConnectionHandler for UringByteHandler {
     let mut ops = HandlerIoOps::default();
 
     // (a) Drain spillover back into the inbound channel; re-arm reads when clear.
-    if !self.spillover.is_empty() && self.try_drain_spillover() {
-      self.mailbox_full_throttled = false;
+    if !self.spillover.is_empty() {
+      self.try_drain_spillover();
     }
 
     // (b) Re-arm multishot read if not throttled.
@@ -387,24 +392,10 @@ impl UringConnectionHandler for UringByteHandler {
   }
 
   fn should_throttle_reads(&self) -> bool {
-    self.mailbox_full_throttled || !self.spillover.is_empty()
-  }
-
-  fn on_resume_connection(&mut self, _interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
-    if self.try_drain_spillover() {
-      self.mailbox_full_throttled = false;
-    }
-    HandlerIoOps::default()
+    !self.spillover.is_empty()
   }
 
   fn on_buffer_ring_exhausted(&mut self) {
-    if self.mailbox_full_throttled {
-      return;
-    }
-    // tracing::warn!(fd = self.fd, "UringByteHandler: buffer ring exhausted (ENOBUFS) — throttling reads until app catches up");
-    self.mailbox_full_throttled = true;
-    // We DO NOT instantly send ResumeConnection here.
-    // The application (Tokio side) will send ResumeConnection when it fully consumes a lease,
-    // guaranteeing that the buffer ring has capacity again.
+    tracing::trace!(fd = self.fd, "UringByteHandler: buffer ring exhausted (ENOBUFS) — transient, will re-arm next cycle");
   }
 }

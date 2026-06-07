@@ -49,6 +49,11 @@ impl HandlerManager {
     self.handlers.keys().copied().collect()
   }
 
+  pub(crate) fn fill_active_fds(&self, dst: &mut Vec<RawFd>) {
+    dst.clear();
+    dst.extend(self.handlers.keys().copied());
+  }
+
   /// Creates a new handler, adds it, calls `connection_ready`, and returns initial I/O operations.
   pub fn create_and_add_handler<'a>(
     &mut self,

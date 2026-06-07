@@ -127,6 +127,7 @@ pub(crate) fn process_handler_blueprint(
             };
             zc_entry = Some(
               opcode::SendZc::new(types::Fd(fd), buffer_ptr, len_copied)
+                .buf_index(Some(reg_buf_id.0))
                 .flags(send_op_flags)
                 .build(),
             );
@@ -235,7 +236,7 @@ pub(crate) fn process_handler_blueprint(
 
     HandlerSqeBlueprint::RequestSendZeroCopyLeased { id, ptr, len } => {
       let op_payload = InternalOpPayload::SendZeroCopyLeased { send_buf_id: id };
-      let mut entry = opcode::SendZc::new(types::Fd(fd), ptr, len).build();
+      let mut entry = opcode::SendZc::new(types::Fd(fd), ptr, len).buf_index(Some(id.0)).build();
       let user_data = internal_ops.new_op_id(fd, InternalOpType::SendZeroCopyLeased, op_payload);
       entry = entry.user_data(user_data);
       unsafe {
@@ -348,14 +349,18 @@ pub(crate) fn process_all_cqes(
   worker: &mut UringWorker,
   is_worker_shutting_down: bool,
 ) -> Result<(usize, Vec<(RawFd, Vec<HandlerSqeBlueprint>)>), ZmqError> {
-  let mut cq: cqueue::CompletionQueue<'_> = unsafe { worker.ring.completion_shared() };
-  cq.sync();
-  let entries: Vec<Entry> = cq.into_iter().collect();
-  let num_processed = entries.len();
+  {
+    let mut cq: cqueue::CompletionQueue<'_> = unsafe { worker.ring.completion_shared() };
+    cq.sync();
+    worker.cqe_scratch.clear();
+    worker.cqe_scratch.extend(cq.into_iter());
+  }
+  let num_processed = worker.cqe_scratch.len();
 
   let mut new_work_generated: Vec<(RawFd, Vec<HandlerSqeBlueprint>)> = Vec::new();
 
-  for cqe in entries {
+  for i in 0..num_processed {
+    let cqe = worker.cqe_scratch[i].clone(); // 16-byte struct clone — stack copy, no heap allocation
     let cqe_user_data = cqe.user_data();
     let cqe_result = cqe.result();
     let cqe_flags = cqe.flags();
@@ -514,7 +519,6 @@ pub(crate) fn process_all_cqes(
     }
 
     let mut op_details_taken_for_final_processing: Option<InternalOpDetails> = None;
-    let mut is_zc_initial_pending_notify = false;
     let mut is_multishot_read_pending_more = false;
     let mut was_delegated_to_multishot_handler = false;
 
@@ -522,18 +526,7 @@ pub(crate) fn process_all_cqes(
       let handler_fd_peeked = peeked_details.fd;
       let op_type_peeked = peeked_details.op_type;
 
-      if op_type_peeked == InternalOpType::SendZeroCopy
-        || op_type_peeked == InternalOpType::SendZeroCopyLeased
-      {
-        if (cqe_flags & CQE_F_NOTIFY_FLAG) == 0 && cqe_result >= 0 {
-          // If the kernel did not set F_MORE, it means no F_NOTIFY CQE will follow
-          // (e.g. the data was copied synchronously). We must process this CQE fully now
-          // to clear `write_in_flight` and prevent a permanent send deadlock.
-          if (cqe_flags & IOURING_CQE_F_MORE) != 0 {
-            is_zc_initial_pending_notify = true;
-          }
-        }
-      } else if op_type_peeked == InternalOpType::RingReadMultishot {
+      if op_type_peeked == InternalOpType::RingReadMultishot {
         if cqe_result >= 0 && (cqe_flags & IOURING_CQE_F_MORE) != 0 {
           is_multishot_read_pending_more = true;
         }
@@ -606,8 +599,7 @@ pub(crate) fn process_all_cqes(
       }
     }
 
-    if !is_zc_initial_pending_notify
-      && !is_multishot_read_pending_more
+    if !is_multishot_read_pending_more
       && !was_delegated_to_multishot_handler
     {
       op_details_taken_for_final_processing =
@@ -750,6 +742,10 @@ pub(crate) fn process_all_cqes(
             if let Some(mut h) = worker.handler_manager.remove_handler(handler_fd) {
               h.fd_has_been_closed();
             }
+            // Drop all queued write blueprints and in-flight send buffer allocations
+            // for this fd so they are freed immediately rather than leaking.
+            worker.work_map.remove(&handler_fd);
+            worker.internal_op_tracker.remove_ops_for_fd(handler_fd);
             if let Some(mailbox) = mailbox_for_close_notify {
               let endpoint_uri = endpoint_uri_for_notify.unwrap_or_default();
               let _ = mailbox.try_send(Command::UringFdError {
@@ -769,7 +765,24 @@ pub(crate) fn process_all_cqes(
         | InternalOpType::SendZeroCopy
         | InternalOpType::SendRawVectored
         | InternalOpType::SendZeroCopyLeased => {
+          let is_notify = (cqe_flags & CQE_F_NOTIFY_FLAG) != 0;
+          let is_initial_with_more = !is_notify && (cqe_flags & IOURING_CQE_F_MORE) != 0;
+
+          if is_notify {
+            match op_details.payload {
+              InternalOpPayload::SendZeroCopy { send_buf_id, .. }
+              | InternalOpPayload::SendZeroCopyLeased { send_buf_id } => {
+                if let Some(pool) = &worker.send_buffer_pool {
+                  pool.release_buffer(send_buf_id);
+                }
+              }
+              _ => {}
+            }
+            continue; // Buffer released, nothing more to do for F_NOTIFY.
+          }
+
           // Clear the per-FD in-flight lock so the next queued write can be submitted.
+          // This allows 1-RTT zero-copy pipelining!
           if let Some(work) = worker.work_map.get_mut(&handler_fd) {
             work.write_in_flight = false;
           }
@@ -779,8 +792,6 @@ pub(crate) fn process_all_cqes(
 
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOBUFS {
               // Non-destructive recovery: move payload out and re-queue to front of work_map.
-              // ENOBUFS on writes means the kernel is temporarily out of lock/descriptor resources;
-              // releasing the ZC buffer and retrying as a standard copy-send is safe and sufficient.
               let blueprint_to_requeue = match op_details.payload {
                 InternalOpPayload::SendBuffer { buffer, send_op_flags, app_op_ud, .. } => {
                   Some(HandlerSqeBlueprint::RequestSend {
@@ -796,9 +807,16 @@ pub(crate) fn process_all_cqes(
                   app_op_ud,
                   ..
                 } => {
-                  // Release the ZC buffer before retrying as standard Send
-                  if let Some(pool) = &worker.send_buffer_pool {
-                    pool.release_buffer(send_buf_id);
+                  if !is_initial_with_more {
+                    if let Some(pool) = &worker.send_buffer_pool {
+                      pool.release_buffer(send_buf_id);
+                    }
+                  } else {
+                    worker.internal_op_tracker.op_to_details.insert(cqe_user_data, InternalOpDetails {
+                      fd: handler_fd,
+                      op_type: InternalOpType::SendZeroCopyLeased,
+                      payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                    });
                   }
                   Some(HandlerSqeBlueprint::RequestSend {
                     data: original_data,
@@ -807,16 +825,22 @@ pub(crate) fn process_all_cqes(
                   })
                 }
                 InternalOpPayload::RawVectored(batch) => {
-                  // EAGAIN/ENOBUFS: re-queue all payloads as a fresh vectored write.
                   Some(HandlerSqeBlueprint::RequestSendRawVectored {
                     bufs: batch.payloads,
                     send_op_flags: batch.send_op_flags,
                   })
                 }
                 InternalOpPayload::SendZeroCopyLeased { send_buf_id } => {
-                  // No original data held — can't reconstruct payload. Release slot and close.
-                  if let Some(pool) = &worker.send_buffer_pool {
-                    pool.release_buffer(send_buf_id);
+                  if !is_initial_with_more {
+                    if let Some(pool) = &worker.send_buffer_pool {
+                      pool.release_buffer(send_buf_id);
+                    }
+                  } else {
+                    worker.internal_op_tracker.op_to_details.insert(cqe_user_data, InternalOpDetails {
+                      fd: handler_fd,
+                      op_type: InternalOpType::SendZeroCopyLeased,
+                      payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                    });
                   }
                   error!(fd = handler_fd, errno, "EAGAIN on leased ZC send — no original data for retry. Closing.");
                   worker.fds_needing_close_initiated_pass.push_back(handler_fd);
@@ -844,13 +868,19 @@ pub(crate) fn process_all_cqes(
             match op_details.payload {
               InternalOpPayload::SendZeroCopy { send_buf_id, .. }
               | InternalOpPayload::SendZeroCopyLeased { send_buf_id } => {
-                if let Some(pool) = &worker.send_buffer_pool {
-                  pool.release_buffer(send_buf_id);
+                if !is_initial_with_more {
+                  if let Some(pool) = &worker.send_buffer_pool {
+                    pool.release_buffer(send_buf_id);
+                  }
+                } else {
+                  worker.internal_op_tracker.op_to_details.insert(cqe_user_data, InternalOpDetails {
+                    fd: handler_fd,
+                    op_type: InternalOpType::SendZeroCopyLeased,
+                    payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                  });
                 }
               }
-              InternalOpPayload::RawVectored(_) => {
-                // PinnedEgressBatch dropped here — Bytes refs freed.
-              }
+              InternalOpPayload::RawVectored(_) => {}
               _ => {}
             }
             let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(errno));
@@ -859,9 +889,6 @@ pub(crate) fn process_all_cqes(
             continue;
           }
 
-          // Partial-write guard: cqe_result >= 0 but fewer bytes were written than requested.
-          // Without this check the unwritten tail is silently dropped, permanently corrupting
-          // the ZMTP byte stream and causing the receiver's parser to lose frame alignment.
           let bytes_written = cqe_result as usize;
           let total_expected = match &op_details.payload {
             InternalOpPayload::SendBuffer { buffer, .. } => buffer.len(),
@@ -889,8 +916,16 @@ pub(crate) fn process_all_cqes(
               InternalOpPayload::SendZeroCopy {
                 send_buf_id, original_data, send_op_flags, app_op_ud, ..
               } => {
-                if let Some(pool) = &worker.send_buffer_pool {
-                  pool.release_buffer(send_buf_id);
+                if !is_initial_with_more {
+                  if let Some(pool) = &worker.send_buffer_pool {
+                    pool.release_buffer(send_buf_id);
+                  }
+                } else {
+                  worker.internal_op_tracker.op_to_details.insert(cqe_user_data, InternalOpDetails {
+                    fd: handler_fd,
+                    op_type: InternalOpType::SendZeroCopyLeased,
+                    payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                  });
                 }
                 HandlerSqeBlueprint::RequestSend {
                   data: original_data.slice(bytes_written..),
@@ -949,8 +984,16 @@ pub(crate) fn process_all_cqes(
           match op_details.payload {
             InternalOpPayload::SendZeroCopy { send_buf_id, .. }
             | InternalOpPayload::SendZeroCopyLeased { send_buf_id } => {
-              if let Some(pool) = &worker.send_buffer_pool {
-                pool.release_buffer(send_buf_id);
+              if !is_initial_with_more {
+                if let Some(pool) = &worker.send_buffer_pool {
+                  pool.release_buffer(send_buf_id);
+                }
+              } else {
+                worker.internal_op_tracker.op_to_details.insert(cqe_user_data, InternalOpDetails {
+                  fd: handler_fd,
+                  op_type: InternalOpType::SendZeroCopyLeased,
+                  payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                });
               }
             }
             _ => {}
@@ -1013,19 +1056,21 @@ pub(crate) fn process_all_cqes(
                 let bid = cqueue::buffer_select(cqe_flags).unwrap();
                 let bytes_read = cqe_result as usize;
                 if let Some(bm) = worker.buffer_manager.as_ref() {
-                  match unsafe { bm.borrow_kernel_filled_buffer(bid, bytes_read) } {
-                    Ok(borrowed) => {
-                      let ptr = (*borrowed).as_ptr() as *const u8;
-                      let len = (*borrowed).len();
-                      std::mem::forget(borrowed);
-                      let lease = crate::io_uring_backend::byte_handler::UringInboundLease { id: bid, ptr, len };
-                      handler.process_ring_read_data(lease, &interface)
+                  if bytes_read == 0 {
+                    // EOF with buffer consumed — reprovide inline and send EOF sentinel.
+                    if let Err(e) = unsafe { bm.reprovide_buffer(bid) } {
+                      tracing::warn!("cqe_processor: reprovide_buffer({}) on EOF failed: {:?}", bid, e);
                     }
-                    Err(_e) => {
-                      worker
-                        .fds_needing_close_initiated_pass
-                        .push_back(handler_fd);
-                      HandlerIoOps::default().set_error_close()
+                    handler.process_ring_read_bytes(bytes::Bytes::new(), &interface)
+                  } else {
+                    match unsafe { bm.take_and_replenish_buffer(bid, bytes_read) } {
+                      Ok(owned_bytes) => handler.process_ring_read_bytes(owned_bytes, &interface),
+                      Err(_e) => {
+                        worker
+                          .fds_needing_close_initiated_pass
+                          .push_back(handler_fd);
+                        HandlerIoOps::default().set_error_close()
+                      }
                     }
                   }
                 } else {

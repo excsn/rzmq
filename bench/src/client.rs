@@ -288,6 +288,7 @@ async fn run_throughput_worker(
   }
 
   let mut loop_counter = 0u32;
+  let mut exit_result: Result<(), ZmqError> = Ok(());
 
   loop {
     loop_counter += 1;
@@ -338,14 +339,15 @@ async fn run_throughput_worker(
       }
       Err(e) => {
         error!("[Throughput Worker {}] Send failed with error: {}", id, e);
-        return Err(e);
+        exit_result = Err(e);
+        break;
       }
     }
   }
 
   let _ = socket.close().await;
   info!("[Throughput Worker {}] Exited cleanly.", id);
-  Ok(())
+  exit_result
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +408,7 @@ async fn run_reqrep_worker(
 
   let mut messages_sent = 0usize;
   let mut local_hist = Histogram::<u64>::new(3).expect("histogram");
+  let mut exit_result: Result<(), ZmqError> = Ok(());
 
   loop {
     if shutdown.load(Ordering::Relaxed) {
@@ -444,7 +447,11 @@ async fn run_reqrep_worker(
         );
         break;
       }
-      Err(e) => return Err(e),
+      Err(e) => {
+        error!("[ReqRep Worker {}] Send failed with error: {}", id, e);
+        exit_result = Err(e);
+        break;
+      }
     }
 
     match socket.recv().await {
@@ -465,14 +472,18 @@ async fn run_reqrep_worker(
         );
         break;
       }
-      Err(e) => return Err(e),
+      Err(e) => {
+        error!("[ReqRep Worker {}] Recv failed with error: {}", id, e);
+        exit_result = Err(e);
+        break;
+      }
     }
   }
 
   let _ = socket.close().await;
   collector.merge_histogram(&local_hist);
   info!("[ReqRep Worker {}] Exited cleanly.", id);
-  Ok(())
+  exit_result
 }
 
 // ---------------------------------------------------------------------------

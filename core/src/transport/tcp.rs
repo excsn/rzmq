@@ -394,7 +394,7 @@ impl TcpListener {
                         let rcvhwm = socket_options_clone.rcvhwm.max(1);
                         let sndhwm = socket_options_clone.sndhwm.max(1);
                         let (raw_inbound_tx, raw_inbound_rx_sync) =
-                          fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::UringInboundLease>(rcvhwm);
+                          fibre::mpsc::bounded::<bytes::Bytes>(rcvhwm);
                         let (raw_egress_sync_tx, raw_egress_rx) =
                           fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::EgressChunk>(sndhwm);
 
@@ -410,6 +410,7 @@ impl TcpListener {
                           reply_tx: reply_tx_for_op,
                           raw_inbound_tx,
                           raw_egress_rx,
+                          use_recv_multishot: socket_options_clone.io_uring.recv_multishot,
                         };
 
                         if let Err(e) = worker_op_tx.send(register_req).await {
@@ -443,6 +444,7 @@ impl TcpListener {
                                   worker_asleep,
                                   event_fd,
                                   send_pool,
+                                  rcvhwm,
                                 );
 
                               let sca_handle_id = handle_source_clone
@@ -1033,7 +1035,7 @@ impl TcpConnecter {
             let rcvhwm = self.socket_options.rcvhwm.max(1);
             let sndhwm = self.socket_options.sndhwm.max(1);
             let (raw_inbound_tx, raw_inbound_rx_sync) =
-              fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::UringInboundLease>(rcvhwm);
+              fibre::mpsc::bounded::<bytes::Bytes>(rcvhwm);
             let (raw_egress_sync_tx, raw_egress_rx) =
               fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::EgressChunk>(sndhwm);
 
@@ -1048,6 +1050,7 @@ impl TcpConnecter {
               reply_tx: reply_tx_for_op,
               raw_inbound_tx,
               raw_egress_rx,
+              use_recv_multishot: self.socket_options.io_uring.recv_multishot,
             };
             worker_op_tx.send(register_req).await.map_err(|e| {
               ZmqError::Internal(format!("Send RegisterExternalByteFd to UringWorker: {}", e))
@@ -1071,6 +1074,7 @@ impl TcpConnecter {
                   worker_asleep,
                   event_fd,
                   send_pool,
+                  rcvhwm,
                 );
 
                 let sca_handle_id = self

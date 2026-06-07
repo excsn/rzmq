@@ -102,6 +102,13 @@ pub struct UringWorker {
   // Shared flag: true while the worker is blocked in submit_with_args waiting for kernel events.
   // Connections check this before writing to eventfd to avoid redundant syscalls.
   pub(crate) worker_asleep: Arc<AtomicBool>,
+
+  /// Scratchpad for active file descriptors to avoid hot-path heap allocations.
+  pub(crate) active_fds_scratch: Vec<RawFd>,
+  /// Scratchpad for MPSC channel FDs to avoid hot-path heap allocations.
+  pub(crate) mpsc_fds_scratch: Vec<RawFd>,
+  /// Scratchpad for CQE entries to avoid hot-path heap allocations.
+  pub(crate) cqe_scratch: Vec<io_uring::cqueue::Entry>,
 }
 
 impl fmt::Debug for UringWorker {
@@ -256,6 +263,9 @@ impl UringWorker {
               cfg_sqpoll_active: actual_sqpoll_enabled,
               cfg_polling_strategy: config.polling_strategy,
               worker_asleep,
+              active_fds_scratch: Vec::with_capacity(256),
+              mpsc_fds_scratch: Vec::with_capacity(256),
+              cqe_scratch: Vec::with_capacity(256),
             };
 
             {

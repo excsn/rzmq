@@ -320,7 +320,7 @@ impl IpcListener {
                     let rcvhwm = socket_options_clone.rcvhwm.max(1);
                     let sndhwm = socket_options_clone.sndhwm.max(1);
                     let (raw_inbound_tx, raw_inbound_rx_sync) =
-                      fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::UringInboundLease>(rcvhwm);
+                      fibre::mpsc::bounded::<bytes::Bytes>(rcvhwm);
                     let (raw_egress_sync_tx, raw_egress_rx) =
                       fibre::mpsc::bounded::<EgressChunk>(sndhwm);
 
@@ -335,6 +335,7 @@ impl IpcListener {
                           reply_tx,
                           raw_inbound_tx,
                           raw_egress_rx,
+                          use_recv_multishot: socket_options_clone.io_uring.recv_multishot,
                         }).await.is_ok();
 
                         if reg_ok {
@@ -350,6 +351,7 @@ impl IpcListener {
                                 worker_asleep,
                                 event_fd,
                                 send_pool,
+                                rcvhwm,
                               );
                               let sca_handle_id = handle_source_clone
                                 .fetch_add(1, AtomicOrdering::Relaxed);
@@ -648,7 +650,7 @@ impl IpcConnecter {
                   let rcvhwm = self.context_options.rcvhwm.max(1);
                   let sndhwm = self.context_options.sndhwm.max(1);
                   let (raw_inbound_tx, raw_inbound_rx_sync) =
-                    fibre::mpsc::bounded::<crate::io_uring_backend::byte_handler::UringInboundLease>(rcvhwm);
+                    fibre::mpsc::bounded::<bytes::Bytes>(rcvhwm);
                   let (raw_egress_sync_tx, raw_egress_rx) =
                     fibre::mpsc::bounded::<EgressChunk>(sndhwm);
 
@@ -663,6 +665,7 @@ impl IpcConnecter {
                         reply_tx,
                         raw_inbound_tx,
                         raw_egress_rx,
+                        use_recv_multishot: self.context_options.io_uring.recv_multishot,
                       }).await.is_ok();
 
                       if reg_ok {
@@ -678,6 +681,7 @@ impl IpcConnecter {
                               worker_asleep,
                               event_fd,
                               send_pool,
+                              rcvhwm,
                             );
                             let sca_handle_id = self.context_handle_source
                               .fetch_add(1, AtomicOrdering::Relaxed);

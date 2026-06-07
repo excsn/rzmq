@@ -3,6 +3,8 @@ use std::time::Duration;
 use crate::throttle::types::AdaptiveThrottleConfig;
 use crate::{Blob, CoreState, ZmqError};
 
+pub const DEFAULT_SNDBATCH_COUNT: usize = 128;
+
 // Use values consistent with libzmq where possible
 pub const SNDBUF: i32 = 11;
 pub const RCVBUF: i32 = 12;
@@ -173,7 +175,7 @@ impl Default for SocketOptions {
         c.priority_boost_factor = 5.0;
         c
       },
-      sndbatch_count: 128,
+      sndbatch_count: DEFAULT_SNDBATCH_COUNT,
       sndbatch_bytes: 512 * 1024, // 512 KB
       rcvbatch_count: 256,
       rcvbatch_bytes: 512 * 1024, // 512 KB
@@ -294,6 +296,29 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
         { false }
     };
 
+    // When zero-copy sends are enabled, clamp sndbatch_bytes to DEFAULT_IO_URING_SND_BUFFER_SIZE.
+    // The physical pool slot is sized by calculate_required_slot_size to absorb framing overhead
+    // on top of this logical payload ceiling, so no further per-message headroom deduction is
+    // needed here.
+    #[cfg(feature = "io-uring")]
+    let sndbatch_bytes = if options.io_uring.send_zerocopy {
+      let ceiling = crate::uring::DEFAULT_IO_URING_SND_BUFFER_SIZE;
+      if options.sndbatch_bytes > ceiling {
+        tracing::warn!(
+          sndbatch_bytes = options.sndbatch_bytes,
+          ceiling,
+          "sndbatch_bytes clamped to io_uring logical payload ceiling to prevent ZC slot overflow"
+        );
+        ceiling
+      } else {
+        options.sndbatch_bytes
+      }
+    } else {
+      options.sndbatch_bytes
+    };
+    #[cfg(not(feature = "io-uring"))]
+    let sndbatch_bytes = options.sndbatch_bytes;
+
     ZmtpEngineConfig {
       routing_id: options.routing_id.clone(),
       socket_type_name: options.socket_type_name.clone(),
@@ -324,7 +349,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       max_msg_size: options.maxmsgsize,
       throttle_config: options.throttle_config.clone(),
       sndbatch_count: options.sndbatch_count,
-      sndbatch_bytes: options.sndbatch_bytes,
+      sndbatch_bytes,
       rcvbatch_count: options.rcvbatch_count,
       rcvbatch_bytes: options.rcvbatch_bytes,
     }

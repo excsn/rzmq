@@ -15,7 +15,7 @@ use eventfd::EventFD;
 use futures::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::io_uring_backend::byte_handler::{EgressChunk, UringInboundLease};
+use crate::io_uring_backend::byte_handler::EgressChunk;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::transport::{ZmtpReadHalf, ZmtpStdStream};
 
@@ -23,13 +23,16 @@ use crate::transport::{ZmtpReadHalf, ZmtpStdStream};
 
 /// Owned read half of a split `UringStream`.
 ///
-/// Holds the inbound lease channel and any partially-consumed active lease.
-/// Drop notifies the io_uring worker automatically via the lease's Drop impl.
+/// Holds the inbound bytes channel and any partially-consumed active chunk.
 pub(crate) struct UringReadHalf {
   fd: RawFd,
-  rx_from_worker: fibre::mpsc::BoundedAsyncReceiver<UringInboundLease>,
-  /// Active lease with a read-position offset for partial drains.
-  current_lease: Option<(UringInboundLease, usize)>,
+  rx_from_worker: fibre::mpsc::BoundedAsyncReceiver<Bytes>,
+  /// Active chunk with remaining bytes for partial drains.
+  current_lease: Option<Bytes>,
+  worker_asleep: Arc<AtomicBool>,
+  event_fd: EventFD,
+  /// Wakeup threshold: write EventFD when channel occupancy drops to or below this value.
+  channel_lwm: usize,
 }
 
 impl std::fmt::Debug for UringReadHalf {
@@ -46,40 +49,40 @@ impl AsyncRead for UringReadHalf {
     cx: &mut Context<'_>,
     buf: &mut ReadBuf<'_>,
   ) -> Poll<io::Result<()>> {
-    // Fast path: drain the active lease (partial read from a prior call).
-    if let Some((ref lease, ref mut offset)) = self.current_lease {
-      let remaining = lease.len - *offset;
-      let to_copy = remaining.min(buf.remaining());
-      // SAFETY: ptr is valid and exclusively owned until RecycleRecvBuffer is sent.
-      let src = unsafe { std::slice::from_raw_parts(lease.ptr.add(*offset), to_copy) };
-      buf.put_slice(src);
-      *offset += to_copy;
-      if *offset == lease.len {
-        self.current_lease = None; // Drop fires RecycleRecvBuffer
-        self.notify_lease_consumed();
+    // Fast path: drain the active chunk (partial read from a prior call).
+    if let Some(ref mut bytes) = self.current_lease {
+      let to_copy = bytes.len().min(buf.remaining());
+      buf.put_slice(&bytes[..to_copy]);
+      if to_copy < bytes.len() {
+        *bytes = bytes.slice(to_copy..); // zero-alloc slice advance
+      } else {
+        self.current_lease = None;
       }
       return Poll::Ready(Ok(()));
     }
 
-    // Wait for the next lease from the worker.
+    // Wait for the next chunk from the worker.
     match Pin::new(&mut self.rx_from_worker).poll_next(cx) {
       Poll::Pending => Poll::Pending,
       Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "UringReadHalf: worker channel closed",
       ))),
-      Poll::Ready(Some(lease)) => {
-        if lease.len == 0 {
-          return Poll::Ready(Ok(()));
+      Poll::Ready(Some(bytes)) => {
+        if bytes.is_empty() {
+          return Poll::Ready(Ok(())); // EOF sentinel
         }
-        let to_copy = lease.len.min(buf.remaining());
-        // SAFETY: ptr is valid and exclusively owned until RecycleRecvBuffer is sent.
-        let src = unsafe { std::slice::from_raw_parts(lease.ptr, to_copy) };
-        buf.put_slice(src);
-        if to_copy < lease.len {
-          self.current_lease = Some((lease, to_copy));
-        } else {
-          self.notify_lease_consumed();
+        let to_copy = bytes.len().min(buf.remaining());
+        buf.put_slice(&bytes[..to_copy]);
+        if to_copy < bytes.len() {
+          self.current_lease = Some(bytes.slice(to_copy..));
+        }
+        // Nudge the worker awake if the channel has drained to or below LWM so
+        // it runs prepare_sqes and drains any spillover promptly.
+        if self.rx_from_worker.len() <= self.channel_lwm
+          && self.worker_asleep.load(Ordering::Relaxed)
+        {
+          let _ = self.event_fd.write(1);
         }
         Poll::Ready(Ok(()))
       }
@@ -88,19 +91,26 @@ impl AsyncRead for UringReadHalf {
 }
 
 impl UringReadHalf {
-  /// Poll for the next raw inbound lease without copying into a `ReadBuf`.
-  pub(crate) fn poll_recv_lease(
+  /// Poll for the next raw inbound chunk without copying into a `ReadBuf`.
+  pub(crate) fn poll_recv_bytes(
     mut self: Pin<&mut Self>,
     cx: &mut Context<'_>,
-  ) -> Poll<io::Result<UringInboundLease>> {
+  ) -> Poll<io::Result<Bytes>> {
     if self.current_lease.is_some() {
       return Poll::Ready(Err(io::Error::new(
         io::ErrorKind::Other,
-        "UringReadHalf: partial lease active; drain before polling raw lease",
+        "UringReadHalf: partial chunk active; drain before polling raw bytes",
       )));
     }
     match Pin::new(&mut self.rx_from_worker).poll_next(cx) {
-      Poll::Ready(Some(lease)) => Poll::Ready(Ok(lease)),
+      Poll::Ready(Some(bytes)) => {
+        if self.rx_from_worker.len() <= self.channel_lwm
+          && self.worker_asleep.load(Ordering::Relaxed)
+        {
+          let _ = self.event_fd.write(1);
+        }
+        Poll::Ready(Ok(bytes))
+      }
       Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "UringReadHalf: worker channel closed",
@@ -109,15 +119,22 @@ impl UringReadHalf {
     }
   }
 
-  /// Try to receive the next lease synchronously (noop waker — always returns immediately).
-  pub(crate) fn try_recv_lease(&mut self) -> Option<io::Result<UringInboundLease>> {
+  /// Try to receive the next chunk synchronously (noop waker — always returns immediately).
+  pub(crate) fn try_recv_bytes(&mut self) -> Option<io::Result<Bytes>> {
     if self.current_lease.is_some() {
       return None;
     }
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     match Pin::new(&mut self.rx_from_worker).poll_next(&mut cx) {
-      Poll::Ready(Some(lease)) => Some(Ok(lease)),
+      Poll::Ready(Some(bytes)) => {
+        if self.rx_from_worker.len() <= self.channel_lwm
+          && self.worker_asleep.load(Ordering::Relaxed)
+        {
+          let _ = self.event_fd.write(1);
+        }
+        Some(Ok(bytes))
+      }
       Poll::Ready(None) => Some(Err(io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "UringReadHalf: worker channel closed",
@@ -126,34 +143,28 @@ impl UringReadHalf {
     }
   }
 
-  /// Take ownership of any partially-consumed lease (handshake→data phase transition).
-  pub(crate) fn steal_current_lease(&mut self) -> Option<(UringInboundLease, usize)> {
+  /// Take ownership of any partially-consumed chunk (handshake→data phase transition).
+  pub(crate) fn steal_current_bytes(&mut self) -> Option<Bytes> {
     self.current_lease.take()
   }
 }
 
 impl ZmtpReadHalf for UringReadHalf {
-  fn try_recv_lease(&mut self) -> Option<io::Result<UringInboundLease>> {
-    UringReadHalf::try_recv_lease(self)
+  fn try_recv_bytes(&mut self) -> Option<io::Result<Bytes>> {
+    UringReadHalf::try_recv_bytes(self)
   }
 
-  fn steal_current_lease(&mut self) -> Option<(UringInboundLease, usize)> {
-    UringReadHalf::steal_current_lease(self)
+  fn steal_current_bytes(&mut self) -> Option<Bytes> {
+    UringReadHalf::steal_current_bytes(self)
   }
 
-  fn poll_recv_lease(
+  fn poll_recv_bytes(
     self: Pin<&mut Self>,
     cx: &mut std::task::Context<'_>,
-  ) -> Poll<io::Result<UringInboundLease>> {
-    UringReadHalf::poll_recv_lease(self, cx)
+  ) -> Poll<io::Result<Bytes>> {
+    UringReadHalf::poll_recv_bytes(self, cx)
   }
 
-  fn notify_lease_consumed(&self) {
-    if let Ok(op_tx) = crate::uring::global_state::get_global_uring_worker_op_tx() {
-      let _ = op_tx
-        .try_send(crate::io_uring_backend::ops::UringOpRequest::ResumeConnection { fd: self.fd });
-    }
-  }
 }
 
 // ─── Write Half ──────────────────────────────────────────────────────────────
@@ -326,24 +337,26 @@ impl AsyncWrite for UringWriteHalf {
 /// produce independent `UringReadHalf` and `UringWriteHalf` for concurrent I/O.
 pub(crate) struct UringStream {
   fd: RawFd,
-  rx_from_worker: fibre::mpsc::BoundedAsyncReceiver<UringInboundLease>,
-  current_lease: Option<(UringInboundLease, usize)>,
+  rx_from_worker: fibre::mpsc::BoundedAsyncReceiver<Bytes>,
+  current_lease: Option<Bytes>,
   tx_to_worker_sync: fibre::mpsc::BoundedSender<EgressChunk>,
   tx_to_worker_async: fibre::mpsc::BoundedAsyncSender<EgressChunk>,
   pending_write: Option<(usize, Pin<Box<dyn Future<Output = Result<(), fibre::SendError>> + Send>>)>,
   worker_asleep: Arc<AtomicBool>,
   event_fd: EventFD,
   pool: Option<Arc<SendBufferPool>>,
+  channel_lwm: usize,
 }
 
 impl UringStream {
   pub(crate) fn new(
     fd: RawFd,
-    rx_from_worker: fibre::mpsc::BoundedAsyncReceiver<UringInboundLease>,
+    rx_from_worker: fibre::mpsc::BoundedAsyncReceiver<Bytes>,
     tx_to_worker_sync: fibre::mpsc::BoundedSender<EgressChunk>,
     worker_asleep: Arc<AtomicBool>,
     event_fd: EventFD,
     pool: Option<Arc<SendBufferPool>>,
+    channel_hwm: usize,
   ) -> Self {
     let tx_to_worker_async = tx_to_worker_sync.clone().to_async();
     Self {
@@ -356,6 +369,7 @@ impl UringStream {
       worker_asleep,
       event_fd,
       pool,
+      channel_lwm: channel_hwm / 2,
     }
   }
 
@@ -425,6 +439,7 @@ impl UringStream {
     let _ = self.tx_to_worker_sync.try_send(EgressChunk::SetCork(enable));
     self.wake_worker_if_asleep();
   }
+
 }
 
 impl std::fmt::Debug for UringStream {
@@ -447,16 +462,13 @@ impl AsyncRead for UringStream {
     cx: &mut Context<'_>,
     buf: &mut ReadBuf<'_>,
   ) -> Poll<io::Result<()>> {
-    if let Some((ref lease, ref mut offset)) = self.current_lease {
-      let remaining = lease.len - *offset;
-      let to_copy = remaining.min(buf.remaining());
-      // SAFETY: ptr is valid and exclusively owned until RecycleRecvBuffer is sent.
-      let src = unsafe { std::slice::from_raw_parts(lease.ptr.add(*offset), to_copy) };
-      buf.put_slice(src);
-      *offset += to_copy;
-      if *offset == lease.len {
+    if let Some(ref mut bytes) = self.current_lease {
+      let to_copy = bytes.len().min(buf.remaining());
+      buf.put_slice(&bytes[..to_copy]);
+      if to_copy < bytes.len() {
+        *bytes = bytes.slice(to_copy..);
+      } else {
         self.current_lease = None;
-        self.notify_lease_consumed();
       }
       return Poll::Ready(Ok(()));
     }
@@ -467,18 +479,19 @@ impl AsyncRead for UringStream {
         io::ErrorKind::ConnectionAborted,
         "UringStream: worker channel closed",
       ))),
-      Poll::Ready(Some(lease)) => {
-        if lease.len == 0 {
-          return Poll::Ready(Ok(()));
+      Poll::Ready(Some(bytes)) => {
+        if bytes.is_empty() {
+          return Poll::Ready(Ok(())); // EOF sentinel
         }
-        let to_copy = lease.len.min(buf.remaining());
-        // SAFETY: ptr is valid and exclusively owned until RecycleRecvBuffer is sent.
-        let src = unsafe { std::slice::from_raw_parts(lease.ptr, to_copy) };
-        buf.put_slice(src);
-        if to_copy < lease.len {
-          self.current_lease = Some((lease, to_copy));
-        } else {
-          self.notify_lease_consumed();
+        let to_copy = bytes.len().min(buf.remaining());
+        buf.put_slice(&bytes[..to_copy]);
+        if to_copy < bytes.len() {
+          self.current_lease = Some(bytes.slice(to_copy..));
+        }
+        if self.rx_from_worker.len() <= self.channel_lwm
+          && self.worker_asleep.load(Ordering::Relaxed)
+        {
+          let _ = self.event_fd.write(1);
         }
         Poll::Ready(Ok(()))
       }
@@ -550,15 +563,6 @@ impl AsyncWrite for UringStream {
   }
 }
 
-impl UringStream {
-  fn notify_lease_consumed(&self) {
-    if let Ok(op_tx) = crate::uring::global_state::get_global_uring_worker_op_tx() {
-      let _ = op_tx
-        .try_send(crate::io_uring_backend::ops::UringOpRequest::ResumeConnection { fd: self.fd });
-    }
-  }
-}
-
 impl ZmtpStdStream for UringStream {
   type ReadHalf = UringReadHalf;
   type WriteHalf = UringWriteHalf;
@@ -568,6 +572,9 @@ impl ZmtpStdStream for UringStream {
       fd: self.fd,
       rx_from_worker: self.rx_from_worker,
       current_lease: self.current_lease,
+      worker_asleep: Arc::clone(&self.worker_asleep),
+      event_fd: self.event_fd.clone(),
+      channel_lwm: self.channel_lwm,
     };
     let write_half = UringWriteHalf {
       fd: self.fd,

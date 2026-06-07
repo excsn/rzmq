@@ -2,7 +2,7 @@
 
 use crate::ZmqError;
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
-use crate::io_uring_backend::byte_handler::UringInboundLease;
+
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringConnectionHandler, UringWorkerInterface,
 };
@@ -215,9 +215,7 @@ impl MultishotReader {
         );
         self.active_op_user_data = None;
         self.is_active = false;
-        // EOF sentinel: len=0, ptr=null — no buffer slot was consumed, Drop is a no-op.
-        let eof_lease = UringInboundLease { id: 0, ptr: std::ptr::null(), len: 0 };
-        ops_to_return = owner_handler.process_ring_read_data(eof_lease, worker_interface);
+        ops_to_return = owner_handler.process_ring_read_bytes(bytes::Bytes::new(), worker_interface);
         return Ok((ops_to_return, true));
       }
 
@@ -239,20 +237,14 @@ impl MultishotReader {
       let bytes_read = cqe_res as usize;
 
       if bytes_read > 0 {
-        // Zero-copy path: borrow the slot to extract a stable pointer, then mem::forget
-        // the guard so the slot is NOT auto-replenished. The worker recycles it later
-        // when UringInboundLease::drop fires RecycleRecvBuffer.
-        match unsafe { buffer_manager.borrow_kernel_filled_buffer(buffer_id, bytes_read) } {
-          Ok(borrowed) => {
-            let ptr = (*borrowed).as_ptr() as *const u8;
-            let len = (*borrowed).len();
-            std::mem::forget(borrowed); // Prevent auto-replenishment
-            let lease = UringInboundLease { id: buffer_id, ptr, len };
-            ops_to_return = owner_handler.process_ring_read_data(lease, worker_interface);
+        // Copy data into owned Bytes and immediately replenish the ring slot.
+        match unsafe { buffer_manager.take_and_replenish_buffer(buffer_id, bytes_read) } {
+          Ok(owned_bytes) => {
+            ops_to_return = owner_handler.process_ring_read_bytes(owned_bytes, worker_interface);
           }
           Err(e) => {
             tracing::error!(
-              "[MultishotReader FD={}] Failed to borrow buffer ID {} ({} bytes): {:?}. Terminating multishot.",
+              "[MultishotReader FD={}] Failed to copy buffer ID {} ({} bytes): {:?}. Terminating multishot.",
               self.fd,
               buffer_id,
               bytes_read,
@@ -271,12 +263,10 @@ impl MultishotReader {
           self.fd,
           cqe_ud
         );
-        // The buffer slot was consumed; reprovide it immediately (no lease needed for EOF).
         if let Err(e) = unsafe { buffer_manager.reprovide_buffer(buffer_id) } {
           tracing::warn!("[MultishotReader FD={}] reprovide_buffer({}) on EOF failed: {:?}", self.fd, buffer_id, e);
         }
-        let eof_lease = UringInboundLease { id: 0, ptr: std::ptr::null(), len: 0 };
-        ops_to_return = owner_handler.process_ring_read_data(eof_lease, worker_interface);
+        ops_to_return = owner_handler.process_ring_read_bytes(bytes::Bytes::new(), worker_interface);
         // Fall through to MORE flag check; EOF means the multishot op should terminate.
       }
 
