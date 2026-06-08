@@ -222,11 +222,11 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 10.3518 seconds
-* **Total Messages:** 13,313,464
-* **Total Data:** 812.59 MB
-* **Throughput:** 1,286,098.82 msg/s
-* **Throughput Rate:** 78.50 MB/s
+* **Elapsed Time:** 10.0255 seconds
+* **Total Messages:** 24,438,468
+* **Total Data:** 1,491.61 MB
+* **Throughput:** 2,437,623.07 msg/s
+* **Throughput Rate:** 148.78 MB/s
 
 ---
 
