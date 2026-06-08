@@ -11,7 +11,9 @@ use std::os::unix::io::RawFd;
 /// Unlike `PinnedBatchWrite`, this has no ZMTP-specific fields (`header_slab`, `app_op_name`).
 /// Used exclusively by `UringByteHandler` for `EgressChunk::Vectored` writes.
 ///
-/// Memory safety: `iovecs` contains raw pointers into `payloads` entries, owned together.
+/// Memory safety: `iovecs` is a heap-allocated Box whose address is stable through any
+/// HashMap resize. `iov_base` pointers inside each iovec reference `payloads` entries,
+/// which are kept alive for the entire SQE→CQE window by this struct's ownership.
 /// Only the worker thread accesses this during the SQE→CQE window.
 pub(crate) struct PinnedEgressBatch {
   pub iovecs: Box<[libc::iovec]>,
@@ -141,11 +143,16 @@ impl InternalOpTracker {
     self.op_to_details.is_empty()
   }
 
-  pub fn remove_ops_for_fd(&mut self, fd_to_remove: RawFd) {
-    // Payloads (like Bytes for Send) associated with removed ops will be dropped here.
-    self
+  pub fn remove_ops_for_fd(&mut self, fd_to_remove: RawFd) -> Vec<InternalOpDetails> {
+    let keys: Vec<UserData> = self
       .op_to_details
-      .retain(|_user_data, details| details.fd != fd_to_remove);
+      .iter()
+      .filter(|(_, v)| v.fd == fd_to_remove)
+      .map(|(k, _)| *k)
+      .collect();
+    keys.into_iter()
+      .filter_map(|k| self.op_to_details.remove(&k))
+      .collect()
   }
 
   /// Finds all UserData for a given FD that match a predicate on the op_type.

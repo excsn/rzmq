@@ -575,11 +575,23 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           }
 
           // --- Pass 2: Egress Pipeline (write-serialized) ---
-          while let Some(first_blueprint) = work.egress_blueprints.pop_front() {
+          while let Some(mut first_blueprint) = work.egress_blueprints.pop_front() {
             if unsafe { worker.ring.submission_shared().is_full() } {
               work.egress_blueprints.push_front(first_blueprint);
               stop_processing_this_fd = true;
               break;
+            }
+
+            // Linux writev(2) rejects iovec arrays longer than UIO_MAXIOV.
+            // Split oversized batches here so cqe_processor never sees > UIO_MAXIOV iovecs.
+            if let HandlerSqeBlueprint::RequestSendRawVectored { bufs, send_op_flags } = &mut first_blueprint {
+              if bufs.len() > libc::UIO_MAXIOV as usize {
+                let remainder = bufs.split_off(libc::UIO_MAXIOV as usize);
+                work.egress_blueprints.push_front(HandlerSqeBlueprint::RequestSendRawVectored {
+                  bufs: remainder,
+                  send_op_flags: *send_op_flags,
+                });
+              }
             }
 
             if let Some(first_write_len) = first_blueprint.write_len() {
@@ -753,7 +765,17 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               };
 
               if should_sleep {
-                let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
+                // Cap sleep to 1ms when any handler has spillover data. Without this,
+                // the worker can enter a deep sleep while holding undelivered data: the
+                // Tokio task reads from the channel (freeing space), sees worker_asleep=false,
+                // skips the eventfd write, then the worker sets worker_asleep=true and sleeps —
+                // a TOCTOU deadlock where nobody wakes the worker up.
+                let actual_timeout = if worker.handler_manager.any_handler_throttled() {
+                  Duration::from_millis(1)
+                } else {
+                  kernel_poll_timeout_duration
+                };
+                let timespec_for_wait = types::Timespec::from(actual_timeout);
                 let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
                 // Double-check pattern: announce sleep, re-drain, then block.
                 // Closes the race: if a sender pushed after the Phase 1 drain, it either

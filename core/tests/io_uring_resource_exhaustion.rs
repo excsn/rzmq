@@ -86,7 +86,7 @@ async fn test_zerocopy_send_buffer_pool_starvation() -> Result<(), ZmqError> {
       let push = ctx_clone.socket(SocketType::Push)?;
       push.set_option_raw(SNDHWM, &2_000i32.to_ne_bytes()).await?;
       push.set_option_raw(SNDTIMEO, &10_000i32.to_ne_bytes()).await?;
-      push.set_option_raw(LINGER, &1_000i32.to_ne_bytes()).await?;
+      push.set_option_raw(LINGER, &60_000i32.to_ne_bytes()).await?;
       push.set_option_raw(IO_URING_SESSION_ENABLED, &1i32.to_ne_bytes()).await?;
       push.set_option_raw(IO_URING_SNDZEROCOPY, &1i32.to_ne_bytes()).await?;
       push.connect(&ep).await?;
@@ -314,7 +314,7 @@ async fn test_multishot_recv_buffer_ring_starvation() -> Result<(), ZmqError> {
       let push = ctx_clone.socket(SocketType::Push)?;
       push.set_option_raw(SNDHWM, &200i32.to_ne_bytes()).await?;
       push.set_option_raw(SNDTIMEO, &5_000i32.to_ne_bytes()).await?;
-      push.set_option_raw(LINGER, &1_000i32.to_ne_bytes()).await?;
+      push.set_option_raw(LINGER, &60_000i32.to_ne_bytes()).await?;
       push.connect(&ep).await?;
       tokio::time::sleep(Duration::from_millis(100)).await;
 

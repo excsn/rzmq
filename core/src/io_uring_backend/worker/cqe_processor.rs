@@ -199,22 +199,26 @@ pub(crate) fn process_handler_blueprint(
 
     HandlerSqeBlueprint::RequestSendRawVectored { bufs, send_op_flags } => {
       let total_len: usize = bufs.iter().map(|b| b.len()).sum();
-      let iovecs_vec: Vec<libc::iovec> = bufs.iter().map(|b| libc::iovec {
-        // SAFETY: each Bytes is held alive in payloads until the CQE is reaped.
+
+      // Convert to a Box before taking the pointer. `into_boxed_slice()` may
+      // reallocate to trim excess Vec capacity; by boxing first the heap address
+      // is final and stable before `iov_ptr` is captured.
+      let iovecs_box: Box<[libc::iovec]> = bufs.iter().map(|b| libc::iovec {
         iov_base: b.as_ptr() as *mut libc::c_void,
         iov_len: b.len(),
-      }).collect();
-      let iov_ptr = iovecs_vec.as_ptr();
-      let iov_len = iovecs_vec.len() as u32;
+      }).collect::<Vec<_>>().into_boxed_slice();
+      let iov_ptr = iovecs_box.as_ptr();
+      let iov_len = iovecs_box.len() as u32;
+
       let batch = PinnedEgressBatch {
-        iovecs: iovecs_vec.into_boxed_slice(),
+        iovecs: iovecs_box,
         payloads: bufs,
         total_len,
         send_op_flags,
       };
       let op_payload = InternalOpPayload::RawVectored(batch);
-      let mut entry = opcode::Writev::new(types::Fd(fd), iov_ptr, iov_len).build();
       let user_data = internal_ops.new_op_id(fd, InternalOpType::SendRawVectored, op_payload);
+      let mut entry = opcode::Writev::new(types::Fd(fd), iov_ptr, iov_len).build();
       entry = entry.user_data(user_data);
       unsafe {
         if sq.push(&entry).is_err() {
@@ -745,7 +749,18 @@ pub(crate) fn process_all_cqes(
             // Drop all queued write blueprints and in-flight send buffer allocations
             // for this fd so they are freed immediately rather than leaking.
             worker.work_map.remove(&handler_fd);
-            worker.internal_op_tracker.remove_ops_for_fd(handler_fd);
+            let removed_ops = worker.internal_op_tracker.remove_ops_for_fd(handler_fd);
+            for op in removed_ops {
+              match op.payload {
+                InternalOpPayload::SendZeroCopy { send_buf_id, .. }
+                | InternalOpPayload::SendZeroCopyLeased { send_buf_id } => {
+                  if let Some(pool) = &worker.send_buffer_pool {
+                    pool.release_buffer(send_buf_id);
+                  }
+                }
+                _ => {}
+              }
+            }
             if let Some(mailbox) = mailbox_for_close_notify {
               let endpoint_uri = endpoint_uri_for_notify.unwrap_or_default();
               let _ = mailbox.try_send(Command::UringFdError {

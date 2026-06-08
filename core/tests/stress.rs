@@ -516,6 +516,7 @@ pub async fn run_bidirectional_ping_pong(
 mod standard_tests {
   use super::*;
   use rstest::rstest;
+  use serial_test::serial;
 
   #[rstest]
   #[case::standard_tcp(
@@ -525,6 +526,7 @@ mod standard_tests {
     StressConfig { use_io_uring: false, send_zerocopy: false, recv_multishot: false, tcp_cork: true }
   ))]
   #[tokio::test]
+  #[serial]
   async fn test_standard_checksum_stream(#[case] config: StressConfig) {
     run_checksum_stream_test(config)
       .await
@@ -539,6 +541,7 @@ mod standard_tests {
     StressConfig { use_io_uring: false, send_zerocopy: false, recv_multishot: false, tcp_cork: true }
   ))]
   #[tokio::test]
+  #[serial]
   async fn test_standard_multipart_fragmentation(#[case] config: StressConfig) {
     run_multipart_fragmentation_test(config)
       .await
@@ -553,6 +556,7 @@ mod standard_tests {
     StressConfig { use_io_uring: false, send_zerocopy: false, recv_multishot: false, tcp_cork: true }
   ))]
   #[tokio::test]
+  #[serial]
   async fn test_standard_connection_churn(#[case] config: StressConfig) {
     run_connection_churn_test(config)
       .await
@@ -563,6 +567,7 @@ mod standard_tests {
   #[case::push_pull(SocketType::Push, SocketType::Pull)]
   #[case::pub_sub(SocketType::Pub, SocketType::Sub)]
   #[tokio::test]
+  #[serial]
   async fn test_standard_unidirectional_stream(
     #[case] sender_type: SocketType,
     #[case] receiver_type: SocketType,
@@ -582,6 +587,7 @@ mod standard_tests {
   #[case::req_rep(SocketType::Req, SocketType::Rep)]
   #[case::dealer_router(SocketType::Dealer, SocketType::Router)]
   #[tokio::test]
+  #[serial]
   async fn test_standard_bidirectional_ping_pong(
     #[case] client_type: SocketType,
     #[case] server_type: SocketType,
@@ -606,6 +612,7 @@ mod standard_tests {
 mod uring_tests {
   use super::*;
   use rstest::rstest;
+  use serial_test::serial;
 
   #[rstest]
   #[case::uring_basic(
@@ -624,6 +631,7 @@ mod uring_tests {
     StressConfig { use_io_uring: true, send_zerocopy: true, recv_multishot: true, tcp_cork: true }
   ))]
   #[tokio::test]
+  #[serial]
   async fn test_uring_checksum_stream(#[case] config: StressConfig) {
     run_checksum_stream_test(config)
       .await
@@ -647,6 +655,7 @@ mod uring_tests {
     StressConfig { use_io_uring: true, send_zerocopy: true, recv_multishot: true, tcp_cork: true }
   ))]
   #[tokio::test]
+  #[serial]
   async fn test_uring_multipart_fragmentation(#[case] config: StressConfig) {
     run_multipart_fragmentation_test(config)
       .await
@@ -670,6 +679,7 @@ mod uring_tests {
     StressConfig { use_io_uring: true, send_zerocopy: true, recv_multishot: true, tcp_cork: true }
   ))]
   #[tokio::test]
+  #[serial]
   async fn test_uring_connection_churn(#[case] config: StressConfig) {
     run_connection_churn_test(config)
       .await
@@ -680,6 +690,7 @@ mod uring_tests {
   #[case::push_pull(SocketType::Push, SocketType::Pull)]
   #[case::pub_sub(SocketType::Pub, SocketType::Sub)]
   #[tokio::test]
+  #[serial]
   async fn test_uring_unidirectional_matrix(
     #[case] sender_type: SocketType,
     #[case] receiver_type: SocketType,
@@ -700,6 +711,7 @@ mod uring_tests {
   #[case::req_rep(SocketType::Req, SocketType::Rep)]
   #[case::dealer_router(SocketType::Dealer, SocketType::Router)]
   #[tokio::test]
+  #[serial]
   async fn test_uring_bidirectional_matrix(
     #[case] client_type: SocketType,
     #[case] server_type: SocketType,

@@ -82,7 +82,7 @@ impl LoopProfiler {
         }
       }
       // Use a specific tracing target for these latency logs
-      tracing::warn!(target: "rzmq::worker_latency", "{}", log_output);
+      tracing::trace!(target: "rzmq::worker_latency", "{}", log_output);
     }
 
     self.loop_start(); // Reset for the next loop iteration

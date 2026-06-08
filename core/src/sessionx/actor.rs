@@ -233,7 +233,10 @@ where
       let mut pending_vectored: std::collections::VecDeque<Vec<bytes::Bytes>> =
         std::collections::VecDeque::new();
 
-      'operational: while self.current_phase == ConnectionPhaseX::Operational {
+      'operational: while self.current_phase == ConnectionPhaseX::Operational
+        || (self.current_phase == ConnectionPhaseX::ShuttingDownStream
+            && (!egress_buffer.is_empty() || !pending_vectored.is_empty()))
+      {
         let mut pong_timeout_future = futures::future::pending().left_future();
         if self.zmtp_handler.heartbeat_state.waiting_for_pong {
           if let Some(deadline_std) = self.zmtp_handler.heartbeat_state.get_pong_deadline() {
@@ -367,9 +370,10 @@ where
             }
           }
 
-          // Outgoing from SocketCore
+          // Outgoing from SocketCore - Only accept messages while in Operational phase
           maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
-              if self.core_pipe_manager.is_attached()
+              if self.current_phase == ConnectionPhaseX::Operational
+                && self.core_pipe_manager.is_attached()
                 && if use_owned_write {
                   pending_vectored.is_empty()
                 } else {
@@ -559,17 +563,7 @@ where
       SystemEvent::ContextTerminating => {
         tracing::info!(sca_handle = self.handle, "Received ContextTerminating.");
         self
-          .transition_to_shutdown_stream(Some(ZmqError::Internal("Context terminating".into())))
-          .await;
-      }
-      SystemEvent::SocketClosing { socket_id } if socket_id == self.parent_socket_id => {
-        tracing::info!(
-          sca_handle = self.handle,
-          "Parent SocketCore ({}) closing.",
-          socket_id
-        );
-        self
-          .transition_to_shutdown_stream(Some(ZmqError::Internal("Parent socket closing".into())))
+          .transition_to_shutdown_stream(None)
           .await;
       }
       _ => {}
@@ -720,30 +714,32 @@ where
     }
 
     // Explicitly shutdown and drop the stream NOW to free the OS File Descriptor.
-    // We do this before the regulator sleep to prevent FD exhaustion attacks.
-    // We ignore errors here as we are already handling a fatal error.
-    // NOTE: if halves were extracted to run_loop locals, zmtp_handler fields will
-    // be None here and this is a no-op — the loop's ShuttingDownStream branch
-    // restores them and calls perform_graceful_shutdown on the next tick.
     let _ = self.zmtp_handler.initiate_stream_shutdown().await;
 
-    self.transition_to_shutdown_stream(None).await;
+    // Transition directly to Terminating to exit the loop immediately since the stream is dead.
+    self.current_phase = ConnectionPhaseX::Terminating;
   }
 
   async fn transition_to_shutdown_stream(&mut self, accompanying_error: Option<ZmqError>) {
     if self.current_phase != ConnectionPhaseX::ShuttingDownStream
       && self.current_phase != ConnectionPhaseX::Terminating
     {
-      tracing::info!(
-        sca_handle = self.handle,
-        "Transitioning to ShuttingDownStream phase."
-      );
       if let Some(err) = accompanying_error {
         if self.error_for_drop_guard.is_none() {
           self.error_for_drop_guard = Some(err);
         }
+        tracing::info!(
+          sca_handle = self.handle,
+          "Transitioning directly to Terminating phase due to error."
+        );
+        self.current_phase = ConnectionPhaseX::Terminating;
+      } else {
+        tracing::info!(
+          sca_handle = self.handle,
+          "Transitioning to ShuttingDownStream phase."
+        );
+        self.current_phase = ConnectionPhaseX::ShuttingDownStream;
       }
-      self.current_phase = ConnectionPhaseX::ShuttingDownStream;
     }
   }
 

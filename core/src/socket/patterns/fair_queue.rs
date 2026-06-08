@@ -1,5 +1,8 @@
 use crate::error::ZmqError;
 use fibre::{mpmc::{bounded_async, AsyncReceiver, AsyncSender}, TryRecvError, TrySendError, RecvError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 #[derive(Debug)]
 pub(crate) enum PushError<T: Send + 'static> {
@@ -14,6 +17,8 @@ pub(crate) struct FairQueue<T: Send + 'static> {
   receiver: AsyncReceiver<T>,
   sender: AsyncSender<T>,
   hwm: usize,
+  close_notifier: Arc<Notify>,
+  is_closed: Arc<AtomicBool>,
 }
 
 impl<T: Send + 'static> FairQueue<T> {
@@ -24,6 +29,8 @@ impl<T: Send + 'static> FairQueue<T> {
       receiver,
       sender,
       hwm: capacity.max(1),
+      close_notifier: Arc::new(Notify::new()),
+      is_closed: Arc::new(AtomicBool::new(false)),
     }
   }
 
@@ -38,11 +45,29 @@ impl<T: Send + 'static> FairQueue<T> {
   }
 
   /// Pushes an item into the fair queue.
+  ///
+  /// Cancel-safe: races the send future against the close notification so that
+  /// a blocked push unblocks immediately when `.close()` is called.
   pub async fn push_item(&self, item: T) -> Result<(), ZmqError> {
-    self.sender.send(item).await.map_err(|e| {
-      tracing::error!("FairQueue send error (queue closed?): {:?}", e);
-      ZmqError::Internal("FairQueue channel closed unexpectedly".into())
-    })
+    if self.is_closed.load(Ordering::Acquire) {
+      return Err(ZmqError::Internal("FairQueue closed".into()));
+    }
+
+    let send_fut = self.sender.send(item);
+    let closed_notification = self.close_notifier.notified();
+
+    tokio::select! {
+      biased;
+      _ = closed_notification => {
+        Err(ZmqError::Internal("FairQueue closed during send".into()))
+      }
+      res = send_fut => {
+        res.map_err(|e| {
+          tracing::error!("FairQueue send error: {:?}", e);
+          ZmqError::Internal("FairQueue channel closed unexpectedly".into())
+        })
+      }
+    }
   }
 
   /// Pops the next available item from the queue.
@@ -55,6 +80,9 @@ impl<T: Send + 'static> FairQueue<T> {
 
   /// Attempts to push an item into the fair queue without blocking.
   pub fn try_push_item(&self, item: T) -> Result<(), PushError<T>> {
+    if self.is_closed.load(Ordering::Acquire) {
+      return Err(PushError::Closed(item));
+    }
     match self.sender.try_send(item) {
       Ok(()) => Ok(()),
       Err(TrySendError::Full(returned_item)) => Err(PushError::Full(returned_item)),
@@ -95,6 +123,8 @@ impl<T: Send + 'static> FairQueue<T> {
 
   pub fn close(&self) {
     self.sender.close();
+    self.is_closed.store(true, Ordering::Release);
+    self.close_notifier.notify_waiters();
   }
 }
 

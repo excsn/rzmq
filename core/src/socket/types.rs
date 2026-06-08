@@ -8,6 +8,7 @@ use fibre::mpmc::bounded_async;
 use fibre::oneshot;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Represents the type of a ZeroMQ socket, defining its messaging pattern and behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,6 +54,7 @@ pub struct Socket {
   // Stores a clone of the command sender for the `SocketCore` actor associated with this socket.
   // This is used to send user-initiated commands (like bind, connect, send, recv) to the core actor.
   pub(crate) core_command_sender: MailboxSender,
+  pub(crate) closed: Arc<AtomicBool>,
 }
 
 impl Socket {
@@ -67,6 +69,7 @@ impl Socket {
     Self {
       inner: socket_impl,
       core_command_sender,
+      closed: Arc::new(AtomicBool::new(false)),
     }
   }
 
@@ -160,7 +163,15 @@ impl Socket {
   /// This will close all connections and release resources associated with the socket.
   /// Further operations on the socket after calling `close()` may fail.
   pub async fn close(&self) -> Result<(), ZmqError> {
-    self.inner.close().await
+    if self
+      .closed
+      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+      .is_ok()
+    {
+      self.inner.close().await
+    } else {
+      Ok(())
+    }
   }
 
   /// Creates a monitoring channel for this socket. Must be called BEFORE connect.

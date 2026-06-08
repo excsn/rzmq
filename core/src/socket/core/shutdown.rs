@@ -219,61 +219,39 @@ pub(crate) async fn initiate_core_shutdown(
     "Initiating SocketCore shutdown steps."
   );
 
-  // Event publishing is now done by the caller (command_loop or event_processor)
-  // publish_socket_closing_event(&core_arc.context, core_handle).await;
-
   {
     let core_s_reader = core_arc.core_state.read(); // Read lock for populating coordinator
     coordinator.begin_shutdown_sequence(core_handle, &core_s_reader);
   }
 
   let child_actors_to_stop = coordinator.pending_child_actors.clone();
-  let connections_to_close = coordinator.pending_connections_to_close.clone();
-  // `inproc_connections_to_cleanup` is used later by `perform_final_pipe_cleanup`.
-  // No need to clone it here just for stopping, as inproc "connections" are stopped
-  // by closing their ISocketConnection if they appear in `connections_to_close`.
 
   drop(coordinator); // Release coordinator lock before async calls
 
-  // Eagerly close the incoming queue so that any run_uring_pipe_reader tasks currently
-  // blocked on push_item().await are immediately unblocked and can exit cleanly.
-  // This must happen before we wait for connections to close, otherwise a full queue
-  // will deadlock: the reader task holds a ref the connection needs to drop.
+  // Close the incoming queue so pipe reader tasks unblock and can exit cleanly.
   let _ = socket_logic_strong.process_command(Command::Stop).await;
 
+  // Stop listeners only — sessions must stay alive to drain pipes_tx during linger.
   stop_child_listener_actors(core_arc.clone(), child_actors_to_stop).await;
-  close_active_connections(core_arc.clone(), connections_to_close).await;
 
-  let mut coordinator = core_arc.shutdown_coordinator.lock().await; // Re-acquire lock
-  if coordinator.pending_child_actors.is_empty()
-    && coordinator.pending_connections_to_close.is_empty()
-  {
-    tracing::debug!(
-      handle = core_handle,
-      "No pending children/connections after initial stop signals. Moving to Lingering."
-    );
-    coordinator.state = ShutdownPhase::Lingering;
-    let linger_opt = core_arc.core_state.read().options.linger;
-    coordinator.start_linger_if_needed(linger_opt, core_handle);
+  let mut coordinator = core_arc.shutdown_coordinator.lock().await;
+  coordinator.state = ShutdownPhase::Lingering;
+  let linger_opt = core_arc.core_state.read().options.linger;
+  coordinator.start_linger_if_needed(linger_opt, core_handle);
 
-    if coordinator.is_linger_expired_or_queues_empty(&core_arc.core_state.read(), core_handle) {
-      {
-        let mut core_s_write = core_arc.core_state.write();
-        advance_to_cleaning_phase(&mut coordinator, core_handle, &mut core_s_write);
-      }
-      #[cfg(feature = "inproc")]
-      let pipes_to_clean = coordinator.inproc_connections_to_cleanup.clone();
-      #[cfg(not(feature = "inproc"))]
-      let pipes_to_clean = Vec::new();
-      drop(coordinator);
-      perform_final_pipe_cleanup(core_arc.clone(), socket_logic_strong, pipes_to_clean).await;
+  if coordinator.is_linger_expired_or_queues_empty(&core_arc.core_state.read(), core_handle) {
+    let connections_to_close = coordinator.pending_connections_to_close.clone();
+    {
+      let mut core_s_write = core_arc.core_state.write();
+      advance_to_cleaning_phase(&mut coordinator, core_handle, &mut core_s_write);
     }
-  } else {
-    tracing::debug!(
-      handle = core_handle,
-      "State: StoppingChildren. Waiting for child actors and active connections to stop."
-    );
-    coordinator.state = ShutdownPhase::StoppingChildren;
+    #[cfg(feature = "inproc")]
+    let pipes_to_clean = coordinator.inproc_connections_to_cleanup.clone();
+    #[cfg(not(feature = "inproc"))]
+    let pipes_to_clean = Vec::new();
+    drop(coordinator);
+    close_active_connections(core_arc.clone(), connections_to_close).await;
+    perform_final_pipe_cleanup(core_arc.clone(), socket_logic_strong, pipes_to_clean).await;
   }
 }
 
@@ -486,6 +464,7 @@ pub(crate) async fn check_and_advance_linger(
       handle = core_handle,
       "Linger complete/queues empty. Advancing to CleaningPipes."
     );
+    let connections_to_close = coordinator.pending_connections_to_close.clone();
     {
       let mut core_s_write = core_arc.core_state.write();
       advance_to_cleaning_phase(&mut coordinator, core_handle, &mut core_s_write);
@@ -495,6 +474,7 @@ pub(crate) async fn check_and_advance_linger(
     #[cfg(not(feature = "inproc"))]
     let pipes_to_clean = Vec::new();
     drop(coordinator);
+    close_active_connections(core_arc.clone(), connections_to_close).await;
     perform_final_pipe_cleanup(core_arc.clone(), socket_logic_strong, pipes_to_clean).await;
   }
   Ok(())
@@ -560,26 +540,29 @@ pub(crate) async fn perform_final_pipe_cleanup(
       .write()
       .pipe_read_id_to_endpoint_uri
       .clear();
-    // uring_fd_to_endpoint_uri removed — UringFd commands are URI-keyed.
-    if !core_arc.core_state.read().endpoints.is_empty() {
-      tracing::warn!(
-        handle = core_handle,
-        "Endpoints map not empty. Forcing clear. Rem: {}",
-        core_arc.core_state.read().endpoints.len()
-      );
-      // Before clearing, ensure any remaining ISocketConnections are closed (best effort)
-      let endpoints_to_force_close: Vec<Arc<dyn ISocketConnection>> = core_arc
-        .core_state
-        .read()
-        .endpoints
-        .values()
-        .map(|ei| ei.connection_iface.clone())
-        .collect();
 
-      for iface in endpoints_to_force_close {
-        let _ = iface.close_connection().await;
+    let mut endpoints_to_force_close = Vec::new();
+    {
+      let mut core_state = core_arc.core_state.write();
+      if !core_state.endpoints.is_empty() {
+        tracing::warn!(
+          handle = core_handle,
+          "Endpoints map not empty. Forcing clear. Rem: {}",
+          core_state.endpoints.len()
+        );
+        for (uri, ep) in core_state.endpoints.drain() {
+          endpoints_to_force_close.push((uri, ep.endpoint_type, ep.connection_iface));
+        }
       }
-      core_arc.core_state.write().endpoints.clear(); // Re-acquire and clear
+    }
+
+    for (uri, ep_type, iface) in endpoints_to_force_close {
+      let _ = iface.close_connection().await;
+      let event = match ep_type {
+        EndpointType::Session => crate::socket::SocketEvent::Disconnected { endpoint: uri },
+        EndpointType::Listener => crate::socket::SocketEvent::Closed { endpoint: uri },
+      };
+      core_arc.core_state.read().send_monitor_event(event);
     }
   }
 

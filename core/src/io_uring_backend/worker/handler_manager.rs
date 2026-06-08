@@ -164,6 +164,10 @@ impl HandlerManager {
     self.handlers.contains_key(&fd)
   }
 
+  pub fn any_handler_throttled(&self) -> bool {
+    self.handlers.values().any(|h| h.should_throttle_reads())
+  }
+
   /// Calls `prepare_sqes` on all managed handlers and collects their requested operations.
   pub fn prepare_all_handler_io_ops<'a>(
     &mut self,
