@@ -19,11 +19,11 @@
 | **DealerRouter**| Concurrency 4, Pipeline 8 | 863,394 | 86,248.34 | 5.26 | 43.26 µs | 63.49 µs |
 | **PushPull** | Standard | 26,507,219 | 2,650,818.38 | 161.79 | — | — |
 | **PushPull** | Concurrency 2 | 26,549,866 | 2,654,677.67 | 162.03 | — | — |
-| **PushPull** | Concurrency 4, Msg Size 32KB | 4,209,965 | 421,013.45 | 13,156.67 | — | — |
+| **PushPull** | Concurrency 4, Msg Size 32KB | 2,065,300 | 206,526.24 | 6,453.95 | — | — |
 | **PubSub** | Standard | 20,557,796 | 2,055,867.02 | 125.48 | — | — |
 | **PubSub** | Concurrency 2 | 19,223,737 | 1,922,517.69 | 117.34 | — | — |
 | **PubSub** | Concurrency 4 | 37,547,928 | 3,754,404.22 | 229.15 | — | — |
-| **PubSub** | Concurrency 4, Msg Size 32KB | 3,998,809 | 399,903.43 | 12,496.98 | — | — |
+| **PubSub** | Concurrency 4, Msg Size 32KB | 2,009,380 | 200,941.70 | 6,279.43 | — | — |
 
 ---
 
@@ -222,11 +222,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9996 seconds
-* **Total Messages:** 4,209,965
-* **Total Data:** 131,561.41 MB
-* **Throughput:** 421,013.45 msg/s
-* **Throughput Rate:** 13,156.67 MB/s
+* **Elapsed Time:** 10.0002 seconds
+* **Total Messages:** 2,065,300
+* **Total Data:** 64,540.62 MB
+* **Throughput:** 206,526.24 msg/s
+* **Throughput Rate:** 6,453.95 MB/s
 
 ---
 
@@ -287,7 +287,7 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 **Metrics:**
 * **Pattern:** PubSub
 * **Elapsed Time:** 9.9994 seconds
-* **Total Messages:** 3,998,809
-* **Total Data:** 124,962.78 MB
-* **Throughput:** 399,903.43 msg/s
-* **Throughput Rate:** 12,496.98 MB/s
+* **Total Messages:** 2,009,380
+* **Total Data:** 62,793.12 MB
+* **Throughput:** 200,941.70 msg/s
+* **Throughput Rate:** 6,279.43 MB/s
