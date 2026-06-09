@@ -372,7 +372,7 @@ existing connections.
 
 ### Outbound Write Batching (`SNDBATCH_COUNT` / `SNDBATCH_BYTES`)
 
-By default, each session actor issues one `write_all` syscall per logical ZMQ message. Under high message rates — telemetry pipelines, fan-out `PUB`/`SUB`, high-frequency `PUSH` senders — this means thousands of short syscalls per second and the corresponding context-switch overhead.
+By default, each session actor issues one `write_all` syscall per logical ZMQ message. Under high message rates, telemetry pipelines, fan-out `PUB`/`SUB`, high-frequency `PUSH` senders - this means thousands of short syscalls per second and the corresponding context-switch overhead.
 
 **How it works**: after the actor wakes on the first available message, it synchronously drains additional queued messages from the pipe (using a non-blocking channel `try_recv`) until either the message count or the cumulative payload size hits the configured ceiling. All drained messages are encoded into a single coalesced buffer and sent with one `write_all` call. The adaptive throttle is debited for the full batch weight at once.
 
