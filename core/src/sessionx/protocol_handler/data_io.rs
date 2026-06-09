@@ -70,7 +70,7 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
   let mut batch: Vec<Msg> = Vec::new();
   let mut total_bytes: usize = 0;
 
-  // Fast path: drain frames already in the buffer (leftover from a prior read)
+  // Drain any frames already assembled in the buffer from a prior partial read.
   loop {
     if batch.len() >= max_count || total_bytes >= max_bytes {
       break;
@@ -87,14 +87,11 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
     return Ok(batch);
   }
 
-  // Fast path: consume owned inbound chunks directly (no unsafe, no cross-thread recycling).
-  // Active only on io-uring connections with no encryption (NULL/PLAIN framer).
+  // Zero-copy fast path: parse directly from kernel ring-buffer chunks.
+  // Active on io-uring connections with NULL/PLAIN framer (no encryption).
+  // Not gated on network_read_buffer.is_empty() — partial bytes are prepended inline.
   #[cfg(feature = "io-uring")]
-  if handler.network_read_buffer.is_empty()
-    && handler.config.use_recv_multishot
-    && handler.framer.is_passthrough()
-  {
-    // Steal any partially-consumed chunk from the handshake→data transition (first call only).
+  if handler.framer.is_passthrough() {
     if handler.active_lease.is_none() {
       if let Some(stolen) = reader.steal_current_bytes() {
         handler.active_lease = Some(stolen);
@@ -106,30 +103,56 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
         match reader.try_recv_bytes() {
           None => break,
           Some(Ok(bytes)) if bytes.is_empty() => return Err(ZmqError::ConnectionClosed),
-          Some(Ok(bytes)) => {
-            handler.active_lease = Some(bytes);
-          }
+          Some(Ok(bytes)) => handler.active_lease = Some(bytes),
           Some(Err(_)) => return Err(ZmqError::ConnectionClosed),
         }
       }
 
       let mut bytes = handler.active_lease.take().unwrap();
-      match handler.zmtp_manual_parser.decode_frame_from_slice(&bytes)? {
+
+      // If a partial frame is trapped in network_read_buffer from a prior straddle,
+      // prepend it to the new chunk so we can parse across the boundary zero-copy.
+      if !handler.network_read_buffer.is_empty() {
+        handler.network_read_buffer.extend_from_slice(&bytes);
+        // split() drains network_read_buffer into a Bytes without copying.
+        let mut combined = handler.network_read_buffer.split().freeze();
+        match handler.zmtp_manual_parser.decode_frame_from_bytes(&combined)? {
+          Some((msg, consumed)) => {
+            combined = combined.slice(consumed..);
+            if !combined.is_empty() {
+              handler.active_lease = Some(combined);
+            }
+            handler.heartbeat_state.record_activity();
+            total_bytes += msg.size();
+            batch.push(msg);
+            if batch.len() >= max_count || total_bytes >= max_bytes {
+              return Ok(batch);
+            }
+            continue;
+          }
+          None => {
+            // Still not enough data — put combined back and wait for another chunk.
+            handler.network_read_buffer.extend_from_slice(&combined);
+            break;
+          }
+        }
+      }
+
+      // Standard zero-copy parse from the raw lease.
+      match handler.zmtp_manual_parser.decode_frame_from_bytes(&bytes)? {
         Some((msg, consumed)) => {
-          bytes = bytes.slice(consumed..); // zero-alloc slice advance
+          bytes = bytes.slice(consumed..);
           if !bytes.is_empty() {
             handler.active_lease = Some(bytes);
           }
           handler.heartbeat_state.record_activity();
-          let msg_size = msg.size();
+          total_bytes += msg.size();
           batch.push(msg);
-          total_bytes += msg_size;
           if batch.len() >= max_count || total_bytes >= max_bytes {
             return Ok(batch);
           }
         }
         None => {
-          // Frame straddles chunk boundary — copy remainder to network_read_buffer.
           handler.network_read_buffer.extend_from_slice(&bytes);
           break;
         }
@@ -139,13 +162,13 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
     if !batch.is_empty() {
       return Ok(batch);
     }
-    // Fall through to standard path
   }
 
   // Slow path: buffer empty — do one async kernel read
   if handler.network_read_buffer.len() > 16 * 1024 * 1024 {
     return Err(ZmqError::ResourceLimitReached);
   }
+  handler.network_read_buffer.reserve(65536);
   let bytes_read = reader
     .read_buf(&mut handler.network_read_buffer)
     .await

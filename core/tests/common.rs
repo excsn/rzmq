@@ -1,5 +1,4 @@
-// tests/common.rs
-#![allow(dead_code)] // Allow unused helpers for now
+#![allow(dead_code)]
 
 use rzmq::socket::{MonitorReceiver, SocketEvent};
 use rzmq::{Context, Socket, ZmqError};

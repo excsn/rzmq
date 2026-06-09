@@ -7,8 +7,13 @@ use dashmap::DashMap;
 use parking_lot::Mutex as ParkingMutex;
 use std::collections::VecDeque;
 use std::time::Duration;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout as tokio_timeout;
+
+#[derive(Debug, Clone)]
+pub(crate) enum AppFrames {
+  Single(Msg),
+  Multiple(Vec<Msg>),
+}
 
 #[derive(Debug)]
 pub(crate) struct IncomingMessageOrchestrator<QItem: Send + 'static> {
@@ -16,7 +21,7 @@ pub(crate) struct IncomingMessageOrchestrator<QItem: Send + 'static> {
   main_incoming_queue: FairQueue<QItem>,
   partial_pipe_messages: DashMap<usize, Vec<Msg>>,
   // Buffer for delivering frames of a single QItem one-by-one via recv_message()
-  current_recv_frames_buffer: TokioMutex<VecDeque<Msg>>,
+  current_recv_frames_buffer: ParkingMutex<VecDeque<Msg>>,
   // Cache of pre-fetched logical messages; serves recv()/recv_multipart() without channel waits
   pending_logical_messages: ParkingMutex<VecDeque<QItem>>,
 }
@@ -27,9 +32,14 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
       socket_core_handle: core_handle,
       main_incoming_queue: FairQueue::new(rcvhwm.max(1)),
       partial_pipe_messages: DashMap::new(),
-      current_recv_frames_buffer: TokioMutex::new(VecDeque::new()),
+      current_recv_frames_buffer: ParkingMutex::new(VecDeque::new()),
       pending_logical_messages: ParkingMutex::new(VecDeque::new()),
     }
+  }
+
+  #[inline(always)]
+  pub fn has_partial_message(&self, pipe_read_id: usize) -> bool {
+    self.partial_pipe_messages.contains_key(&pipe_read_id)
   }
 
   pub fn accumulate_pipe_frame(&self, pipe_read_id: usize, incoming_frame: Msg) -> Result<Option<Vec<Msg>>, ZmqError> {
@@ -85,28 +95,14 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     Ok(())
   }
 
-  /// Shared fetch helper used by both recv_message and recv_logical_message.
-  /// Checks the local cache first; only awaits the channel when the cache is empty.
-  /// After a channel wait, drains all additional available items into the cache so
-  /// subsequent recv calls return without any async overhead.
   pub(crate) async fn fetch_next_logical_item(
     &self,
     rcvtimeo_opt: Option<Duration>,
   ) -> Result<QItem, ZmqError> {
-    // Fast path: serve from cache (pure sync, no async overhead)
     if let Some(item) = self.pending_logical_messages.lock().pop_front() {
       return Ok(item);
     }
-    // Slow path: await the channel
-    let item = self.recv_item_from_main_queue(rcvtimeo_opt).await?;
-    // Drain all immediately available items into the cache (raw QItems — caller applies transform)
-    {
-      let mut cache = self.pending_logical_messages.lock();
-      while let Ok(Some(extra)) = self.main_incoming_queue.try_pop_item() {
-        cache.push_back(extra);
-      }
-    }
-    Ok(item)
+    self.recv_item_from_main_queue(rcvtimeo_opt).await
   }
 
   /// Helper to pop a QItem from the main FairQueue with timeout logic.
@@ -145,85 +141,69 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
   pub async fn recv_logical_message(
     &self,
     rcvtimeo_opt: Option<Duration>,
-    // Closure to transform QItem into the Vec<Msg> the application expects for multipart.
-    // e.g., for Router: (Blob, Vec<Msg>) -> [identity_frame, payload_frames...]
-    qitem_to_app_frames: impl FnOnce(QItem) -> Vec<Msg>,
+    qitem_to_app_frames: impl FnOnce(QItem) -> AppFrames,
   ) -> Result<Vec<Msg>, ZmqError> {
-    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
-    if !buffer_guard.is_empty() {
-      // A `recv_message()` sequence was in progress. Application is mixing API calls.
-      // Clear buffer and fetch a new full message.
-      tracing::warn!(
-        handle = self.socket_core_handle,
-        "recv_logical_message called while recv_message buffer was active. Clearing buffer."
-      );
-      *buffer_guard = VecDeque::new();
+    {
+      let mut buffer_guard = self.current_recv_frames_buffer.lock();
+      if !buffer_guard.is_empty() {
+        tracing::warn!(
+          handle = self.socket_core_handle,
+          "recv_logical_message called while recv_message buffer was active. Clearing buffer."
+        );
+        *buffer_guard = VecDeque::new();
+      }
     }
-    // Drop guard before await
-    drop(buffer_guard);
 
     let q_item = self.fetch_next_logical_item(rcvtimeo_opt).await?;
-    let app_frames = qitem_to_app_frames(q_item);
-    Ok(app_frames)
+    match qitem_to_app_frames(q_item) {
+      AppFrames::Single(msg) => Ok(vec![msg]),
+      AppFrames::Multiple(msgs) => Ok(msgs),
+    }
   }
 
   /// For ISocket::recv(). Fetches frames one by one for a logical message.
   pub async fn recv_message(
     &self,
     rcvtimeo_opt: Option<Duration>,
-    // Closure to transform QItem into Vec<Msg> for buffering if buffer is empty.
-    qitem_to_app_frames: impl FnOnce(QItem) -> Vec<Msg>,
+    qitem_to_app_frames: impl FnOnce(QItem) -> AppFrames,
   ) -> Result<Msg, ZmqError> {
-    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
-
-    if let Some(mut frame) = buffer_guard.pop_front() {
-      // Set MORE flag based on whether more frames remain *in this buffer*
-      if !buffer_guard.is_empty() {
-        frame.set_flags(frame.flags() | MsgFlags::MORE);
-      } else {
-        frame.set_flags(frame.flags() & !MsgFlags::MORE);
+    // Fast path: serve buffered frame from a previous multipart fetch
+    {
+      let mut buffer_guard = self.current_recv_frames_buffer.lock();
+      if let Some(mut frame) = buffer_guard.pop_front() {
+        if !buffer_guard.is_empty() {
+          frame.set_flags(frame.flags() | MsgFlags::MORE);
+        } else {
+          frame.set_flags(frame.flags() & !MsgFlags::MORE);
+        }
+        return Ok(frame);
       }
-      return Ok(frame);
     }
-
-    // Buffer is empty, need to fetch and populate.
-    // Drop guard before await
-    drop(buffer_guard);
 
     let q_item = self.fetch_next_logical_item(rcvtimeo_opt).await?;
-    let app_frames_vec = qitem_to_app_frames(q_item);
-
-    // Re-acquire lock to update buffer
-    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
-
-    if app_frames_vec.is_empty() {
-      // This indicates the QItem transformed into an empty Vec<Msg>, which is unusual
-      // unless it represents an intentionally empty message from the peer.
-      // ZMQ recv on an empty message might block or have specific behavior.
-      // For now, return error or a single empty Msg.
-      tracing::warn!(
-        handle = self.socket_core_handle,
-        "recv_message: Transformed QItem resulted in empty app_frames. Returning empty Msg."
-      );
-      // Or an error: return Err(ZmqError::InvalidMessage("Received an empty logical message".into()));
-      return Ok(Msg::new()); // Return a single empty message without MORE flag.
+    match qitem_to_app_frames(q_item) {
+      AppFrames::Single(msg) => Ok(msg),
+      AppFrames::Multiple(mut msgs) => {
+        if msgs.is_empty() {
+          return Ok(Msg::new());
+        }
+        if msgs.len() == 1 {
+          return Ok(msgs.pop().unwrap());
+        }
+        let mut app_frames_deque = VecDeque::from(msgs);
+        let first_frame = app_frames_deque.pop_front().unwrap();
+        {
+          let mut buffer_guard = self.current_recv_frames_buffer.lock();
+          *buffer_guard = app_frames_deque;
+        }
+        Ok(first_frame)
+      }
     }
-
-    let mut app_frames_deque = VecDeque::from(app_frames_vec);
-    let first_frame = app_frames_deque.pop_front().unwrap(); // Safe due to is_empty check above
-
-    *buffer_guard = app_frames_deque; // Store remaining frames
-
-    // The MORE flag on first_frame should have been set correctly by qitem_to_app_frames
-    // based on whether there were subsequent frames in *its* sequence.
-    Ok(first_frame)
   }
 
   /// Clears the internal buffer used by `recv_message`.
-  /// Should be called when the socket pattern knows that any partially consumed
-  /// message is no longer valid (e.g., REQ socket sending a new request).
   pub async fn reset_recv_message_buffer(&self) {
-    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
+    let mut buffer_guard = self.current_recv_frames_buffer.lock();
     if !buffer_guard.is_empty() {
       tracing::trace!(
         handle = self.socket_core_handle,
@@ -252,7 +232,6 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     self.main_incoming_queue.close();
     self.partial_pipe_messages.clear();
     self.pending_logical_messages.lock().clear();
-    let mut buffer_guard = self.current_recv_frames_buffer.lock().await;
-    *buffer_guard = VecDeque::new();
+    self.current_recv_frames_buffer.lock().clear();
   }
 }

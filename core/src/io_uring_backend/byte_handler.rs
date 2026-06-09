@@ -118,6 +118,7 @@ impl UringByteHandler {
   }
 
   fn try_drain_spillover(&mut self) -> bool {
+    let initial_len = self.spillover.len();
     while let Some(bytes) = self.spillover.pop_front() {
       match self.raw_inbound_tx.try_send(bytes) {
         Ok(()) => {}
@@ -128,6 +129,11 @@ impl UringByteHandler {
         Err(_) => {} // receiver dropped; discard
       }
     }
+    tracing::trace!(
+      fd = self.fd,
+      drained_chunks = initial_len,
+      "UringByteHandler: spillover fully drained"
+    );
     true
   }
 
@@ -206,6 +212,18 @@ impl UringConnectionHandler for UringByteHandler {
       ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestClose);
       return ops;
     }
+    // FIFO guard: if spillover is non-empty, this chunk must not bypass it.
+    if !self.spillover.is_empty() {
+      // tracing::warn!(
+      //   fd = self.fd,
+      //   spillover_len = self.spillover.len(),
+      //   chunk_len = bytes.len(),
+      //   "UringByteHandler: stashing incoming chunk to spillover queue due to active backpressure"
+      // );
+      self.spillover.push_back(bytes);
+      return HandlerIoOps::default();
+    }
+
     match self.raw_inbound_tx.try_send(bytes) {
       Ok(()) => {}
       Err(fibre::TrySendError::Full(returned)) => {
@@ -395,7 +413,12 @@ impl UringConnectionHandler for UringByteHandler {
     !self.spillover.is_empty()
   }
 
+  fn has_drainable_spillover(&self) -> bool {
+    !self.spillover.is_empty() && !self.raw_inbound_tx.is_full()
+  }
+
   fn on_buffer_ring_exhausted(&mut self) {
     tracing::trace!(fd = self.fd, "UringByteHandler: buffer ring exhausted (ENOBUFS) — transient, will re-arm next cycle");
   }
+
 }

@@ -4,7 +4,7 @@ use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use fibre::{mpmc::AsyncSender, SendError, TrySendError};
 use once_cell::sync::OnceCell;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::{os::fd::AsRawFd, usize};
 
@@ -12,7 +12,7 @@ use std::{os::fd::AsRawFd, usize};
 pub struct SignalingOpSender {
   op_tx: AsyncSender<UringOpRequest>,
   event_fd: eventfd::EventFD,
-  worker_asleep: Arc<AtomicBool>,
+  worker_asleep: Arc<AtomicU8>,
   /// Shared slot populated by the worker thread once the `SendBufferPool` is initialized.
   /// `OnceCell` is lock-free for reads after the one-time write.
   pool_slot: Arc<OnceCell<Arc<SendBufferPool>>>,
@@ -22,14 +22,14 @@ impl SignalingOpSender {
   pub fn new(
     op_tx: AsyncSender<UringOpRequest>,
     event_fd: eventfd::EventFD,
-    worker_asleep: Arc<AtomicBool>,
+    worker_asleep: Arc<AtomicU8>,
     pool_slot: Arc<OnceCell<Arc<SendBufferPool>>>,
   ) -> Self {
     Self { op_tx, event_fd, worker_asleep, pool_slot }
   }
 
   /// Clones the worker-asleep flag to share with data connections.
-  pub fn clone_worker_asleep(&self) -> Arc<AtomicBool> {
+  pub fn clone_worker_asleep(&self) -> Arc<AtomicU8> {
     Arc::clone(&self.worker_asleep)
   }
 

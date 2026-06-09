@@ -6,7 +6,7 @@ use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::SocketCore;
 use crate::socket::options::{AUTO_DELIMITER, ROUTER_MANDATORY};
-use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use crate::socket::patterns::incoming_orchestrator::{AppFrames, IncomingMessageOrchestrator};
 use crate::socket::patterns::{FramingLatch, RouterMap, WritePipeCoordinator, router_auto_decode, router_auto_encode};
 
 use dashmap::DashMap;
@@ -376,7 +376,7 @@ impl ISocket for RouterSocket {
     self
       .incoming_orchestrator
       .recv_message(rcvtimeo_opt, |(identity_blob, payload_frames_vec)| {
-        Self::transform_qitem_to_app_frames(identity_blob, payload_frames_vec)
+        AppFrames::Multiple(Self::transform_qitem_to_app_frames(identity_blob, payload_frames_vec))
       })
       .await
   }
@@ -519,7 +519,7 @@ impl ISocket for RouterSocket {
     self
       .incoming_orchestrator
       .recv_logical_message(rcvtimeo_opt, |(identity_blob, payload_frames_vec)| {
-        Self::transform_qitem_to_app_frames(identity_blob, payload_frames_vec)
+        AppFrames::Multiple(Self::transform_qitem_to_app_frames(identity_blob, payload_frames_vec))
       })
       .await
   }

@@ -1,7 +1,8 @@
 use crate::cli::{Cli, OutputFormat, Pattern};
+use crate::metrics::{BenchStats, print_combined_report};
 use rzmq::ZmqError;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tracing::{error, info};
 
@@ -20,23 +21,50 @@ async fn run_in_process_orchestration(args: Cli) -> Result<(), ZmqError> {
   info!("Orchestrator: Initiating in-process benchmark execution for inproc.");
   let context = rzmq::Context::new()?;
 
-  let server_args = args.clone();
+  let run_id = run_id_base();
+  // Safety: single-threaded at this point (before any tokio tasks are spawned).
+  unsafe { std::env::set_var("RZMQ_BENCH_RUN", &run_id); }
+
+  let client_warmup = args.warmup.unwrap_or(5);
+  let mut server_args = args.clone();
+  server_args.warmup = Some(client_warmup);
   let server_context = context.clone();
 
   let server_handle = tokio::spawn(async move {
-    if let Err(e) = crate::server::run_with_context(server_args, server_context).await {
-      error!("In-process server task exited with error: {}", e);
-    }
+    crate::server::run_with_context(server_args, server_context).await
   });
 
   tokio::time::sleep(Duration::from_millis(250)).await;
 
-  let client_result = crate::client::run_with_context(args, context).await;
+  let client_stats = crate::client::run_with_context(args.clone(), context).await?;
 
-  server_handle.abort();
+  // Wait briefly for the server to see ConnectionClosed and exit cleanly.
+  let server_stats: Option<BenchStats> = tokio::time::timeout(
+    Duration::from_secs(2),
+    server_handle,
+  )
+  .await
+  .ok()
+  .and_then(|r| r.ok())
+  .and_then(|r| r.ok());
+
+  // Clean up temp files written during in-process run.
+  let _ = std::fs::remove_file(format!("{run_id}-client.json"));
+  let _ = std::fs::remove_file(format!("{run_id}-server.json"));
+  unsafe { std::env::remove_var("RZMQ_BENCH_RUN"); }
+
   info!("Orchestrator: In-process execution complete.");
+  let pattern_str = format!("{:?}", args.pattern);
+  print_combined_report(args.output, &pattern_str, args.msg_size, &client_stats, server_stats.as_ref());
+  Ok(())
+}
 
-  client_result
+fn run_id_base() -> String {
+  let ts = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_millis();
+  format!("/tmp/rzmq-bench-{ts}")
 }
 
 async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
@@ -58,6 +86,8 @@ async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
     OutputFormat::Json => "json",
     OutputFormat::Csv => "csv",
   };
+
+  let client_warmup = args.warmup.unwrap_or(5);
 
   let mut base_args = vec![
     format!("--endpoint={}", args.endpoint),
@@ -103,10 +133,14 @@ async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
     base_args.push(format!("--uring-strategy={}", strategy_str));
   }
 
+  let run_id = run_id_base();
+
   // 2. Configure the Server Command
   let mut server_cmd = Command::new(&current_exe);
   server_cmd.arg("--role").arg("server");
   server_cmd.args(&base_args);
+  server_cmd.arg(format!("--warmup={client_warmup}"));
+  server_cmd.env("RZMQ_BENCH_RUN", &run_id);
 
   // If structured output (JSON or CSV) is requested, redirect Server stdout
   // to stderr to avoid corrupting the structured client data on stdout.
@@ -145,6 +179,8 @@ async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
   let mut client_cmd = Command::new(&current_exe);
   client_cmd.arg("--role").arg("client");
   client_cmd.args(&base_args);
+  client_cmd.arg(format!("--warmup={client_warmup}"));
+  client_cmd.env("RZMQ_BENCH_RUN", &run_id);
   client_cmd.stdout(Stdio::inherit());
   client_cmd.stderr(Stdio::inherit());
 
@@ -175,7 +211,7 @@ async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
     .await
     .map_err(|e| ZmqError::Internal(format!("Error awaiting Client child process: {}", e)))?;
 
-  // 7. Handshake/Execution Complete. Forcefully terminate the infinite Server loop.
+  // 7. Kill the server and read the stats files it wrote during the run.
   info!(
     "Orchestrator: Client finished (status: {}). Terminating Server process...",
     client_status
@@ -184,9 +220,12 @@ async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
 
   if !client_status.success() {
     error!("Orchestrator: Client exited with non-zero status.");
+    let _ = std::fs::remove_file(format!("{run_id}-server.json"));
+    let _ = std::fs::remove_file(format!("{run_id}-client.json"));
     return Err(ZmqError::Internal("Client process failed".into()));
   }
 
+  // The client process already printed the combined report and deleted both files.
   info!("Orchestrator: Benchmark execution complete.");
   Ok(())
 }

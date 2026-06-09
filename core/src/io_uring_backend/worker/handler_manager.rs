@@ -168,6 +168,13 @@ impl HandlerManager {
     self.handlers.values().any(|h| h.should_throttle_reads())
   }
 
+  /// True if any handler has spillover bytes that can now flow into the inbound channel
+  /// (i.e., the Tokio side drained the channel below capacity). Used in the pre-sleep
+  /// double-check to prevent the worker from sleeping while there is drainable spillover.
+  pub fn any_handler_has_inbound_data(&self) -> bool {
+    self.handlers.values().any(|h| h.has_drainable_spillover())
+  }
+
   /// Calls `prepare_sqes` on all managed handlers and collects their requested operations.
   pub fn prepare_all_handler_io_ops<'a>(
     &mut self,

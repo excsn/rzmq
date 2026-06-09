@@ -1,8 +1,9 @@
 use crate::cli::{Cli, Pattern};
-use crate::metrics::BenchmarkCollector;
+use crate::metrics::{BenchStats, BenchmarkCollector};
 use fibre::mpsc;
-use rzmq::socket::{ADAPTIVE_THROTTLE, RCVHWM, SUBSCRIBE, TCP_CORK};
+use rzmq::socket::{ADAPTIVE_THROTTLE, RCVBUF, RCVHWM, SNDBUF, SUBSCRIBE, TCP_CORK};
 use rzmq::{Context, SocketType, ZmqError};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
@@ -11,10 +12,10 @@ use rzmq::socket::{IO_URING_RCVMULTISHOT, IO_URING_SESSION_ENABLED};
 
 pub async fn run(args: Cli) -> Result<(), ZmqError> {
   let context = Context::new()?;
-  run_with_context(args, context).await
+  run_with_context(args, context).await.map(|_| ())
 }
 
-pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqError> {
+pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats, ZmqError> {
   // Determine target socket type based on pattern
   let socket_type = match args.pattern {
     Pattern::ReqRep => SocketType::Rep,
@@ -29,6 +30,8 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
   socket.set_option(RCVHWM, args.hwm as i32).await?;
   socket.set_option(TCP_CORK, args.cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
+  socket.set_option(SNDBUF, 65536i32).await?;
+  socket.set_option(RCVBUF, 65536i32).await?;
 
   // Configure Linux-specific io_uring options if compiled and enabled
   #[cfg(feature = "io-uring")]
@@ -53,10 +56,23 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
   socket.bind(&args.endpoint).await?;
   info!("Server bound successfully. Starting operational loop.");
 
-  let mut collector = BenchmarkCollector::new(false);
+  let warmup_secs = args.warmup.unwrap_or(0);
+  let collector = Arc::new(BenchmarkCollector::new(false));
+  let warming_up = Arc::new(AtomicBool::new(warmup_secs > 0));
   let mut last_interim_check = Instant::now();
   let interim_interval = Duration::from_secs(1);
   let mut total_received = 0u64;
+
+  if warmup_secs > 0 {
+    let wu_collector = Arc::clone(&collector);
+    let wu_flag = Arc::clone(&warming_up);
+    let warmup_duration = Duration::from_secs(warmup_secs);
+    tokio::spawn(async move {
+      tokio::time::sleep(warmup_duration).await;
+      wu_flag.store(false, Ordering::Release);
+      wu_collector.begin_measurement();
+    });
+  }
 
   match args.pattern {
     Pattern::PushPull | Pattern::PubSub => {
@@ -68,11 +84,20 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
             std::hint::black_box(msg);
             total_received += 1;
 
-            collector.record_message(size);
+            if !warming_up.load(Ordering::Relaxed) {
+              collector.record_message(size);
+            }
 
             if last_interim_check.elapsed() >= interim_interval {
-              collector.print_interim_report_if_due(interim_interval, "Server");
               last_interim_check = Instant::now();
+              if warming_up.load(Ordering::Relaxed) {
+                info!("[Server] Warming up...");
+              } else {
+                collector.print_interim_report_if_due(interim_interval, "Server");
+                if let Ok(base) = std::env::var("RZMQ_BENCH_RUN") {
+                  collector.snapshot("server").write_to_file(&format!("{base}-server.json"));
+                }
+              }
             }
           }
           Err(ZmqError::ConnectionClosed) => {
@@ -95,11 +120,20 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
             socket.send(msg).await?;
             total_received += 1;
 
-            collector.record_message(size);
+            if !warming_up.load(Ordering::Relaxed) {
+              collector.record_message(size);
+            }
 
             if last_interim_check.elapsed() >= interim_interval {
-              collector.print_interim_report_if_due(interim_interval, "Server");
               last_interim_check = Instant::now();
+              if warming_up.load(Ordering::Relaxed) {
+                info!("[Server] Warming up...");
+              } else {
+                collector.print_interim_report_if_due(interim_interval, "Server");
+                if let Ok(base) = std::env::var("RZMQ_BENCH_RUN") {
+                  collector.snapshot("server").write_to_file(&format!("{base}-server.json"));
+                }
+              }
             }
           }
           Err(ZmqError::ConnectionClosed) => {
@@ -141,7 +175,9 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
             let size: usize = frames.iter().map(|f| f.size()).sum();
             total_received += 1;
 
-            collector.record_message(size);
+            if !warming_up.load(Ordering::Relaxed) {
+              collector.record_message(size);
+            }
 
             if send_tx.send(frames).await.is_err() {
               error!("Server internal send channel closed unexpectedly.");
@@ -149,8 +185,15 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
             }
 
             if last_interim_check.elapsed() >= interim_interval {
-              collector.print_interim_report_if_due(interim_interval, "Server");
               last_interim_check = Instant::now();
+              if warming_up.load(Ordering::Relaxed) {
+                info!("[Server] Warming up...");
+              } else {
+                collector.print_interim_report_if_due(interim_interval, "Server");
+                if let Ok(base) = std::env::var("RZMQ_BENCH_RUN") {
+                  collector.snapshot("server").write_to_file(&format!("{base}-server.json"));
+                }
+              }
             }
           }
           Err(ZmqError::ConnectionClosed) => {
@@ -167,5 +210,9 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
   }
 
   info!("Server task run finished cleanly.");
-  Ok(())
+  let stats = collector.snapshot("server");
+  if let Ok(base) = std::env::var("RZMQ_BENCH_RUN") {
+    stats.write_to_file(&format!("{base}-server.json"));
+  }
+  Ok(stats)
 }

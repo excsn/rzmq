@@ -70,10 +70,10 @@ impl UringPollingStrategy {
   /// **Warning**: pins the `UringWorker` OS thread at 100% CPU.
   pub fn ultra_low_latency() -> Self {
     Self::Tiered {
-      aggressive_spin_limit: 1000,
-      cooperative_spin_limit: 500,
-      os_yield_limit: 100,
-      deep_sleep_fallback: false,
+      aggressive_spin_limit: 10000, // Pure register spin
+      cooperative_spin_limit: 5000, // CPU pipeline pause hint (PAUSE instruction)
+      os_yield_limit: 0,            // Change from 100 to 0 (ELIMINATE SYSCALL STORM)
+      deep_sleep_fallback: false,   // Stay in user-space
     }
   }
 }

@@ -1,8 +1,8 @@
 use bytes::BytesMut;
 use crate::cli::{Cli, Pattern};
-use crate::metrics::BenchmarkCollector;
+use crate::metrics::{BenchStats, BenchmarkCollector, print_combined_report};
 use hdrhistogram::Histogram;
-use rzmq::socket::{ADAPTIVE_THROTTLE, SNDHWM, TCP_CORK};
+use rzmq::socket::{ADAPTIVE_THROTTLE, RCVBUF, SNDBUF, SNDHWM, TCP_CORK};
 use rzmq::{Context, Msg, SocketType, ZmqError};
 use std::sync::{
   Arc,
@@ -18,10 +18,20 @@ use rzmq::socket::{IO_URING_RCVMULTISHOT, IO_URING_SESSION_ENABLED, IO_URING_SND
 
 pub async fn run(args: Cli) -> Result<(), ZmqError> {
   let context = Context::new()?;
-  run_with_context(args, context).await
+  let client_stats = run_with_context(args.clone(), context).await?;
+  let server_stats = std::env::var("RZMQ_BENCH_RUN").ok().and_then(|base| {
+    let path = format!("{base}-server.json");
+    let stats = BenchStats::read_from_file(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&format!("{base}-client.json"));
+    stats
+  });
+  let pattern_str = format!("{:?}", args.pattern);
+  print_combined_report(args.output, &pattern_str, args.msg_size, &client_stats, server_stats.as_ref());
+  Ok(())
 }
 
-pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqError> {
+pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats, ZmqError> {
   let socket_type = match args.pattern {
     Pattern::ReqRep => SocketType::Req,
     Pattern::PushPull => SocketType::Push,
@@ -37,17 +47,18 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
   let max_messages = args.messages.unwrap_or(usize::MAX);
 
   let start_time = Instant::now();
-  let warmup_duration = Duration::from_secs(args.warmup);
+  let warmup_secs = args.warmup.unwrap_or(5);
+  let warmup_duration = Duration::from_secs(warmup_secs);
   let duration_limit = Duration::from_secs(args.duration);
   // Workers run for warmup + measurement; deadline gates the entire window.
   let deadline = start_time + warmup_duration + duration_limit;
   let interim_interval = Duration::from_secs(1);
 
   // True during warmup; workers skip measurement while this is set.
-  let warming_up = Arc::new(AtomicBool::new(args.warmup > 0));
+  let warming_up = Arc::new(AtomicBool::new(warmup_secs > 0));
 
-  if args.warmup > 0 {
-    info!("Warmup period: {} seconds.", args.warmup);
+  if warmup_secs > 0 {
+    info!("Warmup period: {} seconds.", warmup_secs);
     let wu_collector = Arc::clone(&collector);
     let wu_flag = Arc::clone(&warming_up);
     tokio::spawn(async move {
@@ -145,6 +156,8 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
       socket.set_option(SNDHWM, args.hwm as i32).await?;
       socket.set_option(TCP_CORK, args.cork).await?;
       socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
+      socket.set_option(SNDBUF, 65536i32).await?;
+      socket.set_option(RCVBUF, 65536i32).await?;
       #[cfg(feature = "io-uring")]
       if use_io_uring {
         socket.set_option(IO_URING_SESSION_ENABLED, true).await?;
@@ -222,11 +235,13 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<(), ZmqErro
   report_handle.abort();
 
   info!("All worker tasks successfully joined. Preparing final reports.");
-  let pattern_str = format!("{:?}", args.pattern);
-  collector.print_final_report(args.output, &pattern_str, "Client", args.msg_size);
+  let stats = collector.snapshot("client");
+  if let Ok(base) = std::env::var("RZMQ_BENCH_RUN") {
+    stats.write_to_file(&format!("{base}-client.json"));
+  }
 
   info!("Client run completed successfully.");
-  Ok(())
+  Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +274,8 @@ async fn run_throughput_worker(
   socket.set_option(SNDHWM, hwm as i32).await?;
   socket.set_option(TCP_CORK, cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
+  socket.set_option(SNDBUF, 65536i32).await?;
+  socket.set_option(RCVBUF, 65536i32).await?;
 
   #[cfg(feature = "io-uring")]
   if use_io_uring {
@@ -378,6 +395,8 @@ async fn run_reqrep_worker(
   socket.set_option(SNDHWM, hwm as i32).await?;
   socket.set_option(TCP_CORK, cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
+  socket.set_option(SNDBUF, 65536i32).await?;
+  socket.set_option(RCVBUF, 65536i32).await?;
 
   #[cfg(feature = "io-uring")]
   if use_io_uring {

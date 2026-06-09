@@ -54,9 +54,9 @@ pub struct Cli {
   #[arg(long, default_value_t = 10)]
   pub duration: u64,
 
-  /// Warmup duration in seconds before recording measurements (default: no warmup)
-  #[arg(long, default_value_t = 5)]
-  pub warmup: u64,
+  /// Warmup duration in seconds before recording measurements (server default: 0, orchestrator default: 5)
+  #[arg(long)]
+  pub warmup: Option<u64>,
 
   /// Number of concurrent asynchronous worker tasks to spawn
   #[arg(long, default_value_t = 1)]
@@ -102,6 +102,7 @@ pub struct Cli {
   #[cfg(feature = "io-uring")]
   #[arg(long, value_enum, default_value_t = UringStrategy::Performance)]
   pub uring_strategy: UringStrategy,
+
 }
 
 /// Polling strategy profile for the io_uring worker thread.

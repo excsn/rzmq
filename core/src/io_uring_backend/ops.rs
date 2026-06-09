@@ -13,6 +13,10 @@ use fibre::{mpsc, oneshot};
 
 pub const HANDLER_INTERNAL_SEND_OP_UD: UserData = 0;
 
+pub const WAKEUP_STATE_ACTIVE: u8   = 0;
+pub const WAKEUP_STATE_SLEEPING: u8 = 1;
+pub const WAKEUP_STATE_SIGNALED: u8 = 2;
+
 #[derive(Clone, Debug)]
 pub(crate) enum ProtocolConfig {
   Zmtp(Arc<ZmtpEngineConfig>),

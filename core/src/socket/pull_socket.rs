@@ -4,6 +4,7 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::IncomingMessageOrchestrator;
+use crate::socket::patterns::incoming_orchestrator::AppFrames;
 
 use async_trait::async_trait;
 use parking_lot::RwLockReadGuard;
@@ -15,7 +16,7 @@ use crate::{Blob, delegate_to_core};
 #[derive(Debug)]
 pub(crate) struct PullSocket {
   core: Arc<SocketCore>,
-  incoming_orchestrator: IncomingMessageOrchestrator<Vec<Msg>>,
+  incoming_orchestrator: IncomingMessageOrchestrator<AppFrames>,
 }
 
 impl PullSocket {
@@ -73,8 +74,7 @@ impl ISocket for PullSocket {
     }
 
     let rcvtimeo_opt: Option<Duration> = { self.core_state_read().options.rcvtimeo };
-    // The transform function is identity, as the queued item is already the payload.
-    let transform_fn = |q_item: Vec<Msg>| q_item;
+    let transform_fn = |q_item: AppFrames| q_item;
     self
       .incoming_orchestrator
       .recv_message(rcvtimeo_opt, transform_fn)
@@ -94,7 +94,7 @@ impl ISocket for PullSocket {
 
     let rcvtimeo_opt: Option<Duration> = { self.core_state_read().options.rcvtimeo };
 
-    let transform_fn = |q_item: Vec<Msg>| q_item;
+    let transform_fn = |q_item: AppFrames| q_item;
     self
       .incoming_orchestrator
       .recv_logical_message(rcvtimeo_opt, transform_fn)
@@ -129,21 +129,19 @@ impl ISocket for PullSocket {
   async fn handle_pipe_event(&self, pipe_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
-        if let Some(raw_zmtp_message_vec) = self
-          .incoming_orchestrator
-          .accumulate_pipe_frame(pipe_id, msg)?
-        {
-          self
-            .incoming_orchestrator
-            .queue_item(pipe_id, raw_zmtp_message_vec)
-            .await?;
+        if !msg.is_more() && !self.incoming_orchestrator.has_partial_message(pipe_id) {
+          self.incoming_orchestrator.queue_item(pipe_id, AppFrames::Single(msg)).await?;
+        } else if let Some(raw) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_id, msg)? {
+          self.incoming_orchestrator.queue_item(pipe_id, AppFrames::Multiple(raw)).await?;
         }
       }
       Command::PipeMessageBatchReceived { msgs, .. } => {
         let mut assembled_batch = Vec::new();
         for msg in msgs {
-          if let Some(raw_zmtp_message_vec) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_id, msg)? {
-            assembled_batch.push(raw_zmtp_message_vec);
+          if !msg.is_more() && !self.incoming_orchestrator.has_partial_message(pipe_id) {
+            assembled_batch.push(AppFrames::Single(msg));
+          } else if let Some(raw) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_id, msg)? {
+            assembled_batch.push(AppFrames::Multiple(raw));
           }
         }
         if !assembled_batch.is_empty() {

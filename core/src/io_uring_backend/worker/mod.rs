@@ -14,7 +14,7 @@ use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
   HandlerSqeBlueprint, OutgoingMessage, ProtocolHandlerFactory,
 };
-use crate::io_uring_backend::ops::UringOpRequest;
+use crate::io_uring_backend::ops::{UringOpRequest, WAKEUP_STATE_ACTIVE};
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::io_uring_backend::UserData;
@@ -26,7 +26,7 @@ use std::fmt;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 
 use fibre::mpmc::{unbounded, AsyncSender, Sender as SyncSender, Receiver as SyncReceiver};
@@ -101,7 +101,7 @@ pub struct UringWorker {
   pub(crate) cfg_polling_strategy: UringPollingStrategy,
   // Shared flag: true while the worker is blocked in submit_with_args waiting for kernel events.
   // Connections check this before writing to eventfd to avoid redundant syscalls.
-  pub(crate) worker_asleep: Arc<AtomicBool>,
+  pub(crate) worker_asleep: Arc<AtomicU8>,
 
   /// Scratchpad for active file descriptors to avoid hot-path heap allocations.
   pub(crate) active_fds_scratch: Vec<RawFd>,
@@ -141,7 +141,7 @@ impl UringWorker {
         ZmqError::Internal(format!("Master EventFD creation failed: {}", e))
       })?;
 
-    let worker_asleep = Arc::new(AtomicBool::new(false));
+    let worker_asleep = Arc::new(AtomicU8::new(WAKEUP_STATE_ACTIVE));
     let pool_slot: Arc<once_cell::sync::OnceCell<Arc<crate::io_uring_backend::send_buffer_pool::SendBufferPool>>> =
       Arc::new(once_cell::sync::OnceCell::new());
     let signaling_op_sender = SignalingOpSender::new(

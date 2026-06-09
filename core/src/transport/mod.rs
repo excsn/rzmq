@@ -74,6 +74,10 @@ pub(crate) trait ZmtpWriteHalf: AsyncWrite + Unpin + Send + std::fmt::Debug + 's
       ))
     }
   }
+
+  /// Toggle TCP_CORK on the underlying socket. No-op for transports that do
+  /// not support it (TCP standard path, IPC, inproc).
+  fn set_cork(&self, _enable: bool) {}
 }
 
 /// Trait alias for full-duplex streams usable by ZMTP connection actors.

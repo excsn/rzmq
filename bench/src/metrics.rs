@@ -1,7 +1,7 @@
 use crate::cli::OutputFormat;
 use hdrhistogram::Histogram;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -128,6 +128,13 @@ impl BenchmarkCollector {
     );
   }
 
+  pub fn snapshot(&self, role: &str) -> BenchStats {
+    let total_messages = self.messages_count.load(Ordering::Relaxed);
+    let total_bytes = self.bytes_count.load(Ordering::Relaxed);
+    let elapsed_secs = self.measure_start.lock().elapsed().as_secs_f64().max(0.000001);
+    BenchStats { role: role.to_string(), total_messages, total_bytes, elapsed_secs }
+  }
+
   pub fn print_final_report(
     &self,
     format: OutputFormat,
@@ -241,6 +248,119 @@ impl BenchmarkCollector {
     );
 
     print!("{out}");
+  }
+}
+
+/// Snapshot of a single role's final measurements. Serialized to disk by each
+/// child process; the orchestrator reads both and prints the combined report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchStats {
+  pub role: String,
+  pub total_messages: usize,
+  pub total_bytes: u64,
+  pub elapsed_secs: f64,
+}
+
+impl BenchStats {
+  pub fn throughput_msg_sec(&self) -> f64 {
+    self.total_messages as f64 / self.elapsed_secs
+  }
+  pub fn total_mb(&self) -> f64 {
+    self.total_bytes as f64 / 1_048_576.0
+  }
+  pub fn throughput_mb_sec(&self) -> f64 {
+    self.total_mb() / self.elapsed_secs
+  }
+
+  pub fn write_to_file(&self, path: &str) {
+    if let Ok(json) = serde_json::to_string(self) {
+      let tmp = format!("{path}.tmp");
+      if std::fs::write(&tmp, &json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+      }
+    }
+  }
+
+  pub fn read_from_file(path: &str) -> Option<Self> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+  }
+}
+
+pub fn print_combined_report(
+  format: OutputFormat,
+  pattern: &str,
+  msg_size: usize,
+  client: &BenchStats,
+  server: Option<&BenchStats>,
+) {
+  match format {
+    OutputFormat::Text => print_combined_text(pattern, msg_size, client, server),
+    OutputFormat::Json => print_combined_json(client, server),
+    OutputFormat::Csv => print_combined_csv(client, server),
+  }
+}
+
+fn print_combined_text(
+  pattern: &str,
+  msg_size: usize,
+  client: &BenchStats,
+  server: Option<&BenchStats>,
+) {
+  use std::fmt::Write as _;
+  let mut out = String::with_capacity(2048);
+  let _ = writeln!(out, "\n========================================================");
+  let _ = writeln!(out, "               rzmq BENCHMARK FINAL REPORT              ");
+  let _ = writeln!(out, "========================================================");
+  let _ = writeln!(out, "{:<25} : {}", "Pattern", pattern);
+  let _ = writeln!(out, "{:<25} : {} bytes", "Message Size", msg_size);
+  let _ = writeln!(out, "--------------------------------------------------------");
+
+  if let Some(srv) = server {
+    let _ = writeln!(out, "{:<25}   {:>18}   {:>18}", "", "CLIENT (sent)", "SERVER (recv)");
+    let _ = writeln!(out, "{:<25} : {:>18}   {:>18}", "Elapsed Time (s)",
+      format!("{:.4}", client.elapsed_secs), format!("{:.4}", srv.elapsed_secs));
+    let _ = writeln!(out, "{:<25} : {:>18}   {:>18}", "Total Messages",
+      client.total_messages, srv.total_messages);
+    let _ = writeln!(out, "{:<25} : {:>15.2} MB   {:>15.2} MB", "Total Data",
+      client.total_mb(), srv.total_mb());
+    let _ = writeln!(out, "--------------------------------------------------------");
+    let _ = writeln!(out, "{:<25} : {:>14.2} msg/s   {:>14.2} msg/s", "Throughput",
+      client.throughput_msg_sec(), srv.throughput_msg_sec());
+    let _ = writeln!(out, "{:<25} : {:>14.2} MB/s    {:>14.2} MB/s", "Throughput Rate",
+      client.throughput_mb_sec(), srv.throughput_mb_sec());
+  } else {
+    let _ = writeln!(out, "{:<25} : {:.4} seconds", "Elapsed Time", client.elapsed_secs);
+    let _ = writeln!(out, "{:<25} : {}", "Total Messages", client.total_messages);
+    let _ = writeln!(out, "{:<25} : {:.2} MB", "Total Data", client.total_mb());
+    let _ = writeln!(out, "--------------------------------------------------------");
+    let _ = writeln!(out, "{:<25} : {:.2} msg/s", "Throughput", client.throughput_msg_sec());
+    let _ = writeln!(out, "{:<25} : {:.2} MB/s", "Throughput Rate", client.throughput_mb_sec());
+  }
+  let _ = writeln!(out, "========================================================\n");
+  print!("{out}");
+}
+
+fn print_combined_json(client: &BenchStats, server: Option<&BenchStats>) {
+  #[derive(Serialize)]
+  struct Combined<'a> {
+    client: &'a BenchStats,
+    server: Option<&'a BenchStats>,
+  }
+  if let Ok(s) = serde_json::to_string_pretty(&Combined { client, server }) {
+    println!("{s}");
+  }
+}
+
+fn print_combined_csv(client: &BenchStats, server: Option<&BenchStats>) {
+  println!("role,total_messages,total_bytes,elapsed_secs,throughput_msg_sec,throughput_mb_sec");
+  println!("{},{},{},{:.4},{:.2},{:.2}",
+    client.role, client.total_messages, client.total_bytes,
+    client.elapsed_secs, client.throughput_msg_sec(), client.throughput_mb_sec());
+  if let Some(srv) = server {
+    println!("{},{},{},{:.4},{:.2},{:.2}",
+      srv.role, srv.total_messages, srv.total_bytes,
+      srv.elapsed_secs, srv.throughput_msg_sec(), srv.throughput_mb_sec());
   }
 }
 

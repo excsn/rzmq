@@ -5,6 +5,7 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::IncomingMessageOrchestrator;
+use crate::socket::patterns::incoming_orchestrator::AppFrames;
 use crate::socket::ISocket;
 
 use async_trait::async_trait;
@@ -161,9 +162,8 @@ impl ISocket for RepSocket {
     // The transform closure will be called by the orchestrator after it pops an item.
     // It is synchronous and returns the payload frames to the orchestrator's buffer.
     let transform_fn = |(peer_info, payload_frames): (PeerInfo, Vec<Msg>)| {
-      // Synchronously update state. This is safe because the async part is done.
       *self.state.lock() = RepState::ReceivedRequest(peer_info);
-      payload_frames
+      AppFrames::Multiple(payload_frames)
     };
 
     self
@@ -262,7 +262,7 @@ impl ISocket for RepSocket {
     // updated the state.
     let transform_fn = |(peer_info, payload_frames): (PeerInfo, Vec<Msg>)| {
       *self.state.lock() = RepState::ReceivedRequest(peer_info);
-      payload_frames
+      AppFrames::Multiple(payload_frames)
     };
 
     self

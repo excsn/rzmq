@@ -272,6 +272,16 @@ pub trait UringConnectionHandler: Send {
   /// temporarily exhausted). With immediate-copy, buffers replenish inline, so this is treated
   /// as a transient event. The multishot op is marked inactive and re-armed next `prepare_sqes`.
   fn on_buffer_ring_exhausted(&mut self) {}
+
+  /// Returns true if this handler has spillover bytes that can now be forwarded to the Tokio
+  /// side because the inbound channel has drained below capacity. Used by the worker's
+  /// pre-sleep double-check to avoid a TOCTOU deadlock: if the inbound channel was full
+  /// (causing spillover), Tokio draining it creates space — the worker must stay awake to
+  /// flush the spillover and re-arm reads rather than sleeping until a timeout fires.
+  fn has_drainable_spillover(&self) -> bool {
+    false
+  }
+
 }
 
 pub trait ProtocolHandlerFactory: Send + Sync + 'static {

@@ -1,7 +1,7 @@
 use crate::error::ZmqError;
 use crate::message::{Msg, MsgFlags};
 use crate::protocol::zmtp::command::{ZMTP_FLAG_COMMAND, ZMTP_FLAG_LONG, ZMTP_FLAG_MORE};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[derive(Debug, Default, Clone, Copy)]
 enum ManualDecodingState {
@@ -61,6 +61,49 @@ impl ZmtpManualParser {
     }
     // ONE copy: kernel ring buffer → final Msg payload allocation
     let mut msg = Msg::from_vec(src[header_len..total].to_vec());
+    let mut rz_flags = MsgFlags::empty();
+    if (flags & ZMTP_FLAG_MORE) != 0 {
+      rz_flags |= MsgFlags::MORE;
+    }
+    if (flags & ZMTP_FLAG_COMMAND) != 0 {
+      rz_flags |= MsgFlags::COMMAND;
+    }
+    msg.set_flags(rz_flags);
+    Ok(Some((msg, total)))
+  }
+
+  /// Parse one ZMTP frame from a `Bytes` chunk without allocating.
+  /// Uses `Bytes::slice()` (atomic refcount bump) instead of copying payload data.
+  pub fn decode_frame_from_bytes(&self, src: &Bytes) -> Result<Option<(Msg, usize)>, ZmqError> {
+    if src.len() < 2 {
+      return Ok(None);
+    }
+    let flags = src[0];
+    let is_long = (flags & ZMTP_FLAG_LONG) != 0;
+    let header_len = if is_long { 9 } else { 2 };
+    if src.len() < header_len {
+      return Ok(None);
+    }
+    let raw_size = if is_long {
+      let mut len_bytes = [0u8; 8];
+      len_bytes.copy_from_slice(&src[1..9]);
+      u64::from_be_bytes(len_bytes)
+    } else {
+      src[1] as u64
+    };
+    if self.max_msg_size >= 0 && raw_size > self.max_msg_size as u64 {
+      return Err(ZmqError::ProtocolViolation(format!(
+        "frame size {} exceeds ZMQ_MAXMSGSIZE {}",
+        raw_size, self.max_msg_size
+      )));
+    }
+    let size = raw_size as usize;
+    let total = header_len + size;
+    if src.len() < total {
+      return Ok(None);
+    }
+    let payload_bytes = src.slice(header_len..total);
+    let mut msg = Msg::from_bytes(payload_bytes);
     let mut rz_flags = MsgFlags::empty();
     if (flags & ZMTP_FLAG_MORE) != 0 {
       rz_flags |= MsgFlags::MORE;

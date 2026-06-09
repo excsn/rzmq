@@ -6,7 +6,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::{
   Arc,
-  atomic::{AtomicBool, Ordering},
+  atomic::{AtomicU8, Ordering},
 };
 use std::task::{Context, Poll};
 
@@ -16,6 +16,7 @@ use futures::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::io_uring_backend::byte_handler::EgressChunk;
+use crate::io_uring_backend::ops::{WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING};
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::transport::{ZmtpReadHalf, ZmtpStdStream, ZmtpWriteHalf};
 
@@ -29,7 +30,7 @@ pub(crate) struct UringReadHalf {
   rx_from_worker: fibre::mpsc::BoundedAsyncReceiver<Bytes>,
   /// Active chunk with remaining bytes for partial drains.
   current_lease: Option<Bytes>,
-  worker_asleep: Arc<AtomicBool>,
+  worker_asleep: Arc<AtomicU8>,
   event_fd: EventFD,
   /// Wakeup threshold: write EventFD when channel occupancy drops to or below this value.
   channel_lwm: usize,
@@ -79,12 +80,17 @@ impl AsyncRead for UringReadHalf {
         if to_copy < bytes.len() {
           self.current_lease = Some(bytes.slice(to_copy..));
         }
-        // Nudge the worker awake if the channel has drained to or below LWM so
-        // it runs prepare_sqes and drains any spillover promptly.
-        if self.rx_from_worker.len() <= self.channel_lwm
-          && self.worker_asleep.load(Ordering::Relaxed)
-        {
-          let _ = self.event_fd.write(1);
+        // Nudge the worker awake if it confirmed itself asleep. During active
+        // streaming worker_asleep is false, so this write is skipped entirely.
+        if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+          if self.worker_asleep.compare_exchange(
+            WAKEUP_STATE_SLEEPING,
+            WAKEUP_STATE_SIGNALED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+          ).is_ok() {
+            let _ = self.event_fd.write(1);
+          }
         }
         Poll::Ready(Ok(()))
       }
@@ -106,10 +112,15 @@ impl UringReadHalf {
     }
     match Pin::new(&mut self.rx_from_worker).poll_next(cx) {
       Poll::Ready(Some(bytes)) => {
-        if self.rx_from_worker.len() <= self.channel_lwm
-          && self.worker_asleep.load(Ordering::Relaxed)
-        {
-          let _ = self.event_fd.write(1);
+        if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+          if self.worker_asleep.compare_exchange(
+            WAKEUP_STATE_SLEEPING,
+            WAKEUP_STATE_SIGNALED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+          ).is_ok() {
+            let _ = self.event_fd.write(1);
+          }
         }
         Poll::Ready(Ok(bytes))
       }
@@ -123,17 +134,22 @@ impl UringReadHalf {
 
   /// Try to receive the next chunk synchronously (noop waker — always returns immediately).
   pub(crate) fn try_recv_bytes(&mut self) -> Option<io::Result<Bytes>> {
-    if self.current_lease.is_some() {
-      return None;
+    if let Some(lease) = self.current_lease.take() {
+      return Some(Ok(lease));
     }
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     match Pin::new(&mut self.rx_from_worker).poll_next(&mut cx) {
       Poll::Ready(Some(bytes)) => {
-        if self.rx_from_worker.len() <= self.channel_lwm
-          && self.worker_asleep.load(Ordering::Relaxed)
-        {
-          let _ = self.event_fd.write(1);
+        if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+          if self.worker_asleep.compare_exchange(
+            WAKEUP_STATE_SLEEPING,
+            WAKEUP_STATE_SIGNALED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+          ).is_ok() {
+            let _ = self.event_fd.write(1);
+          }
         }
         Some(Ok(bytes))
       }
@@ -183,7 +199,7 @@ pub(crate) struct UringWriteHalf {
     usize,
     Pin<Box<dyn Future<Output = Result<(), fibre::SendError>> + Send>>,
   )>,
-  worker_asleep: Arc<AtomicBool>,
+  worker_asleep: Arc<AtomicU8>,
   event_fd: EventFD,
   pool: Option<Arc<SendBufferPool>>,
 }
@@ -201,8 +217,15 @@ impl Unpin for UringWriteHalf {}
 impl UringWriteHalf {
   #[inline]
   fn wake_worker_if_asleep(&self) {
-    if self.worker_asleep.load(Ordering::Acquire) {
-      let _ = self.event_fd.write(1);
+    if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+      if self.worker_asleep.compare_exchange(
+        WAKEUP_STATE_SLEEPING,
+        WAKEUP_STATE_SIGNALED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+      ).is_ok() {
+        let _ = self.event_fd.write(1);
+      }
     }
   }
 
@@ -367,7 +390,7 @@ pub(crate) struct UringStream {
     usize,
     Pin<Box<dyn Future<Output = Result<(), fibre::SendError>> + Send>>,
   )>,
-  worker_asleep: Arc<AtomicBool>,
+  worker_asleep: Arc<AtomicU8>,
   event_fd: EventFD,
   pool: Option<Arc<SendBufferPool>>,
   channel_lwm: usize,
@@ -378,7 +401,7 @@ impl UringStream {
     fd: RawFd,
     rx_from_worker: fibre::mpsc::BoundedAsyncReceiver<Bytes>,
     tx_to_worker_sync: fibre::mpsc::BoundedSender<EgressChunk>,
-    worker_asleep: Arc<AtomicBool>,
+    worker_asleep: Arc<AtomicU8>,
     event_fd: EventFD,
     pool: Option<Arc<SendBufferPool>>,
     channel_hwm: usize,
@@ -400,8 +423,15 @@ impl UringStream {
 
   #[inline]
   fn wake_worker_if_asleep(&self) {
-    if self.worker_asleep.load(Ordering::Acquire) {
-      let _ = self.event_fd.write(1);
+    if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+      if self.worker_asleep.compare_exchange(
+        WAKEUP_STATE_SLEEPING,
+        WAKEUP_STATE_SIGNALED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+      ).is_ok() {
+        let _ = self.event_fd.write(1);
+      }
     }
   }
 
@@ -521,10 +551,15 @@ impl AsyncRead for UringStream {
         if to_copy < bytes.len() {
           self.current_lease = Some(bytes.slice(to_copy..));
         }
-        if self.rx_from_worker.len() <= self.channel_lwm
-          && self.worker_asleep.load(Ordering::Relaxed)
-        {
-          let _ = self.event_fd.write(1);
+        if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+          if self.worker_asleep.compare_exchange(
+            WAKEUP_STATE_SLEEPING,
+            WAKEUP_STATE_SIGNALED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+          ).is_ok() {
+            let _ = self.event_fd.write(1);
+          }
         }
         Poll::Ready(Ok(()))
       }
@@ -608,6 +643,11 @@ impl ZmtpWriteHalf for UringWriteHalf {
     true
   }
 
+  fn set_cork(&self, enable: bool) {
+    let _ = self.tx_to_worker_sync.try_send(EgressChunk::SetCork(enable));
+    self.wake_worker_if_asleep();
+  }
+
   fn write_owned(
     &mut self,
     bufs: Vec<bytes::Bytes>,
@@ -625,8 +665,15 @@ impl ZmtpWriteHalf for UringWriteHalf {
       let chunk = EgressChunk::Vectored(non_empty);
       match tx_sync.try_send(chunk) {
         Ok(()) => {
-          if worker_asleep.load(std::sync::atomic::Ordering::Acquire) {
-            let _ = event_fd.write(1);
+          if worker_asleep.load(std::sync::atomic::Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+            if worker_asleep.compare_exchange(
+              WAKEUP_STATE_SLEEPING,
+              WAKEUP_STATE_SIGNALED,
+              std::sync::atomic::Ordering::AcqRel,
+              std::sync::atomic::Ordering::Acquire,
+            ).is_ok() {
+              let _ = event_fd.write(1);
+            }
           }
           Ok(())
         }
@@ -637,8 +684,15 @@ impl ZmtpWriteHalf for UringWriteHalf {
               "UringWriteHalf: worker channel closed",
             )
           })?;
-          if worker_asleep.load(std::sync::atomic::Ordering::Acquire) {
-            let _ = event_fd.write(1);
+          if worker_asleep.load(std::sync::atomic::Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+            if worker_asleep.compare_exchange(
+              WAKEUP_STATE_SLEEPING,
+              WAKEUP_STATE_SIGNALED,
+              std::sync::atomic::Ordering::AcqRel,
+              std::sync::atomic::Ordering::Acquire,
+            ).is_ok() {
+              let _ = event_fd.write(1);
+            }
           }
           Ok(())
         }

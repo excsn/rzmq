@@ -6,7 +6,7 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
 use crate::socket::options::AUTO_DELIMITER;
-use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use crate::socket::patterns::incoming_orchestrator::{AppFrames, IncomingMessageOrchestrator};
 use crate::socket::patterns::{FramingLatch, LoadBalancer, dealer_auto_decode, dealer_auto_encode};
 
 use std::collections::{HashMap, VecDeque};
@@ -560,7 +560,7 @@ impl ISocket for DealerSocket {
     // For DEALER, QItem is Vec<Msg> (payload parts).
     // The transform_fn tells orchestrator.recv_message how to convert QItem into app_frames.
     // For DEALER, the QItem (payload Vec<Msg>) IS the app_frames for the orchestrator's buffer.
-    let transform_fn = |q_item: Vec<Msg>| q_item;
+    let transform_fn = |q_item: Vec<Msg>| AppFrames::Multiple(q_item);
     self
       .incoming_orchestrator
       .recv_message(rcvtimeo_opt, transform_fn)
@@ -574,7 +574,7 @@ impl ISocket for DealerSocket {
 
     let rcvtimeo_opt: Option<Duration> = { self.core.core_state.read().options.rcvtimeo };
     // For DEALER, QItem is Vec<Msg> (the payload parts). Transform is identity.
-    let transform_fn = |q_item: Vec<Msg>| q_item;
+    let transform_fn = |q_item: Vec<Msg>| AppFrames::Multiple(q_item);
     self
       .incoming_orchestrator
       .recv_logical_message(rcvtimeo_opt, transform_fn)

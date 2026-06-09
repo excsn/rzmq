@@ -364,8 +364,7 @@ impl TcpListener {
                       #[cfg(target_os = "linux")]
                       {
                         let socket_type = socket_options_clone.socket_type_name.as_str();
-                        let use_cork_at_startup = socket_options_clone.tcp_cork
-                          && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB");
+                        let use_cork_at_startup = false;
                         if use_cork_at_startup {
                           tracing::debug!(
                             handle = accept_loop_handle,
@@ -546,8 +545,7 @@ impl TcpListener {
                   #[cfg(target_os = "linux")]
                   {
                     let socket_type = socket_options_clone.socket_type_name.as_str();
-                    let use_cork_at_startup = socket_options_clone.tcp_cork
-                      && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB");
+                    let use_cork_at_startup = false;
 
                     if use_cork_at_startup {
                       tracing::debug!(
@@ -995,8 +993,7 @@ impl TcpConnecter {
             #[cfg(target_os = "linux")]
             {
               let socket_type = self.socket_options.socket_type_name.as_str();
-              let use_cork_at_startup = self.socket_options.tcp_cork
-                && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB");
+              let use_cork_at_startup = false;
 
               if use_cork_at_startup {
                 tracing::debug!(
@@ -1177,8 +1174,7 @@ impl TcpConnecter {
           #[cfg(target_os = "linux")]
           {
             let socket_type = self.socket_options.socket_type_name.as_str();
-            let use_cork_at_startup =
-              self.socket_options.tcp_cork && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB");
+            let use_cork_at_startup = false;
 
             if use_cork_at_startup {
               tracing::debug!(

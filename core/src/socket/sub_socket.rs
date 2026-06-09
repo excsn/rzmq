@@ -1,4 +1,4 @@
-use super::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use super::patterns::incoming_orchestrator::{AppFrames, IncomingMessageOrchestrator};
 use crate::error::ZmqError;
 use crate::message::Msg;
 use crate::runtime::{Command, MailboxSender};
@@ -19,7 +19,7 @@ use std::time::Duration;
 pub(crate) struct SubSocket {
   core: Arc<SocketCore>,
   subscriptions: SubscriptionTrie,
-  incoming_orchestrator: IncomingMessageOrchestrator<Vec<Msg>>,
+  incoming_orchestrator: IncomingMessageOrchestrator<AppFrames>,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
 }
 
@@ -162,9 +162,7 @@ impl ISocket for SubSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
-    // For SUB, QItem is Vec<Msg> (the filtered message).
-    // The transform closure is identity because app_frames *is* the QItem.
-    let transform_fn = |q_item: Vec<Msg>| q_item;
+    let transform_fn = |q_item: AppFrames| q_item;
     self
       .incoming_orchestrator
       .recv_message(rcvtimeo_opt, transform_fn)
@@ -189,9 +187,7 @@ impl ISocket for SubSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
-    // For SUB, QItem is Vec<Msg> (the filtered logical message).
-    // The transform closure is identity.
-    let transform_fn = |q_item: Vec<Msg>| q_item;
+    let transform_fn = |q_item: AppFrames| q_item;
     self
       .incoming_orchestrator
       .recv_logical_message(rcvtimeo_opt, transform_fn)
@@ -241,31 +237,30 @@ impl ISocket for SubSocket {
   async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
       Command::PipeMessageReceived { msg, .. } => {
-        if let Some(raw_zmtp_message_vec) = self
-          .incoming_orchestrator
-          .accumulate_pipe_frame(pipe_read_id, msg)?
-        {
-          let topic_data = raw_zmtp_message_vec
-            .get(0)
-            .and_then(|frame| frame.data())
-            .unwrap_or_default();
+        if !msg.is_more() && !self.incoming_orchestrator.has_partial_message(pipe_read_id) {
+          let topic_data = msg.data().unwrap_or_default();
           if self.subscriptions.matches(topic_data).await {
-            self
-              .incoming_orchestrator
-              .queue_item(pipe_read_id, raw_zmtp_message_vec)
-              .await?;
-          } else {
-            tracing::trace!(handle = self.core.handle, pipe_id = pipe_read_id, topic = ?String::from_utf8_lossy(topic_data), "SUB: Message dropped (no subscription match).");
+            self.incoming_orchestrator.queue_item(pipe_read_id, AppFrames::Single(msg)).await?;
+          }
+        } else if let Some(raw) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
+          let topic_data = raw.get(0).and_then(|frame| frame.data()).unwrap_or_default();
+          if self.subscriptions.matches(topic_data).await {
+            self.incoming_orchestrator.queue_item(pipe_read_id, AppFrames::Multiple(raw)).await?;
           }
         }
       }
       Command::PipeMessageBatchReceived { msgs, .. } => {
         let mut assembled_batch = Vec::new();
         for msg in msgs {
-          if let Some(raw_zmtp_message_vec) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
-            let topic_data = raw_zmtp_message_vec.get(0).and_then(|f| f.data()).unwrap_or_default();
+          if !msg.is_more() && !self.incoming_orchestrator.has_partial_message(pipe_read_id) {
+            let topic_data = msg.data().unwrap_or_default();
             if self.subscriptions.matches(topic_data).await {
-              assembled_batch.push(raw_zmtp_message_vec);
+              assembled_batch.push(AppFrames::Single(msg));
+            }
+          } else if let Some(raw) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
+            let topic_data = raw.get(0).and_then(|f| f.data()).unwrap_or_default();
+            if self.subscriptions.matches(topic_data).await {
+              assembled_batch.push(AppFrames::Multiple(raw));
             }
           }
         }

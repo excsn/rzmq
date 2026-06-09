@@ -4,7 +4,7 @@ use crate::io_uring_backend::connection_handler::OutgoingMessage;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::UringOpRequest;
 #[cfg(feature = "io-uring")]
-use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
+use crate::io_uring_backend::ops::{WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING};
 use crate::message::Msg;
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
@@ -18,7 +18,7 @@ use std::fmt;
 #[cfg(feature = "io-uring")]
 use std::os::{fd::AsRawFd, unix::io::RawFd};
 #[cfg(feature = "io-uring")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "io-uring")]
 use std::time::Duration;
@@ -79,7 +79,7 @@ pub(crate) struct UringFdConnection {
   fd: RawFd,
   mpsc_tx: mpsc::BoundedAsyncSender<OutgoingMessage>,
   event_fd: eventfd::EventFD,
-  worker_asleep: Arc<AtomicBool>,
+  worker_asleep: Arc<AtomicU8>,
   context: Context,
 }
 
@@ -101,7 +101,7 @@ impl UringFdConnection {
     fd: RawFd,
     mpsc_tx: mpsc::BoundedAsyncSender<OutgoingMessage>,
     event_fd: eventfd::EventFD,
-    worker_asleep: Arc<AtomicBool>,
+    worker_asleep: Arc<AtomicU8>,
     context: Context,
   ) -> Self {
     Self {
@@ -126,9 +126,16 @@ impl UringFdConnection {
         // Together they ensure: if the worker set `worker_asleep = true` before this load,
         // we will see it and write the eventfd. If we miss the store (false), the worker's
         // double-check re-drain loop will see our enqueued message and stay awake.
-        if self.mpsc_tx.len() <= 1 && self.worker_asleep.load(Ordering::Acquire) {
-          if let Err(e) = self.event_fd.write(1) {
-            tracing::error!("UringFdConnection: Failed to signal eventfd: {}", e);
+        if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+          if self.worker_asleep.compare_exchange(
+            WAKEUP_STATE_SLEEPING,
+            WAKEUP_STATE_SIGNALED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+          ).is_ok() {
+            if let Err(e) = self.event_fd.write(1) {
+              tracing::error!("UringFdConnection: Failed to signal eventfd: {}", e);
+            }
           }
         }
         Ok(())

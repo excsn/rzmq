@@ -4,7 +4,7 @@ use super::{ExternalOpContext, UringWorker, cqe_processor};
 use crate::ZmqError;
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{HandlerSqeBlueprint, UringWorkerInterface};
-use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest};
+use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest, WAKEUP_STATE_ACTIVE, WAKEUP_STATE_SLEEPING};
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerState};
 use crate::uring::UringPollingStrategy;
 
@@ -781,15 +781,16 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 // Closes the race: if a sender pushed after the Phase 1 drain, it either
                 // saw worker_asleep=true (wrote eventfd to wake us) or its message is
                 // now visible via is_empty() below.
-                worker.worker_asleep.store(true, Ordering::Release);
-                let late_work = worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty());
+                worker.worker_asleep.store(WAKEUP_STATE_SLEEPING, Ordering::Release);
+                let late_work = worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty())
+                  || worker.handler_manager.any_handler_has_inbound_data();
                 if late_work {
-                  worker.worker_asleep.store(false, Ordering::Release);
+                  worker.worker_asleep.store(WAKEUP_STATE_ACTIVE, Ordering::Release);
                   work_was_available = true;
                   Ok(0)
                 } else {
                   let res = worker.ring.submitter().submit_with_args(1, &submit_args);
-                  worker.worker_asleep.store(false, Ordering::Release);
+                  worker.worker_asleep.store(WAKEUP_STATE_ACTIVE, Ordering::Release);
                   res
                 }
               } else {

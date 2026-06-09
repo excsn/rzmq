@@ -616,6 +616,22 @@ where
       );
       self.current_phase = ConnectionPhaseX::Operational;
 
+      // Deferred cork: handshake is complete, now safe to enable TCP_CORK for
+      // streaming patterns. Applied here rather than at socket creation so that
+      // small handshake frames are never held by the 200ms kernel cork timer.
+      let socket_type = self.zmtp_handler.config.socket_type_name.as_str();
+      if self.zmtp_handler.config.use_cork
+        && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB")
+      {
+        if let Some(ref wh) = self.zmtp_handler.write_half {
+          wh.set_cork(true);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(ref mut ci) = self.zmtp_handler.cork_info {
+          ci.apply_cork_state(true, self.handle).await;
+        }
+      }
+
       // Determine final peer identity: one from handshake (security or READY) takes precedence.
       let final_peer_identity = self.pending_peer_identity_from_handshake.take();
       let peer_socket_type = self.zmtp_handler.handshake_state.peer_socket_type.clone();

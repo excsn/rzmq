@@ -5,7 +5,7 @@ use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::LoadBalancer;
-use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use crate::socket::patterns::incoming_orchestrator::{AppFrames, IncomingMessageOrchestrator};
 use crate::{Blob, delegate_to_core};
 
 use async_trait::async_trait;
@@ -217,7 +217,7 @@ impl ISocket for ReqSocket {
     }
 
     let notifier = self.reply_available_notifier.clone();
-    let transform_fn_main = |q_item: Vec<Msg>| q_item;
+    let transform_fn_main = |q_item: Vec<Msg>| AppFrames::Multiple(q_item);
     let orchestrator_fut = self
       .incoming_orchestrator
       .recv_message(rcvtimeo_opt, transform_fn_main);
@@ -230,7 +230,7 @@ impl ISocket for ReqSocket {
           tracing::debug!("REQ recv: Notifier signaled, core not running. Exiting due to close.");
           received_msg_result = Err(ZmqError::ConnectionClosed);
         } else {
-          let transform_fn_poll = |q_item: Vec<Msg>| q_item;
+          let transform_fn_poll = |q_item: Vec<Msg>| AppFrames::Multiple(q_item);
           match self.incoming_orchestrator.recv_message(Some(Duration::ZERO), transform_fn_poll).await {
             Ok(msg) => {
               received_msg_result = Ok(msg);
@@ -321,7 +321,7 @@ impl ISocket for ReqSocket {
       let mut state_guard = self.state.lock();
       *state_guard = ReqState::ReadyToSend;
       self.reply_available_notifier.notify_waiters();
-      payload_frames
+      AppFrames::Multiple(payload_frames)
     };
 
     let result = self
