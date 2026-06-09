@@ -5,15 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-#[derive(Serialize)]
-struct LatencyReport {
-  min_ns: u64,
-  p50_ns: u64,
-  p90_ns: u64,
-  p95_ns: u64,
-  p99_ns: u64,
-  p999_ns: u64,
-  max_ns: u64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencyReport {
+  pub min_ns: u64,
+  pub p50_ns: u64,
+  pub p90_ns: u64,
+  pub p95_ns: u64,
+  pub p99_ns: u64,
+  pub p999_ns: u64,
+  pub max_ns: u64,
 }
 
 #[derive(Serialize)]
@@ -132,7 +132,19 @@ impl BenchmarkCollector {
     let total_messages = self.messages_count.load(Ordering::Relaxed);
     let total_bytes = self.bytes_count.load(Ordering::Relaxed);
     let elapsed_secs = self.measure_start.lock().elapsed().as_secs_f64().max(0.000001);
-    BenchStats { role: role.to_string(), total_messages, total_bytes, elapsed_secs }
+    let latency = self.histogram.as_ref().map(|m| {
+      let hist = m.lock();
+      LatencyReport {
+        min_ns: hist.min(),
+        p50_ns: hist.value_at_quantile(0.50),
+        p90_ns: hist.value_at_quantile(0.90),
+        p95_ns: hist.value_at_quantile(0.95),
+        p99_ns: hist.value_at_quantile(0.99),
+        p999_ns: hist.value_at_quantile(0.999),
+        max_ns: hist.max(),
+      }
+    });
+    BenchStats { role: role.to_string(), total_messages, total_bytes, elapsed_secs, latency }
   }
 
   pub fn print_final_report(
@@ -259,6 +271,7 @@ pub struct BenchStats {
   pub total_messages: usize,
   pub total_bytes: u64,
   pub elapsed_secs: f64,
+  pub latency: Option<LatencyReport>,
 }
 
 impl BenchStats {
@@ -329,6 +342,17 @@ fn print_combined_text(
       client.throughput_msg_sec(), srv.throughput_msg_sec());
     let _ = writeln!(out, "{:<25} : {:>14.2} MB/s    {:>14.2} MB/s", "Throughput Rate",
       client.throughput_mb_sec(), srv.throughput_mb_sec());
+    if let Some(ref lat) = client.latency {
+      let _ = writeln!(out, "--------------------------------------------------------");
+      let _ = writeln!(out, "  Latency (client round-trip)");
+      let _ = writeln!(out, "  {:<15} : {:>12}", "min",         fmt_ns(lat.min_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p50 (Median)", fmt_ns(lat.p50_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p90",         fmt_ns(lat.p90_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p95",         fmt_ns(lat.p95_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99",         fmt_ns(lat.p99_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9",       fmt_ns(lat.p999_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "max",         fmt_ns(lat.max_ns));
+    }
   } else {
     let _ = writeln!(out, "{:<25} : {:.4} seconds", "Elapsed Time", client.elapsed_secs);
     let _ = writeln!(out, "{:<25} : {}", "Total Messages", client.total_messages);
@@ -336,6 +360,17 @@ fn print_combined_text(
     let _ = writeln!(out, "--------------------------------------------------------");
     let _ = writeln!(out, "{:<25} : {:.2} msg/s", "Throughput", client.throughput_msg_sec());
     let _ = writeln!(out, "{:<25} : {:.2} MB/s", "Throughput Rate", client.throughput_mb_sec());
+    if let Some(ref lat) = client.latency {
+      let _ = writeln!(out, "--------------------------------------------------------");
+      let _ = writeln!(out, "  Latency (client round-trip)");
+      let _ = writeln!(out, "  {:<15} : {:>12}", "min",          fmt_ns(lat.min_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p50 (Median)", fmt_ns(lat.p50_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p90",          fmt_ns(lat.p90_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p95",          fmt_ns(lat.p95_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99",          fmt_ns(lat.p99_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9",        fmt_ns(lat.p999_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "max",          fmt_ns(lat.max_ns));
+    }
   }
   let _ = writeln!(out, "========================================================\n");
   print!("{out}");
