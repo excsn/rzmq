@@ -9,7 +9,7 @@
 
 ## Performance Highlights
 
- TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U with Adaptive Throttling enabled.
+TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
 
 - **3.2 M msg/s** - PushPull · 64 B · Linux · 4 workers
 - **8.7 GB/s** - PushPull · 32 KB · Linux · 4 workers
