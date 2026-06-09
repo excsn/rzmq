@@ -11,10 +11,13 @@
 
  TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U with Adaptive Throttling enabled.
 
-- **2.2 M msg/s** - PushPull · 64 B · Linux · io\_uring + cork · 4 workers
-- **6.6 GB/s** - PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
+- **3.2 M msg/s** - PushPull · 64 B · Linux · 4 workers
+- **8.7 GB/s** - PushPull · 32 KB · Linux · 4 workers
 
- By integrating `io_uring` with TCP Cork, `rzmq` **has demonstrated superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput [benchmarks](#benchmarks) included in this repository.**
+- **3.2 M msg/s** - PushPull · 64 B · Linux · io\_uring + cork · 4 workers
+- **7.3 GB/s** - PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
+
+ By integrating `io_uring` with TCP Cork, `rzmq` **has demonstrated stunningly superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput [benchmarks](#benchmarks) included in this repository.**
 
 ## Project Status: Beta ⚠️
 
