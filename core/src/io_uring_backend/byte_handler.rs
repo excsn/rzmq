@@ -38,7 +38,7 @@ use crate::io_uring_backend::{
   send_buffer_pool::{RegisteredSendBufferId, SendBufferLease, SendBufferPool},
   worker::{InternalOpTracker, MultishotReader},
 };
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::MailboxSyncSender;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::ZmqError;
@@ -52,7 +52,7 @@ struct DummySocketConnection;
 
 #[async_trait]
 impl ISocketConnection for DummySocketConnection {
-  async fn send_multipart(&self, _msgs: Vec<Msg>) -> Result<(), ZmqError> {
+  async fn send_multipart(&self, _msgs: FrameBatch) -> Result<(), ZmqError> {
     Err(ZmqError::InvalidState("UringByteHandler: route via raw channel".into()))
   }
   async fn close_connection(&self) -> Result<(), ZmqError> {
@@ -99,7 +99,7 @@ impl UringByteHandler {
     use_recv_multishot: bool,
     send_buffer_slot_size: usize,
   ) -> Self {
-    let (dummy_tx, _dummy_rx) = fibre::mpsc::bounded::<Vec<Msg>>(1);
+    let (dummy_tx, _dummy_rx) = fibre::mpsc::bounded::<FrameBatch>(1);
     let worker_io_config = Arc::new(WorkerIoConfig {
       socket_mailbox,
       inbound_data_tx: dummy_tx,

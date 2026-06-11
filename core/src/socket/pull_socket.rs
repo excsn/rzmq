@@ -1,15 +1,15 @@
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
-use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::core::SocketCore;
+use crate::socket::options::SocketOptions;
 use crate::socket::patterns::IncomingMessageOrchestrator;
 use crate::socket::patterns::incoming_orchestrator::AppFrames;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use parking_lot::RwLockReadGuard;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::{Blob, delegate_to_core};
 
@@ -17,22 +17,21 @@ use crate::{Blob, delegate_to_core};
 pub(crate) struct PullSocket {
   core: Arc<SocketCore>,
   incoming_orchestrator: IncomingMessageOrchestrator<AppFrames>,
+  cached_options: ArcSwap<SocketOptions>,
 }
 
 impl PullSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let queue_capacity = { core.core_state.read().options.rcvhwm.max(1) };
-
+    let (queue_capacity, options_snapshot) = {
+      let s = core.core_state.read();
+      (s.options.rcvhwm.max(1), s.options.clone())
+    };
     let incoming_orchestrator = IncomingMessageOrchestrator::new(core.handle, queue_capacity);
-
     Self {
       core,
       incoming_orchestrator,
+      cached_options: ArcSwap::from(options_snapshot),
     }
-  }
-
-  fn core_state_read(&self) -> RwLockReadGuard<'_, CoreState> {
-    self.core.core_state.read()
   }
 }
 
@@ -69,11 +68,11 @@ impl ISocket for PullSocket {
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
-    let rcvtimeo_opt: Option<Duration> = { self.core_state_read().options.rcvtimeo };
+    let rcvtimeo_opt = self.cached_options.load().rcvtimeo;
     let transform_fn = |q_item: AppFrames| q_item;
     self
       .incoming_orchestrator
@@ -81,18 +80,18 @@ impl ISocket for PullSocket {
       .await
   }
 
-  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
+  async fn send_multipart(&self, _frames: FrameBatch) -> Result<(), ZmqError> {
     Err(ZmqError::InvalidState(
       "PULL sockets cannot send messages".into(),
     ))
   }
 
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    if !self.core.is_running().await {
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
-    let rcvtimeo_opt: Option<Duration> = { self.core_state_read().options.rcvtimeo };
+    let rcvtimeo_opt = self.cached_options.load().rcvtimeo;
 
     let transform_fn = |q_item: AppFrames| q_item;
     self
@@ -102,7 +101,11 @@ impl ISocket for PullSocket {
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
-    delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec())
+    let result = delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec());
+    if result.is_ok() {
+      self.cached_options.store(self.core.core_state.read().options.clone());
+    }
+    result
   }
 
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {

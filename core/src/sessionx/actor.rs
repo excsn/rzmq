@@ -1,7 +1,7 @@
 #![allow(dead_code, unused_variables, unused_mut)]
 
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};
 use crate::sessionx::regulator::SessionRegulator;
 use crate::socket::ISocket;
@@ -158,7 +158,7 @@ where
     };
 
     // Reusable batch buffer — allocated once, cleared on each wakeup
-    let mut outgoing_batch: Vec<Vec<Msg>> =
+    let mut outgoing_batch: Vec<FrameBatch> =
       Vec::with_capacity(self.zmtp_handler.config.sndbatch_count);
 
     let mut egress_buffer = EgressBuffer::new();
@@ -236,10 +236,10 @@ where
       // Logical messages batch-pulled from the core pipe beyond the per-round
       // sndbatch budgets; drained (FIFO) before the pipe is polled again so the
       // byte/count budgets are preserved exactly despite batch pulls.
-      let mut core_carryover: std::collections::VecDeque<Vec<Msg>> =
+      let mut core_carryover: std::collections::VecDeque<FrameBatch> =
         std::collections::VecDeque::new();
       // Reusable scratch for batch pulls from the core pipe.
-      let mut core_batch_scratch: Vec<Vec<Msg>> = Vec::new();
+      let mut core_batch_scratch: Vec<FrameBatch> = Vec::new();
 
       'operational: while self.current_phase == ConnectionPhaseX::Operational
         || (self.current_phase == ConnectionPhaseX::ShuttingDownStream
@@ -257,7 +257,7 @@ where
           }
         {
           outgoing_batch.clear();
-          let wire_size = |msgs: &Vec<Msg>| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
+          let wire_size = |msgs: &FrameBatch| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
           let max_count = self.zmtp_handler.config.sndbatch_count;
           let max_bytes = self.zmtp_handler.config.sndbatch_bytes;
           let mut total_bytes = 0usize;
@@ -370,12 +370,14 @@ where
                   .core_pipe_read_id_for_incoming_routing
                   .expect("pipe_id required for incoming routing");
 
-                let mut data_msgs = Vec::with_capacity(msgs.len());
+                let mut data_msgs = FrameBatch::new();
                 for msg in msgs {
                   if msg.is_command() {
                     match self.zmtp_handler.process_incoming_data_command_frame(&msg) {
                       Ok(Some(pong)) => {
-                        match self.zmtp_handler.frame_outgoing_msgs(vec![pong]) {
+                        let mut pong_fb = FrameBatch::new();
+                        pong_fb.push(pong);
+                        match self.zmtp_handler.frame_outgoing_msgs(pong_fb) {
                           Ok(bytes) => egress_buffer.push_priority(bytes),
                           Err(e) => { self.set_fatal_error(e).await; }
                         }
@@ -460,7 +462,7 @@ where
                 outgoing_batch.clear();
                 // Count wire bytes (payload + 9 bytes ZMTP long-frame overhead per message)
                 // so the framed batch never exceeds sndbatch_bytes and busts the ZC slot.
-                let wire_size = |msgs: &Vec<Msg>| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
+                let wire_size = |msgs: &FrameBatch| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
                 let mut total_bytes = wire_size(&first_msgs);
                 outgoing_batch.push(first_msgs);
 

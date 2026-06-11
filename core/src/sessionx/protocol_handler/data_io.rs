@@ -2,7 +2,7 @@
 
 use super::ZmtpProtocolHandlerX;
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::transport::{ZmtpReadHalf, ZmtpStdStream, ZmtpWriteHalf};
 
 use bytes::BytesMut;
@@ -64,10 +64,10 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
 pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
   reader: &mut S::ReadHalf,
-) -> Result<Vec<Msg>, ZmqError> {
+) -> Result<FrameBatch, ZmqError> {
   let max_count = handler.config.rcvbatch_count;
   let max_bytes = handler.config.rcvbatch_bytes;
-  let mut batch: Vec<Msg> = Vec::new();
+  let mut batch: FrameBatch = FrameBatch::new();
   let mut total_bytes: usize = 0;
 
   // Drain any frames already assembled in the buffer from a prior partial read.
@@ -240,12 +240,14 @@ pub(crate) fn frame_single_msg_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
   msg: Msg,
 ) -> Result<bytes::Bytes, crate::ZmqError> {
-  handler.framer.write_msg_multipart(vec![msg])
+  let mut fb = FrameBatch::new();
+  fb.push(msg);
+  handler.framer.write_msg_multipart(fb)
 }
 
 pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
-  msgs: Vec<Msg>,
+  msgs: FrameBatch,
 ) -> Result<(), ZmqError> {
   if msgs.is_empty() {
     return Ok(());
@@ -318,7 +320,7 @@ pub(crate) async fn write_data_msgs_impl<S: ZmtpStdStream>(
 
 pub(crate) async fn write_data_batch_impl<S: ZmtpStdStream>(
   handler: &mut ZmtpProtocolHandlerX<S>,
-  batch: &[Vec<Msg>],
+  batch: &[FrameBatch],
 ) -> Result<(), ZmqError> {
   if batch.is_empty() {
     return Ok(());
@@ -374,6 +376,8 @@ pub(crate) async fn write_data_msg_impl<S: ZmtpStdStream>(
   _is_first_part_of_logical_zmq_msg: bool,
 ) -> Result<bool, ZmqError> {
   let was_last_part = !msg.is_more();
-  write_data_msgs_impl(handler, vec![msg]).await?;
+  let mut fb = FrameBatch::new();
+  fb.push(msg);
+  write_data_msgs_impl(handler, fb).await?;
   Ok(was_last_part)
 }

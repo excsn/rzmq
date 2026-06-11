@@ -22,7 +22,7 @@ pub mod sub_socket;
 
 use crate::context::Context;
 use crate::error::{ZmqError, ZmqResult};
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::options::SocketOptions;
 
@@ -124,12 +124,12 @@ pub trait ISocket: Send + Sync + 'static {
   /// Other types: May error or have specific behavior.
   ///
   /// The `frames` Vec should have MsgFlags::MORE set correctly on all but the last Msg.
-  async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError>;
+  async fn send_multipart(&self, frames: FrameBatch) -> Result<(), ZmqError>;
 
   /// Receives all frames of a complete logical ZMQ message.
   /// Handles reading subsequent frames if the first frame has the MORE flag.
   /// Respects RCVTIMEO for the overall operation of receiving the full message.
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError>;
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError>;
 
   /// Applies a socket option. Some options might be handled by `SocketCore` directly,
   /// while others might require pattern-specific logic via `set_pattern_option`.

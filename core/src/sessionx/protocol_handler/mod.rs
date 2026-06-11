@@ -5,7 +5,7 @@ mod handshake;
 mod heartbeat;
 
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::protocol::zmtp::greeting::ZmtpGreeting;
 use crate::protocol::zmtp::manual_parser::ZmtpManualParser;
 use crate::security::framer::{ISecureFramer, NullFramer};
@@ -27,7 +27,7 @@ use heartbeat::ZmtpHandshakeStateX;
 
 pub(crate) enum NetworkActionX {
   HandshakeProgress(ZmtpHandshakeProgressX),
-  DataBatch(Vec<Msg>),
+  DataBatch(FrameBatch),
 }
 
 pub(crate) struct ZmtpProtocolHandlerX<S: ZmtpStdStream> {
@@ -154,7 +154,7 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
   pub(crate) async fn read_and_parse_data_frames_batch(
     &mut self,
     reader: &mut S::ReadHalf,
-  ) -> Result<Vec<Msg>, ZmqError> {
+  ) -> Result<FrameBatch, ZmqError> {
     data_io::read_data_frames_batch_impl(self, reader).await
   }
 
@@ -166,11 +166,11 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     data_io::write_data_msg_impl(self, msg, is_first_part_of_logical_zmq_msg).await
   }
 
-  pub(crate) async fn write_data_msgs(&mut self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+  pub(crate) async fn write_data_msgs(&mut self, msgs: FrameBatch) -> Result<(), ZmqError> {
     data_io::write_data_msgs_impl(self, msgs).await
   }
 
-  pub(crate) async fn write_data_batch(&mut self, batch: &[Vec<Msg>]) -> Result<(), ZmqError> {
+  pub(crate) async fn write_data_batch(&mut self, batch: &[FrameBatch]) -> Result<(), ZmqError> {
     data_io::write_data_batch_impl(self, batch).await
   }
 
@@ -185,18 +185,18 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     heartbeat::try_send_ping_impl(self).await
   }
 
-  pub(crate) fn frame_outgoing_batch(&mut self, batch: &[Vec<Msg>]) -> Result<bytes::Bytes, ZmqError> {
+  pub(crate) fn frame_outgoing_batch(&mut self, batch: &[FrameBatch]) -> Result<bytes::Bytes, ZmqError> {
     self.framer.write_msg_batch(batch)
   }
 
   pub(crate) fn frame_outgoing_batch_vectored(
     &mut self,
-    batch: &[Vec<Msg>],
+    batch: &[FrameBatch],
   ) -> Result<Vec<bytes::Bytes>, ZmqError> {
     self.framer.frame_vectored(batch)
   }
 
-  pub(crate) fn frame_outgoing_msgs(&mut self, msgs: Vec<Msg>) -> Result<bytes::Bytes, ZmqError> {
+  pub(crate) fn frame_outgoing_msgs(&mut self, msgs: FrameBatch) -> Result<bytes::Bytes, ZmqError> {
     self.framer.write_msg_multipart(msgs)
   }
 

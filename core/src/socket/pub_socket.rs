@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::SocketCore;
 use crate::socket::patterns::Distributor;
@@ -63,7 +63,7 @@ impl ISocket for PubSocket {
   }
 
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let payload_preview_str = msg
@@ -104,8 +104,8 @@ impl ISocket for PubSocket {
     Err(ZmqError::InvalidState("PUB sockets cannot receive messages"))
   }
 
-  async fn send_multipart(&self, mut frames: Vec<Msg>) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+  async fn send_multipart(&self, mut frames: FrameBatch) -> Result<(), ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     if frames.is_empty() {
@@ -148,7 +148,7 @@ impl ISocket for PubSocket {
     }
   }
 
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
     Err(ZmqError::UnsupportedFeature("PUB sockets cannot receive messages"))
   }
 

@@ -14,20 +14,20 @@
 | **ReqRep** | Standard | 1 | 192,244 | 19,224.37 | 1.17 | 51 us | 62 us |
 | **DealerRouter** | Standard | 1 | 247,153 | 24,715.10 | 1.51 | 37 us | 66 us |
 | **PushPull** | Standard | 1 | 28,179,700 | 2,818,072.87 | 172.00 | — | — |
-| **PushPull** | Standard | 4 | 32,697,546 | 3,269,858.17 | 199.58 | — | — |
-| **PushPull** | Standard (32 KB msg) | 4 | 2,799,716 | 279,982.38 | 8,749.45 | — | — |
+| **PushPull** | Standard | 4 | 50,809,050 | 5,080,981.41 | 310.12 | — | — |
+| **PushPull** | Standard (32 KB msg) | 4 | 3,124,097 | 312,393.53 | 9,762.30 | — | — |
 | **PubSub** | Standard | 1 | 25,855,210 | 2,585,706.53 | 157.82 | — | — |
 | **PubSub** | `--cork` | 1 | 26,223,062 | 2,622,501.09 | 160.06 | — | — |
 | **PushPull** | `--cork` | 1 | 29,882,684 | 2,988,397.11 | 182.40 | — | — |
-| **PushPull** | `--cork` | 4 | 32,080,701 | 3,206,541.52 | 195.71 | — | — |
-| **PushPull** | `--cork` (32 KB msg) | 4 | 2,394,404 | 239,456.93 | 7,483.03 | — | — |
+| **PushPull** | `--cork` | 4 | 50,332,551 | 5,032,172.68 | 307.14 | — | — |
+| **PushPull** | `--cork` (32 KB msg) | 4 | 2,683,392 | 268,320.71 | 8,385.02 | — | — |
 | **PushPull** | `io-uring` | 1 | 21,602,689 | 2,160,111.87 | 131.84 | — | — |
-| **PushPull** | `io-uring` | 4 | 30,960,825 | 3,096,307.99 | 188.98 | — | — |
-| **PushPull** | `io-uring` + `--cork` | 1 | 22,383,879 | 2,238,510.98 | 136.63 | — | — |
-| **PushPull** | `io-uring` + `--cork` | 2 | 31,715,151 | 3,171,293.67 | 193.56 | — | — |
-| **PushPull** | `io-uring` + `--cork` | 4 | 32,812,183 | 3,280,899.61 | 200.25 | — | — |
+| **PushPull** | `io-uring` | 4 | 41,799,583 | 4,179,833.77 | 255.12 | — | — |
+| **PushPull** | `io-uring` + `--cork` | 1 | 23,772,462 | 2,377,393.48 | 145.10 | — | — |
+| **PushPull** | `io-uring` + `--cork` | 2 | 34,543,208 | 3,454,466.59 | 210.84 | — | — |
+| **PushPull** | `io-uring` + `--cork` | 4 | 41,322,072 | 4,131,451.07 | 252.16 | — | — |
 | **PushPull** | `io-uring` + `--uring-multishot` | 1 | 21,529,422 | 2,152,982.17 | 131.41 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` | 4 | 31,528,145 | 3,138,975.93 | 191.59 | — | — |
+| **PushPull** | `io-uring` + `--uring-multishot` | 4 | 39,676,273 | 3,967,953.46 | 242.18 | — | — |
 | **PushPull** | `--cork` (32 KB msg) | 8 | 2,286,920 | 228,688.71 | 7,146.52 | — | — |
 | **PushPull** | `io-uring` + `--cork` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 8 | 2,360,709 | 236,048.02 | 7,376.50 | — | — |
 
@@ -117,7 +117,6 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 * **Throughput:** 5,080,981.41 msg/s
 * **Throughput Rate:** 310.12 MB/s
 
-
 #### Concurrency 4, Msg Size 32KB
 
 **Command:**
@@ -149,7 +148,6 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 * **Total Data:** 1,578.08 MB
 * **Throughput:** 2,585,706.53 msg/s
 * **Throughput Rate:** 157.82 MB/s
-
 
 #### PubSub with Cork
 

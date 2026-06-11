@@ -368,6 +368,7 @@ pub(crate) async fn run_command_loop(
     // if they weren't completed, but that adds complexity.
     // For now, we ensure we move to Finished state.
     final_coord_guard.state = ShutdownPhase::Finished;
+    core_arc.is_running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
   }
   drop(final_coord_guard);
 

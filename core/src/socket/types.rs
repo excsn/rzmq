@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::Command;
 use crate::runtime::MailboxSender;
 use crate::socket::ISocket;
@@ -127,7 +127,7 @@ impl Socket {
   ///
   /// The `frames` Vec should have MsgFlags::MORE set correctly on all but the last Msg.
   pub async fn send_multipart(&self, frames: Vec<Msg>) -> Result<(), ZmqError> {
-    self.inner.send_multipart(frames).await
+    self.inner.send_multipart(FrameBatch::from_vec(frames)).await
   }
 
   /// Receives a complete multipart message from the socket.
@@ -138,7 +138,7 @@ impl Socket {
   /// receiving all parts of the message. If a timeout occurs mid-message,
   /// an error is returned and partial data is discarded.
   pub async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    self.inner.recv_multipart().await
+    self.inner.recv_multipart().await.map(|fb| fb.into_vec())
   }
 
   /// Sets a socket option asynchronously.

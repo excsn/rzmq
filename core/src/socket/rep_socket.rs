@@ -1,6 +1,6 @@
 use crate::delegate_to_core;
 use crate::error::ZmqError;
-use crate::message::{Blob, Msg, MsgFlags};
+use crate::message::{Blob, FrameBatch, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
@@ -18,7 +18,7 @@ use std::time::Duration;
 struct PeerInfo {
   source_pipe_read_id: usize,
   target_endpoint_uri: String,
-  routing_prefix: Vec<Msg>,
+  routing_prefix: FrameBatch,
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +30,7 @@ enum RepState {
 #[derive(Debug)]
 pub(crate) struct RepSocket {
   core: Arc<SocketCore>,
-  incoming_orchestrator: IncomingMessageOrchestrator<(PeerInfo, Vec<Msg>)>,
+  incoming_orchestrator: IncomingMessageOrchestrator<(PeerInfo, FrameBatch)>,
   state: ParkingLotMutex<RepState>,
   pipe_read_id_to_endpoint_uri: RwLock<HashMap<usize, String>>,
 }
@@ -54,7 +54,7 @@ impl RepSocket {
   async fn process_and_queue_rep_message(
     &self,
     pipe_read_id: usize,
-    raw_zmtp_message: Vec<Msg>,
+    raw_zmtp_message: FrameBatch,
   ) -> Result<(), ZmqError> {
     let target_endpoint_uri_for_reply = {
       let core_s_read = self.core_state_read();
@@ -65,8 +65,8 @@ impl RepSocket {
         .ok_or_else(|| ZmqError::Internal("REP: Endpoint URI lookup failed for request".into()))?
     };
 
-    let mut routing_prefix: Vec<Msg> = Vec::new();
-    let mut payload_frames: Vec<Msg> = Vec::new();
+    let mut routing_prefix: FrameBatch = FrameBatch::new();
+    let mut payload_frames: FrameBatch = FrameBatch::new();
     let mut delimiter_found = false;
 
     for frame in raw_zmtp_message {
@@ -83,7 +83,7 @@ impl RepSocket {
 
     if !delimiter_found {
       payload_frames = routing_prefix;
-      routing_prefix = Vec::new();
+      routing_prefix = FrameBatch::new();
     }
 
     let peer_info = PeerInfo {
@@ -132,7 +132,7 @@ impl ISocket for RepSocket {
   }
 
   async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
@@ -140,11 +140,13 @@ impl ISocket for RepSocket {
       msg.set_flags(msg.flags() & !MsgFlags::MORE);
     }
     self.incoming_orchestrator.reset_recv_message_buffer().await;
-    self.send_multipart(vec![msg]).await
+    let mut fb = FrameBatch::new();
+    fb.push(msg);
+    self.send_multipart(fb).await
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
@@ -161,7 +163,7 @@ impl ISocket for RepSocket {
 
     // The transform closure will be called by the orchestrator after it pops an item.
     // It is synchronous and returns the payload frames to the orchestrator's buffer.
-    let transform_fn = |(peer_info, payload_frames): (PeerInfo, Vec<Msg>)| {
+    let transform_fn = |(peer_info, payload_frames): (PeerInfo, FrameBatch)| {
       *self.state.lock() = RepState::ReceivedRequest(peer_info);
       AppFrames::Multiple(payload_frames)
     };
@@ -172,8 +174,8 @@ impl ISocket for RepSocket {
       .await
   }
 
-  async fn send_multipart(&self, payload_frames: Vec<Msg>) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+  async fn send_multipart(&self, payload_frames: FrameBatch) -> Result<(), ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     self.incoming_orchestrator.reset_recv_message_buffer().await;
@@ -212,8 +214,8 @@ impl ISocket for RepSocket {
       }
     };
 
-    let mut zmtp_wire_frames: Vec<Msg> =
-      Vec::with_capacity(peer_to_reply_to.routing_prefix.len() + user_payload_frames.len());
+    let mut zmtp_wire_frames: FrameBatch =
+      FrameBatch::with_capacity(peer_to_reply_to.routing_prefix.len() + user_payload_frames.len());
     zmtp_wire_frames.extend(peer_to_reply_to.routing_prefix);
     zmtp_wire_frames.extend(user_payload_frames);
 
@@ -242,8 +244,8 @@ impl ISocket for RepSocket {
     }
   }
 
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    if !self.core.is_running().await {
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
@@ -260,7 +262,7 @@ impl ISocket for RepSocket {
 
     // The transform function is synchronous and just passes the data through after we've
     // updated the state.
-    let transform_fn = |(peer_info, payload_frames): (PeerInfo, Vec<Msg>)| {
+    let transform_fn = |(peer_info, payload_frames): (PeerInfo, FrameBatch)| {
       *self.state.lock() = RepState::ReceivedRequest(peer_info);
       AppFrames::Multiple(payload_frames)
     };

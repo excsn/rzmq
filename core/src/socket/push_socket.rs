@@ -1,13 +1,14 @@
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
+use crate::socket::options::SocketOptions;
 use crate::socket::patterns::LoadBalancer;
 
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -18,22 +19,21 @@ use crate::{Blob, MsgFlags, delegate_to_core};
 #[derive(Debug)]
 pub(crate) struct PushSocket {
   core: Arc<SocketCore>,
-  load_balancer: LoadBalancer, // Stores endpoint_uri
-  /// Maps a pipe's read ID (from SocketCore's perspective) to the endpoint_uri of the connection.
-  /// Needed during `pipe_detached` to tell LoadBalancer which URI to remove.
+  load_balancer: LoadBalancer,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
+  cached_options: ArcSwap<SocketOptions>,
 }
 
 impl PushSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
+    let options_snapshot = core.core_state.read().options.clone();
     Self {
       core,
       load_balancer: LoadBalancer::new(),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
+      cached_options: ArcSwap::from(options_snapshot),
     }
   }
-
-  // Removed core_state(), direct access via self.core.core_state
 }
 
 #[async_trait]
@@ -62,14 +62,14 @@ impl ISocket for PushSocket {
   }
 
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       // Consistent with libzmq, PUSH with SNDTIMEO=0 would return EAGAIN if no peers.
       // If SNDTIMEO > 0, it would block/timeout.
       // Returning ResourceLimitReached implies "cannot send now".
       return Err(ZmqError::ResourceLimitReached);
     }
 
-    let sndtimeo_opt: Option<Duration> = self.core.core_state.read().options.sndtimeo;
+    let sndtimeo_opt = self.cached_options.load().sndtimeo;
 
     // 1. Select a peer connection URI using the load balancer.
     let endpoint_uri_to_send_to = loop {
@@ -173,8 +173,8 @@ impl ISocket for PushSocket {
     ))
   }
 
-  async fn send_multipart(&self, mut frames: Vec<Msg>) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+  async fn send_multipart(&self, mut frames: FrameBatch) -> Result<(), ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::ResourceLimitReached);
     }
     if frames.is_empty() {
@@ -192,7 +192,7 @@ impl ISocket for PushSocket {
     }
     // `frames` now correctly represents the ZMTP frames of one logical ZMQ message.
 
-    let sndtimeo_opt: Option<Duration> = self.core.core_state.read().options.sndtimeo;
+    let sndtimeo_opt = self.cached_options.load().sndtimeo;
 
     let endpoint_uri_to_send_to = loop {
       if let Some(uri) = self.load_balancer.get_next_connection_uri() {
@@ -202,7 +202,7 @@ impl ISocket for PushSocket {
           self.load_balancer.remove_connection(&uri);
         }
       } else {
-        if !self.core.is_running().await {
+        if !self.core.is_running() {
           return Err(ZmqError::InvalidState(
             "Socket terminated while waiting for peer".into(),
           ));
@@ -256,14 +256,18 @@ impl ISocket for PushSocket {
     }
   }
 
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
     Err(ZmqError::UnsupportedFeature(
       "PUSH sockets cannot receive messages",
     ))
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
-    delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec())
+    let result = delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec());
+    if result.is_ok() {
+      self.cached_options.store(self.core.core_state.read().options.clone());
+    }
+    result
   }
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     delegate_to_core!(self, UserGetOpt, option: option)

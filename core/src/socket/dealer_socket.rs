@@ -1,7 +1,7 @@
 use super::patterns::WritePipeCoordinator;
 use crate::delegate_to_core;
 use crate::error::ZmqError;
-use crate::message::{Blob, Msg, MsgFlags};
+use crate::message::{Blob, FrameBatch, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
@@ -27,7 +27,7 @@ const MAX_DEALER_SEND_BUFFER_PARTS: usize = 10240;
 enum DealerSendTransaction {
   Idle,
   Buffering {
-    parts: Vec<Msg>,
+    parts: FrameBatch,
     completion_notifier: Arc<Notify>,
   },
 }
@@ -35,7 +35,7 @@ enum DealerSendTransaction {
 #[derive(Debug)]
 struct DealerSocketOutgoingProcessor {
   core_handle: usize,
-  pending_queue: Arc<TokioMutex<VecDeque<Vec<Msg>>>>,
+  pending_queue: Arc<TokioMutex<VecDeque<FrameBatch>>>,
   load_balancer: Arc<LoadBalancer>,
   core_accessor: Arc<SocketCore>,
   queue_activity_notifier: Arc<Notify>,
@@ -52,7 +52,7 @@ impl DealerSocketOutgoingProcessor {
     );
 
     loop {
-      let mut current_message_to_send_option: Option<Vec<Msg>> = None;
+      let mut current_message_to_send_option: Option<FrameBatch> = None;
 
       tokio::select! {
         biased;
@@ -94,7 +94,7 @@ impl DealerSocketOutgoingProcessor {
         'peer_send_loop: while !message_successfully_sent_to_a_peer
           && attempts_this_message_cycle < max_attempts
         {
-          if !self.core_accessor.is_running().await {
+          if !self.core_accessor.is_running() {
             tracing::warn!(
               "[DealerProc {}] Socket closing, stopping send attempts for current message from queue.",
               self.core_handle
@@ -234,9 +234,9 @@ impl DealerSocketOutgoingProcessor {
 pub(crate) struct DealerSocket {
   core: Arc<SocketCore>,
   load_balancer: Arc<LoadBalancer>,
-  incoming_orchestrator: IncomingMessageOrchestrator<Vec<Msg>>,
+  incoming_orchestrator: IncomingMessageOrchestrator<FrameBatch>,
   pipe_read_to_endpoint_uri: ParkingLotRwLock<HashMap<usize, String>>,
-  pending_outgoing_queue: Arc<TokioMutex<VecDeque<Vec<Msg>>>>,
+  pending_outgoing_queue: Arc<TokioMutex<VecDeque<FrameBatch>>>,
   outgoing_queue_activity_notifier: Arc<Notify>,
   peer_availability_notifier: Arc<Notify>,
   processor_task_handle: TokioMutex<Option<JoinHandle<()>>>,
@@ -289,8 +289,8 @@ impl DealerSocket {
   fn process_incoming_zmtp_message_for_dealer(
     &self,
     pipe_read_id: usize,
-    mut frames: Vec<Msg>,
-  ) -> Result<Vec<Msg>, ZmqError> {
+    mut frames: FrameBatch,
+  ) -> Result<FrameBatch, ZmqError> {
     tracing::trace!(
       handle = self.core.handle,
       pipe_id = pipe_read_id,
@@ -362,7 +362,7 @@ impl DealerSocket {
     Ok(frames)
   }
 
-  fn prepare_full_multipart_send_sequence(&self, mut frames: Vec<Msg>) -> Vec<Msg> {
+  fn prepare_full_multipart_send_sequence(&self, mut frames: FrameBatch) -> FrameBatch {
     if self.framing.is_manual() {
       // Manual mode: do not insert delimiter.
       let len = frames.len();
@@ -381,7 +381,10 @@ impl DealerSocket {
       delimiter.set_flags(MsgFlags::MORE);
       let mut last_empty = Msg::new();
       last_empty.set_flags(last_empty.flags() & !MsgFlags::MORE);
-      return vec![delimiter, last_empty];
+      let mut fb = FrameBatch::new();
+      fb.push(delimiter);
+      fb.push(last_empty);
+      return fb;
     }
 
     self.framing.encode(&mut frames);
@@ -433,7 +436,7 @@ impl ISocket for DealerSocket {
   }
 
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
@@ -443,8 +446,10 @@ impl ISocket for DealerSocket {
       match &mut *transaction_guard {
         DealerSendTransaction::Idle => {
           let notifier = Arc::new(Notify::new());
+          let mut fb = FrameBatch::new();
+          fb.push(msg);
           *transaction_guard = DealerSendTransaction::Buffering {
-            parts: vec![msg],
+            parts: fb,
             completion_notifier: notifier,
           };
         }
@@ -471,7 +476,11 @@ impl ISocket for DealerSocket {
     } else {
       let (parts_to_send_app_level, notifier_opt) =
         match std::mem::replace(&mut *transaction_guard, DealerSendTransaction::Idle) {
-          DealerSendTransaction::Idle => (vec![msg], None),
+          DealerSendTransaction::Idle => {
+            let mut fb = FrameBatch::new();
+            fb.push(msg);
+            (fb, None)
+          }
           DealerSendTransaction::Buffering {
             mut parts,
             completion_notifier,
@@ -493,8 +502,8 @@ impl ISocket for DealerSocket {
     }
   }
 
-  async fn send_multipart(&self, user_frames: Vec<Msg>) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+  async fn send_multipart(&self, user_frames: FrameBatch) -> Result<(), ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
@@ -520,7 +529,7 @@ impl ISocket for DealerSocket {
 
           let closing_signal_future = async {
             loop {
-              if !self.core.is_running().await {
+              if !self.core.is_running() {
                 break;
               }
               tokio::time::sleep(Duration::from_millis(50)).await;
@@ -553,28 +562,28 @@ impl ISocket for DealerSocket {
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = { self.core.core_state.read().options.rcvtimeo };
     // For DEALER, QItem is Vec<Msg> (payload parts).
     // The transform_fn tells orchestrator.recv_message how to convert QItem into app_frames.
     // For DEALER, the QItem (payload Vec<Msg>) IS the app_frames for the orchestrator's buffer.
-    let transform_fn = |q_item: Vec<Msg>| AppFrames::Multiple(q_item);
+    let transform_fn = |q_item: FrameBatch| AppFrames::Multiple(q_item);
     self
       .incoming_orchestrator
       .recv_message(rcvtimeo_opt, transform_fn)
       .await
   }
 
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    if !self.core.is_running().await {
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
     let rcvtimeo_opt: Option<Duration> = { self.core.core_state.read().options.rcvtimeo };
     // For DEALER, QItem is Vec<Msg> (the payload parts). Transform is identity.
-    let transform_fn = |q_item: Vec<Msg>| AppFrames::Multiple(q_item);
+    let transform_fn = |q_item: FrameBatch| AppFrames::Multiple(q_item);
     self
       .incoming_orchestrator
       .recv_logical_message(rcvtimeo_opt, transform_fn)
@@ -643,7 +652,7 @@ impl ISocket for DealerSocket {
         }
       }
       Command::PipeMessageBatchReceived { msgs, .. } => {
-        let mut assembled_batch = Vec::new();
+        let mut assembled_batch: Vec<FrameBatch> = Vec::new();
         for msg in msgs {
           if let Some(raw) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
             match self.process_incoming_zmtp_message_for_dealer(pipe_read_id, raw) {
@@ -732,8 +741,8 @@ impl ISocket for DealerSocket {
 }
 
 impl DealerSocket {
-  async fn send_logical_message(&self, zmtp_wire_frames: Vec<Msg>) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+  async fn send_logical_message(&self, zmtp_wire_frames: FrameBatch) -> Result<(), ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState(
         "Socket is closing or terminated".into(),
       ));
@@ -757,7 +766,7 @@ impl DealerSocket {
       }
       attempts_this_message_cycle += 1;
 
-      if !self.core.is_running().await {
+      if !self.core.is_running() {
         return Err(ZmqError::InvalidState(
           "Socket closing mid-send_logical_message".into(),
         ));
@@ -866,7 +875,7 @@ impl DealerSocket {
 
   async fn queue_message_or_error(
     &self,
-    full_message_parts: Vec<Msg>,
+    full_message_parts: FrameBatch,
     global_sndhwm: usize,
     global_sndtimeo: Option<Duration>,
   ) -> Result<(), ZmqError> {
@@ -876,7 +885,7 @@ impl DealerSocket {
       full_message_parts.len()
     );
     loop {
-      if !self.core.is_running().await {
+      if !self.core.is_running() {
         return Err(ZmqError::InvalidState(
           "Socket is closing while trying to queue".into(),
         ));
@@ -901,7 +910,7 @@ impl DealerSocket {
         None => {
           tokio::select! {
             biased;
-             _ = async { if !self.core.is_running().await { futures::future::pending().await } else { futures::future::pending().await } } => {
+             _ = async { if !self.core.is_running() { futures::future::pending().await } else { futures::future::pending().await } } => {
                 return Err(ZmqError::InvalidState("Socket is closing while waiting for queue space".into()));
             }
             _ = self.outgoing_queue_activity_notifier.notified() => {}

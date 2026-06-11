@@ -1,6 +1,6 @@
 use super::patterns::incoming_orchestrator::{AppFrames, IncomingMessageOrchestrator};
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
@@ -158,7 +158,7 @@ impl ISocket for SubSocket {
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
@@ -176,14 +176,14 @@ impl ISocket for SubSocket {
     }
   }
 
-  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
+  async fn send_multipart(&self, _frames: FrameBatch) -> Result<(), ZmqError> {
     Err(ZmqError::InvalidState(
       "SUB sockets cannot send data messages",
     ))
   }
 
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    if !self.core.is_running().await {
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;

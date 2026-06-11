@@ -8,7 +8,7 @@ use crate::io_uring_backend::{
   ops::ProtocolConfig,
   UserData,
 };
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::MailboxSyncSender;
 use crate::socket::connection_iface::ISocketConnection;
 
@@ -65,8 +65,8 @@ impl HandlerManager {
     endpoint_uri: String,
     target_endpoint_uri: String,
     connection_iface: Arc<dyn ISocketConnection>,
-    inbound_data_tx: fibre::mpsc::BoundedSender<Vec<Msg>>,
-    inbound_data_rx: fibre::mpsc::BoundedAsyncReceiver<Vec<Msg>>,
+    inbound_data_tx: fibre::mpsc::BoundedSender<FrameBatch>,
+    inbound_data_rx: fibre::mpsc::BoundedAsyncReceiver<FrameBatch>,
     buffer_manager_for_interface: Option<&'a BufferRingManager>,
     default_bgid_val_from_worker: Option<u16>,
     originating_op_ud_for_connection: UserData,

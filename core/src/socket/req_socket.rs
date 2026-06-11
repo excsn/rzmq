@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::{Msg, MsgFlags};
+use crate::message::{FrameBatch, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
@@ -27,7 +27,7 @@ enum ReqState {
 pub(crate) struct ReqSocket {
   core: Arc<SocketCore>,
   load_balancer: LoadBalancer,
-  incoming_orchestrator: IncomingMessageOrchestrator<Vec<Msg>>,
+  incoming_orchestrator: IncomingMessageOrchestrator<FrameBatch>,
   state: ParkingLotMutex<ReqState>,
   reply_available_notifier: Arc<Notify>,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
@@ -53,8 +53,8 @@ impl ReqSocket {
   fn process_incoming_zmtp_message_for_req(
     &self,
     pipe_read_id: usize,
-    mut raw_zmtp_message: Vec<Msg>,
-  ) -> Result<Vec<Msg>, ZmqError> {
+    mut raw_zmtp_message: FrameBatch,
+  ) -> Result<FrameBatch, ZmqError> {
     if !raw_zmtp_message.is_empty() && raw_zmtp_message[0].size() == 0 {
       tracing::trace!(
         handle = self.core.handle,
@@ -104,7 +104,7 @@ impl ISocket for ReqSocket {
   }
 
   async fn send(&self, mut msg: Msg) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
@@ -171,7 +171,9 @@ impl ISocket for ReqSocket {
 
     let mut empty_delimiter = Msg::new();
     empty_delimiter.set_flags(MsgFlags::MORE);
-    let zmtp_frames_to_send = vec![empty_delimiter, msg];
+    let mut zmtp_frames_to_send = FrameBatch::new();
+    zmtp_frames_to_send.push(empty_delimiter);
+    zmtp_frames_to_send.push(msg);
 
     // === ASYNC OPERATION: Send Message (No Lock Held) ===
     match conn_iface.send_multipart(zmtp_frames_to_send).await {
@@ -200,7 +202,7 @@ impl ISocket for ReqSocket {
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
@@ -217,7 +219,7 @@ impl ISocket for ReqSocket {
     }
 
     let notifier = self.reply_available_notifier.clone();
-    let transform_fn_main = |q_item: Vec<Msg>| AppFrames::Multiple(q_item);
+    let transform_fn_main = |q_item: FrameBatch| AppFrames::Multiple(q_item);
     let orchestrator_fut = self
       .incoming_orchestrator
       .recv_message(rcvtimeo_opt, transform_fn_main);
@@ -226,11 +228,11 @@ impl ISocket for ReqSocket {
     tokio::select! {
       biased;
       _ = notifier.notified() => {
-        if !self.core.is_running().await {
+        if !self.core.is_running() {
           tracing::debug!("REQ recv: Notifier signaled, core not running. Exiting due to close.");
           received_msg_result = Err(ZmqError::ConnectionClosed);
         } else {
-          let transform_fn_poll = |q_item: Vec<Msg>| AppFrames::Multiple(q_item);
+          let transform_fn_poll = |q_item: FrameBatch| AppFrames::Multiple(q_item);
           match self.incoming_orchestrator.recv_message(Some(Duration::ZERO), transform_fn_poll).await {
             Ok(msg) => {
               received_msg_result = Ok(msg);
@@ -290,7 +292,7 @@ impl ISocket for ReqSocket {
     received_msg_result
   }
 
-  async fn send_multipart(&self, _frames: Vec<Msg>) -> Result<(), ZmqError> {
+  async fn send_multipart(&self, _frames: FrameBatch) -> Result<(), ZmqError> {
     tracing::warn!(
       handle = self.core.handle,
       "REQ socket: send_multipart() called. REQ sockets should use send() for single-part requests."
@@ -300,8 +302,8 @@ impl ISocket for ReqSocket {
     ))
   }
 
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    if !self.core.is_running().await {
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
@@ -317,7 +319,7 @@ impl ISocket for ReqSocket {
       }
     }
 
-    let transform_fn = |payload_frames: Vec<Msg>| {
+    let transform_fn = |payload_frames: FrameBatch| {
       let mut state_guard = self.state.lock();
       *state_guard = ReqState::ReadyToSend;
       self.reply_available_notifier.notify_waiters();

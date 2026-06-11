@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::runtime::system_events::ConnectionInteractionModel;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::MonitorSender;
@@ -81,7 +81,7 @@ pub enum Command {
   },
   PipeMessageBatchReceived {
     pipe_id: usize,
-    msgs: Vec<Msg>,
+    msgs: FrameBatch,
   },
   PipeClosedByPeer {
     pipe_id: usize,
@@ -97,7 +97,7 @@ pub enum Command {
 
   ScaInitializePipes {
     sca_handle_id: usize,
-    rx_from_core: AsyncReceiver<Vec<Msg>>,
+    rx_from_core: AsyncReceiver<FrameBatch>,
     core_pipe_read_id_for_incoming_routing: usize,
   },
 
@@ -123,7 +123,7 @@ pub enum Command {
     peer_identity: Option<Blob>,
     /// Dedicated per-connection inbound data channel. Taken once by command_processor
     /// to spawn the UringPipeReader task, bypassing the control mailbox for data delivery.
-    inbound_data_rx: Option<BoundedAsyncReceiver<Vec<Msg>>>,
+    inbound_data_rx: Option<BoundedAsyncReceiver<FrameBatch>>,
     /// Raw file descriptor for this connection. Passed to UringPipeReader so it can send
     /// `ResumeConnection { fd }` when the inbound channel drains below the LWM.
     fd: RawFd,

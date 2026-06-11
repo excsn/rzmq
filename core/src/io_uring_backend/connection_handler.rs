@@ -1,6 +1,6 @@
 #![cfg(feature = "io-uring")]
 
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::{Blob, ZmqError};
 
 use std::os::unix::io::RawFd;
@@ -296,7 +296,7 @@ pub trait ProtocolHandlerFactory: Send + Sync + 'static {
     is_server: bool,
     // Dedicated inbound data channel receiver. Stored in the handler and taken once
     // at handshake completion to be forwarded in UringConnectionEstablished.
-    inbound_data_rx: fibre::mpsc::BoundedAsyncReceiver<Vec<Msg>>,
+    inbound_data_rx: fibre::mpsc::BoundedAsyncReceiver<FrameBatch>,
   ) -> Result<Box<dyn UringConnectionHandler + Send>, String>;
 }
 
@@ -304,7 +304,7 @@ pub trait ProtocolHandlerFactory: Send + Sync + 'static {
 #[derive(Debug)]
 pub enum OutgoingMessage {
   Single(Msg),
-  Multipart(Vec<Msg>),
+  Multipart(FrameBatch),
 }
 
 #[derive(Clone)]
@@ -314,7 +314,7 @@ pub struct WorkerIoConfig {
   pub socket_mailbox: MailboxSyncSender,
   /// Dedicated data plane: sync sender used by the UringWorker OS thread to push decoded
   /// message batches directly to the per-connection reader task, bypassing the control mailbox.
-  pub inbound_data_tx: fibre::mpsc::BoundedSender<Vec<Msg>>,
+  pub inbound_data_tx: fibre::mpsc::BoundedSender<FrameBatch>,
   /// Logical endpoint URI for this connection (e.g. "tcp://1.2.3.4:5678").
   pub endpoint_uri: String,
   /// The original target URI requested by the user.

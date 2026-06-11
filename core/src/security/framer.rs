@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::{Msg, MsgFlags};
+use crate::message::{FrameBatch, Msg, MsgFlags};
 use crate::protocol::zmtp::{ZmtpCodec, manual_parser::ZmtpManualParser};
 use crate::security::IDataCipher;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -11,11 +11,11 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
   fn try_read_msg(&mut self, network_buffer: &mut BytesMut) -> Result<Option<Msg>, ZmqError>;
 
   /// Frames and encrypts a multi-part ZMTP message into a single byte buffer for the wire.
-  fn write_msg_multipart(&mut self, msgs: Vec<Msg>) -> Result<Bytes, ZmqError>;
+  fn write_msg_multipart(&mut self, msgs: FrameBatch) -> Result<Bytes, ZmqError>;
 
   /// Frames and coalesces a batch of multiple logical ZMQ messages into a single wire buffer.
   /// This eliminates per-message allocation and enables single-syscall transmission.
-  fn write_msg_batch(&mut self, batch: &[Vec<Msg>]) -> Result<Bytes, ZmqError>;
+  fn write_msg_batch(&mut self, batch: &[FrameBatch]) -> Result<Bytes, ZmqError>;
 
   /// Returns `true` when the framer performs no encryption — wire bytes ARE the message bytes.
   /// `false` (default) gates off the zero-copy lease path for encrypted connections.
@@ -27,7 +27,9 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
   /// header contains only the ZMTP frame prefix (≤9 bytes) and payload is a zero-copy
   /// ref to the message data. Encrypted framers fall back to `(merged_bytes, None)`.
   fn write_msg_split(&mut self, msg: Msg) -> Result<(Bytes, Option<Bytes>), ZmqError> {
-    let merged = self.write_msg_multipart(vec![msg])?;
+    let mut fb = FrameBatch::new();
+    fb.push(msg);
+    let merged = self.write_msg_multipart(fb)?;
     Ok((merged, None))
   }
 
@@ -37,7 +39,7 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
   /// Layout: `[hdr₁, payload₁, hdr₂, payload₂, ...]` where empty payloads are omitted.
   /// `NullFramer` overrides this for true zero-copy (payload is an Arc refcount increment).
   /// Encrypted framers use this default which falls back to a single encrypted buffer.
-  fn frame_vectored(&mut self, batch: &[Vec<Msg>]) -> Result<Vec<Bytes>, ZmqError> {
+  fn frame_vectored(&mut self, batch: &[FrameBatch]) -> Result<Vec<Bytes>, ZmqError> {
     Ok(vec![self.write_msg_batch(batch)?])
   }
 
@@ -88,7 +90,7 @@ impl ISecureFramer for NullFramer {
     self.parser.decode_from_buffer(network_buffer)
   }
 
-  fn write_msg_multipart(&mut self, msgs: Vec<Msg>) -> Result<Bytes, ZmqError> {
+  fn write_msg_multipart(&mut self, msgs: FrameBatch) -> Result<Bytes, ZmqError> {
     let mut codec = ZmtpCodec::new();
     let mut buffer = BytesMut::new();
     for msg in msgs {
@@ -97,7 +99,7 @@ impl ISecureFramer for NullFramer {
     Ok(buffer.freeze())
   }
 
-  fn write_msg_batch(&mut self, batch: &[Vec<Msg>]) -> Result<Bytes, ZmqError> {
+  fn write_msg_batch(&mut self, batch: &[FrameBatch]) -> Result<Bytes, ZmqError> {
     self.coalesce_buffer.clear();
     let mut codec = ZmtpCodec::new();
     for msgs in batch {
@@ -126,7 +128,7 @@ impl ISecureFramer for NullFramer {
     Ok((hdr.freeze(), Some(payload)))
   }
 
-  fn frame_vectored(&mut self, batch: &[Vec<Msg>]) -> Result<Vec<Bytes>, ZmqError> {
+  fn frame_vectored(&mut self, batch: &[FrameBatch]) -> Result<Vec<Bytes>, ZmqError> {
     let total_msgs: usize = batch.iter().map(|g| g.len()).sum();
     let mut out = Vec::with_capacity(total_msgs * 2);
     for group in batch {
@@ -202,7 +204,7 @@ impl ISecureFramer for LengthPrefixedFramer {
     }
   }
 
-  fn write_msg_multipart(&mut self, msgs: Vec<Msg>) -> Result<Bytes, ZmqError> {
+  fn write_msg_multipart(&mut self, msgs: FrameBatch) -> Result<Bytes, ZmqError> {
     let mut codec = ZmtpCodec::new();
     let mut plaintext_buffer = BytesMut::new();
     for msg in msgs {
@@ -218,7 +220,7 @@ impl ISecureFramer for LengthPrefixedFramer {
     Ok(final_buffer.freeze())
   }
 
-  fn write_msg_batch(&mut self, batch: &[Vec<Msg>]) -> Result<Bytes, ZmqError> {
+  fn write_msg_batch(&mut self, batch: &[FrameBatch]) -> Result<Bytes, ZmqError> {
     self.coalesce_buffer.clear();
     let mut codec = ZmtpCodec::new();
     for msgs in batch {

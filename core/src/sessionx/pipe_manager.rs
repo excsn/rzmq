@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::Msg;
+use crate::message::FrameBatch;
 use fibre::{RecvError, TryRecvError};
 use fibre::mpmc::AsyncReceiver;
 
@@ -20,7 +20,7 @@ impl CorePipeManagerX {
   }
 
   /// Attaches the pipes and routing information received from SocketCore.
-  pub(crate) fn attach(&mut self, rx_from_core: AsyncReceiver<Vec<Msg>>, core_pipe_read_id_for_incoming_routing: usize) {
+  pub(crate) fn attach(&mut self, rx_from_core: AsyncReceiver<FrameBatch>, core_pipe_read_id_for_incoming_routing: usize) {
     if self.state.is_attached {
       return;
     }
@@ -37,7 +37,7 @@ impl CorePipeManagerX {
   /// Attempts to receive a message from SocketCore (i.e., an outgoing message
   /// to be sent over the network).
   /// This is an async method that will await if the channel is empty.
-  pub(crate) async fn recv_from_core(&self) -> Result<Vec<Msg>, RecvError> {
+  pub(crate) async fn recv_from_core(&self) -> Result<FrameBatch, RecvError> {
     if let Some(ref rx) = self.state.rx_from_core {
       rx.recv().await
     } else {
@@ -59,7 +59,7 @@ impl CorePipeManagerX {
   /// Non-blocking check for a queued outbound message batch from SocketCore.
   /// Returns `Err(TryRecvError::Empty)` when the pipe is empty, or
   /// `Err(TryRecvError::Disconnected)` when not attached or the channel is closed.
-  pub(crate) fn try_recv_from_core(&self) -> Result<Vec<Msg>, TryRecvError> {
+  pub(crate) fn try_recv_from_core(&self) -> Result<FrameBatch, TryRecvError> {
     if let Some(ref rx) = self.state.rx_from_core {
       rx.try_recv()
     } else {
@@ -71,7 +71,7 @@ impl CorePipeManagerX {
   /// Appends up to `max` items to `out` in one channel pass and returns the count
   /// appended; `0` when the pipe is empty, closed, or not attached (closure is
   /// surfaced by the next blocking `recv_from_core`).
-  pub(crate) fn try_recv_batch_from_core(&self, out: &mut Vec<Vec<Msg>>, max: usize) -> usize {
+  pub(crate) fn try_recv_batch_from_core(&self, out: &mut Vec<FrameBatch>, max: usize) -> usize {
     if let Some(ref rx) = self.state.rx_from_core {
       rx.try_recv_batch_mut(out, max).unwrap_or(0)
     } else {
@@ -94,7 +94,7 @@ mod additional_pipe_manager_tests {
     let mut manager = CorePipeManagerX::new();
     assert!(!manager.is_attached());
 
-    let (tx, rx) = fibre::mpmc::bounded_async::<Vec<Msg>>(1);
+    let (tx, rx) = fibre::mpmc::bounded_async::<FrameBatch>(1);
     let _ = tx; // keep sender alive
     manager.attach(rx, 42);
 

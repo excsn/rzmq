@@ -1,6 +1,6 @@
 use crate::delegate_to_core;
 use crate::error::ZmqError;
-use crate::message::{Blob, Msg, MsgFlags};
+use crate::message::{Blob, FrameBatch, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
@@ -30,7 +30,7 @@ struct ActiveFragmentedSend {
 pub(crate) struct RouterSocket {
   core: Arc<SocketCore>,
   router_map_for_send: RouterMap,
-  incoming_orchestrator: IncomingMessageOrchestrator<(Blob, Vec<Msg>)>,
+  incoming_orchestrator: IncomingMessageOrchestrator<(Blob, FrameBatch)>,
   pipe_to_identity_shared_map: Arc<DashMap<usize, Blob>>,
   current_send_target: TokioMutex<Option<ActiveFragmentedSend>>,
   pipe_send_coordinator: Arc<WritePipeCoordinator>,
@@ -60,8 +60,8 @@ impl RouterSocket {
   fn process_incoming_zmtp_message(
     &self,
     pipe_read_id: usize,
-    mut raw_zmtp_message: Vec<Msg>,
-  ) -> Result<(Blob, Vec<Msg>), ZmqError> {
+    mut raw_zmtp_message: FrameBatch,
+  ) -> Result<(Blob, FrameBatch), ZmqError> {
     // The application should receive [sender_identity, payload...].
     // The 'payload' is the entire message received from the peer, after stripping
     // a single leading delimiter IF the peer is a REQ or DEALER.
@@ -122,8 +122,8 @@ impl RouterSocket {
     Ok((identity_blob, raw_zmtp_message))
   }
 
-  fn transform_qitem_to_app_frames(identity_blob: Blob, payload_frames_vec: Vec<Msg>) -> Vec<Msg> {
-    let mut result_frames = Vec::with_capacity(1 + payload_frames_vec.len());
+  fn transform_qitem_to_app_frames(identity_blob: Blob, payload_frames_vec: FrameBatch) -> FrameBatch {
+    let mut result_frames = FrameBatch::with_capacity(1 + payload_frames_vec.len());
     let id_bytes = Bytes::copy_from_slice(identity_blob.as_ref());
     let mut id_msg = Msg::from_bytes(id_bytes);
 
@@ -177,7 +177,7 @@ impl ISocket for RouterSocket {
   }
 
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
@@ -369,7 +369,7 @@ impl ISocket for RouterSocket {
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
-    if !self.core.is_running().await {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt = { self.core.core_state.read().options.rcvtimeo };
@@ -381,8 +381,8 @@ impl ISocket for RouterSocket {
       .await
   }
 
-  async fn send_multipart(&self, mut frames: Vec<Msg>) -> Result<(), ZmqError> {
-    if !self.core.is_running().await {
+  async fn send_multipart(&self, mut frames: FrameBatch) -> Result<(), ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     if frames.is_empty() {
@@ -511,8 +511,8 @@ impl ISocket for RouterSocket {
     }
   }
 
-  async fn recv_multipart(&self) -> Result<Vec<Msg>, ZmqError> {
-    if !self.core.is_running().await {
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
+    if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt = { self.core.core_state.read().options.rcvtimeo };

@@ -212,7 +212,8 @@ pub(crate) async fn initiate_core_shutdown(
   if coordinator.state != ShutdownPhase::Running {
     return;
   }
-  
+  core_arc.is_running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+
   tracing::info!(
     handle = core_handle,
     was_due_to_error,

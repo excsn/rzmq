@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 #[cfg(feature = "io-uring")]
 use crate::runtime::ActorType;
 use crate::runtime::system_events::ConnectionInteractionModel;
@@ -943,7 +943,7 @@ async fn handle_new_connection_established(
       }
 
       let (tx_core_to_sca, rx_sca_from_core) =
-        fibre::mpmc::bounded_async::<Vec<Msg>>(core_arc.core_state.read().options.sndhwm.max(1));
+        fibre::mpmc::bounded_async::<FrameBatch>(core_arc.core_state.read().options.sndhwm.max(1));
 
       let core_write_id = core_arc.context.inner().next_handle();
       let core_read_id = core_arc.context.inner().next_handle();

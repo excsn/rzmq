@@ -5,7 +5,7 @@ use crate::io_uring_backend::connection_handler::OutgoingMessage;
 use crate::io_uring_backend::ops::UringOpRequest;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::{WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING};
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
 use crate::socket::SocketEvent;
@@ -36,13 +36,14 @@ use tokio::time::timeout as tokio_timeout;
 pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
   /// Sends a single message as a convenience wrapper around `send_multipart`.
   async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
-    // Default implementation wraps the single message in a Vec and calls the primary method.
-    self.send_multipart(vec![msg]).await
+    let mut fb = FrameBatch::new();
+    fb.push(msg);
+    self.send_multipart(fb).await
   }
 
   /// Sends a complete logical message, which may consist of one or more parts.
   /// This is the primary method for sending data over the connection.
-  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError>;
+  async fn send_multipart(&self, msgs: FrameBatch) -> Result<(), ZmqError>;
 
   async fn close_connection(&self) -> Result<(), ZmqError>;
   fn as_any(&self) -> &dyn Any;
@@ -59,7 +60,7 @@ impl ISocketConnection for DummyConnection {
     ))
   }
 
-  async fn send_multipart(&self, _msgs: Vec<Msg>) -> Result<(), ZmqError> {
+  async fn send_multipart(&self, _msgs: FrameBatch) -> Result<(), ZmqError> {
     Err(ZmqError::UnsupportedFeature(
       "DummyConnection cannot send multipart".into(),
     ))
@@ -153,7 +154,7 @@ impl ISocketConnection for UringFdConnection {
     self.send_outgoing(OutgoingMessage::Single(msg)).await
   }
 
-  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+  async fn send_multipart(&self, msgs: FrameBatch) -> Result<(), ZmqError> {
     self.send_outgoing(OutgoingMessage::Multipart(msgs)).await
   }
 
@@ -192,7 +193,7 @@ pub(crate) struct InprocConnection {
   local_pipe_read_id_from_peer: usize,
   peer_inproc_name_or_uri: String,
   context: Context,
-  data_tx_to_peer: AsyncSender<Vec<Msg>>,
+  data_tx_to_peer: AsyncSender<FrameBatch>,
   monitor_tx: Option<MonitorSender>,
   socket_options: Arc<SocketOptions>,
 }
@@ -225,7 +226,7 @@ impl InprocConnection {
     local_pipe_read_id_from_peer: usize,
     peer_inproc_name_or_uri: String,
     context: Context,
-    data_tx_to_peer: AsyncSender<Vec<Msg>>,
+    data_tx_to_peer: AsyncSender<FrameBatch>,
     monitor_tx: Option<MonitorSender>,
     socket_options: Arc<SocketOptions>,
   ) -> Self {
@@ -244,7 +245,7 @@ impl InprocConnection {
 
 #[async_trait]
 impl ISocketConnection for InprocConnection {
-  async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+  async fn send_multipart(&self, msgs: FrameBatch) -> Result<(), ZmqError> {
     let timeout_opt = self.socket_options.sndtimeo;
 
     match timeout_opt {

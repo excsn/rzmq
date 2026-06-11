@@ -173,7 +173,7 @@ impl RouterMap {
 mod additional_router_map_tests {
   use super::*;
   use super::strategies::ReqPeerStrategy;
-  use crate::message::{Blob, Msg};
+  use crate::message::{Blob, FrameBatch, Msg};
   use crate::socket::patterns::framing::FramingLatch;
 
   #[tokio::test]
@@ -218,7 +218,7 @@ mod additional_router_map_tests {
     let req_strat = ReqPeerStrategy;
 
     let id_msg = Msg::from_static(b"destination-identity");
-    let payload = vec![Msg::from_static(b"hello")];
+    let payload: FrameBatch = smallvec::smallvec![Msg::from_static(b"hello")];
 
     let result = req_strat.prepare_wire_frames(id_msg, payload, &framing);
 
@@ -230,27 +230,19 @@ mod additional_router_map_tests {
 }
 
 pub(crate) mod strategies {
-  use crate::message::{Msg, MsgFlags};
+  use crate::message::{FrameBatch, Msg, MsgFlags};
   use crate::socket::patterns::framing::FramingLatch;
   use std::fmt::Debug;
 
-  /// Defines a strategy for how a ROUTER socket should prepare outgoing frames
-  /// based on the peer's socket type.
   pub(crate) trait RouterSendStrategy: Debug + Send + Sync + 'static {
-    /// Prepares the final Vec<Msg> to be sent over the wire.
-    ///
-    /// # Arguments
-    /// * `destination_identity_msg`: The first frame from the user, containing the routing ID.
-    /// * `payload_frames`: The rest of the frames from the user.
     fn prepare_wire_frames(
       &self,
       destination_identity_msg: Msg,
-      payload_frames: Vec<Msg>,
+      payload_frames: FrameBatch,
       framing: &FramingLatch,
-    ) -> Vec<Msg>;
+    ) -> FrameBatch;
   }
 
-  // Strategy for talking to REQ peers.
   #[derive(Debug)]
   pub(crate) struct ReqPeerStrategy;
 
@@ -258,12 +250,10 @@ pub(crate) mod strategies {
     fn prepare_wire_frames(
       &self,
       _destination_identity_msg: Msg,
-      payload_frames: Vec<Msg>,
+      payload_frames: FrameBatch,
       _framing: &FramingLatch,
-    ) -> Vec<Msg> {
-      // REQ peers expect: [empty_delimiter, payload...]
-      // The destination_identity_msg is discarded.
-      let mut zmtp_wire_frames = Vec::with_capacity(1 + payload_frames.len());
+    ) -> FrameBatch {
+      let mut zmtp_wire_frames = FrameBatch::with_capacity(1 + payload_frames.len());
       let mut delimiter = Msg::new();
       if !payload_frames.is_empty() {
         delimiter.set_flags(MsgFlags::MORE);
@@ -274,7 +264,6 @@ pub(crate) mod strategies {
     }
   }
 
-  // Strategy for talking to DEALER peers.
   #[derive(Debug)]
   pub(crate) struct DealerPeerStrategy;
 
@@ -282,26 +271,18 @@ pub(crate) mod strategies {
     fn prepare_wire_frames(
       &self,
       mut destination_identity_msg: Msg,
-      mut payload_frames: Vec<Msg>,
+      mut payload_frames: FrameBatch,
       framing: &FramingLatch,
-    ) -> Vec<Msg> {
-      // If Manual framing is enabled, we act as a raw ROUTER:
-      // We consume the destination identity (used for routing) but do NOT send it on the wire.
+    ) -> FrameBatch {
       if framing.is_manual() {
         return payload_frames;
       }
 
-      // A ROUTER must send [identity, delimiter, payload...] to a DEALER.
-
-      // 1. Prepare Identity (Must have MORE flag if payload follows)
       if !payload_frames.is_empty() {
         destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
       }
 
-      // 2. Insert Identity at the front.
       payload_frames.insert(0, destination_identity_msg);
-
-      // 3. Apply framing (Auto inserts delimiter at index 1, Manual does nothing)
       framing.encode(&mut payload_frames);
 
       payload_frames
@@ -315,17 +296,13 @@ pub(crate) mod strategies {
     fn prepare_wire_frames(
       &self,
       _destination_identity_msg: Msg,
-      payload_frames: Vec<Msg>,
+      payload_frames: FrameBatch,
       _framing: &FramingLatch,
-    ) -> Vec<Msg> {
-      // When a ROUTER sends to another ROUTER peer, it strips the peer's
-      // identity (the destination_identity_msg) for routing and sends
-      // only the remaining payload frames over the wire.
+    ) -> FrameBatch {
       payload_frames
     }
   }
 
-  // Default strategy for talking to ROUTER, REP, or unknown peers.
   #[derive(Debug)]
   pub(crate) struct DefaultRouterStrategy;
 
@@ -333,11 +310,9 @@ pub(crate) mod strategies {
     fn prepare_wire_frames(
       &self,
       mut destination_identity_msg: Msg,
-      mut payload_frames: Vec<Msg>,
+      mut payload_frames: FrameBatch,
       framing: &FramingLatch,
-    ) -> Vec<Msg> {
-      // Default behavior: [identity, empty_delimiter, payload...]
-
+    ) -> FrameBatch {
       if !payload_frames.is_empty() {
         destination_identity_msg.set_flags(destination_identity_msg.flags() | MsgFlags::MORE);
       }

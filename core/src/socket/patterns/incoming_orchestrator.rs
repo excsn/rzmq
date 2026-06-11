@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::{Msg, MsgFlags};
+use crate::message::{FrameBatch, Msg, MsgFlags};
 use crate::socket::patterns::fair_queue::FairQueue;
 #[allow(unused_imports)]
 use crate::Blob;
@@ -16,14 +16,14 @@ const RECV_REFILL_MAX: usize = 64;
 #[derive(Debug, Clone)]
 pub(crate) enum AppFrames {
   Single(Msg),
-  Multiple(Vec<Msg>),
+  Multiple(FrameBatch),
 }
 
 #[derive(Debug)]
 pub(crate) struct IncomingMessageOrchestrator<QItem: Send + 'static> {
   socket_core_handle: usize,
   main_incoming_queue: FairQueue<QItem>,
-  partial_pipe_messages: DashMap<usize, Vec<Msg>>,
+  partial_pipe_messages: DashMap<usize, FrameBatch>,
   // Buffer for delivering frames of a single QItem one-by-one via recv_message()
   current_recv_frames_buffer: ParkingMutex<VecDeque<Msg>>,
   // Cache of pre-fetched logical messages; serves recv()/recv_multipart() without channel waits
@@ -46,14 +46,14 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     self.partial_pipe_messages.contains_key(&pipe_read_id)
   }
 
-  pub fn accumulate_pipe_frame(&self, pipe_read_id: usize, incoming_frame: Msg) -> Result<Option<Vec<Msg>>, ZmqError> {
+  pub fn accumulate_pipe_frame(&self, pipe_read_id: usize, incoming_frame: Msg) -> Result<Option<FrameBatch>, ZmqError> {
     let is_last_frame_of_zmtp_message = !incoming_frame.is_more();
     if is_last_frame_of_zmtp_message {
       let mut assembled_message = self
         .partial_pipe_messages
         .remove(&pipe_read_id)
         .map(|(_key, val)| val)
-        .unwrap_or_else(Vec::new);
+        .unwrap_or_else(FrameBatch::new);
       assembled_message.push(incoming_frame);
       if assembled_message.is_empty() {
         tracing::warn!(
@@ -63,7 +63,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
       }
       Ok(Some(assembled_message))
     } else {
-      let mut pipe_buffer_entry = self.partial_pipe_messages.entry(pipe_read_id).or_insert_with(Vec::new);
+      let mut pipe_buffer_entry = self.partial_pipe_messages.entry(pipe_read_id).or_insert_with(FrameBatch::new);
       pipe_buffer_entry.value_mut().push(incoming_frame);
       Ok(None)
     }
@@ -166,7 +166,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     &self,
     rcvtimeo_opt: Option<Duration>,
     qitem_to_app_frames: impl FnOnce(QItem) -> AppFrames,
-  ) -> Result<Vec<Msg>, ZmqError> {
+  ) -> Result<FrameBatch, ZmqError> {
     {
       let mut buffer_guard = self.current_recv_frames_buffer.lock();
       if !buffer_guard.is_empty() {
@@ -180,7 +180,11 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
 
     let q_item = self.fetch_next_logical_item(rcvtimeo_opt).await?;
     match qitem_to_app_frames(q_item) {
-      AppFrames::Single(msg) => Ok(vec![msg]),
+      AppFrames::Single(msg) => {
+        let mut fb = FrameBatch::new();
+        fb.push(msg);
+        Ok(fb)
+      }
       AppFrames::Multiple(msgs) => Ok(msgs),
     }
   }
@@ -214,7 +218,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
         if msgs.len() == 1 {
           return Ok(msgs.pop().unwrap());
         }
-        let mut app_frames_deque = VecDeque::from(msgs);
+        let mut app_frames_deque: VecDeque<Msg> = msgs.into_iter().collect();
         let first_frame = app_frames_deque.pop_front().unwrap();
         {
           let mut buffer_guard = self.current_recv_frames_buffer.lock();

@@ -37,7 +37,7 @@ pub mod uring;
 // from the crate root (e.g., `rzmq::ZmqError`, `rzmq::Socket`).
 pub use context::Context;
 pub use error::ZmqError;
-pub use message::{Blob, Metadata, Msg, MsgFlags};
+pub use message::{Blob, FrameBatch, Metadata, Msg, MsgFlags};
 pub use runtime::Command;
 pub(crate) use runtime::{MailboxReceiver, MailboxSender};
 

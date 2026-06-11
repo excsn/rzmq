@@ -16,6 +16,7 @@ pub(crate) use state::CoreState;
 use state::ShutdownCoordinator;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
 
@@ -29,6 +30,8 @@ pub struct SocketCore {
   pub(crate) socket_logic: TokioRwLock<Option<std::sync::Weak<dyn ISocket>>>,
   // Manages the multi-stage shutdown process. Needs Tokio's Mutex as its methods are async.
   pub(crate) shutdown_coordinator: TokioMutex<ShutdownCoordinator>,
+  // Lockless running flag — false as soon as shutdown begins.
+  pub(crate) is_running_flag: AtomicBool,
 }
 
 impl SocketCore {
@@ -51,6 +54,7 @@ impl SocketCore {
       core_state: parking_lot::RwLock::new(core_state_instance_new),
       socket_logic: TokioRwLock::new(None),
       shutdown_coordinator: TokioMutex::new(ShutdownCoordinator::default()),
+      is_running_flag: AtomicBool::new(true),
     });
 
     let socket_logic_arc_impl: Arc<dyn ISocket> = match socket_type {
@@ -104,8 +108,7 @@ impl SocketCore {
       .and_then(|weak_ref| weak_ref.upgrade())
   }
 
-  pub(crate) async fn is_running(&self) -> bool {
-    // Assuming ShutdownPhase is in shutdown.rs or re-exported by state.rs
-    self.shutdown_coordinator.lock().await.state == state::ShutdownPhase::Running
+  pub(crate) fn is_running(&self) -> bool {
+    self.is_running_flag.load(Ordering::Relaxed)
   }
 }

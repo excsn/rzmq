@@ -1,11 +1,11 @@
-use crate::message::{Msg, MsgFlags};
+use crate::message::{FrameBatch, Msg, MsgFlags};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Function signature for framing operations (encode/decode).
-type FramingOp = fn(&mut Vec<Msg>);
+type FramingOp = fn(&mut FrameBatch);
 
 /// No-op function for Manual mode (Raw).
-fn noop(_: &mut Vec<Msg>) {}
+fn noop(_: &mut FrameBatch) {}
 
 /// A specialized latch that manages framing strategy.
 /// Starts as 'Auto' (0) and can be switched to 'Manual' (1) exactly once.
@@ -33,7 +33,7 @@ impl FramingLatch {
   /// Hot Path: Encode outgoing frames.
   /// Uses branchless array lookup to execute the correct strategy.
   #[inline(always)]
-  pub fn encode(&self, frames: &mut Vec<Msg>) {
+  pub fn encode(&self, frames: &mut FrameBatch) {
     let idx = self.mode.load(Ordering::Acquire);
     // Safety: idx & 1 ensures we never go out of bounds even if memory is corrupted,
     // allowing the compiler to elide bounds checks.
@@ -42,7 +42,7 @@ impl FramingLatch {
 
   /// Hot Path: Decode incoming frames.
   #[inline(always)]
-  pub fn decode(&self, frames: &mut Vec<Msg>) {
+  pub fn decode(&self, frames: &mut FrameBatch) {
     let idx = self.mode.load(Ordering::Acquire);
     (self.decoders[idx & 1])(frames);
   }
@@ -63,7 +63,7 @@ impl FramingLatch {
 
 // --- Optimized Auto Implementations ---
 
-pub(crate) fn router_auto_encode(frames: &mut Vec<Msg>) {
+pub(crate) fn router_auto_encode(frames: &mut FrameBatch) {
   // Assumes frames is [Identity, Payload...]
   // We want to insert a delimiter at index 1 -> [Identity, Delimiter, Payload...]
 
@@ -85,14 +85,14 @@ pub(crate) fn router_auto_encode(frames: &mut Vec<Msg>) {
   }
 }
 
-pub(crate) fn router_auto_decode(frames: &mut Vec<Msg>) {
+pub(crate) fn router_auto_decode(frames: &mut FrameBatch) {
   // Router receives [Identity, Delimiter, Payload...]. We remove index 1.
   if frames.len() > 1 {
     frames.remove(1);
   }
 }
 
-pub(crate) fn dealer_auto_encode(frames: &mut Vec<Msg>) {
+pub(crate) fn dealer_auto_encode(frames: &mut FrameBatch) {
   // Dealer sends [Payload...]. We insert Delimiter at index 0 -> [Delimiter, Payload...]
   let mut delimiter = Msg::new();
   if !frames.is_empty() {
@@ -101,7 +101,7 @@ pub(crate) fn dealer_auto_encode(frames: &mut Vec<Msg>) {
   frames.insert(0, delimiter);
 }
 
-pub(crate) fn dealer_auto_decode(frames: &mut Vec<Msg>) {
+pub(crate) fn dealer_auto_decode(frames: &mut FrameBatch) {
   // Dealer receives [Delimiter, Payload...]. We remove index 0.
   if !frames.is_empty() {
     frames.remove(0);
@@ -111,11 +111,12 @@ pub(crate) fn dealer_auto_decode(frames: &mut Vec<Msg>) {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use smallvec::smallvec;
 
   #[test]
   fn test_router_auto_encode() {
     // Case 1: Identity + Payload
-    let mut frames = vec![Msg::from_static(b"Identity"), Msg::from_static(b"Payload")];
+    let mut frames: FrameBatch = smallvec![Msg::from_static(b"Identity"), Msg::from_static(b"Payload")];
     router_auto_encode(&mut frames);
 
     assert_eq!(frames.len(), 3);
@@ -129,7 +130,7 @@ mod tests {
     assert!(!frames[2].is_more()); // Payload didn't have MORE
 
     // Case 2: Identity only (no payload)
-    let mut frames = vec![Msg::from_static(b"Identity")];
+    let mut frames: FrameBatch = smallvec![Msg::from_static(b"Identity")];
     router_auto_encode(&mut frames);
 
     assert_eq!(frames.len(), 2);
@@ -143,7 +144,7 @@ mod tests {
   #[test]
   fn test_dealer_auto_encode() {
     // Case 1: Payload
-    let mut frames = vec![Msg::from_static(b"Payload")];
+    let mut frames: FrameBatch = smallvec![Msg::from_static(b"Payload")];
     dealer_auto_encode(&mut frames);
 
     assert_eq!(frames.len(), 2);
@@ -154,7 +155,7 @@ mod tests {
     assert!(!frames[1].is_more());
 
     // Case 2: Empty payload list
-    let mut frames = vec![];
+    let mut frames: FrameBatch = FrameBatch::new();
     dealer_auto_encode(&mut frames);
 
     assert_eq!(frames.len(), 1);

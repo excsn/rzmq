@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::Msg;
+use crate::message::{FrameBatch, Msg};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::CoreState;
 
@@ -124,7 +124,7 @@ impl Distributor {
   /// Sends a logical ZMQ message (composed of one or more ZMTP frames) to all peers.
   pub async fn send_to_all_multipart(
     &self,
-    zmtp_frames: Vec<Msg>, // These are the ZMTP frames for one logical ZMQ message
+    zmtp_frames: FrameBatch,
     core_handle: usize,
     core_state_accessor: &parking_lot::RwLock<CoreState>,
   ) -> Result<(), Vec<(String, ZmqError)>> {
@@ -152,7 +152,7 @@ impl Distributor {
       };
 
       if let Some(conn_iface) = conn_iface_opt {
-        // Clone the Vec<Msg> for each peer, as send_multipart might be consumed or held by handler
+        // Clone the FrameBatch for each peer
         let frames_for_this_peer = zmtp_frames.clone();
         match conn_iface.send_multipart(frames_for_this_peer).await {
           Ok(()) => {
@@ -213,7 +213,7 @@ mod additional_distributor_tests {
 
   #[async_trait]
   impl ISocketConnection for MockConnection {
-    async fn send_multipart(&self, msgs: Vec<Msg>) -> Result<(), ZmqError> {
+    async fn send_multipart(&self, msgs: FrameBatch) -> Result<(), ZmqError> {
       if self.should_fail {
         return Err(ZmqError::ConnectionClosed);
       }
