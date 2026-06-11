@@ -92,90 +92,134 @@ pub(crate) struct InternalOpDetails {
   pub payload: InternalOpPayload,
 }
 
+/// Internal op user_data IDs are offset by this constant so they never overlap with
+/// external (app-visible) op IDs, which are allocated from the range 1..INTERNAL_OP_BASE.
+const INTERNAL_OP_BASE: u64 = 1_000_000_000;
+
 #[derive(Debug)]
 pub(crate) struct InternalOpTracker {
-  pub(crate) op_to_details: HashMap<UserData, InternalOpDetails>,
-  pub(crate) next_id: UserData,
+  /// Hot path: O(1) direct-index lookup via `user_data - INTERNAL_OP_BASE`.
+  pub(crate) op_to_details: slab::Slab<InternalOpDetails>,
+  /// Cold path: holds entries for in-flight SEND_ZC operations awaiting a second
+  /// notification CQE with the same `user_data`. Typically empty; bounded by active ZC sends.
+  pending_notifications: HashMap<UserData, InternalOpDetails>,
 }
 
 impl InternalOpTracker {
   pub fn new() -> Self {
     Self {
-      op_to_details: HashMap::new(),
-      next_id: 1_000_000_000,
+      op_to_details: slab::Slab::new(),
+      pending_notifications: HashMap::new(),
     }
   }
 
-  /// Generates a new UserData for an internal operation and maps it to its details,
-  /// including an optional payload.
+  /// Allocates a new `UserData` for an internal operation, stores its details, and returns the ID.
   pub fn new_op_id(
     &mut self,
     fd: RawFd,
     op_type: InternalOpType,
-    payload: InternalOpPayload, // Accept payload
+    payload: InternalOpPayload,
   ) -> UserData {
-    let id = self.next_id;
-    self.next_id = self.next_id.wrapping_add(1);
-    if self.next_id == 0 {
-      self.next_id = 1_000_000_000;
-    }
-    self.op_to_details.insert(
-      id,
-      InternalOpDetails {
-        fd,
-        op_type,
-        payload,
-      },
-    );
-    id
+    let key = self.op_to_details.insert(InternalOpDetails { fd, op_type, payload });
+    key as u64 + INTERNAL_OP_BASE
   }
 
   pub fn take_op_details(&mut self, user_data: UserData) -> Option<InternalOpDetails> {
-    self.op_to_details.remove(&user_data)
+    if user_data < INTERNAL_OP_BASE {
+      return None;
+    }
+    let key = (user_data - INTERNAL_OP_BASE) as usize;
+    if self.op_to_details.contains(key) {
+      Some(self.op_to_details.remove(key))
+    } else {
+      self.pending_notifications.remove(&user_data)
+    }
   }
 
   #[allow(dead_code)]
   pub fn get_op_details(&self, user_data: UserData) -> Option<&InternalOpDetails> {
-    self.op_to_details.get(&user_data)
+    if user_data < INTERNAL_OP_BASE {
+      return None;
+    }
+    let key = (user_data - INTERNAL_OP_BASE) as usize;
+    self.op_to_details.get(key)
+      .or_else(|| self.pending_notifications.get(&user_data))
+  }
+
+  /// Re-registers details for a SEND_ZC op that expects a second notification CQE with the
+  /// same `user_data`. The entry is moved to the secondary map so `take_op_details` can find
+  /// it when the kernel delivers the `IORING_CQE_F_NOTIF` completion.
+  pub fn reinsert_for_notification(&mut self, user_data: UserData, details: InternalOpDetails) {
+    self.pending_notifications.insert(user_data, details);
   }
 
   pub fn is_empty(&self) -> bool {
-    self.op_to_details.is_empty()
+    self.op_to_details.is_empty() && self.pending_notifications.is_empty()
   }
 
-  pub fn remove_ops_for_fd(&mut self, fd_to_remove: RawFd) -> Vec<InternalOpDetails> {
-    let keys: Vec<UserData> = self
-      .op_to_details
+  /// Returns all tracked `UserData` IDs (slab + notification map). Used for bulk cancellation
+  /// during shutdown.
+  pub fn all_op_ids(&self) -> Vec<UserData> {
+    self.op_to_details
       .iter()
-      .filter(|(_, v)| v.fd == fd_to_remove)
-      .map(|(k, _)| *k)
-      .collect();
-    keys.into_iter()
-      .filter_map(|k| self.op_to_details.remove(&k))
+      .map(|(k, _)| k as u64 + INTERNAL_OP_BASE)
+      .chain(self.pending_notifications.keys().copied())
       .collect()
   }
 
-  /// Finds all UserData for a given FD that match a predicate on the op_type.
+  pub fn remove_ops_for_fd(&mut self, fd_to_remove: RawFd) -> Vec<InternalOpDetails> {
+    let slab_keys: Vec<usize> = self
+      .op_to_details
+      .iter()
+      .filter(|(_, v)| v.fd == fd_to_remove)
+      .map(|(k, _)| k)
+      .collect();
+    let mut removed: Vec<InternalOpDetails> = slab_keys
+      .into_iter()
+      .map(|k| self.op_to_details.remove(k))
+      .collect();
+
+    let notif_keys: Vec<UserData> = self
+      .pending_notifications
+      .iter()
+      .filter(|(_, d)| d.fd == fd_to_remove)
+      .map(|(k, _)| *k)
+      .collect();
+    for k in notif_keys {
+      if let Some(d) = self.pending_notifications.remove(&k) {
+        removed.push(d);
+      }
+    }
+    removed
+  }
+
+  /// Finds all `UserData` for a given FD that match a predicate on the op_type.
   pub fn find_ops_for_fd(
     &self,
     fd_to_find: RawFd,
     predicate: impl Fn(InternalOpType) -> bool,
   ) -> Vec<UserData> {
-    self
+    let mut result: Vec<UserData> = self
       .op_to_details
       .iter()
-      .filter(|(_, details)| details.fd == fd_to_find && predicate(details.op_type))
-      .map(|(user_data, _)| *user_data)
-      .collect()
+      .filter(|(_, d)| d.fd == fd_to_find && predicate(d.op_type))
+      .map(|(k, _)| k as u64 + INTERNAL_OP_BASE)
+      .collect();
+    let from_notifs: Vec<UserData> = self
+      .pending_notifications
+      .iter()
+      .filter(|(_, d)| d.fd == fd_to_find && predicate(d.op_type))
+      .map(|(k, _)| *k)
+      .collect();
+    result.extend(from_notifs);
+    result
   }
 
   pub(crate) fn has_pending_read_op(&self, fd_to_check: RawFd) -> bool {
-    self.op_to_details.values().any(|details| {
-      details.fd == fd_to_check
-        && matches!(
-          details.op_type,
-          InternalOpType::RingRead | InternalOpType::RingReadMultishot
-        )
+    // pending_notifications holds ZC send continuations, never reads
+    self.op_to_details.values().any(|d| {
+      d.fd == fd_to_check
+        && matches!(d.op_type, InternalOpType::RingRead | InternalOpType::RingReadMultishot)
     })
   }
 }

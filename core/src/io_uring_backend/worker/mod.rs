@@ -298,8 +298,7 @@ impl UringWorker {
     let mut sq_for_shutdown = unsafe { self.ring.submission_shared() };
 
     // Cancel all in-flight internal kernel operations.
-    let internal_ops_to_cancel: Vec<UserData> =
-      self.internal_op_tracker.op_to_details.keys().copied().collect();
+    let internal_ops_to_cancel: Vec<UserData> = self.internal_op_tracker.all_op_ids();
 
     info!(
       "UringWorker: Draining state - Cancelling {} in-flight internal operations.",

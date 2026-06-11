@@ -1362,6 +1362,7 @@ dependencies = [
  "rand",
  "rstest",
  "serial_test",
+ "slab",
  "smallvec",
  "snow",
  "socket2",

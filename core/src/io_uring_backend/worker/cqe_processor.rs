@@ -827,7 +827,7 @@ pub(crate) fn process_all_cqes(
                       pool.release_buffer(send_buf_id);
                     }
                   } else {
-                    worker.internal_op_tracker.op_to_details.insert(cqe_user_data, InternalOpDetails {
+                    worker.internal_op_tracker.reinsert_for_notification(cqe_user_data, InternalOpDetails {
                       fd: handler_fd,
                       op_type: InternalOpType::SendZeroCopyLeased,
                       payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
@@ -851,7 +851,7 @@ pub(crate) fn process_all_cqes(
                       pool.release_buffer(send_buf_id);
                     }
                   } else {
-                    worker.internal_op_tracker.op_to_details.insert(cqe_user_data, InternalOpDetails {
+                    worker.internal_op_tracker.reinsert_for_notification(cqe_user_data, InternalOpDetails {
                       fd: handler_fd,
                       op_type: InternalOpType::SendZeroCopyLeased,
                       payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
@@ -888,7 +888,7 @@ pub(crate) fn process_all_cqes(
                     pool.release_buffer(send_buf_id);
                   }
                 } else {
-                  worker.internal_op_tracker.op_to_details.insert(cqe_user_data, InternalOpDetails {
+                  worker.internal_op_tracker.reinsert_for_notification(cqe_user_data, InternalOpDetails {
                     fd: handler_fd,
                     op_type: InternalOpType::SendZeroCopyLeased,
                     payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },

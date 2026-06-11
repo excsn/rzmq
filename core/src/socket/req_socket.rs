@@ -614,6 +614,7 @@ mod tests {
       shutdown_coordinator: tokio::sync::Mutex::new(
         crate::socket::core::state::ShutdownCoordinator::default(),
       ),
+      is_running_flag: std::sync::atomic::AtomicBool::new(true),
     });
 
     let req_socket = ReqSocket::new(core);
