@@ -1,8 +1,8 @@
-use rzmq::{Context, Msg, SocketType, ZmqError};
-use std::time::Duration;
-mod common; // Assumes common.rs is in the tests/ directory
+mod common;
 
-// Use constants for timeouts from common if defined, otherwise define here
+use rzmq::{Msg, SocketType, ZmqError};
+use std::time::Duration;
+
 const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
 const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -295,9 +295,7 @@ async fn test_req_rep_req_disconnects_before_reply() -> Result<(), ZmqError> {
   let send_result = rep.send(Msg::from_static(b"Reply")).await;
   println!("REP send result: {:?}", send_result);
 
-  // Expected error: The pipe should be closed. send_msg_with_timeout maps
-  // SendError to ConnectionClosed. The REP send might return this or
-  // potentially HostUnreachable if the core handles detachment that way.
+  // Expected error: The pipe should be closed.
   assert!(
     matches!(send_result, Err(ZmqError::InvalidState(_))),
     "Expected InvalidState error, got {:?}",

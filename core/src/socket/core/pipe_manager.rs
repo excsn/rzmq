@@ -1,11 +1,9 @@
 use crate::Command;
-use crate::context::Context as RzmqContext;
 use crate::error::ZmqError;
 use crate::error::ZmqResult;
-use crate::message::Msg;
-use crate::runtime::{ActorDropGuard, ActorType, mailbox, system_events::ConnectionInteractionModel};
+use crate::runtime::{ActorType, mailbox, system_events::ConnectionInteractionModel};
 use crate::socket::core::state::{EndpointInfo, EndpointType};
-use crate::socket::core::{SocketCore, command_processor};
+use crate::socket::core::SocketCore;
 use crate::socket::{ISocket, SocketEvent};
 use crate::socket::options::ZmtpEngineConfig;
 
@@ -16,113 +14,10 @@ use crate::sessionx::states::ActorConfigX;
 #[cfg(feature = "inproc")]
 use crate::transport::inproc_stream::InprocStream;
 
-use fibre::mpmc::{AsyncReceiver, AsyncSender};
 #[cfg(feature = "inproc")]
 use fibre::oneshot;
-use fibre::{SendError, TrySendError};
-#[cfg(feature = "io-uring")]
-use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
-
-/// Max messages drained from the pipe per wakeup; delivered to the socket as one
-/// `PipeMessageBatchReceived` command instead of one command per message.
-const PIPE_READ_BATCH_MAX: usize = 64;
-
-pub(crate) async fn run_pipe_reader_task(
-  context: RzmqContext,
-  core_handle: usize,
-  socket_logic_strong: Arc<dyn ISocket>,
-  pipe_read_id: usize,
-  pipe_receiver: AsyncReceiver<Msg>,
-) {
-  let pipe_reader_task_handle_id = context.inner().next_handle();
-  let pipe_reader_actor_type = ActorType::PipeReader; // This ActorType might be removed soon
-
-  let mut actor_drop_guard = ActorDropGuard::new(
-    context.clone(),
-    pipe_reader_task_handle_id,
-    pipe_reader_actor_type,
-    None, // PipeReader is not associated with a specific user-facing URI
-    Some(core_handle),
-  );
-
-  tracing::debug!(
-    core_handle = core_handle,
-    pipe_read_id = pipe_read_id,
-    pipe_reader_task_id = pipe_reader_task_handle_id,
-    "PipeReaderTask started."
-  );
-
-  let mut final_error_for_stopping: Option<ZmqError> = None;
-
-  loop {
-    // We can check if the socket logic is still alive if needed, but recv() will
-    // fail if the other end of the pipe is dropped, which is the primary signal.
-    // if socket_logic_strong.is_closed() { ... break; ... } // ISocket doesn't have is_closed()
-
-    match pipe_receiver.recv_batch(PIPE_READ_BATCH_MAX).await {
-      Ok(msgs) => {
-        let cmd_for_isocket = Command::PipeMessageBatchReceived {
-          pipe_id: pipe_read_id,
-          msgs,
-        };
-        if let Err(e) = socket_logic_strong
-          .handle_pipe_event(pipe_read_id, cmd_for_isocket)
-          .await
-        {
-          tracing::error!(
-            core_handle = core_handle,
-            pipe_reader_task_id = pipe_reader_task_handle_id,
-            pipe_read_id = pipe_read_id,
-            "PipeReaderTask: Error from ISocket::handle_pipe_event: {}. Stopping reader.",
-            e
-          );
-          if final_error_for_stopping.is_none() {
-            final_error_for_stopping = Some(e);
-          }
-          break;
-        }
-      }
-      Err(_) => {
-        // RecvError implies channel is closed and empty
-        tracing::debug!(
-          core_handle = core_handle,
-          pipe_reader_task_id = pipe_reader_task_handle_id,
-          pipe_read_id = pipe_read_id,
-          "PipeReaderTask: Data pipe closed by peer. Notifying ISocket."
-        );
-
-        let cmd_closed_for_isocket = Command::PipeClosedByPeer {
-          pipe_id: pipe_read_id,
-        };
-        if let Err(e) = socket_logic_strong
-          .handle_pipe_event(pipe_read_id, cmd_closed_for_isocket)
-          .await
-        {
-          tracing::warn!(
-            core_handle = core_handle,
-            "PipeReaderTask: Error from ISocket::handle_pipe_event for PipeClosedByPeer: {}.",
-            e
-          );
-          if final_error_for_stopping.is_none() {
-            final_error_for_stopping = Some(e);
-          }
-        }
-
-        break;
-      }
-    }
-  }
-
-  if let Some(err) = final_error_for_stopping.take() {
-    actor_drop_guard.set_error(err);
-  } else {
-    actor_drop_guard.waive();
-  }
-}
 
 pub(crate) async fn cleanup_stopped_child_resources(
   core_arc: Arc<SocketCore>,
@@ -198,8 +93,6 @@ pub(crate) async fn cleanup_stopped_child_resources(
       tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, uri=%ep_info.endpoint_uri, "Removed pipe state for stopped child.");
     }
 
-    // uring_fd_to_endpoint_uri removed — UringFd commands are now URI-keyed.
-
     // Send monitor event for the disconnection/closure.
     let monitor_event = match (ep_info.endpoint_type, error_opt) {
       (EndpointType::Session, Some(e @ &ZmqError::SecurityError(_)))
@@ -261,6 +154,7 @@ pub(crate) async fn cleanup_stopped_child_resources(
   should_consider_reconnect
 }
 
+// TODO cleanup
 pub(crate) async fn cleanup_session_state_by_uri(
   core_arc: Arc<SocketCore>,
   endpoint_uri: &str,
@@ -338,6 +232,7 @@ pub(crate) async fn cleanup_session_state_by_uri(
   Some(ep_info_to_process)
 }
 
+// TODO cleanup
 pub(crate) async fn cleanup_session_state_by_pipe(
   core_arc: Arc<SocketCore>,
   pipe_read_id: usize,
@@ -496,86 +391,4 @@ pub(crate) async fn process_inproc_binding_request_event(
   tracing::info!(binder_handle = binder_core_handle, %connector_uri, "Inproc binder SCAX spawned; sending Ok to connector.");
   let _ = reply_tx_to_connector.send(Ok(()));
   Ok(())
-}
-
-pub(crate) async fn send_msg_with_timeout(
-  pipe_tx: &AsyncSender<Msg>,
-  msg: Msg,
-  timeout_opt: Option<Duration>,
-  socket_core_handle: usize,
-  pipe_target_id: usize,
-) -> Result<(), ZmqError> {
-  match timeout_opt {
-    None => {
-      tracing::trace!(
-        core_handle = socket_core_handle,
-        pipe_id = pipe_target_id,
-        "Sending message via pipe (blocking on HWM)"
-      );
-      pipe_tx.send(msg).await.map_err(|_| {
-        tracing::debug!(
-          core_handle = socket_core_handle,
-          pipe_id = pipe_target_id,
-          "Pipe send failed (ConnectionClosed)"
-        );
-        ZmqError::ConnectionClosed
-      })
-    }
-    Some(d) if d.is_zero() => {
-      tracing::trace!(
-        core_handle = socket_core_handle,
-        pipe_id = pipe_target_id,
-        "Attempting non-blocking send via pipe"
-      );
-
-      match pipe_tx.try_send(msg) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_failed_msg_back)) => {
-          tracing::trace!(
-            core_handle = socket_core_handle,
-            pipe_id = pipe_target_id,
-            "Non-blocking pipe send failed (HWM - ResourceLimitReached)"
-          );
-          Err(ZmqError::ResourceLimitReached)
-        }
-        Err(TrySendError::Closed(_failed_msg_back)) => {
-          tracing::debug!(
-            core_handle = socket_core_handle,
-            pipe_id = pipe_target_id,
-            "Non-blocking pipe send failed (ConnectionClosed)"
-          );
-          Err(ZmqError::ConnectionClosed)
-        }
-        _ => unreachable!(),
-      }
-    }
-    Some(timeout_duration) => {
-      tracing::trace!(
-        core_handle = socket_core_handle,
-        pipe_id = pipe_target_id,
-        send_timeout_duration = ?timeout_duration,
-        "Attempting timed send via pipe"
-      );
-      match timeout(timeout_duration, pipe_tx.send(msg)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(SendError::Closed)) => {
-          tracing::debug!(
-            core_handle = socket_core_handle,
-            pipe_id = pipe_target_id,
-            "Timed pipe send failed (ConnectionClosed)"
-          );
-          Err(ZmqError::ConnectionClosed)
-        }
-        Err(_timeout_elapsed_error) => {
-          tracing::trace!(
-            core_handle = socket_core_handle,
-            pipe_id = pipe_target_id,
-            "Timed pipe send failed (Timeout on HWM)"
-          );
-          Err(ZmqError::Timeout)
-        }
-        _ => unreachable!(),
-      }
-    }
-  }
 }

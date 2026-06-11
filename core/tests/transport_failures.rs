@@ -1,14 +1,10 @@
-// tests/transport_failures.rs
-
-use rzmq::socket::options::SNDTIMEO; // Import SNDTIMEO
-use rzmq::{Context, Msg, SocketType, ZmqError};
-use std::fs::{self, File}; // For creating dummy files/dirs
+use rzmq::socket::options::SNDTIMEO;
+use rzmq::{Msg, SocketType, ZmqError};
+use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
 use std::time::Duration;
 mod common;
 
-const SHORT_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECT_RETRY_WAIT: Duration = Duration::from_millis(300); // Time for connect attempts
 
 // --- Test: Connect to TCP address with no listener ---
@@ -16,9 +12,9 @@ const CONNECT_RETRY_WAIT: Duration = Duration::from_millis(300); // Time for con
 async fn test_tcp_connect_fail_no_listener() -> Result<(), ZmqError> {
   println!("Starting test_tcp_connect_fail_no_listener...");
   let ctx = common::test_context();
-  let req = ctx.socket(SocketType::Req)?; // Using REQ as an example client
+  let req = ctx.socket(SocketType::Req)?;
 
-  let unused_endpoint = "tcp://127.0.0.1:5690"; // Port unlikely to be in use
+  let unused_endpoint = "tcp://127.0.0.1:5690";
   println!("REQ connecting to non-existent endpoint {}...", unused_endpoint);
 
   // Connect call itself should succeed immediately as it's async setup
