@@ -27,6 +27,10 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+/// Max messages drained from the pipe per wakeup; delivered to the socket as one
+/// `PipeMessageBatchReceived` command instead of one command per message.
+const PIPE_READ_BATCH_MAX: usize = 64;
+
 pub(crate) async fn run_pipe_reader_task(
   context: RzmqContext,
   core_handle: usize,
@@ -59,11 +63,11 @@ pub(crate) async fn run_pipe_reader_task(
     // fail if the other end of the pipe is dropped, which is the primary signal.
     // if socket_logic_strong.is_closed() { ... break; ... } // ISocket doesn't have is_closed()
 
-    match pipe_receiver.recv().await {
-      Ok(msg) => {
-        let cmd_for_isocket = Command::PipeMessageReceived {
+    match pipe_receiver.recv_batch(PIPE_READ_BATCH_MAX).await {
+      Ok(msgs) => {
+        let cmd_for_isocket = Command::PipeMessageBatchReceived {
           pipe_id: pipe_read_id,
-          msg,
+          msgs,
         };
         if let Err(e) = socket_logic_strong
           .handle_pipe_event(pipe_read_id, cmd_for_isocket)

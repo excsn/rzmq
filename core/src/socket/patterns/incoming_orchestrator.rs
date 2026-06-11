@@ -1,6 +1,6 @@
 use crate::error::ZmqError;
 use crate::message::{Msg, MsgFlags};
-use crate::socket::patterns::fair_queue::{FairQueue, PushError};
+use crate::socket::patterns::fair_queue::FairQueue;
 #[allow(unused_imports)]
 use crate::Blob;
 use dashmap::DashMap;
@@ -8,6 +8,10 @@ use parking_lot::Mutex as ParkingMutex;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::time::timeout as tokio_timeout;
+
+/// Max items pulled from the FairQueue per batch wait; the surplus beyond the first
+/// is cached in `pending_logical_messages` and served without further channel waits.
+const RECV_REFILL_MAX: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) enum AppFrames {
@@ -78,21 +82,10 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
     }
   }
 
-  /// Pushes a batch of assembled logical messages to the FairQueue.
-  /// Uses synchronous try_push_item first; falls back to blocking push_item on HWM.
-  pub async fn queue_batch(&self, _pipe_read_id: usize, items: Vec<QItem>) -> Result<(), ZmqError> {
-    for item in items {
-      match self.main_incoming_queue.try_push_item(item) {
-        Ok(()) => {}
-        Err(PushError::Full(returned)) => {
-          self.main_incoming_queue.push_item(returned).await?;
-        }
-        Err(PushError::Closed(_)) => {
-          return Err(ZmqError::Internal("FairQueue closed during batch push".into()));
-        }
-      }
-    }
-    Ok(())
+  /// Pushes a batch of assembled logical messages to the FairQueue in one batch
+  /// operation (single channel pass + coalesced wakeups), blocking on HWM as needed.
+  pub async fn queue_batch(&self, _pipe_read_id: usize, mut items: Vec<QItem>) -> Result<(), ZmqError> {
+    self.main_incoming_queue.push_batch(&mut items).await
   }
 
   pub(crate) async fn fetch_next_logical_item(
@@ -106,8 +99,12 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
   }
 
   /// Helper to pop a QItem from the main FairQueue with timeout logic.
+  ///
+  /// Pops in batches: the first item is returned and the surplus is cached in
+  /// `pending_logical_messages` (served by `fetch_next_logical_item` before any
+  /// channel wait), so the per-message async channel cost is amortized.
   pub(crate) async fn recv_item_from_main_queue(&self, rcvtimeo_opt: Option<Duration>) -> Result<QItem, ZmqError> {
-    let pop_future = self.main_incoming_queue.pop_item();
+    let pop_future = self.pop_batch_and_cache();
     match rcvtimeo_opt {
       Some(duration) if !duration.is_zero() => match tokio_timeout(duration, pop_future).await {
         Ok(Ok(Some(item))) => Ok(item),
@@ -117,9 +114,17 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
       },
       _ => {
         if rcvtimeo_opt == Some(Duration::ZERO) {
-          match self.main_incoming_queue.try_pop_item() {
-            Ok(Some(item)) => Ok(item),
-            Ok(None) => Err(ZmqError::ResourceLimitReached),
+          let mut popped: Vec<QItem> = Vec::new();
+          match self.main_incoming_queue.try_pop_batch(&mut popped, RECV_REFILL_MAX) {
+            Ok(0) => Err(ZmqError::ResourceLimitReached),
+            Ok(_) => {
+              let mut iter = popped.into_iter();
+              let first = iter.next().unwrap();
+              if iter.len() > 0 {
+                self.pending_logical_messages.lock().extend(iter);
+              }
+              Ok(first)
+            }
             Err(ZmqError::Internal(msg)) if msg.contains("closed") => {
               Err(ZmqError::InvalidState("Socket terminated".into()))
             }
@@ -134,6 +139,25 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
           }
         }
       }
+    }
+  }
+
+  /// Pops up to `RECV_REFILL_MAX` items from the FairQueue in one batch wait,
+  /// returning the first and caching the rest in `pending_logical_messages`.
+  /// Cancel-safe: the underlying batch receive future is cancel-safe, so a
+  /// timeout cancellation cannot lose items.
+  async fn pop_batch_and_cache(&self) -> Result<Option<QItem>, ZmqError> {
+    match self.main_incoming_queue.pop_batch(RECV_REFILL_MAX).await? {
+      Some(items) => {
+        let mut iter = items.into_iter();
+        let first = iter.next();
+        debug_assert!(first.is_some(), "pop_batch returned an empty batch");
+        if iter.len() > 0 {
+          self.pending_logical_messages.lock().extend(iter);
+        }
+        Ok(first)
+      }
+      None => Ok(None),
     }
   }
 

@@ -22,6 +22,9 @@ use crate::transport::{ZmtpReadHalf, ZmtpStdStream, ZmtpWriteHalf};
 
 // ─── Read Half ───────────────────────────────────────────────────────────────
 
+/// Max chunks pulled from the worker channel per batch refill in `try_recv_bytes`.
+const CHUNK_REFILL_MAX: usize = 16;
+
 /// Owned read half of a split `UringStream`.
 ///
 /// Holds the inbound bytes channel and any partially-consumed active chunk.
@@ -30,6 +33,9 @@ pub(crate) struct UringReadHalf {
   rx_from_worker: fibre::mpsc::BoundedAsyncReceiver<Bytes>,
   /// Active chunk with remaining bytes for partial drains.
   current_lease: Option<Bytes>,
+  /// Chunks pulled ahead from the worker channel by a batch refill, served in FIFO
+  /// order before the channel is polled again. May contain the empty EOF sentinel.
+  pending_chunks: std::collections::VecDeque<Bytes>,
   worker_asleep: Arc<AtomicU8>,
   event_fd: EventFD,
   /// Wakeup threshold: write EventFD when channel occupancy drops to or below this value.
@@ -64,6 +70,19 @@ impl AsyncRead for UringReadHalf {
       return Poll::Ready(Ok(()));
     }
 
+    // Serve any chunk pulled ahead by a batch refill before polling the channel.
+    if let Some(bytes) = self.pending_chunks.pop_front() {
+      if bytes.is_empty() {
+        return Poll::Ready(Ok(())); // EOF sentinel
+      }
+      let to_copy = bytes.len().min(buf.remaining());
+      buf.put_slice(&bytes[..to_copy]);
+      if to_copy < bytes.len() {
+        self.current_lease = Some(bytes.slice(to_copy..));
+      }
+      return Poll::Ready(Ok(()));
+    }
+
     // Wait for the next chunk from the worker.
     match Pin::new(&mut self.rx_from_worker).poll_next(cx) {
       Poll::Pending => Poll::Pending,
@@ -80,18 +99,7 @@ impl AsyncRead for UringReadHalf {
         if to_copy < bytes.len() {
           self.current_lease = Some(bytes.slice(to_copy..));
         }
-        // Nudge the worker awake if it confirmed itself asleep. During active
-        // streaming worker_asleep is false, so this write is skipped entirely.
-        if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
-          if self.worker_asleep.compare_exchange(
-            WAKEUP_STATE_SLEEPING,
-            WAKEUP_STATE_SIGNALED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-          ).is_ok() {
-            let _ = self.event_fd.write(1);
-          }
-        }
+        self.wake_worker_if_asleep();
         Poll::Ready(Ok(()))
       }
     }
@@ -99,6 +107,22 @@ impl AsyncRead for UringReadHalf {
 }
 
 impl UringReadHalf {
+  /// Nudge the worker awake if it confirmed itself asleep. During active
+  /// streaming `worker_asleep` is false, so this write is skipped entirely.
+  #[inline]
+  fn wake_worker_if_asleep(&self) {
+    if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+      if self.worker_asleep.compare_exchange(
+        WAKEUP_STATE_SLEEPING,
+        WAKEUP_STATE_SIGNALED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+      ).is_ok() {
+        let _ = self.event_fd.write(1);
+      }
+    }
+  }
+
   /// Poll for the next raw inbound chunk without copying into a `ReadBuf`.
   pub(crate) fn poll_recv_bytes(
     mut self: Pin<&mut Self>,
@@ -110,18 +134,12 @@ impl UringReadHalf {
         "UringReadHalf: partial chunk active; drain before polling raw bytes",
       )));
     }
+    if let Some(bytes) = self.pending_chunks.pop_front() {
+      return Poll::Ready(Ok(bytes));
+    }
     match Pin::new(&mut self.rx_from_worker).poll_next(cx) {
       Poll::Ready(Some(bytes)) => {
-        if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
-          if self.worker_asleep.compare_exchange(
-            WAKEUP_STATE_SLEEPING,
-            WAKEUP_STATE_SIGNALED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-          ).is_ok() {
-            let _ = self.event_fd.write(1);
-          }
-        }
+        self.wake_worker_if_asleep();
         Poll::Ready(Ok(bytes))
       }
       Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
@@ -132,32 +150,30 @@ impl UringReadHalf {
     }
   }
 
-  /// Try to receive the next chunk synchronously (noop waker — always returns immediately).
+  /// Try to receive the next chunk synchronously (always returns immediately).
+  ///
+  /// Refills from the worker channel in batches of up to `CHUNK_REFILL_MAX`:
+  /// one channel pass and at most one worker wakeup per refill instead of per chunk.
   pub(crate) fn try_recv_bytes(&mut self) -> Option<io::Result<Bytes>> {
     if let Some(lease) = self.current_lease.take() {
       return Some(Ok(lease));
     }
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    match Pin::new(&mut self.rx_from_worker).poll_next(&mut cx) {
-      Poll::Ready(Some(bytes)) => {
-        if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
-          if self.worker_asleep.compare_exchange(
-            WAKEUP_STATE_SLEEPING,
-            WAKEUP_STATE_SIGNALED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-          ).is_ok() {
-            let _ = self.event_fd.write(1);
-          }
-        }
-        Some(Ok(bytes))
+    if let Some(chunk) = self.pending_chunks.pop_front() {
+      return Some(Ok(chunk));
+    }
+    match self.rx_from_worker.try_recv_batch(CHUNK_REFILL_MAX) {
+      Ok(chunks) => {
+        let mut iter = chunks.into_iter();
+        let first = iter.next()?; // batch is guaranteed non-empty
+        self.pending_chunks.extend(iter);
+        self.wake_worker_if_asleep();
+        Some(Ok(first))
       }
-      Poll::Ready(None) => Some(Err(io::Error::new(
+      Err(fibre::TryRecvError::Empty) => None,
+      Err(fibre::TryRecvError::Disconnected) => Some(Err(io::Error::new(
         io::ErrorKind::ConnectionAborted,
         "UringReadHalf: worker channel closed",
       ))),
-      Poll::Pending => None,
     }
   }
 
@@ -714,6 +730,7 @@ impl ZmtpStdStream for UringStream {
       fd: self.fd,
       rx_from_worker: self.rx_from_worker,
       current_lease: self.current_lease,
+      pending_chunks: std::collections::VecDeque::new(),
       worker_asleep: Arc::clone(&self.worker_asleep),
       event_fd: self.event_fd.clone(),
       channel_lwm: self.channel_lwm,

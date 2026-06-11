@@ -1,7 +1,6 @@
 #![cfg(feature = "io-uring")]
 
 use std::any::Any;
-use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -71,7 +70,12 @@ pub(crate) struct UringByteHandler {
   raw_egress_rx: fibre::mpsc::BoundedReceiver<EgressChunk>,
   multishot_reader: Option<MultishotReader>,
   is_closing: bool,
-  spillover: VecDeque<Bytes>,
+  /// FIFO overflow stash for inbound chunks when `raw_inbound_tx` is full.
+  /// `Vec` (not `VecDeque`) so it can feed `try_send_batch_mut`, which drains
+  /// sent items from the front and leaves the unsent tail in place.
+  spillover: Vec<Bytes>,
+  /// Reusable scratch for batch-draining `raw_egress_rx` in `prepare_sqes`.
+  egress_scratch: Vec<EgressChunk>,
   /// When true and payload exceeds `ZC_SEND_THRESHOLD`, emit `RequestSendZeroCopy`.
   use_send_zerocopy: bool,
   /// When true, instantiate `MultishotReader` in `connection_ready`. Mirrors the
@@ -110,7 +114,8 @@ impl UringByteHandler {
       raw_egress_rx,
       multishot_reader: None,
       is_closing: false,
-      spillover: VecDeque::new(),
+      spillover: Vec::new(),
+      egress_scratch: Vec::new(),
       use_send_zerocopy,
       use_recv_multishot,
       send_buffer_slot_size,
@@ -118,23 +123,29 @@ impl UringByteHandler {
   }
 
   fn try_drain_spillover(&mut self) -> bool {
+    if self.spillover.is_empty() {
+      return true;
+    }
     let initial_len = self.spillover.len();
-    while let Some(bytes) = self.spillover.pop_front() {
-      match self.raw_inbound_tx.try_send(bytes) {
-        Ok(()) => {}
-        Err(fibre::TrySendError::Full(returned)) => {
-          self.spillover.push_front(returned);
-          return false;
-        }
-        Err(_) => {} // receiver dropped; discard
+    // One batch pass: sent chunks are drained from the front; on a full channel the
+    // unsent tail stays in `spillover`, preserving FIFO order.
+    match self.raw_inbound_tx.try_send_batch_mut(&mut self.spillover) {
+      Ok(_sent) => {}
+      Err(_) => {
+        // Receiver dropped; discard buffered chunks.
+        self.spillover.clear();
       }
     }
-    tracing::trace!(
-      fd = self.fd,
-      drained_chunks = initial_len,
-      "UringByteHandler: spillover fully drained"
-    );
-    true
+    if self.spillover.is_empty() {
+      tracing::trace!(
+        fd = self.fd,
+        drained_chunks = initial_len,
+        "UringByteHandler: spillover fully drained"
+      );
+      true
+    } else {
+      false
+    }
   }
 
   /// Prepare a multishot cancel blueprint when we need to stop kernel-side reads.
@@ -220,7 +231,7 @@ impl UringConnectionHandler for UringByteHandler {
       //   chunk_len = bytes.len(),
       //   "UringByteHandler: stashing incoming chunk to spillover queue due to active backpressure"
       // );
-      self.spillover.push_back(bytes);
+      self.spillover.push(bytes);
       return HandlerIoOps::default();
     }
 
@@ -229,7 +240,7 @@ impl UringConnectionHandler for UringByteHandler {
       Err(fibre::TrySendError::Full(returned)) => {
         // Channel full: stash bytes and cancel the active multishot read.
         // The worker re-arms reads automatically once spillover drains in prepare_sqes.
-        self.spillover.push_back(returned);
+        self.spillover.push(returned);
         let mut ops = HandlerIoOps::default();
         if let Some(cancel_bp) = self.prepare_multishot_cancel() {
           ops.sqe_blueprints.push(cancel_bp);
@@ -281,14 +292,13 @@ impl UringConnectionHandler for UringByteHandler {
     // (c) Drain egress channel and submit sends/control ops.
     // Apply backpressure: stop draining if there are already enough pending blueprints in the work_map
     if interface.pending_egress_count < 16 {
-      let mut chunks_pulled = 0;
       let pull_limit = 16 - interface.pending_egress_count;
-      while chunks_pulled < pull_limit {
-        let chunk = match self.raw_egress_rx.try_recv() {
-          Ok(c) => c,
-          Err(_) => break,
-        };
-        chunks_pulled += 1;
+      // One batch pass over the channel instead of one try_recv per chunk.
+      self.egress_scratch.clear();
+      let _ = self
+        .raw_egress_rx
+        .try_recv_batch_mut(&mut self.egress_scratch, pull_limit);
+      for chunk in self.egress_scratch.drain(..) {
         match chunk {
           EgressChunk::Contiguous(bytes) => {
             if bytes.is_empty() {

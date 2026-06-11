@@ -70,11 +70,62 @@ impl<T: Send + 'static> FairQueue<T> {
     }
   }
 
+  /// Pushes a batch of items into the fair queue, blocking for capacity as needed.
+  ///
+  /// Sent items are drained from the front of `items`; on close, unsent items remain.
+  /// Cancel-safe for the same reason as `push_item`: the in-place batch send future
+  /// leaves unsent items in `items`, and the close notification unblocks a stalled push.
+  pub async fn push_batch(&self, items: &mut Vec<T>) -> Result<(), ZmqError> {
+    if items.is_empty() {
+      return Ok(());
+    }
+    if self.is_closed.load(Ordering::Acquire) {
+      return Err(ZmqError::Internal("FairQueue closed".into()));
+    }
+
+    let send_fut = self.sender.send_batch_mut(items);
+    let closed_notification = self.close_notifier.notified();
+
+    tokio::select! {
+      biased;
+      _ = closed_notification => {
+        Err(ZmqError::Internal("FairQueue closed during send".into()))
+      }
+      res = send_fut => {
+        res.map(|_sent| ()).map_err(|e| {
+          tracing::error!("FairQueue batch send error: {:?}", e);
+          ZmqError::Internal("FairQueue channel closed unexpectedly".into())
+        })
+      }
+    }
+  }
+
   /// Pops the next available item from the queue.
   pub async fn pop_item(&self) -> Result<Option<T>, ZmqError> {
     match self.receiver.recv().await {
       Ok(item) => Ok(Some(item)),
       Err(RecvError::Disconnected) => Ok(None), // Channel closed
+    }
+  }
+
+  /// Pops up to `max` items, waiting until at least one is available.
+  /// Returns `Ok(None)` when the queue is closed and drained (mirrors `pop_item`).
+  pub async fn pop_batch(&self, max: usize) -> Result<Option<Vec<T>>, ZmqError> {
+    match self.receiver.recv_batch(max).await {
+      Ok(items) => Ok(Some(items)),
+      Err(RecvError::Disconnected) => Ok(None), // Channel closed
+    }
+  }
+
+  /// Attempts to pop up to `max` items without blocking, appending to `out`.
+  /// Returns the number appended; `Ok(0)` when the queue is empty.
+  pub fn try_pop_batch(&self, out: &mut Vec<T>, max: usize) -> Result<usize, ZmqError> {
+    match self.receiver.try_recv_batch_mut(out, max) {
+      Ok(appended) => Ok(appended),
+      Err(TryRecvError::Empty) => Ok(0),
+      Err(TryRecvError::Disconnected) => {
+        Err(ZmqError::Internal("FairQueue channel closed unexpectedly".into()))
+      }
     }
   }
 

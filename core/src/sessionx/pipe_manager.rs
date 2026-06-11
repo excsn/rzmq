@@ -67,6 +67,18 @@ impl CorePipeManagerX {
     }
   }
 
+  /// Non-blocking batch pull of queued outbound message batches from SocketCore.
+  /// Appends up to `max` items to `out` in one channel pass and returns the count
+  /// appended; `0` when the pipe is empty, closed, or not attached (closure is
+  /// surfaced by the next blocking `recv_from_core`).
+  pub(crate) fn try_recv_batch_from_core(&self, out: &mut Vec<Vec<Msg>>, max: usize) -> usize {
+    if let Some(ref rx) = self.state.rx_from_core {
+      rx.try_recv_batch_mut(out, max).unwrap_or(0)
+    } else {
+      0
+    }
+  }
+
   #[cfg(test)]
   pub(crate) fn rx_from_core_is_some(&self) -> bool {
     self.state.rx_from_core.is_some()

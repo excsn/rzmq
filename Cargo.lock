@@ -589,6 +589,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fibre"
+version = "0.5.7"
+source = "git+https://github.com/excsn/fibre.git#f920441a6e66b80a948f51806014b3ee85554ee9"
+dependencies = [
+ "futures-core",
+ "futures-intrusive",
+ "futures-util",
+ "lazy_static",
+ "papaya",
+ "parking_lot",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1371,7 +1384,7 @@ dependencies = [
  "dashmap",
  "dryoc",
  "eventfd",
- "fibre",
+ "fibre 0.5.7 (git+https://github.com/excsn/fibre.git)",
  "futures",
  "futures-intrusive",
  "hex",
@@ -1402,7 +1415,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
- "fibre",
+ "fibre 0.5.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "hdrhistogram",
  "nix 0.27.1",
  "parking_lot",

@@ -233,10 +233,85 @@ where
       let mut pending_vectored: std::collections::VecDeque<Vec<bytes::Bytes>> =
         std::collections::VecDeque::new();
 
+      // Logical messages batch-pulled from the core pipe beyond the per-round
+      // sndbatch budgets; drained (FIFO) before the pipe is polled again so the
+      // byte/count budgets are preserved exactly despite batch pulls.
+      let mut core_carryover: std::collections::VecDeque<Vec<Msg>> =
+        std::collections::VecDeque::new();
+      // Reusable scratch for batch pulls from the core pipe.
+      let mut core_batch_scratch: Vec<Vec<Msg>> = Vec::new();
+
       'operational: while self.current_phase == ConnectionPhaseX::Operational
         || (self.current_phase == ConnectionPhaseX::ShuttingDownStream
             && (!egress_buffer.is_empty() || !pending_vectored.is_empty()))
       {
+        // Drain carryover from a prior over-budget batch pull before polling the
+        // core pipe again (the pipe select arm is gated on an empty carryover).
+        // Same egress-room condition as the pipe arm, so this cannot busy-loop.
+        if !core_carryover.is_empty()
+          && self.current_phase == ConnectionPhaseX::Operational
+          && if use_owned_write {
+            pending_vectored.is_empty()
+          } else {
+            egress_buffer.total_pending_bytes() < EGRESS_BACKPRESSURE_BYTES
+          }
+        {
+          outgoing_batch.clear();
+          let wire_size = |msgs: &Vec<Msg>| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
+          let max_count = self.zmtp_handler.config.sndbatch_count;
+          let max_bytes = self.zmtp_handler.config.sndbatch_bytes;
+          let mut total_bytes = 0usize;
+
+          while outgoing_batch.len() < max_count && total_bytes < max_bytes {
+            match core_carryover.pop_front() {
+              Some(msgs) => {
+                total_bytes += wire_size(&msgs);
+                outgoing_batch.push(msgs);
+              }
+              None => break,
+            }
+          }
+          // Top up from the pipe if the budgets still have room.
+          if core_carryover.is_empty()
+            && outgoing_batch.len() < max_count
+            && total_bytes < max_bytes
+          {
+            core_batch_scratch.clear();
+            let _ = self
+              .core_pipe_manager
+              .try_recv_batch_from_core(&mut core_batch_scratch, max_count - outgoing_batch.len());
+            for msgs in core_batch_scratch.drain(..) {
+              if outgoing_batch.len() < max_count && total_bytes < max_bytes {
+                total_bytes += wire_size(&msgs);
+                outgoing_batch.push(msgs);
+              } else {
+                core_carryover.push_back(msgs);
+              }
+            }
+          }
+
+          let throttle_guard = adaptive_throttle.begin_work_bulk(
+            crate::throttle::Direction::Egress,
+            outgoing_batch.len() as u32,
+          );
+
+          if use_owned_write {
+            match self.zmtp_handler.frame_outgoing_batch_vectored(&outgoing_batch) {
+              Ok(bufs) => pending_vectored.push_back(bufs),
+              Err(e) => self.set_fatal_error(e).await,
+            }
+          } else {
+            match self.zmtp_handler.frame_outgoing_batch(&outgoing_batch) {
+              Ok(bytes) => egress_buffer.push(bytes),
+              Err(e) => self.set_fatal_error(e).await,
+            }
+          }
+
+          if throttle_guard.should_throttle() {
+            yield_now().await;
+          }
+        }
+
         let mut pong_timeout_future = futures::future::pending().left_future();
         if self.zmtp_handler.heartbeat_state.waiting_for_pong {
           if let Some(deadline_std) = self.zmtp_handler.heartbeat_state.get_pong_deadline() {
@@ -374,6 +449,7 @@ where
           maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
               if self.current_phase == ConnectionPhaseX::Operational
                 && self.core_pipe_manager.is_attached()
+                && core_carryover.is_empty()
                 && if use_owned_write {
                   pending_vectored.is_empty()
                 } else {
@@ -386,26 +462,31 @@ where
                 // so the framed batch never exceeds sndbatch_bytes and busts the ZC slot.
                 let wire_size = |msgs: &Vec<Msg>| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
                 let mut total_bytes = wire_size(&first_msgs);
-                let mut total_msgs = 1usize;
                 outgoing_batch.push(first_msgs);
 
                 let max_count = self.zmtp_handler.config.sndbatch_count;
                 let max_bytes = self.zmtp_handler.config.sndbatch_bytes;
 
-                while total_msgs < max_count && total_bytes < max_bytes {
-                  match self.core_pipe_manager.try_recv_from_core() {
-                    Ok(next_msgs) => {
-                      total_bytes += wire_size(&next_msgs);
-                      total_msgs += 1;
-                      outgoing_batch.push(next_msgs);
+                // One batch pull instead of one try_recv per item. Items beyond the
+                // budgets go to core_carryover, drained at the top of the loop.
+                if outgoing_batch.len() < max_count && total_bytes < max_bytes {
+                  core_batch_scratch.clear();
+                  let _ = self
+                    .core_pipe_manager
+                    .try_recv_batch_from_core(&mut core_batch_scratch, max_count - 1);
+                  for msgs in core_batch_scratch.drain(..) {
+                    if outgoing_batch.len() < max_count && total_bytes < max_bytes {
+                      total_bytes += wire_size(&msgs);
+                      outgoing_batch.push(msgs);
+                    } else {
+                      core_carryover.push_back(msgs);
                     }
-                    Err(_) => break,
                   }
                 }
 
                 let throttle_guard = adaptive_throttle.begin_work_bulk(
                   crate::throttle::Direction::Egress,
-                  total_msgs as u32,
+                  outgoing_batch.len() as u32,
                 );
 
                 if use_owned_write {
