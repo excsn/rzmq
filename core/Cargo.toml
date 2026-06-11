@@ -18,7 +18,7 @@ full = ["default", "ipc", "inproc", "plain", "noise_xx", "curve"]
 full-linux = ["full", "io-uring"]
 default = ["ipc", "inproc", "plain"]
 
-io-uring = ["dep:eventfd", "dep:io-uring", "dep:io_uring_buf_ring"]
+io-uring = ["dep:eventfd", "dep:io-uring"]
 noise_xx = ["dep:snow", "dep:x25519-dalek"]
 curve = ["dep:dryoc"]
 ipc = []
@@ -42,7 +42,6 @@ parking_lot = "^0.12"
 bytes = "^1.4"
 eventfd = {version = "^0.2", optional = true } 
 io-uring = { version = "^0.7", optional = true }
-io_uring_buf_ring = { version = "^0.2", optional = true }
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
 

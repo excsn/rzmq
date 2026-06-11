@@ -1073,12 +1073,12 @@ pub(crate) fn process_all_cqes(
                 if let Some(bm) = worker.buffer_manager.as_ref() {
                   if bytes_read == 0 {
                     // EOF with buffer consumed — reprovide inline and send EOF sentinel.
-                    if let Err(e) = unsafe { bm.reprovide_buffer(bid) } {
+                    if let Err(e) = bm.reprovide_buffer(bid) {
                       tracing::warn!("cqe_processor: reprovide_buffer({}) on EOF failed: {:?}", bid, e);
                     }
                     handler.process_ring_read_bytes(bytes::Bytes::new(), &interface)
                   } else {
-                    match unsafe { bm.take_and_replenish_buffer(bid, bytes_read) } {
+                    match bm.take_and_replenish_buffer(bid, bytes_read) {
                       Ok(owned_bytes) => handler.process_ring_read_bytes(owned_bytes, &interface),
                       Err(_e) => {
                         worker

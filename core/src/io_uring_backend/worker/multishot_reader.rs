@@ -237,8 +237,9 @@ impl MultishotReader {
       let bytes_read = cqe_res as usize;
 
       if bytes_read > 0 {
-        // Copy data into owned Bytes and immediately replenish the ring slot.
-        match unsafe { buffer_manager.take_and_replenish_buffer(buffer_id, bytes_read) } {
+        // Take ownership of the kernel-filled buffer (zero copy) and immediately
+        // replenish the ring slot with a recycled buffer.
+        match buffer_manager.take_and_replenish_buffer(buffer_id, bytes_read) {
           Ok(owned_bytes) => {
             ops_to_return = owner_handler.process_ring_read_bytes(owned_bytes, worker_interface);
           }
@@ -263,7 +264,7 @@ impl MultishotReader {
           self.fd,
           cqe_ud
         );
-        if let Err(e) = unsafe { buffer_manager.reprovide_buffer(buffer_id) } {
+        if let Err(e) = buffer_manager.reprovide_buffer(buffer_id) {
           tracing::warn!("[MultishotReader FD={}] reprovide_buffer({}) on EOF failed: {:?}", self.fd, buffer_id, e);
         }
         ops_to_return = owner_handler.process_ring_read_bytes(bytes::Bytes::new(), worker_interface);

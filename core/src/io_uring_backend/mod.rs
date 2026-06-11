@@ -4,6 +4,7 @@ pub mod buffer_manager;
 pub mod byte_handler;
 pub mod connection_handler;
 pub mod ops;
+pub mod provided_buffer_ring;
 pub mod send_buffer_pool;
 pub mod signaling_op_sender;
 pub mod worker;

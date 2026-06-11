@@ -920,8 +920,11 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             }
           }
         }
-        if worker.buffer_manager.take().is_some() {
-          info!("UringWorker: Default recv buffer manager dropped and unregistered.");
+        if let Some(bm) = worker.buffer_manager.take() {
+          // Unregister before drop: Drop frees the ring memory and the kernel must
+          // no longer reference it while the IoUring is still alive.
+          bm.unregister(&worker.ring);
+          info!("UringWorker: Default recv buffer manager unregistered and dropped.");
         }
         worker.state = WorkerState::Stopped;
         info!("UringWorker: Cleanup complete. Transitioning to Stopped.");
