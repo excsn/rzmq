@@ -72,6 +72,36 @@ impl ZmtpManualParser {
     Ok(Some((msg, total)))
   }
 
+  /// Inspect the ZMTP frame header at the start of `src` without consuming anything.
+  /// Returns `Ok(Some(total_len))` (header + payload bytes) once enough of the header
+  /// is present to know the frame length, `Ok(None)` when more header bytes are needed.
+  /// Enforces `max_msg_size` like the decode methods.
+  pub fn peek_frame_len(&self, src: &[u8]) -> Result<Option<usize>, ZmqError> {
+    if src.is_empty() {
+      return Ok(None);
+    }
+    let flags = src[0];
+    let is_long = (flags & ZMTP_FLAG_LONG) != 0;
+    let header_len = if is_long { 9 } else { 2 };
+    if src.len() < header_len {
+      return Ok(None);
+    }
+    let raw_size = if is_long {
+      let mut len_bytes = [0u8; 8];
+      len_bytes.copy_from_slice(&src[1..9]);
+      u64::from_be_bytes(len_bytes)
+    } else {
+      src[1] as u64
+    };
+    if self.max_msg_size >= 0 && raw_size > self.max_msg_size as u64 {
+      return Err(ZmqError::ProtocolViolation(format!(
+        "frame size {} exceeds ZMQ_MAXMSGSIZE {}",
+        raw_size, self.max_msg_size
+      )));
+    }
+    Ok(Some(header_len + raw_size as usize))
+  }
+
   /// Parse one ZMTP frame from a `Bytes` chunk without allocating.
   /// Uses `Bytes::slice()` (atomic refcount bump) instead of copying payload data.
   pub fn decode_frame_from_bytes(&self, src: &Bytes) -> Result<Option<(Msg, usize)>, ZmqError> {
@@ -244,6 +274,45 @@ mod tests {
     let mut parser = ZmtpManualParser::new(0);
     let result = parser.decode_from_buffer(&mut long_frame_header(1));
     assert!(matches!(result, Err(ZmqError::ProtocolViolation(_))));
+  }
+
+  #[test]
+  fn peek_frame_len_short_frame() {
+    let parser = ZmtpManualParser::new(-1);
+    // short frame: flags=0x00, len=5 → total 2 + 5
+    assert_eq!(parser.peek_frame_len(&[0x00, 5]).unwrap(), Some(7));
+    // payload bytes present beyond the header don't change the result
+    assert_eq!(parser.peek_frame_len(&[0x00, 5, b'a', b'b']).unwrap(), Some(7));
+  }
+
+  #[test]
+  fn peek_frame_len_long_frame() {
+    let parser = ZmtpManualParser::new(-1);
+    let mut hdr = vec![ZMTP_FLAG_LONG];
+    hdr.extend_from_slice(&300u64.to_be_bytes());
+    assert_eq!(parser.peek_frame_len(&hdr).unwrap(), Some(9 + 300));
+  }
+
+  #[test]
+  fn peek_frame_len_incomplete_header() {
+    let parser = ZmtpManualParser::new(-1);
+    assert_eq!(parser.peek_frame_len(&[]).unwrap(), None);
+    assert_eq!(parser.peek_frame_len(&[0x00]).unwrap(), None);
+    // long frame needs 9 header bytes
+    let mut partial = vec![ZMTP_FLAG_LONG];
+    partial.extend_from_slice(&[0, 0, 0]);
+    assert_eq!(parser.peek_frame_len(&partial).unwrap(), None);
+  }
+
+  #[test]
+  fn peek_frame_len_enforces_max_msg_size() {
+    let parser = ZmtpManualParser::new(64);
+    let mut hdr = vec![ZMTP_FLAG_LONG];
+    hdr.extend_from_slice(&128u64.to_be_bytes());
+    assert!(matches!(
+      parser.peek_frame_len(&hdr),
+      Err(ZmqError::ProtocolViolation(_))
+    ));
   }
 
   #[test]

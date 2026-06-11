@@ -111,17 +111,49 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
       let mut bytes = handler.active_lease.take().unwrap();
 
       // If a partial frame is trapped in network_read_buffer from a prior straddle,
-      // prepend it to the new chunk so we can parse across the boundary zero-copy.
+      // complete it by copying only the frame's missing remainder out of the new
+      // chunk. The rest of the chunk stays a zero-copy slice (active_lease) — the
+      // old approach copied the entire chunk into the buffer on every straddle.
       if !handler.network_read_buffer.is_empty() {
-        handler.network_read_buffer.extend_from_slice(&bytes);
-        // split() drains network_read_buffer into a Bytes without copying.
-        let mut combined = handler.network_read_buffer.split().freeze();
-        match handler.zmtp_manual_parser.decode_frame_from_bytes(&combined)? {
+        // Top up the header first (≤ 9 bytes total) so the frame length is known.
+        let total_len = loop {
+          if let Some(total) = handler
+            .zmtp_manual_parser
+            .peek_frame_len(&handler.network_read_buffer)?
+          {
+            break Some(total);
+          }
+          if bytes.is_empty() {
+            break None;
+          }
+          handler.network_read_buffer.extend_from_slice(&bytes[..1]);
+          bytes = bytes.slice(1..);
+        };
+
+        let Some(total_len) = total_len else {
+          // Chunk exhausted while completing the header; wait for more data.
+          break;
+        };
+
+        let needed = total_len.saturating_sub(handler.network_read_buffer.len());
+        if needed > bytes.len() {
+          // The whole chunk belongs to this frame: the frame's bytes must end up
+          // contiguous, so this copy is unavoidable (and copies frame bytes only).
+          handler.network_read_buffer.extend_from_slice(&bytes);
+          break;
+        }
+
+        handler.network_read_buffer.extend_from_slice(&bytes[..needed]);
+        let rest = bytes.slice(needed..);
+        if !rest.is_empty() {
+          handler.active_lease = Some(rest);
+        }
+
+        // split() hands off the completed frame without copying.
+        let frame_bytes = handler.network_read_buffer.split().freeze();
+        match handler.zmtp_manual_parser.decode_frame_from_bytes(&frame_bytes)? {
           Some((msg, consumed)) => {
-            combined = combined.slice(consumed..);
-            if !combined.is_empty() {
-              handler.active_lease = Some(combined);
-            }
+            debug_assert_eq!(consumed, frame_bytes.len(), "straddle frame length mismatch");
             handler.heartbeat_state.record_activity();
             total_bytes += msg.size();
             batch.push(msg);
@@ -131,8 +163,9 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
             continue;
           }
           None => {
-            // Still not enough data — put combined back and wait for another chunk.
-            handler.network_read_buffer.extend_from_slice(&combined);
+            // Unreachable: frame_bytes holds exactly total_len bytes. Restore the
+            // partial frame defensively rather than lose data.
+            handler.network_read_buffer.extend_from_slice(&frame_bytes);
             break;
           }
         }
