@@ -217,7 +217,7 @@ impl InternalOpTracker {
 
   pub(crate) fn has_pending_read_op(&self, fd_to_check: RawFd) -> bool {
     // pending_notifications holds ZC send continuations, never reads
-    self.op_to_details.values().any(|d| {
+    self.op_to_details.iter().any(|(_, d)| {
       d.fd == fd_to_check
         && matches!(d.op_type, InternalOpType::RingRead | InternalOpType::RingReadMultishot)
     })

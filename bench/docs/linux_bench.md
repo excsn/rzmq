@@ -205,11 +205,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 10.0007 seconds
-* **Total Messages:** 2,683,392
-* **Total Data:** 83,856.00 MB
-* **Throughput:** 268,320.71 msg/s
-* **Throughput Rate:** 8,385.02 MB/s
+* **Elapsed Time:** 10.0004 seconds
+* **Total Messages:** 2,878,977
+* **Total Data:** 89,968.03 MB
+* **Throughput:** 287,887.15 msg/s
+* **Throughput Rate:** 8,996.47 MB/s
 
 ---
 

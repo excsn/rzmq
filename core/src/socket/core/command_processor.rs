@@ -1060,7 +1060,7 @@ async fn handle_new_connection_established(
 async fn run_uring_pipe_reader(
   socket_logic: std::sync::Weak<dyn ISocket>,
   pipe_read_id: usize,
-  inbound_rx: fibre::mpsc::BoundedAsyncReceiver<Vec<Msg>>,
+  inbound_rx: fibre::mpsc::BoundedAsyncReceiver<FrameBatch>,
 ) {
   while let Ok(msgs) = inbound_rx.recv().await {
     let Some(sl) = socket_logic.upgrade() else {

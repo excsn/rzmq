@@ -4,7 +4,9 @@ use crate::throttle::types::AdaptiveThrottleConfig;
 use crate::{Blob, CoreState, ZmqError};
 
 pub const DEFAULT_SNDBATCH_COUNT: usize = 128;
+pub const DEFAULT_SNDBATCH_BYTES: usize = 128 * 1024; // 128 KB
 pub const DEFAULT_RCVBATCH_COUNT: usize = 128;
+pub const DEFAULT_RCVBATCH_BYTES: usize = 256 * 1024; // 256 KB;
 
 // Use values consistent with libzmq where possible
 pub const SNDBUF: i32 = 11;
@@ -177,9 +179,9 @@ impl Default for SocketOptions {
         c
       },
       sndbatch_count: DEFAULT_SNDBATCH_COUNT,
-      sndbatch_bytes: 512 * 1024, // 512 KB
+      sndbatch_bytes: DEFAULT_SNDBATCH_BYTES,
       rcvbatch_count: DEFAULT_RCVBATCH_COUNT,
-      rcvbatch_bytes: 512 * 1024, // 512 KB
+      rcvbatch_bytes: DEFAULT_RCVBATCH_BYTES,
     }
   }
 }
