@@ -50,20 +50,21 @@ impl ISocketConnection for ScaConnectionIface {
 
     let mut fb = FrameBatch::new();
     fb.push(msg);
-    if self.sndtimeo == Some(Duration::ZERO) {
-      match self.pipe_sender.try_send(fb) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => Err(ZmqError::ResourceLimitReached),
-        Err(TrySendError::Closed(_)) => Err(ZmqError::ConnectionClosed),
-        Err(TrySendError::Sent(_)) => unreachable!(),
+    match self.pipe_sender.try_send(fb) {
+      Ok(()) => return Ok(()),
+      Err(TrySendError::Closed(_)) => return Err(ZmqError::ConnectionClosed),
+      Err(TrySendError::Full(_)) if self.sndtimeo == Some(Duration::ZERO) => {
+        return Err(ZmqError::ResourceLimitReached);
       }
-    } else {
-      let timeout_duration = self.sndtimeo.unwrap_or(Duration::from_secs(30));
-      match timeout(timeout_duration, self.pipe_sender.send(fb)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
-        Err(_) => Err(ZmqError::ResourceLimitReached),
+      Err(TrySendError::Full(returned_fb)) => {
+        let timeout_duration = self.sndtimeo.unwrap_or(Duration::from_secs(30));
+        return match timeout(timeout_duration, self.pipe_sender.send(returned_fb)).await {
+          Ok(Ok(())) => Ok(()),
+          Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
+          Err(_) => Err(ZmqError::ResourceLimitReached),
+        };
       }
+      Err(TrySendError::Sent(_)) => unreachable!(),
     }
   }
 
@@ -75,20 +76,21 @@ impl ISocketConnection for ScaConnectionIface {
       "ScaConnectionIface sending multipart via data pipe."
     );
 
-    if self.sndtimeo == Some(Duration::ZERO) {
-      match self.pipe_sender.try_send(msgs) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => Err(ZmqError::ResourceLimitReached),
-        Err(TrySendError::Closed(_)) => Err(ZmqError::ConnectionClosed),
-        Err(TrySendError::Sent(_)) => unreachable!(),
+    match self.pipe_sender.try_send(msgs) {
+      Ok(()) => return Ok(()),
+      Err(TrySendError::Closed(_)) => return Err(ZmqError::ConnectionClosed),
+      Err(TrySendError::Full(_)) if self.sndtimeo == Some(Duration::ZERO) => {
+        return Err(ZmqError::ResourceLimitReached);
       }
-    } else {
-      let timeout_duration = self.sndtimeo.unwrap_or(Duration::from_secs(30));
-      match timeout(timeout_duration, self.pipe_sender.send(msgs)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
-        Err(_) => Err(ZmqError::ResourceLimitReached),
+      Err(TrySendError::Full(returned_msgs)) => {
+        let timeout_duration = self.sndtimeo.unwrap_or(Duration::from_secs(30));
+        return match timeout(timeout_duration, self.pipe_sender.send(returned_msgs)).await {
+          Ok(Ok(())) => Ok(()),
+          Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
+          Err(_) => Err(ZmqError::ResourceLimitReached),
+        };
       }
+      Err(TrySendError::Sent(_)) => unreachable!(),
     }
   }
 

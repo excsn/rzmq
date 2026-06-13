@@ -198,6 +198,22 @@ impl ZmtpReadHalf for UringReadHalf {
   ) -> Poll<io::Result<Bytes>> {
     UringReadHalf::poll_recv_bytes(self, cx)
   }
+
+  fn try_read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    match UringReadHalf::try_recv_bytes(self) {
+      None => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+      Some(Err(e)) => Err(e),
+      Some(Ok(bytes)) if bytes.is_empty() => Ok(0), // EOF sentinel
+      Some(Ok(bytes)) => {
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        if n < bytes.len() {
+          self.pending_chunks.push_front(bytes.slice(n..));
+        }
+        Ok(n)
+      }
+    }
+  }
 }
 
 // ─── Write Half ──────────────────────────────────────────────────────────────

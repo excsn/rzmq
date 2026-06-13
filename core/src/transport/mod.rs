@@ -39,6 +39,16 @@ pub(crate) trait ZmtpReadHalf: AsyncRead + Unpin + Send + std::fmt::Debug + 'sta
       "poll_recv_bytes not supported for this stream type",
     )))
   }
+
+  /// Non-blocking synchronous read into `buf`. Returns the number of bytes read.
+  ///
+  /// Default returns `WouldBlock`, preserving the old single-`read_buf` behaviour for
+  /// any implementor that does not override this method. TCP and IPC override it with
+  /// their native `try_read` so the batch ingestion loop can drain the socket without
+  /// additional async yields after the first data arrives.
+  fn try_read_chunk(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+  }
 }
 
 /// Extension trait for write halves that support ownership-transfer sends.
@@ -101,7 +111,11 @@ pub(crate) trait ZmtpStdStream:
 
 // --- TCP ---
 
-impl ZmtpReadHalf for tokio::net::tcp::OwnedReadHalf {}
+impl ZmtpReadHalf for tokio::net::tcp::OwnedReadHalf {
+  fn try_read_chunk(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    tokio::net::tcp::OwnedReadHalf::try_read(self, buf)
+  }
+}
 
 // Empty impl — TCP uses EgressBuffer + AsyncWrite path (supports_owned_write = false).
 impl ZmtpWriteHalf for tokio::net::tcp::OwnedWriteHalf {}
@@ -118,7 +132,11 @@ impl ZmtpStdStream for tokio::net::TcpStream {
 // --- IPC (UnixStream) ---
 
 #[cfg(feature = "ipc")]
-impl ZmtpReadHalf for tokio::net::unix::OwnedReadHalf {}
+impl ZmtpReadHalf for tokio::net::unix::OwnedReadHalf {
+  fn try_read_chunk(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    tokio::net::unix::OwnedReadHalf::try_read(self, buf)
+  }
+}
 
 // Empty impl — IPC uses EgressBuffer + AsyncWrite path (supports_owned_write = false).
 #[cfg(feature = "ipc")]

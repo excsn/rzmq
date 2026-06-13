@@ -104,14 +104,29 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
   /// `pending_logical_messages` (served by `fetch_next_logical_item` before any
   /// channel wait), so the per-message async channel cost is amortized.
   pub(crate) async fn recv_item_from_main_queue(&self, rcvtimeo_opt: Option<Duration>) -> Result<QItem, ZmqError> {
-    let pop_future = self.pop_batch_and_cache();
     match rcvtimeo_opt {
-      Some(duration) if !duration.is_zero() => match tokio_timeout(duration, pop_future).await {
-        Ok(Ok(Some(item))) => Ok(item),
-        Ok(Ok(None)) => Err(ZmqError::InvalidState("Socket terminated".into())),
-        Ok(Err(e)) => Err(e),
-        Err(_timeout_elapsed) => Err(ZmqError::Timeout),
-      },
+      Some(duration) if !duration.is_zero() => {
+        // Optimistic: serve without touching the timer wheel if items are already waiting
+        let mut popped: Vec<QItem> = Vec::new();
+        match self.main_incoming_queue.try_pop_batch(&mut popped, RECV_REFILL_MAX) {
+          Ok(n) if n > 0 => {
+            let mut iter = popped.into_iter();
+            let first = iter.next().unwrap();
+            if iter.len() > 0 {
+              self.pending_logical_messages.lock().extend(iter);
+            }
+            return Ok(first);
+          }
+          _ => {}
+        }
+        // Slow path: queue was empty, register timeout
+        match tokio_timeout(duration, self.pop_batch_and_cache()).await {
+          Ok(Ok(Some(item))) => Ok(item),
+          Ok(Ok(None)) => Err(ZmqError::InvalidState("Socket terminated".into())),
+          Ok(Err(e)) => Err(e),
+          Err(_timeout_elapsed) => Err(ZmqError::Timeout),
+        }
+      }
       _ => {
         if rcvtimeo_opt == Some(Duration::ZERO) {
           let mut popped: Vec<QItem> = Vec::new();
@@ -132,7 +147,7 @@ impl<QItem: Send + 'static> IncomingMessageOrchestrator<QItem> {
           }
         } else {
           // Infinite wait
-          match pop_future.await {
+          match self.pop_batch_and_cache().await {
             Ok(Some(item)) => Ok(item),
             Ok(None) => Err(ZmqError::InvalidState("Socket terminated".into())),
             Err(e) => Err(e),

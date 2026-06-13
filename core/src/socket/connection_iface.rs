@@ -267,13 +267,23 @@ impl ISocketConnection for InprocConnection {
         }
       }
       Some(duration) => {
-        match tokio_timeout(duration, self.data_tx_to_peer.send(msgs)).await {
-          Ok(Ok(())) => Ok(()),
-          Ok(Err(SendError::Closed)) => {
-            tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection timed send failed (ConnectionClosed)");
+        match self.data_tx_to_peer.try_send(msgs) {
+          Ok(()) => Ok(()),
+          Err(TrySendError::Closed(_)) => {
+            tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection send failed (ConnectionClosed)");
             Err(ZmqError::ConnectionClosed)
           }
-          Err(_) => Err(ZmqError::Timeout),
+          Err(TrySendError::Full(returned_msgs)) => {
+            match tokio_timeout(duration, self.data_tx_to_peer.send(returned_msgs)).await {
+              Ok(Ok(())) => Ok(()),
+              Ok(Err(SendError::Closed)) => {
+                tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection timed send failed (ConnectionClosed)");
+                Err(ZmqError::ConnectionClosed)
+              }
+              Err(_) => Err(ZmqError::Timeout),
+              _ => unreachable!(),
+            }
+          }
           _ => unreachable!(),
         }
       }

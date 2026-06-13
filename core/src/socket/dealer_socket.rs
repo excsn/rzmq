@@ -890,14 +890,13 @@ impl DealerSocket {
           "Socket is closing while trying to queue".into(),
         ));
       }
-      if self.pending_outgoing_queue.lock().await.len() < global_sndhwm {
-        self
-          .pending_outgoing_queue
-          .lock()
-          .await
-          .push_back(full_message_parts);
-        self.outgoing_queue_activity_notifier.notify_one();
-        return Ok(());
+      {
+        let mut queue_guard = self.pending_outgoing_queue.lock().await;
+        if queue_guard.len() < global_sndhwm {
+          queue_guard.push_back(full_message_parts);
+          self.outgoing_queue_activity_notifier.notify_one();
+          return Ok(());
+        }
       }
       match global_sndtimeo {
         Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),

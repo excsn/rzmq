@@ -140,9 +140,9 @@ impl AdaptiveThrottle {
     // Periodic EMA nudge
     let since = self.shared.ops_since_nudge.fetch_add(weight, Ordering::Relaxed) + weight;
     if since >= self.shared.config.nudge_interval_ops {
-      let α = self.shared.config.adaptive_learning_rate;
+      let alpha = self.shared.config.adaptive_learning_rate;
       let old_learned = self.shared.learned_balance.load(Ordering::Relaxed);
-      let updated = α * (new_balance as f64) + (1.0 - α) * old_learned;
+      let updated = alpha * (new_balance as f64) + (1.0 - alpha) * old_learned;
       self
         .shared
         .learned_balance

@@ -82,8 +82,6 @@ impl WritePipeCoordinator {
           ));
         }
 
-        let acquire_future = state.semaphore.clone().acquire_owned();
-
         let permit_result = if let Some(duration) = timeout_opt {
           if duration.is_zero() {
             // Non-blocking attempt
@@ -92,11 +90,16 @@ impl WritePipeCoordinator {
               Err(_) => Err(ZmqError::ResourceLimitReached),
             };
           }
+          // Optimistic try before registering a timer
+          match state.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(_) => {}
+          }
           // Timed wait
-          tokio::time::timeout(duration, acquire_future).await
+          tokio::time::timeout(duration, state.semaphore.clone().acquire_owned()).await
         } else {
           // Infinite wait
-          Ok(acquire_future.await)
+          Ok(state.semaphore.clone().acquire_owned().await)
         };
 
         match permit_result {

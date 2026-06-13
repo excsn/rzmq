@@ -197,7 +197,7 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
     }
   }
 
-  // Slow path: buffer empty — do one async kernel read
+  // Slow path: one async yield to wait for data, then greedy synchronous drain.
   if handler.network_read_buffer.len() > 16 * 1024 * 1024 {
     return Err(ZmqError::ResourceLimitReached);
   }
@@ -215,7 +215,22 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
   }
   handler.heartbeat_state.record_activity();
 
-  // Synchronously drain all complete frames from what just arrived
+  // Greedy drain: pull more bytes synchronously without yielding, capped at max_bytes.
+  // TCP/IPC call try_read(); InprocStream returns WouldBlock immediately (no regression).
+  let mut greedy_buf = [0u8; 65536];
+  while handler.network_read_buffer.len() < max_bytes {
+    match reader.try_read_chunk(&mut greedy_buf) {
+      Ok(0) => {
+        tracing::debug!(sca_handle = handler.actor_handle, "Connection closed by peer (EOF in greedy read).");
+        return Err(ZmqError::ConnectionClosed);
+      }
+      Ok(n) => handler.network_read_buffer.extend_from_slice(&greedy_buf[..n]),
+      Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+      Err(e) => return Err(ZmqError::from_io_endpoint(e, "greedy batch read")),
+    }
+  }
+
+  // Drain all complete frames from the accumulated bytes.
   loop {
     if batch.len() >= max_count || total_bytes >= max_bytes {
       break;
