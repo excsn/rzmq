@@ -36,14 +36,38 @@ impl EgressBuffer {
     self.chunks.front().map(|c| &c[self.write_offset..])
   }
 
-  /// Advances the write cursor by `n` bytes. Pops the front chunk when fully consumed.
-  pub(crate) fn advance(&mut self, n: usize) {
-    self.total_bytes = self.total_bytes.saturating_sub(n);
-    self.write_offset += n;
+  /// Gathers up to `max` pending slices into `out` as `IoSlice` entries.
+  /// The first slice respects `write_offset`; subsequent slices start at byte 0.
+  /// Lifetimes ensure the slices cannot outlive the borrow on `self`.
+  pub(crate) fn current_slices<'a>(&'a self, max: usize, out: &mut Vec<std::io::IoSlice<'a>>) {
+    if self.chunks.is_empty() || max == 0 {
+      return;
+    }
     if let Some(front) = self.chunks.front() {
-      if self.write_offset >= front.len() {
-        self.chunks.pop_front();
-        self.write_offset = 0;
+      out.push(std::io::IoSlice::new(&front[self.write_offset..]));
+    }
+    for chunk in self.chunks.iter().skip(1).take(max - 1) {
+      out.push(std::io::IoSlice::new(chunk));
+    }
+  }
+
+  /// Advances the write cursor by `n` bytes, popping fully-consumed chunks.
+  /// Loops to handle `n` spanning multiple chunks (required for `write_vectored`).
+  pub(crate) fn advance(&mut self, mut n: usize) {
+    self.total_bytes = self.total_bytes.saturating_sub(n);
+    while n > 0 {
+      if let Some(front) = self.chunks.front() {
+        let remaining = front.len() - self.write_offset;
+        if n >= remaining {
+          n -= remaining;
+          self.chunks.pop_front();
+          self.write_offset = 0;
+        } else {
+          self.write_offset += n;
+          break;
+        }
+      } else {
+        break;
       }
     }
   }
@@ -97,6 +121,21 @@ mod tests {
     assert_eq!(buf.current_slice().unwrap(), b"PONG");
     buf.advance(4);
     assert_eq!(buf.current_slice().unwrap(), b"data");
+  }
+
+  #[test]
+  fn advance_spans_multiple_chunks() {
+    let mut buf = EgressBuffer::new();
+    buf.push(Bytes::from_static(b"0123456789")); // 10 bytes
+    buf.push(Bytes::from_static(b"abcde"));      //  5 bytes
+    buf.push(Bytes::from_static(b"XY"));         //  2 bytes
+    // advance 12: consumes all of chunk[0] + 2 bytes of chunk[1]
+    buf.advance(12);
+    assert_eq!(buf.current_slice().unwrap(), b"cde");
+    assert_eq!(buf.total_pending_bytes(), 5);
+    // advance 5: consumes rest of chunk[1] + all of chunk[2]
+    buf.advance(5);
+    assert!(buf.is_empty());
   }
 
   #[test]

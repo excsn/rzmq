@@ -163,6 +163,7 @@ where
 
     let mut egress_buffer = EgressBuffer::new();
     const EGRESS_BACKPRESSURE_BYTES: usize = 256 * 1024;
+    let writev_max_iovecs = self.zmtp_handler.config.sndbatch_count;
 
     // ── HANDSHAKE LOOP ────────────────────────────────────────────────────────
     // zmtp_handler owns both halves here; advance_handshake() drives all I/O.
@@ -422,15 +423,17 @@ where
           // Some(n) = AsyncWrite bytes advanced; None = write_owned completed.
           write_res = async {
             use tokio::io::AsyncWriteExt;
-            if egress_buffer.current_slice().is_some() {
-              let n = write_half.write(egress_buffer.current_slice().unwrap()).await?;
+            if !egress_buffer.is_empty() {
+              let mut slices = Vec::with_capacity(writev_max_iovecs);
+              egress_buffer.current_slices(writev_max_iovecs, &mut slices);
+              let n = write_half.write_vectored(&slices).await?;
               Ok::<Option<usize>, std::io::Error>(Some(n))
             } else {
               let bufs = pending_vectored.front().cloned().unwrap_or_default();
               write_half.write_owned(bufs).await?;
               Ok(None)
             }
-          }, if egress_buffer.current_slice().is_some()
+          }, if !egress_buffer.is_empty()
               || (use_owned_write && pending_vectored.front().is_some()) => {
             match write_res {
               Ok(Some(n)) => {
@@ -471,11 +474,14 @@ where
 
                 // One batch pull instead of one try_recv per item. Items beyond the
                 // budgets go to core_carryover, drained at the top of the loop.
-                if outgoing_batch.len() < max_count && total_bytes < max_bytes {
+                while outgoing_batch.len() < max_count && total_bytes < max_bytes {
                   core_batch_scratch.clear();
-                  let _ = self
+                  let drained = self
                     .core_pipe_manager
-                    .try_recv_batch_from_core(&mut core_batch_scratch, max_count - 1);
+                    .try_recv_batch_from_core(&mut core_batch_scratch, max_count - outgoing_batch.len());
+                  if drained == 0 {
+                    break;
+                  }
                   for msgs in core_batch_scratch.drain(..) {
                     if outgoing_batch.len() < max_count && total_bytes < max_bytes {
                       total_bytes += wire_size(&msgs);

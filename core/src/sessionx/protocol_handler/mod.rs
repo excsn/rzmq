@@ -193,7 +193,12 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     &mut self,
     batch: &[FrameBatch],
   ) -> Result<Vec<bytes::Bytes>, ZmqError> {
-    self.framer.frame_vectored(batch)
+    let total_payload: usize = batch.iter().flat_map(|g| g.iter().map(|m| m.size())).sum();
+    if total_payload < self.config.sndbatch_bytes {
+      Ok(vec![self.framer.write_msg_batch(batch)?])
+    } else {
+      self.framer.frame_vectored(batch)
+    }
   }
 
   pub(crate) fn frame_outgoing_msgs(&mut self, msgs: FrameBatch) -> Result<bytes::Bytes, ZmqError> {
