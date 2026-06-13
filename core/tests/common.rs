@@ -81,6 +81,13 @@ pub async fn send_timeout(socket: &Socket, msg: rzmq::Msg, duration: Duration) -
   }
 }
 
+/// Bind to an ephemeral TCP port and return the resolved endpoint via LAST_ENDPOINT.
+pub async fn bind_and_resolve_tcp(socket: &Socket) -> Result<String, ZmqError> {
+  socket.bind("tcp://127.0.0.1:0").await?;
+  let raw = socket.get_option(rzmq::socket::options::LAST_ENDPOINT).await?;
+  Ok(String::from_utf8(raw).expect("LAST_ENDPOINT is valid UTF-8"))
+}
+
 // Function to bind a socket and return the chosen endpoint (useful for tcp://*)
 pub async fn bind_socket_resolve(socket: &Socket, base_endpoint: &str) -> Result<String, ZmqError> {
   socket.bind(base_endpoint).await?;
