@@ -1,18 +1,19 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use parking_lot::{Mutex as ParkingLotMutex, RwLock, RwLockReadGuard};
+
 use crate::delegate_to_core;
 use crate::error::ZmqError;
 use crate::message::{Blob, FrameBatch, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
+use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::IncomingMessageOrchestrator;
-use crate::socket::patterns::incoming_orchestrator::AppFrames;
-use crate::socket::ISocket;
-
-use async_trait::async_trait;
-use parking_lot::{Mutex as ParkingLotMutex, RwLock, RwLockReadGuard};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 
 #[derive(Debug, Clone)]
 struct PeerInfo {
@@ -30,18 +31,19 @@ enum RepState {
 #[derive(Debug)]
 pub(crate) struct RepSocket {
   core: Arc<SocketCore>,
-  incoming_orchestrator: IncomingMessageOrchestrator<(PeerInfo, FrameBatch)>,
+  incoming_orchestrator: IncomingMessageOrchestrator,
+  pending_pipe_senders: ParkingLotMutex<HashMap<usize, PipeMessageSender>>,
   state: ParkingLotMutex<RepState>,
   pipe_read_id_to_endpoint_uri: RwLock<HashMap<usize, String>>,
 }
 
 impl RepSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let queue_capacity = core.core_state.read().options.rcvhwm.max(1);
-    let orchestrator = IncomingMessageOrchestrator::new(core.handle, queue_capacity);
+    let orchestrator = IncomingMessageOrchestrator::new(core.handle);
     Self {
       core,
       incoming_orchestrator: orchestrator,
+      pending_pipe_senders: ParkingLotMutex::new(HashMap::new()),
       state: ParkingLotMutex::new(RepState::ReadyToReceive),
       pipe_read_id_to_endpoint_uri: RwLock::new(HashMap::new()),
     }
@@ -51,25 +53,11 @@ impl RepSocket {
     self.core.core_state.read()
   }
 
-  async fn process_and_queue_rep_message(
-    &self,
-    pipe_read_id: usize,
-    raw_zmtp_message: FrameBatch,
-  ) -> Result<(), ZmqError> {
-    let target_endpoint_uri_for_reply = {
-      let core_s_read = self.core_state_read();
-      core_s_read
-        .pipe_read_id_to_endpoint_uri
-        .get(&pipe_read_id)
-        .cloned()
-        .ok_or_else(|| ZmqError::Internal("REP: Endpoint URI lookup failed for request".into()))?
-    };
-
-    let mut routing_prefix: FrameBatch = FrameBatch::new();
-    let mut payload_frames: FrameBatch = FrameBatch::new();
+  fn extract_routing_prefix(raw_batch: FrameBatch) -> (FrameBatch, FrameBatch) {
+    let mut routing_prefix = FrameBatch::new();
+    let mut payload_frames = FrameBatch::new();
     let mut delimiter_found = false;
-
-    for frame in raw_zmtp_message {
+    for frame in raw_batch {
       if !delimiter_found {
         let is_delimiter = frame.size() == 0;
         routing_prefix.push(frame);
@@ -80,22 +68,31 @@ impl RepSocket {
         payload_frames.push(frame);
       }
     }
-
     if !delimiter_found {
+      // No delimiter: treat entire message as payload (peer without routing prefix).
       payload_frames = routing_prefix;
       routing_prefix = FrameBatch::new();
     }
+    (routing_prefix, payload_frames)
+  }
 
-    let peer_info = PeerInfo {
-      source_pipe_read_id: pipe_read_id,
-      target_endpoint_uri: target_endpoint_uri_for_reply,
-      routing_prefix,
-    };
+  async fn recv_complete_request(
+    &self,
+    rcvtimeo_opt: Option<Duration>,
+  ) -> Result<(PeerInfo, FrameBatch), ZmqError> {
+    let (pipe_read_id, raw_batch) =
+      self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await?;
 
-    self
-      .incoming_orchestrator
-      .queue_item(pipe_read_id, (peer_info, payload_frames))
-      .await
+    let target_endpoint_uri = self
+      .core_state_read()
+      .pipe_read_id_to_endpoint_uri
+      .get(&pipe_read_id)
+      .cloned()
+      .ok_or_else(|| ZmqError::Internal("REP: Endpoint URI lookup failed for request".into()))?;
+
+    let (routing_prefix, payload_frames) = Self::extract_routing_prefix(raw_batch);
+    let peer_info = PeerInfo { source_pipe_read_id: pipe_read_id, target_endpoint_uri, routing_prefix };
+    Ok((peer_info, payload_frames))
   }
 }
 
@@ -126,7 +123,6 @@ impl ISocket for RepSocket {
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     delegate_to_core!(self, UserGetOpt, option: option)
   }
-
   async fn close(&self) -> Result<(), ZmqError> {
     delegate_to_core!(self, UserClose,)
   }
@@ -135,11 +131,10 @@ impl ISocket for RepSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-
     if msg.is_more() {
       msg.set_flags(msg.flags() & !MsgFlags::MORE);
     }
-    self.incoming_orchestrator.reset_recv_message_buffer().await;
+    self.incoming_orchestrator.reset_recv_buffer();
     let mut fb = FrameBatch::new();
     fb.push(msg);
     self.send_multipart(fb).await
@@ -149,36 +144,29 @@ impl ISocket for RepSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-
     {
-      let current_state_guard = self.state.lock();
-      if !matches!(*current_state_guard, RepState::ReadyToReceive) {
-        return Err(ZmqError::InvalidState(
-          "REP socket must call send() before receiving again",
-        ));
+      let guard = self.state.lock();
+      if !matches!(*guard, RepState::ReadyToReceive) {
+        return Err(ZmqError::InvalidState("REP socket must call send() before receiving again"));
       }
     }
 
-    let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
+    let rcvtimeo_opt = self.core_state_read().options.rcvtimeo;
+    let (peer_info, mut payload_frames) = self.recv_complete_request(rcvtimeo_opt).await?;
+    *self.state.lock() = RepState::ReceivedRequest(peer_info);
 
-    // The transform closure will be called by the orchestrator after it pops an item.
-    // It is synchronous and returns the payload frames to the orchestrator's buffer.
-    let transform_fn = |(peer_info, payload_frames): (PeerInfo, FrameBatch)| {
-      *self.state.lock() = RepState::ReceivedRequest(peer_info);
-      AppFrames::Multiple(payload_frames)
-    };
-
-    self
-      .incoming_orchestrator
-      .recv_message(rcvtimeo_opt, transform_fn)
-      .await
+    if payload_frames.is_empty() {
+      Ok(Msg::new())
+    } else {
+      Ok(payload_frames.remove(0))
+    }
   }
 
   async fn send_multipart(&self, payload_frames: FrameBatch) -> Result<(), ZmqError> {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    self.incoming_orchestrator.reset_recv_message_buffer().await;
+    self.incoming_orchestrator.reset_recv_buffer();
 
     let mut user_payload_frames = payload_frames;
     if user_payload_frames.is_empty() {
@@ -186,46 +174,42 @@ impl ISocket for RepSocket {
     }
 
     let peer_to_reply_to = {
-      let mut current_state_guard = self.state.lock();
-      match std::mem::replace(&mut *current_state_guard, RepState::ReadyToReceive) {
+      let mut guard = self.state.lock();
+      match std::mem::replace(&mut *guard, RepState::ReadyToReceive) {
         RepState::ReceivedRequest(info) => info,
         RepState::ReadyToReceive => {
-          *current_state_guard = RepState::ReadyToReceive;
-          return Err(ZmqError::InvalidState(
-            "REP socket must recv() a request before sending a reply",
-          ));
+          *guard = RepState::ReadyToReceive;
+          return Err(ZmqError::InvalidState("REP socket must recv() a request before sending a reply"));
         }
       }
     };
 
     let conn_iface: Arc<dyn ISocketConnection> = {
       let core_s_read = self.core_state_read();
-      match core_s_read
-        .endpoints
-        .get(&peer_to_reply_to.target_endpoint_uri)
-      {
+      match core_s_read.endpoints.get(&peer_to_reply_to.target_endpoint_uri) {
         Some(ep_info) => ep_info.connection_iface.clone(),
         None => {
-          tracing::error!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP send_multipart: ISocketConnection not found. Peer likely disconnected.");
-          return Err(ZmqError::HostUnreachable(
-            "Peer disconnected before reply could be sent".into(),
-          ));
+          tracing::error!(
+            handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri,
+            "REP send_multipart: ISocketConnection not found. Peer likely disconnected."
+          );
+          return Err(ZmqError::HostUnreachable("Peer disconnected before reply could be sent".into()));
         }
       }
     };
 
-    let mut zmtp_wire_frames: FrameBatch =
-      FrameBatch::with_capacity(peer_to_reply_to.routing_prefix.len() + user_payload_frames.len());
+    let mut zmtp_wire_frames = FrameBatch::with_capacity(
+      peer_to_reply_to.routing_prefix.len() + user_payload_frames.len(),
+    );
     zmtp_wire_frames.extend(peer_to_reply_to.routing_prefix);
     zmtp_wire_frames.extend(user_payload_frames);
 
-    let num_total_frames = zmtp_wire_frames.len();
-    if num_total_frames == 0 {
+    let n = zmtp_wire_frames.len();
+    if n == 0 {
       return Ok(());
     }
-
     for (i, frame) in zmtp_wire_frames.iter_mut().enumerate() {
-      if i < num_total_frames - 1 {
+      if i < n - 1 {
         frame.set_flags(frame.flags() | MsgFlags::MORE);
       } else {
         frame.set_flags(frame.flags() & !MsgFlags::MORE);
@@ -234,11 +218,11 @@ impl ISocket for RepSocket {
 
     match conn_iface.send_multipart(zmtp_wire_frames).await {
       Ok(()) => {
-        tracing::trace!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP send_multipart: Sent complete reply.");
+        tracing::trace!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP sent complete reply.");
         Ok(())
       }
       Err(e) => {
-        tracing::warn!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, error = %e, "REP send_multipart: Send failed.");
+        tracing::warn!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, error = %e, "REP send failed.");
         Err(e)
       }
     }
@@ -248,29 +232,17 @@ impl ISocket for RepSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-
     {
-      let current_state_guard = self.state.lock();
-      if !matches!(*current_state_guard, RepState::ReadyToReceive) {
-        return Err(ZmqError::InvalidState(
-          "REP socket must call send() before receiving again",
-        ));
+      let guard = self.state.lock();
+      if !matches!(*guard, RepState::ReadyToReceive) {
+        return Err(ZmqError::InvalidState("REP socket must call send() before receiving again"));
       }
     }
 
-    let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
-
-    // The transform function is synchronous and just passes the data through after we've
-    // updated the state.
-    let transform_fn = |(peer_info, payload_frames): (PeerInfo, FrameBatch)| {
-      *self.state.lock() = RepState::ReceivedRequest(peer_info);
-      AppFrames::Multiple(payload_frames)
-    };
-
-    self
-      .incoming_orchestrator
-      .recv_logical_message(rcvtimeo_opt, transform_fn)
-      .await
+    let rcvtimeo_opt = self.core_state_read().options.rcvtimeo;
+    let (peer_info, payload_frames) = self.recv_complete_request(rcvtimeo_opt).await?;
+    *self.state.lock() = RepState::ReceivedRequest(peer_info);
+    Ok(payload_frames)
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
@@ -281,40 +253,27 @@ impl ISocket for RepSocket {
   }
 
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
-
     match command {
       Command::Stop => {
         self.incoming_orchestrator.close().await;
       }
       _ => return Ok(false),
     }
-    
     Ok(true)
   }
 
-  async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
+  async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
-      Command::PipeMessageReceived { msg, .. } => {
-        if let Some(raw_zmtp_message) = self
-          .incoming_orchestrator
-          .accumulate_pipe_frame(pipe_read_id, msg)?
-        {
-          self.process_and_queue_rep_message(pipe_read_id, raw_zmtp_message).await?;
-        }
-      }
-      Command::PipeMessageBatchReceived { msgs, .. } => {
-        for msg in msgs {
-          if let Some(raw_zmtp_message) = self
-            .incoming_orchestrator
-            .accumulate_pipe_frame(pipe_read_id, msg)?
-          {
-            self.process_and_queue_rep_message(pipe_read_id, raw_zmtp_message).await?;
-          }
-        }
+      Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {
+        // Data frames are pushed directly by the actor via PipeMessageSender; no action needed.
       }
       _ => {}
     }
     Ok(())
+  }
+
+  fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {
+    self.pending_pipe_senders.lock().remove(&pipe_read_id)
   }
 
   async fn pipe_attached(
@@ -331,50 +290,44 @@ impl ISocket for RepSocket {
 
     if let Some(endpoint_uri) = endpoint_uri_option {
       tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "REP attaching pipe");
-      self
-        .pipe_read_id_to_endpoint_uri
-        .write()
-        .insert(pipe_read_id, endpoint_uri);
+      self.pipe_read_id_to_endpoint_uri.write().insert(pipe_read_id, endpoint_uri);
+
+      let rcvhwm = self.core_state_read().options.rcvhwm.max(1);
+      let raw_sender = self.incoming_orchestrator.register_connection_pipe(pipe_read_id, rcvhwm);
+      self.pending_pipe_senders.lock().insert(pipe_read_id, PipeMessageSender::Direct(raw_sender));
     } else {
       tracing::warn!(
-        handle = self.core.handle,
-        pipe_read_id,
-        "REP pipe_attached: Endpoint URI not found for pipe. Map not updated."
+        handle = self.core.handle, pipe_read_id,
+        "REP pipe_attached: Endpoint URI not found for pipe."
       );
     }
   }
 
   async fn update_peer_identity(&self, pipe_read_id: usize, identity: Option<Blob>) {
-    tracing::trace!(handle = self.core.handle, socket_type = "REP", pipe_read_id, ?identity, "update_peer_identity called, but REP socket does not use peer identities beyond routing. Ignoring for main state.");
+    tracing::trace!(
+      handle = self.core.handle, socket_type = "REP", pipe_read_id, ?identity,
+      "update_peer_identity called, REP ignores it for main state."
+    );
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
-    tracing::debug!(
-      handle = self.core.handle,
-      pipe_read_id,
-      "REP detaching pipe"
-    );
-    self
-      .pipe_read_id_to_endpoint_uri
-      .write()
-      .remove(&pipe_read_id);
+    tracing::debug!(handle = self.core.handle, pipe_read_id, "REP detaching pipe");
+    self.pipe_read_id_to_endpoint_uri.write().remove(&pipe_read_id);
 
     {
-      let mut current_state_guard = self.state.lock();
-      if let RepState::ReceivedRequest(ref peer_info) = *current_state_guard {
+      let mut guard = self.state.lock();
+      if let RepState::ReceivedRequest(ref peer_info) = *guard {
         if peer_info.source_pipe_read_id == pipe_read_id {
           tracing::warn!(
-            handle = self.core.handle,
-            pipe_id = pipe_read_id,
+            handle = self.core.handle, pipe_id = pipe_read_id,
             "Peer disconnected while REP socket held its request. Resetting REP state."
           );
-          *current_state_guard = RepState::ReadyToReceive;
+          *guard = RepState::ReadyToReceive;
         }
       }
     }
-    self
-      .incoming_orchestrator
-      .clear_pipe_state(pipe_read_id)
-      .await;
+
+    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }
 }

@@ -45,6 +45,16 @@ pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
   /// This is the primary method for sending data over the connection.
   async fn send_multipart(&self, msgs: FrameBatch) -> Result<(), ZmqError>;
 
+  /// Attempts to send, returning ownership of `msgs` if the channel is immediately full
+  /// (SNDTIMEO=0 path). For blocking/timed sends that time out, the message is consumed
+  /// inside the dropped future and an empty batch is returned with the error.
+  async fn try_send_multipart_owned(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
+    match self.send_multipart(msgs).await {
+      Ok(()) => Ok(()),
+      Err(e) => Err((FrameBatch::new(), e)),
+    }
+  }
+
   async fn close_connection(&self) -> Result<(), ZmqError>;
   fn as_any(&self) -> &dyn Any;
 }

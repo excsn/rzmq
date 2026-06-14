@@ -44,10 +44,12 @@ pub(crate) async fn connect_inproc(
       let zmq_err = ZmqError::ConnectionRefused(err_msg.clone());
       let monitor_tx_opt = core_arc.core_state.read().get_monitor_sender_clone();
       if let Some(monitor) = monitor_tx_opt {
-        let _ = monitor.send(SocketEvent::ConnectFailed {
-          endpoint: connector_uri_str.clone(),
-          error_msg: err_msg,
-        }).await;
+        let _ = monitor
+          .send(SocketEvent::ConnectFailed {
+            endpoint: connector_uri_str.clone(),
+            error_msg: err_msg,
+          })
+          .await;
       }
       let _ = reply_tx_user.send(Err(zmq_err));
       return;
@@ -65,17 +67,30 @@ pub(crate) async fn connect_inproc(
       tracing::error!(connector_core_handle, inproc_name = %name, "connect_inproc: ISocket logic unavailable. Aborting.");
       let err = ZmqError::Internal("ISocket logic unavailable for inproc connector".into());
       let _ = reply_tx_user.send(Err(err.clone()));
-      let _ = core_arc.context.event_bus().publish(SystemEvent::ConnectionAttemptFailed {
-        parent_core_id: connector_core_handle,
-        target_endpoint_uri: connector_uri_str,
-        error: err,
-      });
+      let _ = core_arc
+        .context
+        .event_bus()
+        .publish(SystemEvent::ConnectionAttemptFailed {
+          parent_core_id: connector_core_handle,
+          target_endpoint_uri: connector_uri_str,
+          error: err,
+        });
       return;
     }
   };
 
   // Create the in-memory duplex pipe; binder gets one half, connector the other.
-  let buf_size = pipe_hwm.saturating_mul(64 * 1024).max(64 * 1024);
+  let pipe_hwm = {
+    let s = core_arc.core_state.read();
+    match s.socket_type {
+      crate::socket::SocketType::Push | crate::socket::SocketType::Pub => s.options.sndhwm,
+      crate::socket::SocketType::Pull | crate::socket::SocketType::Sub => s.options.rcvhwm,
+      _ => s.options.rcvhwm.max(s.options.sndhwm),
+    }
+    .max(1)
+  };
+
+  let buf_size = pipe_hwm.saturating_mul(8192).clamp(8192, 4 * 1024 * 1024);
   let (connector_stream_end, binder_stream_end) = tokio::io::duplex(buf_size);
 
   // Spawn connector-side SCAX
@@ -138,16 +153,20 @@ pub(crate) async fn connect_inproc(
       };
       if socket_logic.mailbox().send(cmd).await.is_err() {
         tracing::error!(connector_core_handle, inproc_name = %name, "Failed to send NewConnectionEstablished to connector socket core.");
-        let _ = reply_tx_user.send(Err(ZmqError::Internal("connector socket core closed".into())));
+        let _ = reply_tx_user.send(Err(ZmqError::Internal(
+          "connector socket core closed".into(),
+        )));
         return;
       }
 
       let monitor_tx = core_arc.core_state.read().get_monitor_sender_clone();
       if let Some(monitor) = monitor_tx {
-        let _ = monitor.send(SocketEvent::Connected {
-          endpoint: connector_uri_str.clone(),
-          peer_addr: format!("inproc-binder-for-{}", name),
-        }).await;
+        let _ = monitor
+          .send(SocketEvent::Connected {
+            endpoint: connector_uri_str.clone(),
+            peer_addr: format!("inproc-binder-for-{}", name),
+          })
+          .await;
       }
 
       let _ = reply_tx_user.send(Ok(()));
@@ -156,10 +175,12 @@ pub(crate) async fn connect_inproc(
       tracing::warn!(connector_core_handle, inproc_name = %name, "Inproc connection rejected by binder: {}", e);
       let monitor_tx = core_arc.core_state.read().get_monitor_sender_clone();
       if let Some(monitor) = monitor_tx {
-        let _ = monitor.send(SocketEvent::ConnectFailed {
-          endpoint: connector_uri_str,
-          error_msg: e.to_string(),
-        }).await;
+        let _ = monitor
+          .send(SocketEvent::ConnectFailed {
+            endpoint: connector_uri_str,
+            error_msg: e.to_string(),
+          })
+          .await;
       }
       let _ = reply_tx_user.send(Err(e));
     }
@@ -168,10 +189,12 @@ pub(crate) async fn connect_inproc(
       tracing::error!(connector_core_handle, inproc_name = %name, "{}", err_msg);
       let monitor_tx = core_arc.core_state.read().get_monitor_sender_clone();
       if let Some(monitor) = monitor_tx {
-        let _ = monitor.send(SocketEvent::ConnectFailed {
-          endpoint: connector_uri_str,
-          error_msg: err_msg.clone(),
-        }).await;
+        let _ = monitor
+          .send(SocketEvent::ConnectFailed {
+            endpoint: connector_uri_str,
+            error_msg: err_msg.clone(),
+          })
+          .await;
       }
       let _ = reply_tx_user.send(Err(ZmqError::Internal(err_msg)));
     }

@@ -1,25 +1,26 @@
 use crate::error::ZmqError;
-use crate::message::{FrameBatch, Msg};
+use crate::message::{FrameBatch, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
 use crate::socket::options::SocketOptions;
-use crate::socket::patterns::LoadBalancer;
+use crate::socket::patterns::OutgoingMessageOrchestrator;
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use tokio::time::timeout as tokio_timeout;
 
-use crate::{Blob, MsgFlags, delegate_to_core};
+use crate::{Blob, delegate_to_core};
 
 #[derive(Debug)]
 pub(crate) struct PushSocket {
   core: Arc<SocketCore>,
-  load_balancer: LoadBalancer,
+  outgoing_orchestrator: OutgoingMessageOrchestrator,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
   cached_options: ArcSwap<SocketOptions>,
 }
@@ -29,7 +30,7 @@ impl PushSocket {
     let options_snapshot = core.core_state.read().options.clone();
     Self {
       core,
-      load_balancer: LoadBalancer::new(),
+      outgoing_orchestrator: OutgoingMessageOrchestrator::new(),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
       cached_options: ArcSwap::from(options_snapshot),
     }
@@ -63,108 +64,14 @@ impl ISocket for PushSocket {
 
   async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
     if !self.core.is_running() {
-      // Consistent with libzmq, PUSH with SNDTIMEO=0 would return EAGAIN if no peers.
-      // If SNDTIMEO > 0, it would block/timeout.
-      // Returning ResourceLimitReached implies "cannot send now".
       return Err(ZmqError::ResourceLimitReached);
     }
+    let sndtimeo = self.cached_options.load().sndtimeo;
+    let wait_for_peer = !matches!(sndtimeo, Some(d) if d.is_zero());
 
-    let sndtimeo_opt = self.cached_options.load().sndtimeo;
-
-    // 1. Select a peer connection URI using the load balancer.
-    let endpoint_uri_to_send_to = loop {
-      if let Some(uri) = self.load_balancer.get_next_connection_uri() {
-        // Check if this URI still corresponds to an active endpoint in SocketCore
-        if self.core.core_state.read().endpoints.contains_key(&uri) {
-          break uri;
-        } else {
-          // Stale URI in load balancer, remove it and try again
-          tracing::warn!(handle = self.core.handle, uri = %uri, "PUSH send: Stale URI found in LoadBalancer. Removing.");
-          self.load_balancer.remove_connection(&uri); // remove_connection takes &str
-          // No need to notify waiters here, as we are in a loop that will re-check or wait.
-        }
-      } else {
-        // No URI available from load balancer
-        if self.core.command_sender().is_closed() {
-          // Check if socket is shutting down
-          return Err(ZmqError::InvalidState("Socket terminated".into()));
-        }
-        match sndtimeo_opt {
-          Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
-          None => {
-            self.load_balancer.wait_for_connection().await?;
-            // continue loop implicitly
-          }
-          Some(duration) => {
-            match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
-              Ok(res) => res?,
-              Err(_timeout_elapsed) => return Err(ZmqError::Timeout),
-            }
-          }
-        }
-      }
-    };
-
-    // 2. Get the ISocketConnection interface for this URI.
-    let connection_iface_arc = {
-      let core_s = self.core.core_state.read(); // Read lock
-      // We re-check contains_key here in case of races, though LB should be fairly up to date.
-      core_s
-        .endpoints
-        .get(&endpoint_uri_to_send_to)
-        .map(|ep_info| ep_info.connection_iface.clone())
-        .ok_or_else(|| {
-          tracing::warn!(
-            handle = self.core.handle,
-            uri = %endpoint_uri_to_send_to,
-            "PUSH send: EndpointInfo disappeared for URI from LoadBalancer *after* selection. Removing from LB."
-          );
-          self.load_balancer.remove_connection(&endpoint_uri_to_send_to);
-          // This indicates the peer likely disconnected right as we were selecting it.
-          ZmqError::HostUnreachable("Peer connection disappeared just before send".into())
-        })?
-    }; // core_s (read lock) is dropped here.
-
-    // 3. Send the message using the connection interface.
-    // The ISocketConnection::send_message implementation now handles SNDTIMEO for HWM.
-    match connection_iface_arc.send_message(msg).await {
-      Ok(()) => Ok(()),
-      Err(ZmqError::ConnectionClosed) => {
-        self
-          .load_balancer
-          .remove_connection(&endpoint_uri_to_send_to);
-        Err(ZmqError::HostUnreachable(
-          "Peer connection closed during send".into(),
-        ))
-      }
-      Err(e @ ZmqError::ResourceLimitReached) | Err(e @ ZmqError::Timeout) => {
-        // These are expected errors if the peer's HWM is hit or SNDTIMEO expires.
-        // PUSH sockets typically drop messages or block based on SNDTIMEO.
-        // If SNDTIMEO=0, ResourceLimitReached (EAGAIN) means drop.
-        // If SNDTIMEO>0, Timeout means drop/fail.
-        // If SNDTIMEO=-1, send_message in ISocketConnection would block, so this path shouldn't be hit unless pipe closes.
-        tracing::trace!(
-          handle = self.core.handle,
-          uri = %endpoint_uri_to_send_to,
-          error = %e,
-          "PUSH send: HWM reached or timeout on specific connection. Propagating error."
-        );
-        Err(e)
-      }
-      Err(e) => {
-        // Other, more severe errors (e.g., internal library errors)
-        tracing::error!(
-            handle = self.core.handle,
-            uri = %endpoint_uri_to_send_to,
-            error = %e,
-            "PUSH send: Unexpected error on connection_iface.send_message. Removing from LB."
-        );
-        self
-          .load_balancer
-          .remove_connection(&endpoint_uri_to_send_to);
-        Err(e)
-      }
-    }
+    let mut fb = FrameBatch::new();
+    fb.push(msg);
+    self.send_with_timeout(fb, wait_for_peer, sndtimeo).await
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
@@ -178,10 +85,9 @@ impl ISocket for PushSocket {
       return Err(ZmqError::ResourceLimitReached);
     }
     if frames.is_empty() {
-      return Ok(()); // Sending an empty multipart is a no-op for PUSH
+      return Ok(());
     }
 
-    // Adjust MORE flags for the logical ZMQ message parts
     let num_frames = frames.len();
     for (i, frame) in frames.iter_mut().enumerate() {
       if i < num_frames - 1 {
@@ -190,70 +96,10 @@ impl ISocket for PushSocket {
         frame.set_flags(frame.flags() & !MsgFlags::MORE);
       }
     }
-    // `frames` now correctly represents the ZMTP frames of one logical ZMQ message.
 
-    let sndtimeo_opt = self.cached_options.load().sndtimeo;
-
-    let endpoint_uri_to_send_to = loop {
-      if let Some(uri) = self.load_balancer.get_next_connection_uri() {
-        if self.core.core_state.read().endpoints.contains_key(&uri) {
-          break uri;
-        } else {
-          self.load_balancer.remove_connection(&uri);
-        }
-      } else {
-        if !self.core.is_running() {
-          return Err(ZmqError::InvalidState(
-            "Socket terminated while waiting for peer".into(),
-          ));
-        }
-        match sndtimeo_opt {
-          Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
-          None => {
-            self.load_balancer.wait_for_connection().await?;
-            continue;
-          }
-          Some(duration) => {
-            match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
-              Ok(res) => {
-                res?;
-                continue;
-              }
-              Err(_) => return Err(ZmqError::Timeout),
-            }
-          }
-        }
-      }
-    };
-
-    let connection_iface_arc = {
-      let core_s = self.core.core_state.read();
-      core_s
-        .endpoints
-        .get(&endpoint_uri_to_send_to)
-        .map(|ep_info| ep_info.connection_iface.clone())
-        .ok_or_else(|| {
-          self
-            .load_balancer
-            .remove_connection(&endpoint_uri_to_send_to);
-          ZmqError::HostUnreachable(
-            "PUSH: Peer for multipart send disappeared after selection".into(),
-          )
-        })?
-    };
-
-    match connection_iface_arc.send_multipart(frames).await {
-      Ok(()) => Ok(()),
-      Err(ZmqError::ConnectionClosed) => {
-        self
-          .load_balancer
-          .remove_connection(&endpoint_uri_to_send_to);
-        Err(ZmqError::HostUnreachable(
-          "PUSH: Peer connection closed during multipart send".into(),
-        ))
-      }
-      Err(e) => Err(e),
-    }
+    let sndtimeo = self.cached_options.load().sndtimeo;
+    let wait_for_peer = !matches!(sndtimeo, Some(d) if d.is_zero());
+    self.send_with_timeout(frames, wait_for_peer, sndtimeo).await
   }
 
   async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
@@ -285,9 +131,9 @@ impl ISocket for PushSocket {
       Command::Stop => {
         tracing::debug!(
           handle = self.core.handle,
-          "PushSocket received Stop. Deactivating load balancer."
+          "PushSocket received Stop. Deactivating outgoing orchestrator."
         );
-        self.load_balancer.deactivate();
+        self.outgoing_orchestrator.deactivate();
       }
       _ => return Ok(false),
     }
@@ -307,37 +153,32 @@ impl ISocket for PushSocket {
   async fn pipe_attached(
     &self,
     pipe_read_id: usize,
-    _pipe_write_id: usize, // Not directly used by PUSH LoadBalancer if it stores URIs
+    _pipe_write_id: usize,
     _peer_identity: Option<&[u8]>,
   ) {
-    // To add to LoadBalancer (which stores endpoint_uri), we need the endpoint_uri for this pipe.
-    // SocketCore maintains pipe_read_id_to_endpoint_uri.
-    let endpoint_uri_option = self
-      .core
-      .core_state
-      .read()
-      .pipe_read_id_to_endpoint_uri
-      .get(&pipe_read_id)
-      .cloned();
+    let (endpoint_uri_opt, connection_iface_opt) = {
+      let core_s = self.core.core_state.read();
+      let uri = core_s.pipe_read_id_to_endpoint_uri.get(&pipe_read_id).cloned();
+      let iface = uri.as_ref().and_then(|u| {
+        core_s.endpoints.get(u).map(|ep| ep.connection_iface.clone())
+      });
+      (uri, iface)
+    };
 
-    if let Some(endpoint_uri) = endpoint_uri_option {
+    if let (Some(endpoint_uri), Some(iface)) = (endpoint_uri_opt, connection_iface_opt) {
       tracing::debug!(
         handle = self.core.handle,
         pipe_read_id,
-        // pipe_write_id, // Not logged as primary key for LB
         uri = %endpoint_uri,
         "PUSH attaching connection"
       );
-      self
-        .pipe_read_to_endpoint_uri
-        .write()
-        .insert(pipe_read_id, endpoint_uri.clone());
-      self.load_balancer.add_connection(endpoint_uri);
+      self.pipe_read_to_endpoint_uri.write().insert(pipe_read_id, endpoint_uri.clone());
+      self.outgoing_orchestrator.add_connection(endpoint_uri, iface);
     } else {
       tracing::warn!(
         handle = self.core.handle,
         pipe_read_id,
-        "PUSH pipe_attached: Could not find endpoint_uri for pipe_read_id. Cannot add to LoadBalancer."
+        "PUSH pipe_attached: Could not find endpoint_uri or connection_iface. Cannot add to orchestrator."
       );
     }
   }
@@ -348,7 +189,7 @@ impl ISocket for PushSocket {
       socket_type = "PUSH",
       pipe_read_id,
       ?identity,
-      "update_peer_identity called, but PUSH socket does not use peer identities. Ignoring."
+      "update_peer_identity called, PUSH ignores peer identities."
     );
   }
 
@@ -356,25 +197,39 @@ impl ISocket for PushSocket {
     tracing::debug!(
       handle = self.core.handle,
       pipe_read_id,
-      "PUSH detaching connection identified by pipe_read_id"
+      "PUSH detaching connection"
     );
-
-    let maybe_endpoint_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id);
-
-    if let Some(endpoint_uri) = maybe_endpoint_uri {
-      self.load_balancer.remove_connection(&endpoint_uri);
-      tracing::trace!(
-        handle = self.core.handle,
-        pipe_read_id,
-        uri = %endpoint_uri,
-        "PUSH removed detached connection from load balancer"
-      );
+    if let Some(endpoint_uri) = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id) {
+      self.outgoing_orchestrator.remove_connection(&endpoint_uri);
     } else {
       tracing::warn!(
         handle = self.core.handle,
         pipe_read_id,
-        "PUSH detach: Endpoint URI not found for pipe_read_id. LoadBalancer may not be updated."
+        "PUSH detach: Endpoint URI not found for pipe_read_id."
       );
+    }
+  }
+}
+
+impl PushSocket {
+  async fn send_with_timeout(
+    &self,
+    fb: FrameBatch,
+    wait_for_peer: bool,
+    sndtimeo: Option<Duration>,
+  ) -> Result<(), ZmqError> {
+    match sndtimeo {
+      Some(d) if !d.is_zero() => {
+        match tokio_timeout(d, self.outgoing_orchestrator.route_message(fb, wait_for_peer)).await {
+          Ok(Ok(())) => Ok(()),
+          Ok(Err((_, e))) => Err(e),
+          Err(_) => Err(ZmqError::Timeout),
+        }
+      }
+      _ => match self.outgoing_orchestrator.route_message(fb, wait_for_peer).await {
+        Ok(()) => Ok(()),
+        Err((_, e)) => Err(e),
+      },
     }
   }
 }

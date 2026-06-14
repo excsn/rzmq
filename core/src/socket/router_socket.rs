@@ -6,10 +6,13 @@ use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::SocketCore;
 use crate::socket::options::{AUTO_DELIMITER, ROUTER_MANDATORY};
-use crate::socket::patterns::incoming_orchestrator::{AppFrames, IncomingMessageOrchestrator};
+use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::socket::patterns::{FramingLatch, RouterMap, WritePipeCoordinator, router_auto_decode, router_auto_encode};
 
 use dashmap::DashMap;
+use parking_lot::Mutex as ParkingMutex;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,7 +33,9 @@ struct ActiveFragmentedSend {
 pub(crate) struct RouterSocket {
   core: Arc<SocketCore>,
   router_map_for_send: RouterMap,
-  incoming_orchestrator: IncomingMessageOrchestrator<(Blob, FrameBatch)>,
+  incoming_orchestrator: IncomingMessageOrchestrator,
+  pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
+  frame_recv_buffer: ParkingMutex<Option<VecDeque<Msg>>>,
   pipe_to_identity_shared_map: Arc<DashMap<usize, Blob>>,
   current_send_target: TokioMutex<Option<ActiveFragmentedSend>>,
   pipe_send_coordinator: Arc<WritePipeCoordinator>,
@@ -39,13 +44,14 @@ pub(crate) struct RouterSocket {
 
 impl RouterSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let rcvhwm = { core.core_state.read().options.rcvhwm };
-    let orchestrator = IncomingMessageOrchestrator::new(core.handle, rcvhwm);
+    let orchestrator = IncomingMessageOrchestrator::new(core.handle);
 
     Self {
       core,
       router_map_for_send: RouterMap::new(),
       incoming_orchestrator: orchestrator,
+      pending_pipe_senders: ParkingMutex::new(HashMap::new()),
+      frame_recv_buffer: ParkingMutex::new(None),
       pipe_to_identity_shared_map: Arc::new(DashMap::new()),
       current_send_target: TokioMutex::new(None),
       pipe_send_coordinator: Arc::new(WritePipeCoordinator::new()),
@@ -372,13 +378,32 @@ impl ISocket for RouterSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let rcvtimeo_opt = { self.core.core_state.read().options.rcvtimeo };
-    self
-      .incoming_orchestrator
-      .recv_message(rcvtimeo_opt, |(identity_blob, payload_frames_vec)| {
-        AppFrames::Multiple(Self::transform_qitem_to_app_frames(identity_blob, payload_frames_vec))
-      })
-      .await
+    // Fast path: serve from frame buffer (mid-multipart delivery).
+    {
+      let mut guard = self.frame_recv_buffer.lock();
+      if let Some(ref mut frames) = *guard {
+        if let Some(frame) = frames.pop_front() {
+          if frames.is_empty() { *guard = None; }
+          return Ok(frame);
+        }
+        *guard = None;
+      }
+    }
+    // Slow path: fetch next complete raw batch, process, return first frame.
+    let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
+    let (pipe_read_id, raw_batch) = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await?;
+    let (identity_blob, payload) = self.process_incoming_zmtp_message(pipe_read_id, raw_batch)?;
+    let mut app_frames = Self::transform_qitem_to_app_frames(identity_blob, payload);
+    if app_frames.is_empty() {
+      return Ok(Msg::new());
+    }
+    if app_frames.len() == 1 {
+      return Ok(app_frames.remove(0));
+    }
+    let mut deque: VecDeque<Msg> = app_frames.into_iter().collect();
+    let first = deque.pop_front().unwrap();
+    *self.frame_recv_buffer.lock() = Some(deque);
+    Ok(first)
   }
 
   async fn send_multipart(&self, mut frames: FrameBatch) -> Result<(), ZmqError> {
@@ -515,13 +540,10 @@ impl ISocket for RouterSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let rcvtimeo_opt = { self.core.core_state.read().options.rcvtimeo };
-    self
-      .incoming_orchestrator
-      .recv_logical_message(rcvtimeo_opt, |(identity_blob, payload_frames_vec)| {
-        AppFrames::Multiple(Self::transform_qitem_to_app_frames(identity_blob, payload_frames_vec))
-      })
-      .await
+    let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
+    let (pipe_read_id, raw_batch) = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await?;
+    let (identity_blob, payload) = self.process_incoming_zmtp_message(pipe_read_id, raw_batch)?;
+    Ok(Self::transform_qitem_to_app_frames(identity_blob, payload))
   }
 
   async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -562,43 +584,17 @@ impl ISocket for RouterSocket {
     Ok(true)
   }
 
-  async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
+  async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
-      Command::PipeMessageReceived { msg, .. } => {
-        if let Some(raw_zmtp_message_vec) = self
-          .incoming_orchestrator
-          .accumulate_pipe_frame(pipe_read_id, msg)?
-        {
-          match self.process_incoming_zmtp_message(pipe_read_id, raw_zmtp_message_vec) {
-            Ok((identity_blob, payload_only_vec)) => {
-              self
-                .incoming_orchestrator
-                .queue_item(pipe_read_id, (identity_blob, payload_only_vec))
-                .await?;
-            }
-            Err(e) => {
-              tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "Router: Error processing incoming ZMTP message: {}. Dropped.", e);
-            }
-          }
-        }
-      }
-      Command::PipeMessageBatchReceived { msgs, .. } => {
-        let mut assembled_batch = Vec::new();
-        for msg in msgs {
-          if let Some(raw) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
-            match self.process_incoming_zmtp_message(pipe_read_id, raw) {
-              Ok((identity_blob, payload_only_vec)) => assembled_batch.push((identity_blob, payload_only_vec)),
-              Err(e) => tracing::error!(handle = self.core.handle, pipe_id = pipe_read_id, "Router batch: Error processing ZMTP message: {}. Dropped.", e),
-            }
-          }
-        }
-        if !assembled_batch.is_empty() {
-          self.incoming_orchestrator.queue_batch(pipe_read_id, assembled_batch).await?;
-        }
-      }
+      // Data frames are pushed directly by the actor via PipeMessageSender; no action needed.
+      Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {}
       _ => {}
     }
     Ok(())
+  }
+
+  fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {
+    self.pending_pipe_senders.lock().remove(&pipe_read_id)
   }
 
   async fn pipe_attached(
@@ -639,6 +635,11 @@ impl ISocket for RouterSocket {
         .pipe_to_identity_shared_map
         .insert(pipe_read_id, identity_to_use);
       self.pipe_send_coordinator.add_pipe(pipe_read_id).await;
+
+      // Register per-pipe ingress channel.
+      let rcvhwm = self.core.core_state.read().options.rcvhwm.max(1);
+      let raw_sender = self.incoming_orchestrator.register_connection_pipe(pipe_read_id, rcvhwm);
+      self.pending_pipe_senders.lock().insert(pipe_read_id, PipeMessageSender::Direct(raw_sender));
     } else {
       tracing::warn!(
         handle = self.core.handle,
@@ -727,7 +728,6 @@ impl ISocket for RouterSocket {
     self.pipe_send_coordinator.remove_pipe(pipe_read_id).await;
 
     if connection_id_opt.is_some() {
-
       let mut active_frag_guard = self.current_send_target.lock().await;
       if let Some(active_info) = &*active_frag_guard {
         if endpoint_uri_opt.as_deref() == Some(&active_info.target_endpoint_uri) {
@@ -736,9 +736,7 @@ impl ISocket for RouterSocket {
       }
     }
 
-    self
-      .incoming_orchestrator
-      .clear_pipe_state(pipe_read_id)
-      .await;
+    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }
 }

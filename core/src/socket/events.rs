@@ -39,8 +39,14 @@ pub enum SocketEvent {
   HandshakeFailed { endpoint: String, error_msg: String },
   /// ZMTP handshake (including security mechanism) succeeded.
   HandshakeSucceeded { endpoint: String },
-  // /// A specific ZMTP protocol event occurred during handshake (e.g., ZAP needed).
-  // HandshakeProtocol { endpoint: String, event_code: i32 }, // Example
+
+  // --- Backpressure/Congestion Events ---
+  /// The connection's egress pipe has reached its send HWM; the socket is
+  /// actively skipping this peer via write-ready skip.
+  ConnectionCongested { endpoint: String },
+  /// The connection's egress pipe has drained below its send HWM; the peer
+  /// re-enters the load-balancer rotation.
+  ConnectionUncongested { endpoint: String },
 }
 
 // Type alias for the channel sender used for monitor events

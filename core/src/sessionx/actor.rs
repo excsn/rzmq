@@ -3,17 +3,22 @@
 use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg};
 use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};
+use crate::sessionx::ingress_future::IngressDriver;
 use crate::sessionx::regulator::SessionRegulator;
 use crate::socket::ISocket;
+use crate::socket::events::SocketEvent;
 use crate::socket::options::ZmtpEngineConfig;
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::throttle::AdaptiveThrottle;
 use crate::transport::{ZmtpStdStream, ZmtpWriteHalf};
 use crate::{Blob, MailboxReceiver};
 
+use super::message_processor::ZmqMessageProcessor;
+
 use futures::FutureExt;
 use std::fmt::Debug;
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd; // For AsRawFd bound if S needs it for cork_info init
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, broadcast};
@@ -21,13 +26,12 @@ use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
 use super::egress_buffer::EgressBuffer;
+use super::egress_future::EgressDriver;
 use super::pipe_manager::CorePipeManagerX;
 use super::protocol_handler::ZmtpProtocolHandlerX;
 use super::states::ActorConfigX;
 use super::types::{ConnectionPhaseX, ZmtpHandshakeProgressX};
 
-// SessionConnectionActorX might not need to be Debug itself if not printed directly.
-// If it is, S would need to be Debug. Let's assume for now it doesn't need direct Debug.
 pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   handle: usize,
   current_phase: ConnectionPhaseX,
@@ -49,68 +53,59 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   socket_logic: Arc<dyn ISocket>,
   session_regulator: SessionRegulator,
   _connection_permit: Option<OwnedSemaphorePermit>,
+  incoming_pipe_sender: Option<PipeMessageSender>,
+  is_currently_congested: bool,
 }
 
-// Add AsRawFd bound here if ZmtpProtocolHandlerX::new needs it for cork setup.
-// This depends on how try_create_cork_info and ZPHX::new are finalized for S.
-// If ZPHX::new takes Option<RawFd>, then SCA doesn't need this bound directly for that.
-// However, if ZPHX::new takes &S and calls as_raw_fd(), then SCA::new needs S: AsRawFd.
-// Let's assume for now that ZPHX::new is passed what it needs regarding FD for cork.
 impl<S> SessionConnectionActorX<S>
 where
-  S: ZmtpStdStream + Debug + Unpin + Send + 'static, // Keep Send + 'static for tokio::spawn
+  S: ZmtpStdStream + Debug + Unpin + Send + 'static,
 {
   pub(crate) fn create_and_spawn(
     handle: usize,
     parent_socket_id: usize,
-    stream: S, // Consumes the stream
+    stream: S,
     actor_config: ActorConfigX,
     engine_config: Arc<ZmtpEngineConfig>,
     command_mailbox_receiver: MailboxReceiver,
     socket_logic: Arc<dyn ISocket>,
     connection_permit: Option<OwnedSemaphorePermit>,
   ) -> JoinHandle<()> {
-    // Returns JoinHandle for the SCA task
 
     let zmtp_handler = ZmtpProtocolHandlerX::new(
       stream,
-      engine_config.clone(), // ZmtpProtocolHandlerX clones Arc
+      engine_config.clone(),
       actor_config.is_server_role,
-      handle, // Pass actor handle for logging within ZmtpProtocolHandlerX
+      handle,
     );
 
     let mut ping_check_timer = None;
     if let Some(ivl) = engine_config.heartbeat_ivl {
       if !ivl.is_zero() {
-        // Start timer such that the first tick is after `ivl` from now.
         let mut timer = tokio::time::interval_at(TokioInstant::now() + ivl, ivl);
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ping_check_timer = Some(timer);
       }
     }
 
-    // Overall handshake timeout
     let handshake_deadline = engine_config
       .handshake_timeout
       .map(|d| TokioInstant::now() + d);
 
     let system_event_receiver = actor_config.context.event_bus().subscribe();
 
-    // We enforce a minimum 1s lifespan if the configured receive timeout is short,
-    // to prevent rapid crash-loops from flooding logs.
     let rcv_timeout = engine_config
       .rcvtimeo
       .unwrap_or(std::time::Duration::from_secs(30));
     let regulator_min_lifespan = if rcv_timeout < std::time::Duration::from_millis(1000) {
       std::time::Duration::from_millis(1000)
     } else {
-      // Even if rcvtimeo is long, a crash-on-connect should still be throttled.
       std::time::Duration::from_millis(1000)
     };
 
     let actor = Self {
       handle,
-      current_phase: ConnectionPhaseX::HandshakeInProgress, // Start handshake immediately
+      current_phase: ConnectionPhaseX::HandshakeInProgress,
       parent_socket_id,
       actor_config,
       zmtp_handler,
@@ -124,6 +119,8 @@ where
       socket_logic,
       session_regulator: SessionRegulator::new(regulator_min_lifespan),
       _connection_permit: connection_permit,
+      incoming_pipe_sender: None,
+      is_currently_congested: false,
     };
 
     let task_handle = tokio::spawn(actor.run_loop());
@@ -141,14 +138,13 @@ where
     let mut actor_drop_guard = ActorDropGuard::new(
       self.actor_config.context.clone(),
       self.handle,
-      ActorType::Session, // Consider ActorType::SessionConnectionActorX
+      ActorType::Session,
       Some(self.actor_config.connected_endpoint_uri.clone()),
       Some(self.parent_socket_id),
     );
 
     let adaptive_throttle = {
       let mut config = self.zmtp_handler.config.throttle_config.clone();
-      // Priority is role-dependent and cannot be set via socket options.
       if self.actor_config.is_server_role {
         config.priority = crate::throttle::types::Priority::Egress;
       } else {
@@ -157,17 +153,16 @@ where
       AdaptiveThrottle::new(config)
     };
 
-    // Reusable batch buffer — allocated once, cleared on each wakeup
     let mut outgoing_batch: Vec<FrameBatch> =
       Vec::with_capacity(self.zmtp_handler.config.sndbatch_count);
 
     let mut egress_buffer = EgressBuffer::new();
-    const EGRESS_BACKPRESSURE_BYTES: usize = 256 * 1024;
-    let writev_max_iovecs = self.zmtp_handler.config.sndbatch_count;
+
+    // Local FIFO queue decouples network read from application pipe send to prevent deadlock.
+    let mut ingress_buffer: std::collections::VecDeque<FrameBatch> =
+      std::collections::VecDeque::new();
 
     // ── HANDSHAKE LOOP ────────────────────────────────────────────────────────
-    // zmtp_handler owns both halves here; advance_handshake() drives all I/O.
-    // Exits when phase leaves HandshakeInProgress/WaitingForPipes, or on shutdown.
     'handshake: while matches!(
       self.current_phase,
       ConnectionPhaseX::HandshakeInProgress | ConnectionPhaseX::WaitingForPipes
@@ -223,43 +218,38 @@ where
     }
 
     // ── OPERATIONAL LOOP ──────────────────────────────────────────────────────
-    // Split halves into local variables so ingress and egress arms are independent.
     if self.current_phase == ConnectionPhaseX::Operational {
+      let mut message_processor = ZmqMessageProcessor::new();
+
       let mut read_half = self.zmtp_handler.read_half.take()
         .expect("read_half must be present at operational start");
       let mut write_half = self.zmtp_handler.write_half.take()
         .expect("write_half must be present at operational start");
 
       let use_owned_write = write_half.supports_owned_write();
+      let sndhwm = self.zmtp_handler.config.sndhwm.max(1);
+      let sndbatch_count = self.zmtp_handler.config.sndbatch_count;
       let mut pending_vectored: std::collections::VecDeque<Vec<bytes::Bytes>> =
         std::collections::VecDeque::new();
 
-      // Logical messages batch-pulled from the core pipe beyond the per-round
-      // sndbatch budgets; drained (FIFO) before the pipe is polled again so the
-      // byte/count budgets are preserved exactly despite batch pulls.
       let mut core_carryover: std::collections::VecDeque<FrameBatch> =
         std::collections::VecDeque::new();
-      // Reusable scratch for batch pulls from the core pipe.
       let mut core_batch_scratch: Vec<FrameBatch> = Vec::new();
 
       'operational: while self.current_phase == ConnectionPhaseX::Operational
-        || (self.current_phase == ConnectionPhaseX::ShuttingDownStream
-            && (!egress_buffer.is_empty() || !pending_vectored.is_empty()))
       {
-        // Drain carryover from a prior over-budget batch pull before polling the
-        // core pipe again (the pipe select arm is gated on an empty carryover).
-        // Same egress-room condition as the pipe arm, so this cannot busy-loop.
         if !core_carryover.is_empty()
           && self.current_phase == ConnectionPhaseX::Operational
           && if use_owned_write {
             pending_vectored.is_empty()
           } else {
-            egress_buffer.total_pending_bytes() < EGRESS_BACKPRESSURE_BYTES
+            egress_buffer.pending_messages() < sndhwm
           }
         {
           outgoing_batch.clear();
           let wire_size = |msgs: &FrameBatch| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
-          let max_count = self.zmtp_handler.config.sndbatch_count;
+          let hwm_budget = sndhwm.saturating_sub(egress_buffer.pending_messages()).max(1);
+          let max_count = self.zmtp_handler.config.sndbatch_count.min(hwm_budget);
           let max_bytes = self.zmtp_handler.config.sndbatch_bytes;
           let mut total_bytes = 0usize;
 
@@ -272,7 +262,6 @@ where
               None => break,
             }
           }
-          // Top up from the pipe if the budgets still have room.
           if core_carryover.is_empty()
             && outgoing_batch.len() < max_count
             && total_bytes < max_bytes
@@ -303,7 +292,16 @@ where
             }
           } else {
             match self.zmtp_handler.frame_outgoing_batch(&outgoing_batch) {
-              Ok(bytes) => egress_buffer.push(bytes),
+              Ok(bytes) => {
+                egress_buffer.push(bytes, outgoing_batch.len());
+                if !self.is_currently_congested && egress_buffer.pending_messages() >= sndhwm {
+                  self.is_currently_congested = true;
+                  if let Some(ref tx) = self.actor_config.monitor_tx {
+                    let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri);
+                    let _ = tx.try_send(SocketEvent::ConnectionCongested { endpoint: ep });
+                  }
+                }
+              }
               Err(e) => self.set_fatal_error(e).await,
             }
           }
@@ -361,55 +359,54 @@ where
             }
           }
 
-          // Ingress: concurrent with egress — independent local borrow
-          ingress_res = self.zmtp_handler.read_and_parse_data_frames_batch(&mut read_half) => {
-            match ingress_res {
-              Ok(msgs) if !msgs.is_empty() => {
-                let pipe_read_id = self
-                  .core_pipe_manager
-                  .state
-                  .core_pipe_read_id_for_incoming_routing
-                  .expect("pipe_id required for incoming routing");
-
-                let mut data_msgs = FrameBatch::new();
-                for msg in msgs {
-                  if msg.is_command() {
-                    match self.zmtp_handler.process_incoming_data_command_frame(&msg) {
-                      Ok(Some(pong)) => {
-                        let mut pong_fb = FrameBatch::new();
-                        pong_fb.push(pong);
-                        match self.zmtp_handler.frame_outgoing_msgs(pong_fb) {
-                          Ok(bytes) => egress_buffer.push_priority(bytes),
-                          Err(e) => { self.set_fatal_error(e).await; }
-                        }
-                      }
-                      Ok(None) => {}
-                      Err(e) => { self.set_fatal_error(e).await; }
-                    }
-                  } else {
-                    data_msgs.push(msg);
-                  }
-                }
-
-                if !data_msgs.is_empty() {
-                  let weight = data_msgs.len() as u32;
+          // Drain ingress buffer: decouples network read from application pipe send.
+          drain_res = IngressDriver::new(self.incoming_pipe_sender.as_ref(), &mut ingress_buffer),
+              if !ingress_buffer.is_empty() => {
+            match drain_res {
+              Ok(batch_len) => {
+                if self.incoming_pipe_sender.is_some() {
+                  let weight = batch_len as u32;
                   let throttle_guard = adaptive_throttle
                     .begin_work_bulk(crate::throttle::Direction::Ingress, weight);
-
-                  let cmd = crate::runtime::Command::PipeMessageBatchReceived {
-                    pipe_id: pipe_read_id,
-                    msgs: data_msgs,
-                  };
-                  if let Err(e) = self.socket_logic.handle_pipe_event(pipe_read_id, cmd).await {
-                    self.set_fatal_error(e).await;
-                  }
-
                   if throttle_guard.should_throttle() {
                     yield_now().await;
                   }
                 }
               }
-              Ok(_) => {}
+              Err(e) => {
+                tracing::debug!(sca_handle = self.handle, error = %e, "Ingress pipe closed; shutting down.");
+                self.transition_to_shutdown_stream(Some(e)).await;
+              }
+            }
+          }
+
+          // Ingress network read: gated on empty buffer to propagate TCP backpressure.
+          ingress_res = message_processor.read_and_process(&mut read_half, &mut self.zmtp_handler),
+              if ingress_buffer.is_empty() => {
+            match ingress_res {
+              Ok(complete_batches) => {
+                for frame_batch in complete_batches {
+                  let is_command_batch = frame_batch.first().map_or(false, |m| m.is_command());
+                  if is_command_batch {
+                    for msg in &frame_batch {
+                      match self.zmtp_handler.process_incoming_data_command_frame(msg) {
+                        Ok(Some(pong)) => {
+                          let mut pong_fb = FrameBatch::new();
+                          pong_fb.push(pong);
+                          match self.zmtp_handler.frame_outgoing_msgs(pong_fb) {
+                            Ok(bytes) => egress_buffer.push_priority(bytes),
+                            Err(e) => { self.set_fatal_error(e).await; }
+                          }
+                        }
+                        Ok(None) => {}
+                        Err(e) => { self.set_fatal_error(e).await; }
+                      }
+                    }
+                  } else {
+                    ingress_buffer.push_back(frame_batch);
+                  }
+                }
+              }
               Err(ZmqError::ConnectionClosed) => {
                 tracing::info!(sca_handle = self.handle, "Peer closed connection.");
                 self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
@@ -418,39 +415,42 @@ where
             }
           }
 
-          // Unified write arm: priority egress (EgressBuffer pings/pongs) drains before
-          // zero-copy data. Only one arm borrows write_half so the borrow checker is happy.
-          // Some(n) = AsyncWrite bytes advanced; None = write_owned completed.
+          // Unified write arm.
           write_res = async {
-            use tokio::io::AsyncWriteExt;
             if !egress_buffer.is_empty() {
-              let mut slices = Vec::with_capacity(writev_max_iovecs);
-              egress_buffer.current_slices(writev_max_iovecs, &mut slices);
-              let n = write_half.write_vectored(&slices).await?;
-              Ok::<Option<usize>, std::io::Error>(Some(n))
+              let r = EgressDriver::new(&mut write_half, &mut egress_buffer, sndbatch_count).await;
+              r?;
+              Ok::<bool, ZmqError>(true)
             } else {
               let bufs = pending_vectored.front().cloned().unwrap_or_default();
-              write_half.write_owned(bufs).await?;
-              Ok(None)
+              write_half.write_owned(bufs).await
+                .map_err(|e| ZmqError::from_io_endpoint(e, "egress write"))?;
+              Ok(false)
             }
           }, if !egress_buffer.is_empty()
               || (use_owned_write && pending_vectored.front().is_some()) => {
             match write_res {
-              Ok(Some(n)) => {
-                egress_buffer.advance(n);
+              Ok(true) => {
                 self.zmtp_handler.heartbeat_state.record_activity();
+                if self.is_currently_congested && egress_buffer.pending_messages() < sndhwm {
+                  self.is_currently_congested = false;
+                  if let Some(ref tx) = self.actor_config.monitor_tx {
+                    let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri);
+                    let _ = tx.try_send(SocketEvent::ConnectionUncongested { endpoint: ep });
+                  }
+                }
               }
-              Ok(None) => {
+              Ok(false) => {
                 pending_vectored.pop_front();
                 self.zmtp_handler.heartbeat_state.record_activity();
               }
               Err(e) => {
-                self.set_fatal_error(ZmqError::from_io_endpoint(e, "egress write")).await;
+                self.set_fatal_error(e).await;
               }
             }
           }
 
-          // Outgoing from SocketCore - Only accept messages while in Operational phase
+          // Outgoing from SocketCore.
           maybe_msgs_from_core = async { self.core_pipe_manager.recv_from_core().await },
               if self.current_phase == ConnectionPhaseX::Operational
                 && self.core_pipe_manager.is_attached()
@@ -458,22 +458,19 @@ where
                 && if use_owned_write {
                   pending_vectored.is_empty()
                 } else {
-                  egress_buffer.total_pending_bytes() < EGRESS_BACKPRESSURE_BYTES
+                  egress_buffer.pending_messages() < sndhwm
                 } => {
             match maybe_msgs_from_core {
               Ok(first_msgs) => {
                 outgoing_batch.clear();
-                // Count wire bytes (payload + 9 bytes ZMTP long-frame overhead per message)
-                // so the framed batch never exceeds sndbatch_bytes and busts the ZC slot.
                 let wire_size = |msgs: &FrameBatch| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
                 let mut total_bytes = wire_size(&first_msgs);
                 outgoing_batch.push(first_msgs);
 
-                let max_count = self.zmtp_handler.config.sndbatch_count;
+                let hwm_budget = sndhwm.saturating_sub(egress_buffer.pending_messages());
+                let max_count = self.zmtp_handler.config.sndbatch_count.min(hwm_budget.max(1));
                 let max_bytes = self.zmtp_handler.config.sndbatch_bytes;
 
-                // One batch pull instead of one try_recv per item. Items beyond the
-                // budgets go to core_carryover, drained at the top of the loop.
                 while outgoing_batch.len() < max_count && total_bytes < max_bytes {
                   core_batch_scratch.clear();
                   let drained = self
@@ -504,7 +501,16 @@ where
                   }
                 } else {
                   match self.zmtp_handler.frame_outgoing_batch(&outgoing_batch) {
-                    Ok(bytes) => egress_buffer.push(bytes),
+                    Ok(bytes) => {
+                      egress_buffer.push(bytes, outgoing_batch.len());
+                      if !self.is_currently_congested && egress_buffer.pending_messages() >= sndhwm {
+                        self.is_currently_congested = true;
+                        if let Some(ref tx) = self.actor_config.monitor_tx {
+                          let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri);
+                          let _ = tx.try_send(SocketEvent::ConnectionCongested { endpoint: ep });
+                        }
+                      }
+                    }
                     Err(e) => self.set_fatal_error(e).await,
                   }
                 }
@@ -523,7 +529,6 @@ where
         }
       }
 
-      // Restore halves so initiate_stream_shutdown can shut down the write half.
       self.zmtp_handler.read_half = Some(read_half);
       self.zmtp_handler.write_half = Some(write_half);
     }
@@ -538,26 +543,20 @@ where
       self.current_phase
     );
 
-    // Post-loop cleanup (already initiated if error/stop occurred, this is a final catch-all)
     if self.current_phase != ConnectionPhaseX::Terminating {
-      // If loop exited for other reasons
       self.perform_final_cleanup_actions().await;
     }
 
     let had_error = self.error_for_drop_guard.is_some();
-    
+
     if let Some(err) = self.error_for_drop_guard.take() {
       actor_drop_guard.set_error(err);
     } else {
       actor_drop_guard.waive();
     }
 
-    // This publishes the ActorStopping event (which triggers the Disconnected monitor event)
-    // IMMEDIATELY, before we potentially sleep for the churn penalty.
     drop(actor_drop_guard);
 
-    // Now, enforce the minimum lifespan penalty if there was an error.
-    // The rest of the system is already notified that we are dead.
     if had_error {
       self.session_regulator.enforce_min_lifespan().await;
     }
@@ -569,7 +568,7 @@ where
     );
   }
 
-  // --- Helper Methods for select! Arms & State Transitions ---
+  // --- Helper Methods ---
 
   async fn process_command(&mut self, command: Command) {
     tracing::debug!(
@@ -579,9 +578,10 @@ where
     );
     match command {
       Command::ScaInitializePipes {
-        sca_handle_id, // Used to verify command is for this actor instance
+        sca_handle_id,
         rx_from_core,
         core_pipe_read_id_for_incoming_routing,
+        incoming_pipe_sender,
       } => {
         if self.handle != sca_handle_id {
           tracing::warn!(
@@ -589,7 +589,6 @@ where
             expected_id = sca_handle_id,
             "Received ScaInitializePipes for wrong actor. Ignoring."
           );
-          // Important: Drop rx_from_core to prevent resource leak if it's not used
           drop(rx_from_core);
           return;
         }
@@ -598,7 +597,7 @@ where
             sca_handle = self.handle,
             "Already attached. Ignoring ScaInitializePipes."
           );
-          drop(rx_from_core); // Still drop the provided channels
+          drop(rx_from_core);
           return;
         }
 
@@ -615,6 +614,7 @@ where
           return;
         }
 
+        self.incoming_pipe_sender = incoming_pipe_sender;
         self
           .core_pipe_manager
           .attach(rx_from_core, core_pipe_read_id_for_incoming_routing);
@@ -651,9 +651,12 @@ where
     match event {
       SystemEvent::ContextTerminating => {
         tracing::info!(sca_handle = self.handle, "Received ContextTerminating.");
-        self
-          .transition_to_shutdown_stream(None)
-          .await;
+        self.transition_to_shutdown_stream(None).await;
+      }
+      SystemEvent::SocketClosing { socket_id } => {
+        if socket_id == self.parent_socket_id {
+          self.transition_to_shutdown_stream(None).await;
+        }
       }
       _ => {}
     }
@@ -695,9 +698,9 @@ where
   }
 
   async fn check_and_transition_to_operational(&mut self) {
-    if self.current_phase == ConnectionPhaseX::WaitingForPipes &&
-       self.zmtp_handler.is_handshake_complete() && // Should always be true if in WaitingForPipes
-       self.core_pipe_manager.is_attached()
+    if self.current_phase == ConnectionPhaseX::WaitingForPipes
+      && self.zmtp_handler.is_handshake_complete()
+      && self.core_pipe_manager.is_attached()
     {
       tracing::info!(
         sca_handle = self.handle,
@@ -705,9 +708,6 @@ where
       );
       self.current_phase = ConnectionPhaseX::Operational;
 
-      // Deferred cork: handshake is complete, now safe to enable TCP_CORK for
-      // streaming patterns. Applied here rather than at socket creation so that
-      // small handshake frames are never held by the 200ms kernel cork timer.
       let socket_type = self.zmtp_handler.config.socket_type_name.as_str();
       if self.zmtp_handler.config.use_cork
         && matches!(socket_type, "PUSH" | "PULL" | "PUB" | "SUB")
@@ -721,7 +721,6 @@ where
         }
       }
 
-      // Determine final peer identity: one from handshake (security or READY) takes precedence.
       let final_peer_identity = self.pending_peer_identity_from_handshake.take();
       let peer_socket_type = self.zmtp_handler.handshake_state.peer_socket_type.clone();
 
@@ -736,13 +735,7 @@ where
           peer_identity: final_peer_identity,
           peer_socket_type,
         };
-        if self
-          .actor_config
-          .context
-          .event_bus()
-          .publish(event)
-          .is_err()
-        {
+        if self.actor_config.context.event_bus().publish(event).is_err() {
           tracing::warn!(
             sca_handle = self.handle,
             "Failed to publish PeerIdentityEstablished event."
@@ -758,7 +751,6 @@ where
           sca_handle = self.handle,
           "CRITICAL: Cannot publish PeerIdentityEstablished: core_pipe_read_id not set after pipes attached."
         );
-        // This is a logic error if pipes are attached but no routing ID.
         self
           .set_fatal_error(ZmqError::Internal(
             "Pipe routing ID missing post-attach".into(),
@@ -776,7 +768,6 @@ where
   }
 
   async fn handle_incoming_from_network(&mut self, msg: Msg) {
-    // Get the pipe_id needed for ISocket::handle_pipe_event
     let pipe_read_id = self
       .core_pipe_manager
       .state
@@ -784,18 +775,16 @@ where
       .expect("Cannot handle incoming message without core_pipe_read_id");
 
     if msg.is_command() {
-      // Process PING/PONG
       match self.zmtp_handler.process_incoming_data_command_frame(&msg) {
         Ok(Some(pong_reply)) => {
           if let Err(e) = self.zmtp_handler.write_data_msg(pong_reply, true).await {
             self.set_fatal_error(e).await;
           }
         }
-        Ok(None) => { /* PONG received and handled */ }
+        Ok(None) => {}
         Err(e) => self.set_fatal_error(e).await,
       }
     } else {
-      // Data message. Send DIRECTLY to ISocket pattern logic.
       let command_for_isocket = Command::PipeMessageReceived {
         pipe_id: pipe_read_id,
         msg,
@@ -818,10 +807,7 @@ where
       self.error_for_drop_guard = Some(error);
     }
 
-    // Explicitly shutdown and drop the stream NOW to free the OS File Descriptor.
     let _ = self.zmtp_handler.initiate_stream_shutdown().await;
-
-    // Transition directly to Terminating to exit the loop immediately since the stream is dead.
     self.current_phase = ConnectionPhaseX::Terminating;
   }
 
@@ -849,7 +835,6 @@ where
   }
 
   async fn perform_graceful_shutdown(&mut self) {
-    // This method is called when self.current_phase is ShuttingDownStream
     tracing::info!(
       sca_handle = self.handle,
       "SCA performing graceful shutdown of stream."
@@ -864,7 +849,7 @@ where
         self.error_for_drop_guard = Some(e);
       }
     }
-    self.perform_final_cleanup_actions().await; // Includes setting phase to Terminating
+    self.perform_final_cleanup_actions().await;
   }
 
   async fn perform_final_cleanup_actions(&mut self) {
@@ -877,5 +862,12 @@ where
       sca_handle = self.handle,
       "SCA final cleanup actions complete."
     );
+  }
+}
+
+fn clean_endpoint_uri(uri: &str) -> String {
+  match uri.find('#') {
+    Some(pos) => uri[..pos].to_string(),
+    None => uri.to_string(),
   }
 }

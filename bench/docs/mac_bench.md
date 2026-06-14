@@ -17,12 +17,12 @@
 | **DealerRouter**| Standard | 279,851 | 27,953.15 | 1.71 | 34.59 µs | 51.84 µs |
 | **DealerRouter**| Concurrency 2, Pipeline 4 | 862,548 | 86,246.83 | 5.26 | 43.26 µs | 66.43 µs |
 | **DealerRouter**| Concurrency 4, Pipeline 8 | 863,394 | 86,248.34 | 5.26 | 43.26 µs | 63.49 µs |
-| **PushPull** | Standard | 31,234,272 | 3,123,463.38 | 190.64 | — | — |
-| **PushPull** | Concurrency 2 | 26,549,866 | 2,654,677.67 | 162.03 | — | — |
+| **PushPull** | Standard | 37,768,193 | 3,776,893.17 | 230.52 | — | — |
+| **PushPull** | Concurrency 2 | 30,435,292 | 3,043,867.36 | 185.78 | — | — |
 | **PushPull** | Concurrency 4, Msg Size 32KB | 2,143,360 | 214,318.54 | 6,697.45 | — | — |
 | **PushPull** | Concurrency 8, Msg Size 32KB | 2,790,272 | 278,986.99 | 8,718.34 | — | — |
-| **PubSub** | Standard | 23,611,853 | 2,361,211.74 | 144.12 | — | — |
-| **PubSub** | Concurrency 2 | 19,223,737 | 1,922,517.69 | 117.34 | — | — |
+| **PubSub** | Standard | 26,504,480 | 2,650,445.56 | 161.77 | — | — |
+| **PubSub** | Concurrency 2 | 23,066,626 | 2,306,770.38 | 140.79 | — | — |
 | **PubSub** | Concurrency 4 | 37,547,928 | 3,754,404.22 | 229.15 | — | — |
 | **PubSub** | Concurrency 4, Msg Size 32KB | 2,137,348 | 213,714.16 | 6,678.57 | — | — |
 | **PubSub** | Concurrency 8, Msg Size 32KB | 2,752,904 | 275,255.35 | 8,601.73 | — | — |

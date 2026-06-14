@@ -1,4 +1,12 @@
-use super::patterns::incoming_orchestrator::{AppFrames, IncomingMessageOrchestrator};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use parking_lot::{Mutex as ParkingMutex, RwLock, RwLockReadGuard};
+
+use super::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use super::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
@@ -9,28 +17,23 @@ use crate::socket::options::{SUBSCRIBE, UNSUBSCRIBE};
 use crate::socket::patterns::SubscriptionTrie;
 use crate::{Blob, delegate_to_core};
 
-use async_trait::async_trait;
-use parking_lot::{RwLock, RwLockReadGuard};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-
 #[derive(Debug)]
 pub(crate) struct SubSocket {
   core: Arc<SocketCore>,
-  subscriptions: SubscriptionTrie,
-  incoming_orchestrator: IncomingMessageOrchestrator<AppFrames>,
+  subscriptions: Arc<SubscriptionTrie>,
+  incoming_orchestrator: IncomingMessageOrchestrator,
+  pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
 }
 
 impl SubSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let orchestrator =
-      IncomingMessageOrchestrator::new(core.handle, core.core_state.read().options.rcvhwm);
+    let orchestrator = IncomingMessageOrchestrator::new(core.handle);
     Self {
       core,
-      subscriptions: SubscriptionTrie::new(),
+      subscriptions: Arc::new(SubscriptionTrie::new()),
       incoming_orchestrator: orchestrator,
+      pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
     }
   }
@@ -41,11 +44,7 @@ impl SubSocket {
 
   fn construct_subscription_message(is_subscribe: bool, topic: &[u8]) -> Msg {
     let mut msg_body = Vec::with_capacity(1 + topic.len());
-    if is_subscribe {
-      msg_body.push(0x01);
-    } else {
-      msg_body.push(0x00);
-    }
+    msg_body.push(if is_subscribe { 0x01 } else { 0x00 });
     msg_body.extend_from_slice(topic);
     Msg::from_vec(msg_body)
   }
@@ -88,43 +87,37 @@ impl SubSocket {
     } else {
       tracing::warn!(
         handle = self.core.handle, uri = %endpoint_uri,
-        "SUB: No ISocketConnection found for URI during subscription command send. Peer might have detached."
+        "SUB: No ISocketConnection found for URI during subscription command send."
       );
     }
   }
 
   async fn send_subscription_command_to_all(&self, is_subscribe: bool, topic: &[u8]) {
     let msg = Self::construct_subscription_message(is_subscribe, topic);
-    let peer_uris: Vec<String> = {
-      self
-        .pipe_read_to_endpoint_uri
-        .read()
-        .values()
-        .cloned()
-        .collect()
-    };
+    let peer_uris: Vec<String> = self
+      .pipe_read_to_endpoint_uri
+      .read()
+      .values()
+      .cloned()
+      .collect();
 
     if peer_uris.is_empty() {
-      tracing::trace!(
-        handle = self.core.handle,
-        "Subscription command (all): No peer URIs to send to."
-      );
       return;
     }
 
-    let mut send_futures = Vec::new();
+    let num_peers = peer_uris.len();
+    let mut futures = Vec::with_capacity(num_peers);
     for uri in peer_uris {
-      send_futures.push(self.send_subscription_command_to_uri(uri.clone(), &msg));
+      futures.push(self.send_subscription_command_to_uri(uri, &msg));
     }
-
-    let num_peers = send_futures.len();
-    futures::future::join_all(send_futures).await;
+    futures::future::join_all(futures).await;
 
     tracing::debug!(
-        handle = self.core.handle,
-        command = if is_subscribe { "SUB" } else { "CANCEL" },
-        topic = ?String::from_utf8_lossy(topic),
-        num_peers, "Sent subscription command to all known peer URIs."
+      handle = self.core.handle,
+      command = if is_subscribe { "SUB" } else { "CANCEL" },
+      topic = ?String::from_utf8_lossy(topic),
+      num_peers,
+      "Sent subscription command to all known peer URIs."
     );
   }
 }
@@ -152,9 +145,7 @@ impl ISocket for SubSocket {
   }
 
   async fn send(&self, _msg: Msg) -> Result<(), ZmqError> {
-    Err(ZmqError::InvalidState(
-      "SUB sockets cannot send data messages",
-    ))
+    Err(ZmqError::InvalidState("SUB sockets cannot send data messages"))
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
@@ -162,11 +153,27 @@ impl ISocket for SubSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
-    let transform_fn = |q_item: AppFrames| q_item;
     self
       .incoming_orchestrator
-      .recv_message(rcvtimeo_opt, transform_fn)
+      .recv_frame(rcvtimeo_opt)
       .await
+      .map(|(_, msg)| msg)
+  }
+
+  async fn send_multipart(&self, _frames: FrameBatch) -> Result<(), ZmqError> {
+    Err(ZmqError::InvalidState("SUB sockets cannot send data messages"))
+  }
+
+  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
+    if !self.core.is_running() {
+      return Err(ZmqError::InvalidState("Socket is closing".into()));
+    }
+    let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
+    self
+      .incoming_orchestrator
+      .recv_logical_message(rcvtimeo_opt)
+      .await
+      .map(|(_, batch)| batch)
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -176,27 +183,10 @@ impl ISocket for SubSocket {
     }
   }
 
-  async fn send_multipart(&self, _frames: FrameBatch) -> Result<(), ZmqError> {
-    Err(ZmqError::InvalidState(
-      "SUB sockets cannot send data messages",
-    ))
-  }
-
-  async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
-    if !self.core.is_running() {
-      return Err(ZmqError::InvalidState("Socket is closing".into()));
-    }
-    let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
-    let transform_fn = |q_item: AppFrames| q_item;
-    self
-      .incoming_orchestrator
-      .recv_logical_message(rcvtimeo_opt, transform_fn)
-      .await
-  }
-
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
     delegate_to_core!(self, UserGetOpt, option: option)
   }
+
   async fn close(&self) -> Result<(), ZmqError> {
     delegate_to_core!(self, UserClose,)
   }
@@ -204,13 +194,13 @@ impl ISocket for SubSocket {
   async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     match option {
       SUBSCRIBE => {
-        tracing::debug!(handle=self.core.handle, topic=?String::from_utf8_lossy(value), "Subscribing to topic");
+        tracing::debug!(handle = self.core.handle, topic = ?String::from_utf8_lossy(value), "Subscribing to topic");
         self.subscriptions.subscribe(value).await;
         self.send_subscription_command_to_all(true, value).await;
         Ok(())
       }
       UNSUBSCRIBE => {
-        tracing::debug!(handle=self.core.handle, topic=?String::from_utf8_lossy(value), "Unsubscribing from topic");
+        tracing::debug!(handle = self.core.handle, topic = ?String::from_utf8_lossy(value), "Unsubscribing from topic");
         if self.subscriptions.unsubscribe(value).await {
           self.send_subscription_command_to_all(false, value).await;
         }
@@ -234,43 +224,17 @@ impl ISocket for SubSocket {
     Ok(true)
   }
 
-  async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
+  async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
-      Command::PipeMessageReceived { msg, .. } => {
-        if !msg.is_more() && !self.incoming_orchestrator.has_partial_message(pipe_read_id) {
-          let topic_data = msg.data().unwrap_or_default();
-          if self.subscriptions.matches(topic_data).await {
-            self.incoming_orchestrator.queue_item(pipe_read_id, AppFrames::Single(msg)).await?;
-          }
-        } else if let Some(raw) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
-          let topic_data = raw.get(0).and_then(|frame| frame.data()).unwrap_or_default();
-          if self.subscriptions.matches(topic_data).await {
-            self.incoming_orchestrator.queue_item(pipe_read_id, AppFrames::Multiple(raw)).await?;
-          }
-        }
-      }
-      Command::PipeMessageBatchReceived { msgs, .. } => {
-        let mut assembled_batch = Vec::new();
-        for msg in msgs {
-          if !msg.is_more() && !self.incoming_orchestrator.has_partial_message(pipe_read_id) {
-            let topic_data = msg.data().unwrap_or_default();
-            if self.subscriptions.matches(topic_data).await {
-              assembled_batch.push(AppFrames::Single(msg));
-            }
-          } else if let Some(raw) = self.incoming_orchestrator.accumulate_pipe_frame(pipe_read_id, msg)? {
-            let topic_data = raw.get(0).and_then(|f| f.data()).unwrap_or_default();
-            if self.subscriptions.matches(topic_data).await {
-              assembled_batch.push(AppFrames::Multiple(raw));
-            }
-          }
-        }
-        if !assembled_batch.is_empty() {
-          self.incoming_orchestrator.queue_batch(pipe_read_id, assembled_batch).await?;
-        }
-      }
+      // Data frames are pushed directly by the actor via PipeMessageSender; no action needed.
+      Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {}
       _ => {}
     }
     Ok(())
+  }
+
+  fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {
+    self.pending_pipe_senders.lock().remove(&pipe_read_id)
   }
 
   async fn pipe_attached(
@@ -292,10 +256,25 @@ impl ISocket for SubSocket {
         .write()
         .insert(pipe_read_id, endpoint_uri.clone());
 
+      // Register per-pipe ingress channel and create a filtered sender.
+      let rcvhwm = self.core_state_read().options.rcvhwm.max(1);
+      let raw_sender = self
+        .incoming_orchestrator
+        .register_connection_pipe(pipe_read_id, rcvhwm);
+      let sender = PipeMessageSender::Filtered {
+        inner: raw_sender,
+        trie: Arc::clone(&self.subscriptions),
+      };
+      self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
+
+      // Send any existing subscriptions to the new peer.
       let current_topics = self.subscriptions.get_all_topics().await;
       if !current_topics.is_empty() {
-        tracing::debug!(handle = self.core.handle, uri = %endpoint_uri, num_topics = current_topics.len(), "Sending existing subscriptions to newly attached peer.");
-
+        tracing::debug!(
+          handle = self.core.handle, uri = %endpoint_uri,
+          num_topics = current_topics.len(),
+          "Sending existing subscriptions to newly attached peer."
+        );
         if let Some(conn_iface) = self.get_endpoint(&endpoint_uri) {
           for topic in current_topics {
             let sub_msg = Self::construct_subscription_message(true, &topic);
@@ -305,55 +284,38 @@ impl ISocket for SubSocket {
               .is_err()
             {
               tracing::warn!(
-                handle = self.core.handle,
-                uri = %endpoint_uri,
+                handle = self.core.handle, uri = %endpoint_uri,
                 "Aborting subscription sync due to send error."
               );
               break;
             }
           }
-        } else {
-          tracing::warn!(
-            handle = self.core.handle,
-            uri = %endpoint_uri,
-            "SUB pipe_attached: Connection interface not found for URI. Skipping subscription sync."
-          );
         }
       }
     } else {
       tracing::warn!(
-        handle = self.core.handle,
-        pipe_read_id,
-        "SUB pipe_attached: Could not find endpoint_uri for pipe_read_id. Cannot update map or send initial subscriptions."
+        handle = self.core.handle, pipe_read_id,
+        "SUB pipe_attached: Could not find endpoint_uri for pipe_read_id."
       );
     }
   }
 
   async fn update_peer_identity(&self, pipe_read_id: usize, identity: Option<Blob>) {
     tracing::trace!(
-      handle = self.core.handle,
-      socket_type = "SUB",
-      pipe_read_id,
-      ?identity,
-      "update_peer_identity called, but SUB socket does not use peer identities. Ignoring."
+      handle = self.core.handle, socket_type = "SUB", pipe_read_id, ?identity,
+      "update_peer_identity called, SUB ignores peer identities."
     );
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
-    tracing::debug!(
-      handle = self.core.handle,
-      pipe_read_id,
-      "SUB detaching pipe"
-    );
+    tracing::debug!(handle = self.core.handle, pipe_read_id, "SUB detaching pipe");
 
     let removed_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id);
-    if removed_uri.is_some() {
-      tracing::trace!(handle = self.core.handle, pipe_read_id, uri = %removed_uri.unwrap(), "SUB removed endpoint_uri mapping for detached pipe");
+    if let Some(uri) = removed_uri {
+      tracing::trace!(handle = self.core.handle, pipe_read_id, uri = %uri, "SUB removed endpoint_uri mapping");
     }
 
-    self
-      .incoming_orchestrator
-      .clear_pipe_state(pipe_read_id)
-      .await;
+    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }
 }

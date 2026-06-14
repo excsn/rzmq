@@ -25,6 +25,7 @@ use crate::error::{ZmqError, ZmqResult};
 use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::options::SocketOptions;
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 
 use crate::socket::core::SocketCore;
 use crate::Blob;
@@ -196,6 +197,18 @@ pub trait ISocket: Send + Sync + 'static {
   /// # Arguments
   /// * `pipe_read_id` - The ID of the pipe (from `SocketCore`'s perspective, its read ID) being detached.
   async fn pipe_detached(&self, pipe_read_id: usize);
+
+  /// Returns the ingress `PipeMessageSender` that the session actor should use to push
+  /// complete logical messages directly into this socket's per-pipe receive queue.
+  ///
+  /// Called by `command_processor` immediately after `pipe_attached`, before sending
+  /// `ScaInitializePipes` to the session actor. The sender was created inside
+  /// `pipe_attached` via `orchestrator.register_connection_pipe(pipe_read_id, rcvhwm)`.
+  ///
+  /// Send-only sockets (PUSH, PUB) return `None` — they have no ingress queue.
+  fn get_incoming_pipe_sender(&self, _pipe_read_id: usize) -> Option<PipeMessageSender> {
+    None
+  }
 }
 
 // Re-export types from sub-modules for easier access at `rzmq::socket::*`.

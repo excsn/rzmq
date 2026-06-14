@@ -209,6 +209,17 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     heartbeat::try_build_ping_impl(self)
   }
 
+  /// Thin delegation used by `ZmqMessageProcessor` to parse/decrypt one frame
+  /// from an externally managed byte buffer without yielding to the runtime.
+  /// The framer stays in the handler so its cipher state (nonces) remains unified
+  /// across the read and write directions — no cipher split required.
+  pub(crate) fn try_read_msg_from_buffer(
+    &mut self,
+    buf: &mut bytes::BytesMut,
+  ) -> Result<Option<Msg>, ZmqError> {
+    self.framer.try_read_msg(buf)
+  }
+
   pub(crate) fn has_pong_timed_out(&self) -> bool {
     heartbeat::check_pong_timeout_impl(&self.heartbeat_state, Instant::now())
   }

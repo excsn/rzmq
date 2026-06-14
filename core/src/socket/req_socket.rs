@@ -5,7 +5,8 @@ use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::LoadBalancer;
-use crate::socket::patterns::incoming_orchestrator::{AppFrames, IncomingMessageOrchestrator};
+use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::{Blob, delegate_to_core};
 
 use async_trait::async_trait;
@@ -27,7 +28,8 @@ enum ReqState {
 pub(crate) struct ReqSocket {
   core: Arc<SocketCore>,
   load_balancer: LoadBalancer,
-  incoming_orchestrator: IncomingMessageOrchestrator<FrameBatch>,
+  incoming_orchestrator: IncomingMessageOrchestrator,
+  pending_pipe_senders: ParkingLotMutex<HashMap<usize, PipeMessageSender>>,
   state: ParkingLotMutex<ReqState>,
   reply_available_notifier: Arc<Notify>,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
@@ -35,11 +37,12 @@ pub(crate) struct ReqSocket {
 
 impl ReqSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let orchestrator = IncomingMessageOrchestrator::new(core.handle, 1);
+    let orchestrator = IncomingMessageOrchestrator::new(core.handle);
     Self {
       core,
       load_balancer: LoadBalancer::new(),
       incoming_orchestrator: orchestrator,
+      pending_pipe_senders: ParkingLotMutex::new(HashMap::new()),
       state: ParkingLotMutex::new(ReqState::ReadyToSend),
       reply_available_notifier: Arc::new(Notify::new()),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
@@ -185,7 +188,7 @@ impl ISocket for ReqSocket {
             target_endpoint_uri: target_endpoint_uri_for_send.clone(),
           };
         }
-        self.incoming_orchestrator.reset_recv_message_buffer().await;
+        self.incoming_orchestrator.reset_recv_buffer();
         Ok(())
       }
       Err(ZmqError::ConnectionClosed) => {
@@ -206,85 +209,72 @@ impl ISocket for ReqSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
-    let rcvtimeo_opt: Option<Duration> = { self.core.core_state.read().options.rcvtimeo };
+    let rcvtimeo_opt: Option<Duration> = self.core.core_state.read().options.rcvtimeo;
 
-    // === sync lock for initial check ===
     {
       let op_state_guard = self.state.lock();
       if !matches!(*op_state_guard, ReqState::ExpectingReply { .. }) {
-        return Err(ZmqError::InvalidState(
-          "REQ socket must call send() before receiving",
-        ));
+        return Err(ZmqError::InvalidState("REQ socket must call send() before receiving"));
       }
     }
 
     let notifier = self.reply_available_notifier.clone();
-    let transform_fn_main = |q_item: FrameBatch| AppFrames::Multiple(q_item);
-    let orchestrator_fut = self
-      .incoming_orchestrator
-      .recv_message(rcvtimeo_opt, transform_fn_main);
     let received_msg_result: Result<Msg, ZmqError>;
 
     tokio::select! {
       biased;
       _ = notifier.notified() => {
         if !self.core.is_running() {
-          tracing::debug!("REQ recv: Notifier signaled, core not running. Exiting due to close.");
+          tracing::debug!("REQ recv: Notifier signaled, core not running.");
           received_msg_result = Err(ZmqError::ConnectionClosed);
         } else {
-          let transform_fn_poll = |q_item: FrameBatch| AppFrames::Multiple(q_item);
-          match self.incoming_orchestrator.recv_message(Some(Duration::ZERO), transform_fn_poll).await {
-            Ok(msg) => {
-              received_msg_result = Ok(msg);
+          match self.incoming_orchestrator.recv_logical_message(Some(Duration::ZERO)).await {
+            Ok((_, batch)) => {
+              match self.process_incoming_zmtp_message_for_req(0, batch) {
+                Ok(mut payload) => {
+                  received_msg_result = Ok(if payload.is_empty() { Msg::new() } else { payload.remove(0) });
+                }
+                Err(e) => received_msg_result = Err(e),
+              }
             }
             Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
-              let is_ready_to_send;
-              {
-                let state_guard = self.state.lock();
-                is_ready_to_send = matches!(*state_guard, ReqState::ReadyToSend);
-              }
-
-              if is_ready_to_send {
-                tracing::warn!("REQ recv: Notifier signaled, no immediate message. State is ReadyToSend (likely peer disconnect or request aborted).");
-                received_msg_result = Err(ZmqError::InvalidState("Socket state changed to ReadyToSend while waiting for reply".into()));
+              let is_ready = matches!(*self.state.lock(), ReqState::ReadyToSend);
+              if is_ready {
+                tracing::warn!("REQ recv: Notifier signaled, no immediate message. State reset to ReadyToSend.");
+                received_msg_result = Err(ZmqError::InvalidState("Socket state changed while waiting for reply".into()));
               } else {
-                tracing::error!("REQ recv: Notifier signaled, no immediate message, but still ExpectingReply. Treating as interruption.");
-                received_msg_result = Err(ZmqError::Internal("Receive operation interrupted by notification without immediate data.".into()));
+                tracing::error!("REQ recv: Notifier signaled, no immediate message, still ExpectingReply.");
+                received_msg_result = Err(ZmqError::Internal("Receive interrupted by notification".into()));
               }
             }
-            Err(e) => {
-              received_msg_result = Err(e);
-            }
+            Err(e) => received_msg_result = Err(e),
           }
         }
       }
-      res = orchestrator_fut => {
-        received_msg_result = res;
+      res = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt) => {
+        received_msg_result = match res {
+          Ok((_, batch)) => {
+            match self.process_incoming_zmtp_message_for_req(0, batch) {
+              Ok(mut payload) => Ok(if payload.is_empty() { Msg::new() } else { payload.remove(0) }),
+              Err(e) => Err(e),
+            }
+          }
+          Err(e) => Err(e),
+        };
       }
     }
 
-    // === sync locks for final state update ===
     let mut should_notify = false;
-    if let Ok(ref msg) = received_msg_result {
-      if !msg.is_more() {
-        {
-          let mut state_guard = self.state.lock();
-          if matches!(*state_guard, ReqState::ExpectingReply { .. }) {
-            *state_guard = ReqState::ReadyToSend;
-            should_notify = true;
-          }
-        }
-      }
-    } else if received_msg_result.is_err() {
-      {
-        let mut state_guard = self.state.lock();
-        if matches!(*state_guard, ReqState::ExpectingReply { .. }) {
+    {
+      let mut state_guard = self.state.lock();
+      if matches!(*state_guard, ReqState::ExpectingReply { .. }) {
+        let finished = received_msg_result.as_ref().map_or(true, |m| !m.is_more());
+        if finished {
           *state_guard = ReqState::ReadyToSend;
           should_notify = true;
         }
       }
     }
-
     if should_notify {
       self.reply_available_notifier.notify_waiters();
     }
@@ -307,32 +297,17 @@ impl ISocket for ReqSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
 
-    let rcvtimeo_opt: Option<Duration> = { self.core.core_state.read().options.rcvtimeo };
-
     {
-      // Scoped state check
       let state_guard = self.state.lock();
       if !matches!(*state_guard, ReqState::ExpectingReply { .. }) {
-        return Err(ZmqError::InvalidState(
-          "REQ socket must call send() before receiving reply",
-        ));
+        return Err(ZmqError::InvalidState("REQ socket must call send() before receiving reply"));
       }
     }
 
-    let transform_fn = |payload_frames: FrameBatch| {
-      let mut state_guard = self.state.lock();
-      *state_guard = ReqState::ReadyToSend;
-      self.reply_available_notifier.notify_waiters();
-      AppFrames::Multiple(payload_frames)
-    };
+    let rcvtimeo_opt: Option<Duration> = self.core.core_state.read().options.rcvtimeo;
+    let result = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await;
 
-    let result = self
-      .incoming_orchestrator
-      .recv_logical_message(rcvtimeo_opt, transform_fn)
-      .await;
-
-    // If the orchestrator returns an error, we must also reset the state.
-    if result.is_err() {
+    {
       let mut state_guard = self.state.lock();
       if matches!(*state_guard, ReqState::ExpectingReply { .. }) {
         *state_guard = ReqState::ReadyToSend;
@@ -340,7 +315,10 @@ impl ISocket for ReqSocket {
       }
     }
 
-    result
+    match result {
+      Ok((_, batch)) => self.process_incoming_zmtp_message_for_req(0, batch),
+      Err(e) => Err(e),
+    }
   }
 
   async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
@@ -361,150 +339,17 @@ impl ISocket for ReqSocket {
     Ok(true)
   }
 
-  async fn handle_pipe_event(&self, pipe_read_id: usize, event: Command) -> Result<(), ZmqError> {
+  async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
-      Command::PipeMessageReceived { msg, .. } => {
-        let source_uri = {
-          self
-            .pipe_read_to_endpoint_uri
-            .read()
-            .get(&pipe_read_id)
-            .cloned()
-        };
-
-        let source_uri = match source_uri {
-          Some(s_uri) => s_uri,
-          None => {
-            tracing::warn!(
-              handle = self.core.handle,
-              pipe_id = pipe_read_id,
-              "REQ received reply from unknown pipe (no URI mapping). Dropping frame."
-            );
-            return Ok(());
-          }
-        };
-
-        let is_expected_reply;
-        // === LOCK SCOPE 1: Check State ===
-        {
-          let op_state_guard = self.state.lock();
-          is_expected_reply = match &*op_state_guard {
-            ReqState::ExpectingReply {
-              target_endpoint_uri,
-            } => *target_endpoint_uri == source_uri,
-            ReqState::ReadyToSend => false,
-          };
-          // Guard is dropped here
-        }
-
-        if !is_expected_reply {
-          tracing::warn!(handle = self.core.handle, source_pipe_id = pipe_read_id, source_uri = %source_uri, "REQ received reply from unexpected peer or in wrong state. Dropping frame.");
-          return Ok(());
-        }
-
-        if let Some(raw_zmtp_reply_vec) = self
-          .incoming_orchestrator
-          .accumulate_pipe_frame(pipe_read_id, msg)?
-        {
-          match self.process_incoming_zmtp_message_for_req(pipe_read_id, raw_zmtp_reply_vec) {
-            Ok(reply_payload_parts) => {
-              // === ASYNC OPERATION: Queue the item ===
-              if self
-                .incoming_orchestrator
-                .queue_item(pipe_read_id, reply_payload_parts)
-                .await
-                .is_err()
-              {
-                tracing::error!(
-                  handle = self.core.handle,
-                  pipe_id = pipe_read_id,
-                  "REQ: Failed to push reply to orchestrator queue."
-                );
-                // === LOCK SCOPE 2: Update State on Error ===
-                {
-                  let mut state_guard_err = self.state.lock();
-                  *state_guard_err = ReqState::ReadyToSend;
-                }
-                self.reply_available_notifier.notify_waiters();
-              }
-            }
-            Err(e) => {
-              tracing::error!(
-                handle = self.core.handle,
-                pipe_id = pipe_read_id,
-                "REQ: Error processing ZMTP reply: {}. Dropping.",
-                e
-              );
-              // === LOCK SCOPE 3: Update State on Error ===
-              {
-                let mut state_guard_err = self.state.lock();
-                *state_guard_err = ReqState::ReadyToSend;
-              }
-              self.reply_available_notifier.notify_waiters();
-            }
-          }
-        }
-      }
-      Command::PipeMessageBatchReceived { msgs, .. } => {
-        // REQ is a ping-pong socket: at most one reply per request, so batches are typically
-        // size 1. Loop with the same state-machine logic as the single-message path.
-        for msg in msgs {
-          let source_uri = {
-            self
-              .pipe_read_to_endpoint_uri
-              .read()
-              .get(&pipe_read_id)
-              .cloned()
-          };
-          let source_uri = match source_uri {
-            Some(s) => s,
-            None => continue,
-          };
-          let is_expected_reply = {
-            let op_state_guard = self.state.lock();
-            match &*op_state_guard {
-              ReqState::ExpectingReply {
-                target_endpoint_uri,
-              } => *target_endpoint_uri == source_uri,
-              ReqState::ReadyToSend => false,
-            }
-          };
-          if !is_expected_reply {
-            continue;
-          }
-          if let Some(raw_zmtp_reply_vec) = self
-            .incoming_orchestrator
-            .accumulate_pipe_frame(pipe_read_id, msg)?
-          {
-            match self.process_incoming_zmtp_message_for_req(pipe_read_id, raw_zmtp_reply_vec) {
-              Ok(reply_payload_parts) => {
-                if self
-                  .incoming_orchestrator
-                  .queue_item(pipe_read_id, reply_payload_parts)
-                  .await
-                  .is_err()
-                {
-                  *self.state.lock() = ReqState::ReadyToSend;
-                  self.reply_available_notifier.notify_waiters();
-                }
-              }
-              Err(e) => {
-                tracing::error!(
-                  handle = self.core.handle,
-                  pipe_id = pipe_read_id,
-                  "REQ batch: Error processing ZMTP reply: {}. Dropping.",
-                  e
-                );
-                *self.state.lock() = ReqState::ReadyToSend;
-                self.reply_available_notifier.notify_waiters();
-              }
-            }
-          }
-        }
-      }
+      // Data frames are pushed directly by the actor via PipeMessageSender; no action needed.
+      Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {}
       _ => {}
     }
     Ok(())
+  }
+
+  fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {
+    self.pending_pipe_senders.lock().remove(&pipe_read_id)
   }
 
   async fn pipe_attached(
@@ -529,6 +374,11 @@ impl ISocket for ReqSocket {
         .write()
         .insert(pipe_read_id, endpoint_uri.clone());
       self.load_balancer.add_connection(endpoint_uri);
+
+      // Register per-pipe ingress channel (capacity 1: REQ expects one reply at a time).
+      let rcvhwm = self.core.core_state.read().options.rcvhwm.max(1);
+      let raw_sender = self.incoming_orchestrator.register_connection_pipe(pipe_read_id, rcvhwm);
+      self.pending_pipe_senders.lock().insert(pipe_read_id, PipeMessageSender::Direct(raw_sender));
     } else {
       tracing::warn!(
         handle = self.core.handle,
@@ -577,15 +427,12 @@ impl ISocket for ReqSocket {
       } // Guard is dropped here
     }
 
-    // === ASYNC/Notify Operation (No Lock Held) ===
     if should_notify {
       self.reply_available_notifier.notify_one();
     }
 
-    self
-      .incoming_orchestrator
-      .clear_pipe_state(pipe_read_id)
-      .await;
+    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }
 }
 
@@ -604,11 +451,10 @@ mod tests {
     let core_state =
       crate::socket::core::CoreState::new(handle, SocketType::Req, SocketOptions::default());
 
-    // Instantiate a minimal SocketCore to satisfy the ReqSocket constructor
     let core = Arc::new(crate::socket::core::SocketCore {
       handle,
       context: context.clone(),
-      command_sender: fibre::mpmc::bounded_async(1).0, // Dummy sender
+      command_sender: fibre::mpmc::bounded_async(1).0,
       core_state: parking_lot::RwLock::new(core_state),
       socket_logic: tokio::sync::RwLock::new(None),
       shutdown_coordinator: tokio::sync::Mutex::new(
@@ -620,56 +466,44 @@ mod tests {
     let req_socket = ReqSocket::new(core);
     let target_uri = "tcp://127.0.0.1:19876".to_string();
 
-    // Map the pipe read ID to the endpoint URI so handle_pipe_event can resolve the source
     req_socket
       .pipe_read_to_endpoint_uri
       .write()
       .insert(1, target_uri.clone());
 
-    // 1. Set state to ExpectingReply (simulates a completed send)
-    {
-      let mut state_guard = req_socket.state.lock();
-      *state_guard = ReqState::ExpectingReply {
-        target_endpoint_uri: target_uri.clone(),
-      };
-    }
+    // 1. Register the ingress pipe directly to get a sender (no full actor setup needed).
+    let pipe_sender = req_socket.incoming_orchestrator.register_connection_pipe(1, 4);
 
-    // 2. Simulate the arrival of a ZMTP reply message via the real handle_pipe_event pathway
-    let reply_msg = Msg::from_static(b"reply");
-    req_socket
-      .handle_pipe_event(
-        1,
-        Command::PipeMessageReceived {
-          pipe_id: 1,
-          msg: reply_msg,
-        },
-      )
-      .await
-      .unwrap();
+    // 2. Set state to ExpectingReply (simulates a completed send).
+    *req_socket.state.lock() = ReqState::ExpectingReply {
+      target_endpoint_uri: target_uri.clone(),
+    };
 
-    // 3. Consume the message
+    // 3. Push a ZMTP reply via the pipe sender (actor pathway: [empty_delim, payload]).
+    let mut batch = FrameBatch::new();
+    let mut delim = Msg::new();
+    delim.set_flags(MsgFlags::MORE);
+    batch.push(delim);
+    batch.push(Msg::from_static(b"reply"));
+    pipe_sender.send(batch).await.unwrap();
+
+    // 4. Consume the message via recv().
     let recv_result = req_socket.recv().await;
     assert!(recv_result.is_ok());
     assert_eq!(recv_result.unwrap().data().unwrap(), b"reply");
 
-    // 4. Set state back to ExpectingReply (simulating the next send)
-    {
-      let mut state_guard = req_socket.state.lock();
-      *state_guard = ReqState::ExpectingReply {
-        target_endpoint_uri: target_uri,
-      };
-    }
+    // 5. Set state back to ExpectingReply (simulating next send).
+    *req_socket.state.lock() = ReqState::ExpectingReply {
+      target_endpoint_uri: target_uri,
+    };
 
-    // 5. Verify that no stale permit was left in the notifier.
-    // Awaiting notified() must timeout if no stale permit is present.
+    // 6. Verify no stale permit was left in the notifier.
     let notify_check = tokio::time::timeout(
       Duration::from_millis(50),
       req_socket.reply_available_notifier.notified(),
     )
     .await;
 
-    // If the fix is correct, we expect a Timeout (meaning the notification check timed out).
-    // If the bug is still present, the stale permit would cause notified() to resolve instantly.
     assert!(
       notify_check.is_err(),
       "Bug present: A stale permit was deposited in the notifier during a normal message cycle!"

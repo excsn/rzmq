@@ -3,9 +3,9 @@ use std::time::Duration;
 use crate::throttle::types::AdaptiveThrottleConfig;
 use crate::{Blob, CoreState, ZmqError};
 
-pub const DEFAULT_SNDBATCH_COUNT: usize = 128;
-pub const DEFAULT_SNDBATCH_BYTES: usize = 256 * 1024; // 256 KB
-pub const DEFAULT_RCVBATCH_COUNT: usize = 128;
+pub const DEFAULT_SNDBATCH_COUNT: usize = 32;
+pub const DEFAULT_SNDBATCH_BYTES: usize = 512 * 1024; // 512 KB
+pub const DEFAULT_RCVBATCH_COUNT: usize = 64;
 pub const DEFAULT_RCVBATCH_BYTES: usize = 512 * 1024; // 512 KB;
 
 // Use values consistent with libzmq where possible
@@ -276,6 +276,7 @@ pub(crate) struct ZmtpEngineConfig {
   /// Maximum inbound frame size in bytes. -1 means unlimited.
   pub max_msg_size: i64,
   pub throttle_config: AdaptiveThrottleConfig,
+  pub sndhwm: usize,
   pub sndbatch_count: usize,
   pub sndbatch_bytes: usize,
   pub rcvbatch_count: usize,
@@ -351,6 +352,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       plain_password_for_engine: options.plain_options.password.clone(),
       max_msg_size: options.maxmsgsize,
       throttle_config: options.throttle_config.clone(),
+      sndhwm: options.sndhwm,
       sndbatch_count: options.sndbatch_count,
       sndbatch_bytes,
       rcvbatch_count: options.rcvbatch_count,

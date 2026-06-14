@@ -948,27 +948,6 @@ async fn handle_new_connection_established(
       let core_write_id = core_arc.context.inner().next_handle();
       let core_read_id = core_arc.context.inner().next_handle();
 
-      let attach_cmd = Command::ScaInitializePipes {
-        sca_handle_id,
-        rx_from_core: rx_sca_from_core,
-        core_pipe_read_id_for_incoming_routing: core_read_id,
-      };
-
-      if sca_mailbox.send(attach_cmd).await.is_err() {
-        return Err(ZmqError::Internal(format!(
-          "Failed to send ScaInitializePipes to SCA {}",
-          sca_handle_id
-        )));
-      }
-
-      tracing::debug!(
-        handle = core_handle,
-        sca_id = sca_handle_id,
-        core_w_id = core_write_id,
-        core_r_id = core_read_id,
-        "Sent AttachPipesAndRoutingInfo to SessionConnectionActorX."
-      );
-
       let sndtimeo_snapshot = core_arc.core_state.read().options.sndtimeo;
 
       let sca_iface = Arc::new(ScaConnectionIface::new(
@@ -980,7 +959,7 @@ async fn handle_new_connection_established(
       ));
 
       let endpoint_info = EndpointInfo {
-        mailbox: sca_mailbox,
+        mailbox: sca_mailbox.clone(),
         task_handle: None,
         endpoint_type: EndpointType::Session,
         endpoint_uri: endpoint_uri_from_event.clone(),
@@ -1021,10 +1000,36 @@ async fn handle_new_connection_established(
           .insert(core_read_id, endpoint_uri_from_event.clone());
       }
 
+      // pipe_attached FIRST so the socket pattern registers the pipe and creates the sender.
       tracing::debug!(handle=core_handle, sca_id=sca_handle_id, conn_uri=%endpoint_uri_from_event, "Notifying ISocket of pipe attachment for new SCA connection.");
       socket_logic_strong
         .pipe_attached(core_read_id, core_write_id, None)
         .await;
+
+      // Retrieve the ingress sender the socket created inside pipe_attached.
+      let incoming_pipe_sender = socket_logic_strong.get_incoming_pipe_sender(core_read_id);
+
+      let attach_cmd = Command::ScaInitializePipes {
+        sca_handle_id,
+        rx_from_core: rx_sca_from_core,
+        core_pipe_read_id_for_incoming_routing: core_read_id,
+        incoming_pipe_sender,
+      };
+
+      if sca_mailbox.send(attach_cmd).await.is_err() {
+        return Err(ZmqError::Internal(format!(
+          "Failed to send ScaInitializePipes to SCA {}",
+          sca_handle_id
+        )));
+      }
+
+      tracing::debug!(
+        handle = core_handle,
+        sca_id = sca_handle_id,
+        core_w_id = core_write_id,
+        core_r_id = core_read_id,
+        "Sent ScaInitializePipes to SessionConnectionActorX."
+      );
     }
 
     // ViaUringFd connections are now handled atomically via Command::UringConnectionEstablished,

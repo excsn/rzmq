@@ -240,8 +240,12 @@ impl CoreState {
           SocketEvent::HandshakeFailed { endpoint: clean(endpoint), error_msg },
         SocketEvent::HandshakeSucceeded { endpoint } =>
           SocketEvent::HandshakeSucceeded { endpoint: clean(endpoint) },
+        SocketEvent::ConnectionCongested { endpoint } =>
+          SocketEvent::ConnectionCongested { endpoint: clean(endpoint) },
+        SocketEvent::ConnectionUncongested { endpoint } =>
+          SocketEvent::ConnectionUncongested { endpoint: clean(endpoint) },
       };
-      if tx.clone().to_sync().send(event).is_err() {
+      if tx.try_send(event).is_err() {
         tracing::warn!(
           socket_handle = self.handle,
           "Failed to send event to monitor channel (full or closed)"
