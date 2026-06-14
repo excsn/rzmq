@@ -90,7 +90,7 @@ pub(crate) async fn connect_inproc(
     .max(1)
   };
 
-  let buf_size = pipe_hwm.saturating_mul(8192).clamp(8192, 4 * 1024 * 1024);
+  let buf_size = inproc_buffer_size(pipe_hwm);
   let (connector_stream_end, binder_stream_end) = tokio::io::duplex(buf_size);
 
   // Spawn connector-side SCAX
@@ -219,4 +219,47 @@ pub(crate) async fn disconnect_inproc(
     "disconnect_inproc: endpoint not in endpoints map; nothing to clean up"
   );
   Ok(())
+}
+
+/// Calculates the duplex buffer size for an inproc connection based on the pipe's HWM.
+///
+/// Uses a sub-linear (square-root equivalent) scaling model: `8 KB * 2^(ilog2(hwm)/2)`.
+/// This decelerates growth as HWM increases, preventing memory blowouts while still
+/// differentiating meaningfully between HWM values across the full range (1–16384+).
+/// At the default HWM of 256 this yields 128 KB vs. the old formula's 2 MB.
+fn inproc_buffer_size(pipe_hwm: usize) -> usize {
+  const BASE: usize = 8192;
+  const MAX: usize = 1024 * 1024;
+  let hwm = pipe_hwm.max(1);
+  let exponent = hwm.ilog2() / 2;
+  let multiplier = 1_usize << exponent;
+  BASE.saturating_mul(multiplier).clamp(BASE, MAX)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::inproc_buffer_size;
+
+  #[test]
+  fn low_hwm_bounds() {
+    assert_eq!(inproc_buffer_size(0), 8192);
+    assert_eq!(inproc_buffer_size(1), 8192);
+    assert_eq!(inproc_buffer_size(3), 8192);
+  }
+
+  #[test]
+  fn sub_linear_scaling() {
+    assert_eq!(inproc_buffer_size(4), 16384);
+    assert_eq!(inproc_buffer_size(16), 32768);
+    assert_eq!(inproc_buffer_size(64), 65536);
+    assert_eq!(inproc_buffer_size(256), 131072);
+    assert_eq!(inproc_buffer_size(1024), 262144);
+  }
+
+  #[test]
+  fn ceiling_clamp() {
+    assert_eq!(inproc_buffer_size(16384), 1048576);
+    assert_eq!(inproc_buffer_size(100000), 1048576);
+    assert_eq!(inproc_buffer_size(usize::MAX), 1048576);
+  }
 }
