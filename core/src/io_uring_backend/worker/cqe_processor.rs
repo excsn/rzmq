@@ -724,6 +724,9 @@ pub(crate) fn process_all_cqes(
             if worker.fd_to_mpsc_rx.remove(&handler_fd).is_some() {
               trace!("Removed MPSC receiver for closed FD {}", handler_fd);
             }
+            if worker.fd_to_zmtp_egress_rx.remove(&handler_fd).is_some() {
+              trace!("Removed ZMTP egress receiver for closed FD {}", handler_fd);
+            }
             while let Some((ext_ud, ext_ctx)) = worker
               .external_op_tracker
               .take_op_if_shutdown_for_fd(handler_fd)

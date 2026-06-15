@@ -28,9 +28,9 @@ use tokio::time::sleep;
 
 #[cfg(feature = "io-uring")]
 use {
-  crate::io_uring_backend::byte_handler::EgressChunk,
-  crate::io_uring_backend::ops::UringOpRequest as WorkerUringOpRequest,
-  crate::transport::uring_stream::UringStream,
+  crate::io_uring_backend::ops::{
+    ProtocolConfig as WorkerProtocolConfig, UringOpRequest as WorkerUringOpRequest,
+  },
   crate::uring,
   fibre::oneshot::oneshot as fibre_oneshot,
   std::os::unix::io::IntoRawFd,
@@ -317,74 +317,34 @@ impl IpcListener {
                 match stream.into_std() {
                   Ok(std_stream) => {
                     let raw_fd = std_stream.into_raw_fd();
-                    let rcvhwm = socket_options_clone.rcvhwm.max(1);
-                    let sndhwm = socket_options_clone.sndhwm.max(1);
-                    let (raw_inbound_tx, raw_inbound_rx_sync) =
-                      fibre::mpsc::bounded::<bytes::Bytes>(rcvhwm);
-                    let (raw_egress_sync_tx, raw_egress_rx) =
-                      fibre::mpsc::bounded::<EgressChunk>(sndhwm);
 
                     match uring::global_state::get_global_uring_worker_op_tx() {
                       Ok(worker_op_tx) => {
                         let user_data = context_clone.inner().next_handle() as u64;
                         let (reply_tx, reply_rx) = fibre_oneshot();
-                        let reg_ok = worker_op_tx.send(WorkerUringOpRequest::RegisterExternalByteFd {
+                        let engine_cfg =
+                          Arc::new(ZmtpEngineConfig::from(&*socket_options_clone));
+                        let reg_ok = worker_op_tx.send(WorkerUringOpRequest::RegisterExternalZmtpFd {
                           user_data,
                           fd: raw_fd,
+                          is_server: true,
+                          protocol_config: WorkerProtocolConfig::Zmtp(engine_cfg),
                           socket_mailbox: socket_logic.mailbox().to_sync(),
-                          reply_tx,
-                          raw_inbound_tx,
-                          raw_egress_rx,
+                          endpoint_uri: actual_connected_uri.clone(),
+                          target_endpoint_uri: logical_uri.clone(),
                           use_recv_multishot: socket_options_clone.io_uring.recv_multishot,
+                          reply_tx,
                         }).await.is_ok();
 
                         if reg_ok {
                           match reply_rx.recv().await {
                             Ok(Ok(_)) => {
-                              let event_fd = worker_op_tx.clone_event_fd();
-                              let worker_asleep = worker_op_tx.clone_worker_asleep();
-                              let send_pool = worker_op_tx.clone_send_buffer_pool();
-                              let uring_stream = UringStream::new(
-                                raw_fd,
-                                raw_inbound_rx_sync.to_async(),
-                                raw_egress_sync_tx,
-                                worker_asleep,
-                                event_fd,
-                                send_pool,
-                                rcvhwm,
-                              );
-                              let sca_handle_id = handle_source_clone
-                                .fetch_add(1, AtomicOrdering::Relaxed);
-                              let actor_conf = ActorConfigX {
-                                context: context_clone.clone(),
-                                monitor_tx: monitor_tx_clone.clone(),
-                                logical_target_endpoint_uri: logical_uri.clone(),
-                                connected_endpoint_uri: actual_connected_uri.clone(),
-                                is_server_role: true,
-                              };
-                              let engine_conf =
-                                Arc::new(ZmtpEngineConfig::from(&*socket_options_clone));
-                              let (command_sender_for_sca, command_receiver_for_sca) =
-                                mailbox(context_clone.inner().get_actor_mailbox_capacity());
-                              let sca_task_handle = SessionConnectionActorX::create_and_spawn(
-                                sca_handle_id,
-                                parent_socket_core_id,
-                                uring_stream,
-                                actor_conf,
-                                engine_conf,
-                                command_receiver_for_sca,
-                                socket_logic.clone(),
-                                permit_opt.take(),
-                              );
+                              // Worker drives handshake; UringConnectionEstablished arrives later.
                               interaction_model_for_event =
-                                Some(ConnectionInteractionModel::ViaSca {
-                                  sca_mailbox: command_sender_for_sca,
-                                  sca_handle_id,
-                                });
-                              managing_actor_task_id_for_event = Some(sca_task_handle.id());
+                                Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
                               setup_successful = true;
                             }
-                            _ => tracing::error!("IPC accept: RegisterExternalByteFd failed"),
+                            _ => tracing::error!("IPC accept: RegisterExternalZmtpFd failed"),
                           }
                         }
                       }
@@ -428,21 +388,28 @@ impl IpcListener {
               }
 
               if setup_successful {
-                if let Some(inter_model) = interaction_model_for_event {
-                  let cmd = Command::NewConnectionEstablished {
-                    endpoint_uri: actual_connected_uri.clone(),
-                    target_endpoint_uri: logical_uri.clone(),
-                    connection_iface: None,
-                    interaction_model: inter_model,
-                    managing_actor_task_id: managing_actor_task_id_for_event,
-                  };
-                  if socket_logic.mailbox().send(cmd).await.is_err() {
-                    tracing::error!(
-                      "Failed to send NewConnectionEstablished to socket mailbox for IPC {}",
-                      actual_connected_uri
-                    );
+                let worker_handles_lifecycle = matches!(
+                  interaction_model_for_event,
+                  Some(ConnectionInteractionModel::ViaUringFd { .. })
+                );
+                if !worker_handles_lifecycle {
+                  if let Some(inter_model) = interaction_model_for_event {
+                    let cmd = Command::NewConnectionEstablished {
+                      endpoint_uri: actual_connected_uri.clone(),
+                      target_endpoint_uri: logical_uri.clone(),
+                      connection_iface: None,
+                      interaction_model: inter_model,
+                      managing_actor_task_id: managing_actor_task_id_for_event,
+                    };
+                    if socket_logic.mailbox().send(cmd).await.is_err() {
+                      tracing::error!(
+                        "Failed to send NewConnectionEstablished to socket mailbox for IPC {}",
+                        actual_connected_uri
+                      );
+                    }
                   }
                 }
+                // ViaUringFd: worker sends UringConnectionEstablished to SocketCore after handshake
               } else {
                 tracing::warn!(
                   "IPC Connection setup failed for {}, NewConnectionEstablished not sent.",
@@ -647,72 +614,33 @@ impl IpcConnecter {
               match stream.into_std() {
                 Ok(std_stream) => {
                   let raw_fd = std_stream.into_raw_fd();
-                  let rcvhwm = self.context_options.rcvhwm.max(1);
-                  let sndhwm = self.context_options.sndhwm.max(1);
-                  let (raw_inbound_tx, raw_inbound_rx_sync) =
-                    fibre::mpsc::bounded::<bytes::Bytes>(rcvhwm);
-                  let (raw_egress_sync_tx, raw_egress_rx) =
-                    fibre::mpsc::bounded::<EgressChunk>(sndhwm);
 
                   match uring::global_state::get_global_uring_worker_op_tx() {
                     Ok(worker_op_tx) => {
                       let user_data = self.context.inner().next_handle() as u64;
                       let (reply_tx, reply_rx) = fibre_oneshot();
-                      let reg_ok = worker_op_tx.send(WorkerUringOpRequest::RegisterExternalByteFd {
+                      let engine_cfg =
+                        Arc::new(ZmtpEngineConfig::from(&*self.context_options));
+                      let reg_ok = worker_op_tx.send(WorkerUringOpRequest::RegisterExternalZmtpFd {
                         user_data,
                         fd: raw_fd,
+                        is_server: false,
+                        protocol_config: WorkerProtocolConfig::Zmtp(engine_cfg),
                         socket_mailbox: self.socket_logic.mailbox().to_sync(),
-                        reply_tx,
-                        raw_inbound_tx,
-                        raw_egress_rx,
+                        endpoint_uri: actual_connected_uri.clone(),
+                        target_endpoint_uri: endpoint_uri_original.clone(),
                         use_recv_multishot: self.context_options.io_uring.recv_multishot,
+                        reply_tx,
                       }).await.is_ok();
 
                       if reg_ok {
                         match reply_rx.recv().await {
                           Ok(Ok(_)) => {
-                            let event_fd = worker_op_tx.clone_event_fd();
-                            let worker_asleep = worker_op_tx.clone_worker_asleep();
-                            let send_pool = worker_op_tx.clone_send_buffer_pool();
-                            let uring_stream = UringStream::new(
-                              raw_fd,
-                              raw_inbound_rx_sync.to_async(),
-                              raw_egress_sync_tx,
-                              worker_asleep,
-                              event_fd,
-                              send_pool,
-                              rcvhwm,
-                            );
-                            let sca_handle_id = self.context_handle_source
-                              .fetch_add(1, AtomicOrdering::Relaxed);
-                            let actor_conf = ActorConfigX {
-                              context: self.context.clone(),
-                              monitor_tx: monitor_tx.clone(),
-                              logical_target_endpoint_uri: endpoint_uri_original.clone(),
-                              connected_endpoint_uri: actual_connected_uri.clone(),
-                              is_server_role: false,
-                            };
-                            let engine_conf =
-                              Arc::new(ZmtpEngineConfig::from(&*self.context_options));
-                            let (command_sender_for_sca, command_receiver_for_sca) =
-                              mailbox(self.context.inner().get_actor_mailbox_capacity());
-                            let sca_task_handle = SessionConnectionActorX::create_and_spawn(
-                              sca_handle_id,
-                              self.parent_socket_id,
-                              uring_stream,
-                              actor_conf,
-                              engine_conf,
-                              command_receiver_for_sca,
-                              self.socket_logic.clone(),
-                              None,
-                            );
-                            connect_interaction = Some(ConnectionInteractionModel::ViaSca {
-                              sca_mailbox: command_sender_for_sca,
-                              sca_handle_id,
-                            });
-                            connect_task_id = Some(sca_task_handle.id());
+                            // Worker drives handshake; UringConnectionEstablished arrives later.
+                            connect_interaction =
+                              Some(ConnectionInteractionModel::ViaUringFd { fd: raw_fd });
                           }
-                          _ => tracing::error!("IPC connect: RegisterExternalByteFd failed"),
+                          _ => tracing::error!("IPC connect: RegisterExternalZmtpFd failed"),
                         }
                       }
                     }
@@ -785,22 +713,31 @@ impl IpcConnecter {
     // Process the connection_outcome
     match connection_outcome {
       Ok((interaction_model, managing_actor_task_id, actual_uri)) => {
-        let cmd = Command::NewConnectionEstablished {
-          endpoint_uri: actual_uri,
-          target_endpoint_uri: endpoint_uri_original.clone(),
-          connection_iface: None,
+        let worker_handles_lifecycle = matches!(
           interaction_model,
-          managing_actor_task_id,
-        };
-        if self.socket_logic.mailbox().send(cmd).await.is_err() {
-          tracing::error!(
-            "IPC Connecter: Failed to send NewConnectionEstablished to socket mailbox for {}.",
-            endpoint_uri_original
-          );
-          actor_drop_guard.set_error(ZmqError::Internal(
-            "IPC: Socket mailbox closed during NewConnectionEstablished".into(),
-          ));
+          ConnectionInteractionModel::ViaUringFd { .. }
+        );
+        if !worker_handles_lifecycle {
+          let cmd = Command::NewConnectionEstablished {
+            endpoint_uri: actual_uri,
+            target_endpoint_uri: endpoint_uri_original.clone(),
+            connection_iface: None,
+            interaction_model,
+            managing_actor_task_id,
+          };
+          if self.socket_logic.mailbox().send(cmd).await.is_err() {
+            tracing::error!(
+              "IPC Connecter: Failed to send NewConnectionEstablished to socket mailbox for {}.",
+              endpoint_uri_original
+            );
+            actor_drop_guard.set_error(ZmqError::Internal(
+              "IPC: Socket mailbox closed during NewConnectionEstablished".into(),
+            ));
+          } else {
+            actor_drop_guard.waive();
+          }
         } else {
+          // ViaUringFd: worker sends UringConnectionEstablished to SocketCore after handshake.
           actor_drop_guard.waive();
         }
       }

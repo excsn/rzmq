@@ -3,9 +3,11 @@
 use super::{ExternalOpContext, UringWorker, cqe_processor};
 use crate::ZmqError;
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
-use crate::io_uring_backend::connection_handler::{HandlerSqeBlueprint, UringWorkerInterface};
-use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest, WAKEUP_STATE_ACTIVE, WAKEUP_STATE_SLEEPING};
+use crate::io_uring_backend::connection_handler::{HandlerSqeBlueprint, UringWorkerInterface, WorkerIoConfig};
+use crate::io_uring_backend::ops::{ProtocolConfig, UringOpCompletion, UringOpRequest, WAKEUP_STATE_ACTIVE, WAKEUP_STATE_SLEEPING};
 use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerState};
+use crate::io_uring_backend::zmtp_handler::{ZmtpSmartConnection, ZmtpUringHandler};
+use crate::protocol::zmtp::engine::ZmtpEngine;
 use crate::uring::UringPollingStrategy;
 
 use crate::profiler::LoopProfiler;
@@ -352,6 +354,88 @@ impl UringWorker {
           }
         }
       }
+      UringOpRequest::RegisterExternalZmtpFd {
+        user_data,
+        fd,
+        is_server,
+        protocol_config,
+        socket_mailbox,
+        endpoint_uri,
+        target_endpoint_uri,
+        use_recv_multishot,
+        reply_tx,
+      } => {
+        let ProtocolConfig::Zmtp(engine_cfg) = protocol_config;
+
+        // All channels are sync — the worker OS thread never calls .await.
+        let sndhwm = engine_cfg.sndhwm.max(1);
+        let (egress_tx, egress_rx) =
+            fibre::mpsc::bounded::<crate::message::FrameBatch>(sndhwm);
+        let (inbound_tx, inbound_rx_sync) =
+            fibre::mpsc::bounded::<crate::message::FrameBatch>(engine_cfg.rcvhwm.max(1));
+        // Convert the inbound receiver to async only for the Tokio-side UringConnectionEstablished
+        // command — the Tokio task reads from it asynchronously.
+        let inbound_async_rx = inbound_rx_sync.to_async();
+
+        let event_fd = self.event_fd_poller.clone_event_fd();
+        let connection_iface = std::sync::Arc::new(ZmtpSmartConnection::new(
+            fd,
+            egress_tx,
+            event_fd,
+            std::sync::Arc::clone(&self.worker_asleep),
+        ));
+
+        let worker_io_config = std::sync::Arc::new(WorkerIoConfig {
+            socket_mailbox,
+            inbound_data_tx: inbound_tx,
+            endpoint_uri,
+            target_endpoint_uri,
+            connection_iface,
+        });
+
+        let use_zc = self.cfg_send_zerocopy_enabled && self.send_buffer_pool.is_some();
+        let engine = ZmtpEngine::new(is_server, engine_cfg);
+        let egress_rx_arc = std::sync::Arc::new(egress_rx);
+
+        let handler = ZmtpUringHandler::new(
+            fd,
+            worker_io_config,
+            engine,
+            std::sync::Arc::clone(&egress_rx_arc),
+            inbound_async_rx,
+            use_zc,
+            use_recv_multishot,
+            if use_zc { self.cfg_send_buffer_size } else { 0 },
+        );
+
+        self.fd_to_zmtp_egress_rx.insert(fd, egress_rx_arc);
+
+        match self.handler_manager.add_handler_directly(
+          fd,
+          Box::new(handler),
+          self.buffer_manager.as_ref(),
+          self.default_buffer_ring_group_id_val,
+          user_data,
+        ) {
+          Ok(initial_ops) => {
+            if !initial_ops.sqe_blueprints.is_empty() {
+              self.work_map.entry(fd).or_default().route_blueprints(initial_ops.sqe_blueprints);
+            }
+            if initial_ops.initiate_close_due_to_error {
+              self.fds_needing_close_initiated_pass.push_back(fd);
+            }
+            let _ = reply_tx.send(Ok(UringOpCompletion::RegisterExternalZmtpFdSuccess { user_data, fd }));
+          }
+          Err(err_msg) => {
+            self.fd_to_zmtp_egress_rx.remove(&fd);
+            let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
+              user_data,
+              op_name: op_name_str,
+              error: ZmqError::Internal(err_msg),
+            }));
+          }
+        }
+      }
       UringOpRequest::StartFdReadLoop {
         user_data,
         fd,
@@ -410,6 +494,7 @@ impl UringWorker {
 fn has_pending_work(worker: &UringWorker) -> bool {
   !worker.op_rx.is_empty()
     || worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty())
+    || worker.fd_to_zmtp_egress_rx.values().any(|rx| !rx.is_empty())
     || unsafe { !worker.ring.completion_shared().is_empty() }
 }
 
@@ -783,6 +868,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 // now visible via is_empty() below.
                 worker.worker_asleep.store(WAKEUP_STATE_SLEEPING, Ordering::Release);
                 let late_work = worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty())
+                  || worker.fd_to_zmtp_egress_rx.values().any(|rx| !rx.is_empty())
                   || worker.handler_manager.any_handler_has_inbound_data();
                 if late_work {
                   worker.worker_asleep.store(WAKEUP_STATE_ACTIVE, Ordering::Release);

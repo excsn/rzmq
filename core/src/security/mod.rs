@@ -2,12 +2,15 @@ mod cipher;
 pub(crate) mod framer;
 pub mod mechanism;
 pub(crate) mod null;
+#[cfg(feature = "plain")]
 pub(crate) mod plain;
 pub mod zap;
 
 pub(crate) use cipher::IDataCipher;
 pub(crate) use mechanism::{Mechanism, MechanismStatus};
-pub(crate) use {null::NullMechanism, plain::PlainMechanism};
+pub(crate) use null::NullMechanism;
+#[cfg(feature = "plain")]
+pub(crate) use plain::PlainMechanism;
 
 use crate::message::Metadata;
 use crate::{error::ZmqError, protocol::zmtp::ZmtpGreeting, socket::ZmtpEngineConfig};
@@ -46,12 +49,12 @@ fn initialize_null(
   Ok(Box::new(NullMechanism))
 }
 
+#[cfg(feature = "plain")]
 fn initialize_plain(
   is_server: bool,
   local_config: &ZmtpEngineConfig,
   _engine_handle_for_log: usize,
 ) -> Result<Box<dyn Mechanism>, ZmqError> {
-  // Always extract expected/local credentials
   let user_bytes = local_config
     .plain_username_for_engine
     .as_ref()
@@ -62,15 +65,13 @@ fn initialize_plain(
     .map(|s| s.as_bytes().to_vec());
 
   let mut plain_mech = PlainMechanism::new(is_server);
-  
+
   if is_server {
-    // For server, these are the EXPECTED credentials
     plain_mech.set_server_expected_credentials(user_bytes, pass_bytes);
   } else {
-    // For client, these are the OUTGOING credentials
     plain_mech.set_client_credentials(user_bytes, pass_bytes);
   }
-  
+
   Ok(Box::new(plain_mech))
 }
 
@@ -123,6 +124,7 @@ const KNOWN_MECHANISMS: &[KnownMechanismDescriptor] = &[
       !cfg.security_enabled
     },
   },
+  #[cfg(feature = "plain")]
   KnownMechanismDescriptor {
     name_static_bytes: PlainMechanism::NAME_BYTES,
     name_str: PlainMechanism::NAME,
@@ -163,10 +165,20 @@ pub(crate) fn negotiate_security_mechanism(
       "N/A (feature disabled)".to_string()
     }
   };
+  let plain_config_log_val = {
+    #[cfg(feature = "plain")]
+    {
+      format!("{}", local_config.use_plain)
+    }
+    #[cfg(not(feature = "plain"))]
+    {
+      "N/A (feature disabled)".to_string()
+    }
+  };
   tracing::info!(
     engine_handle = engine_handle_for_log,
     peer_mechanism_proposal_bytes = ?std::str::from_utf8(peer_proposed_mechanism_name_bytes).unwrap_or("").trim_end_matches('\0'),
-    config_use_plain = local_config.use_plain,
+    config_use_plain = %plain_config_log_val,
     config_use_noise = %noise_config_log_val,
     "Negotiating security mechanism."
   );

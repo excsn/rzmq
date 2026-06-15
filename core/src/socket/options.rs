@@ -122,6 +122,7 @@ pub(crate) struct SocketOptions {
   pub rcvbuf: Option<usize>,
   pub io_uring: IOURingSocketOptions,
   pub zap_domain: Option<String>, // ZAP Domain
+  #[cfg(feature = "plain")]
   pub plain_options: PlainMechanismSocketOptions,
   #[cfg(feature = "curve")]
   pub curve_options: CurveMechanismSocketOptions,
@@ -164,6 +165,7 @@ impl Default for SocketOptions {
       rcvbuf: None,
       io_uring: Default::default(),
       zap_domain: None,
+      #[cfg(feature = "plain")]
       plain_options: Default::default(),
       #[cfg(feature = "noise_xx")]
       noise_xx_options: NoiseXxSocketOptions::default(),
@@ -232,16 +234,17 @@ pub(crate) struct TcpTransportConfig {
   pub rcvbuf: Option<usize>,
 }
 
+#[cfg(feature = "plain")]
 #[derive(Debug, Clone, Default)]
 pub struct PlainMechanismSocketOptions {
   pub enabled: bool,
-  pub server_role: Option<bool>, // Role override
-  pub username: Option<String>,  // Security options stored here?
+  pub server_role: Option<bool>,
+  pub username: Option<String>,
   pub password: Option<String>,
 }
 
 // Config specific to TCP transport, potentially influenced by socket options
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct ZmtpEngineConfig {
   /// Identity to present in READY command (for Client role)
   pub routing_id: Option<Blob>,
@@ -270,8 +273,11 @@ pub(crate) struct ZmtpEngineConfig {
   pub curve_local_secret_key: Option<[u8; 32]>,
   #[cfg(feature = "curve")]
   pub curve_remote_public_key: Option<[u8; 32]>,
+  #[cfg(feature = "plain")]
   pub use_plain: bool,
+  #[cfg(feature = "plain")]
   pub plain_username_for_engine: Option<String>,
+  #[cfg(feature = "plain")]
   pub plain_password_for_engine: Option<String>,
   /// Maximum inbound frame size in bytes. -1 means unlimited.
   pub max_msg_size: i64,
@@ -283,10 +289,58 @@ pub(crate) struct ZmtpEngineConfig {
   pub rcvbatch_bytes: usize,
 }
 
+impl Default for ZmtpEngineConfig {
+  fn default() -> Self {
+    Self {
+      routing_id: None,
+      socket_type_name: String::new(),
+      security_enabled: false,
+      heartbeat_ivl: None,
+      heartbeat_timeout: None,
+      handshake_timeout: None,
+      rcvtimeo: None,
+      sndtimeo: None,
+      use_send_zerocopy: false,
+      use_recv_multishot: false,
+      use_cork: false,
+      #[cfg(feature = "noise_xx")]
+      use_noise_xx: false,
+      #[cfg(feature = "noise_xx")]
+      noise_xx_local_sk_bytes_for_engine: None,
+      #[cfg(feature = "noise_xx")]
+      noise_xx_remote_pk_bytes_for_engine: None,
+      #[cfg(feature = "curve")]
+      use_curve: false,
+      #[cfg(feature = "curve")]
+      curve_local_secret_key: None,
+      #[cfg(feature = "curve")]
+      curve_remote_public_key: None,
+      #[cfg(feature = "plain")]
+      use_plain: false,
+      #[cfg(feature = "plain")]
+      plain_username_for_engine: None,
+      #[cfg(feature = "plain")]
+      plain_password_for_engine: None,
+      max_msg_size: -1, // -1 = unlimited, mirrors SocketOptions::maxmsgsize default
+      throttle_config: AdaptiveThrottleConfig::default(),
+      sndhwm: 256,
+      sndbatch_count: DEFAULT_SNDBATCH_COUNT,
+      sndbatch_bytes: DEFAULT_SNDBATCH_BYTES,
+      rcvbatch_count: DEFAULT_RCVBATCH_COUNT,
+      rcvbatch_bytes: DEFAULT_RCVBATCH_BYTES,
+    }
+  }
+}
+
 impl From<&SocketOptions> for ZmtpEngineConfig {
   fn from(options: &SocketOptions) -> Self {
     // Determine if any security mechanism is active.
-    let security_enabled = options.plain_options.enabled
+    let security_enabled = {
+        #[cfg(feature = "plain")]
+        { options.plain_options.enabled }
+        #[cfg(not(feature = "plain"))]
+        { false }
+    }
     || {
         #[cfg(feature = "noise_xx")]
         { options.noise_xx_options.enabled }
@@ -347,8 +401,11 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       curve_local_secret_key: options.curve_options.secret_key,
       #[cfg(feature = "curve")]
       curve_remote_public_key: options.curve_options.server_public_key,
+      #[cfg(feature = "plain")]
       use_plain: options.plain_options.enabled,
+      #[cfg(feature = "plain")]
       plain_username_for_engine: options.plain_options.username.clone(),
+      #[cfg(feature = "plain")]
       plain_password_for_engine: options.plain_options.password.clone(),
       max_msg_size: options.maxmsgsize,
       throttle_config: options.throttle_config.clone(),
@@ -592,14 +649,17 @@ pub(crate) fn apply_core_option_value(
         MAX_CONNECTIONS => options.max_connections = parse_max_connections_option(value, option_id)?,
         TCP_CORK => options.tcp_cork = parse_bool_option(value)?,
         ZAP_DOMAIN => options.zap_domain = Some(parse_string_option(value, option_id)?),
+        #[cfg(feature = "plain")]
         PLAIN_SERVER => {
             options.plain_options.server_role = Some(parse_bool_option(value)?);
-            options.plain_options.enabled = true; // Enable PLAIN if server role is set
+            options.plain_options.enabled = true;
         }
+        #[cfg(feature = "plain")]
         PLAIN_USERNAME => {
             options.plain_options.username = Some(parse_string_option(value, option_id)?);
             options.plain_options.enabled = true;
         }
+        #[cfg(feature = "plain")]
         PLAIN_PASSWORD => {
             options.plain_options.password = Some(parse_string_option(value, option_id)?);
             options.plain_options.enabled = true;
@@ -681,8 +741,11 @@ pub(crate) fn retrieve_core_option_value(
         MAX_CONNECTIONS => Ok(options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
         TCP_CORK => Ok((options.tcp_cork as i32).to_ne_bytes().to_vec()),
         ZAP_DOMAIN => options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option ZAP_DOMAIN not set".into())),
+        #[cfg(feature = "plain")]
         PLAIN_SERVER => options.plain_options.server_role.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_SERVER not set".into())),
+        #[cfg(feature = "plain")]
         PLAIN_USERNAME => options.plain_options.username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_USERNAME not set".into())),
+        #[cfg(feature = "plain")]
         PLAIN_PASSWORD => Err(ZmqError::PermissionDenied("PLAIN_PASSWORD is write-only".into())),
 
 

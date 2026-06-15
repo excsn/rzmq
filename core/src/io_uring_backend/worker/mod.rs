@@ -90,6 +90,9 @@ pub struct UringWorker {
   pub(crate) event_fd_poller: EventFdPoller,
   send_buffer_pool: Option<Arc<SendBufferPool>>, // For zero-copy sends
   pub(crate) fd_to_mpsc_rx: HashMap<RawFd, Arc<mpsc::BoundedReceiver<OutgoingMessage>>>,
+  /// Egress channels for `ZmtpUringHandler` connections (SocketCore → worker).
+  /// Checked in the pre-sleep double-check to keep the worker awake when batches are pending.
+  pub(crate) fd_to_zmtp_egress_rx: HashMap<RawFd, Arc<mpsc::BoundedReceiver<crate::message::FrameBatch>>>,
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
   cfg_send_buffer_count: usize, //TODO revisit
@@ -257,6 +260,7 @@ impl UringWorker {
               fds_needing_close_initiated_pass: VecDeque::new(),
               send_buffer_pool: worker_send_buffer_pool,
               fd_to_mpsc_rx: HashMap::new(),
+              fd_to_zmtp_egress_rx: HashMap::new(),
               cfg_send_zerocopy_enabled: effective_send_zerocopy_enabled_for_worker,
               cfg_send_buffer_count: config.default_send_buffer_count,
               cfg_send_buffer_size: config.default_send_buffer_size,

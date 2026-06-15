@@ -84,6 +84,22 @@ pub enum UringOpRequest {
     /// handler uses single-shot reads, respecting the socket's `io_uring.recv_multishot` option.
     use_recv_multishot: bool,
   },
+  /// Registers a pre-connected FD with full ZMTP protocol handling on the worker thread.
+  /// The worker's `ZmtpUringHandler` owns the `ZmtpEngine` and drives all handshake and
+  /// data framing itself — no `UringStream` or `SessionConnectionActorX` is involved.
+  RegisterExternalZmtpFd {
+    user_data: UserData,
+    fd: RawFd,
+    is_server: bool,
+    protocol_config: ProtocolConfig,
+    socket_mailbox: MailboxSyncSender,
+    /// Logical endpoint URI for this connection (e.g. "tcp://1.2.3.4:5678").
+    endpoint_uri: String,
+    /// The original target URI requested by the user.
+    target_endpoint_uri: String,
+    use_recv_multishot: bool,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
+  },
 }
 
 impl UringOpRequest {
@@ -96,6 +112,7 @@ impl UringOpRequest {
       | Self::Listen { user_data, .. }
       | Self::Connect { user_data, .. }
       | Self::RegisterExternalByteFd { user_data, .. }
+      | Self::RegisterExternalZmtpFd { user_data, .. }
       | Self::StartFdReadLoop { user_data, .. }
       | Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
     }
@@ -109,6 +126,7 @@ impl UringOpRequest {
       Self::Listen { .. } => "Listen".to_string(),
       Self::Connect { .. } => "Connect".to_string(),
       Self::RegisterExternalByteFd { .. } => "RegisterExternalByteFd".to_string(),
+      Self::RegisterExternalZmtpFd { .. } => "RegisterExternalZmtpFd".to_string(),
       Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
       Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
     }
@@ -121,6 +139,7 @@ impl UringOpRequest {
       | Self::RegisterRawBuffers { reply_tx, .. }
       | Self::Listen { reply_tx, .. }
       | Self::RegisterExternalByteFd { reply_tx, .. }
+      | Self::RegisterExternalZmtpFd { reply_tx, .. }
       | Self::Connect { reply_tx, .. }
       | Self::StartFdReadLoop { reply_tx, .. }
       | Self::ShutdownConnectionHandler { reply_tx, .. } => Some(reply_tx),
@@ -190,6 +209,13 @@ impl fmt::Debug for UringOpRequest {
         .field("user_data", user_data)
         .field("fd", fd)
         .finish_non_exhaustive(),
+      UringOpRequest::RegisterExternalZmtpFd { user_data, fd, is_server, endpoint_uri, .. } => f
+        .debug_struct("RegisterExternalZmtpFd")
+        .field("user_data", user_data)
+        .field("fd", fd)
+        .field("is_server", is_server)
+        .field("endpoint_uri", endpoint_uri)
+        .finish_non_exhaustive(),
     }
   }
 }
@@ -217,6 +243,10 @@ pub enum UringOpCompletion {
     local_addr: SocketAddr,
   },
   RegisterExternalByteFdSuccess {
+    user_data: UserData,
+    fd: RawFd,
+  },
+  RegisterExternalZmtpFdSuccess {
     user_data: UserData,
     fd: RawFd,
   },
@@ -278,6 +308,11 @@ impl fmt::Debug for UringOpCompletion {
         .finish(),
       UringOpCompletion::RegisterExternalByteFdSuccess { user_data, fd } => f
         .debug_struct("RegisterExternalByteFdSuccess")
+        .field("user_data", user_data)
+        .field("fd", fd)
+        .finish(),
+      UringOpCompletion::RegisterExternalZmtpFdSuccess { user_data, fd } => f
+        .debug_struct("RegisterExternalZmtpFdSuccess")
         .field("user_data", user_data)
         .field("fd", fd)
         .finish(),
