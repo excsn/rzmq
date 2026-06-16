@@ -72,7 +72,9 @@ impl LoopProfiler {
     let total_loop_duration = loop_end_time.duration_since(self.loop_start_time);
     self.log_counter = self.log_counter.wrapping_add(1);
 
-    if total_loop_duration > self.threshold || (self.log_interval > 0 && self.log_counter % self.log_interval == 0) {
+    if total_loop_duration > self.threshold
+      || (self.log_interval > 0 && self.log_counter % self.log_interval == 0)
+    {
       let mut log_output = format!("[UringWorker Latency] Total: {:?}", total_loop_duration);
       for timing in &self.segment_timings {
         if timing.duration > Duration::from_micros(1) || timing.duration.as_nanos() > 0 {

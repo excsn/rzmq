@@ -75,7 +75,9 @@ pub(crate) enum InternalOpPayload {
   /// Protocol-agnostic scatter-gather batch for `UringByteHandler` vectored egress.
   RawVectored(PinnedEgressBatch),
   /// Leased pre-registered buffer slot — only the buffer ID is needed for release on completion.
-  SendZeroCopyLeased { send_buf_id: RegisteredSendBufferId },
+  SendZeroCopyLeased {
+    send_buf_id: RegisteredSendBufferId,
+  },
 }
 
 impl Default for InternalOpPayload {
@@ -120,7 +122,11 @@ impl InternalOpTracker {
     op_type: InternalOpType,
     payload: InternalOpPayload,
   ) -> UserData {
-    let key = self.op_to_details.insert(InternalOpDetails { fd, op_type, payload });
+    let key = self.op_to_details.insert(InternalOpDetails {
+      fd,
+      op_type,
+      payload,
+    });
     key as u64 + INTERNAL_OP_BASE
   }
 
@@ -142,7 +148,9 @@ impl InternalOpTracker {
       return None;
     }
     let key = (user_data - INTERNAL_OP_BASE) as usize;
-    self.op_to_details.get(key)
+    self
+      .op_to_details
+      .get(key)
       .or_else(|| self.pending_notifications.get(&user_data))
   }
 
@@ -160,7 +168,8 @@ impl InternalOpTracker {
   /// Returns all tracked `UserData` IDs (slab + notification map). Used for bulk cancellation
   /// during shutdown.
   pub fn all_op_ids(&self) -> Vec<UserData> {
-    self.op_to_details
+    self
+      .op_to_details
       .iter()
       .map(|(k, _)| k as u64 + INTERNAL_OP_BASE)
       .chain(self.pending_notifications.keys().copied())
@@ -219,7 +228,10 @@ impl InternalOpTracker {
     // pending_notifications holds ZC send continuations, never reads
     self.op_to_details.iter().any(|(_, d)| {
       d.fd == fd_to_check
-        && matches!(d.op_type, InternalOpType::RingRead | InternalOpType::RingReadMultishot)
+        && matches!(
+          d.op_type,
+          InternalOpType::RingRead | InternalOpType::RingReadMultishot
+        )
     })
   }
 }

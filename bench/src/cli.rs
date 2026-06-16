@@ -102,7 +102,6 @@ pub struct Cli {
   #[cfg(feature = "io-uring")]
   #[arg(long, value_enum, default_value_t = UringStrategy::Performance)]
   pub uring_strategy: UringStrategy,
-
 }
 
 /// Polling strategy profile for the io_uring worker thread.

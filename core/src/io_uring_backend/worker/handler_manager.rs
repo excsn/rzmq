@@ -3,7 +3,8 @@
 use crate::io_uring_backend::{
   buffer_manager::BufferRingManager,
   connection_handler::{
-    HandlerIoOps, ProtocolHandlerFactory, UringConnectionHandler, UringWorkerInterface, WorkerIoConfig,
+    HandlerIoOps, ProtocolHandlerFactory, UringConnectionHandler, UringWorkerInterface,
+    WorkerIoConfig,
   },
   ops::ProtocolConfig,
   UserData,
@@ -92,12 +93,8 @@ impl HandlerManager {
       connection_iface,
     });
 
-    let mut handler_box = factory.create_handler(
-      fd,
-      per_conn_config.clone(),
-      protocol_config,
-      is_server,
-    )?;
+    let mut handler_box =
+      factory.create_handler(fd, per_conn_config.clone(), protocol_config, is_server)?;
 
     info!(
       "HandlerManager: Created handler for FD {} using factory '{}'. Calling connection_ready...",
@@ -129,14 +126,26 @@ impl HandlerManager {
     originating_op_ud: UserData,
   ) -> Result<HandlerIoOps, String> {
     if self.handlers.contains_key(&fd) {
-      return Err(format!("HandlerManager: FD {} already registered, cannot add_handler_directly", fd));
+      return Err(format!(
+        "HandlerManager: FD {} already registered, cannot add_handler_directly",
+        fd
+      ));
     }
     let config_clone = handler.io_config().clone();
-    let interface =
-      UringWorkerInterface::new(fd, &config_clone, buffer_manager, default_bgid, originating_op_ud, 0);
+    let interface = UringWorkerInterface::new(
+      fd,
+      &config_clone,
+      buffer_manager,
+      default_bgid,
+      originating_op_ud,
+      0,
+    );
     let initial_ops = handler.connection_ready(&interface);
     self.handlers.insert(fd, handler);
-    info!("HandlerManager: Directly added handler for FD {} via add_handler_directly.", fd);
+    info!(
+      "HandlerManager: Directly added handler for FD {} via add_handler_directly.",
+      fd
+    );
     Ok(initial_ops)
   }
 
@@ -236,7 +245,9 @@ impl HandlerManager {
 
   /// Removes all handlers, calling `fd_has_been_closed` on each.
   /// Also clears all listener metadata.
-  pub fn drain_all_handlers_calling_closed(&mut self) -> Vec<Box<dyn UringConnectionHandler + Send>> {
+  pub fn drain_all_handlers_calling_closed(
+    &mut self,
+  ) -> Vec<Box<dyn UringConnectionHandler + Send>> {
     info!("HandlerManager: Draining all handlers and calling fd_has_been_closed.");
     let mut drained_handlers = Vec::new();
     for (_fd, mut handler) in self.handlers.drain() {

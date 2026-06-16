@@ -1,8 +1,8 @@
 #![allow(dead_code)] // Allow dead code for now
 
 use crate::context::Context;
-use crate::socket::events::MonitorSender;
 use crate::message::FrameBatch;
+use crate::socket::events::MonitorSender;
 
 use fibre::mpmc::AsyncReceiver;
 

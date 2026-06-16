@@ -75,9 +75,9 @@ impl IDataCipher for CurveDataCipher {
   /// Returns the plaintext Vec<u8> on success.
   fn decrypt(&mut self, ciphertext_with_mac: &[u8]) -> Result<Vec<u8>, ZmqError> {
     if ciphertext_with_mac.len() < CRYPTO_BOX_MACBYTES {
-        return Err(ZmqError::InvalidMessage(
-            "Ciphertext too short to contain a MAC".into(),
-        ));
+      return Err(ZmqError::InvalidMessage(
+        "Ciphertext too short to contain a MAC".into(),
+      ));
     }
 
     let nonce = Self::construct_nonce(self.recv_nonce_counter);

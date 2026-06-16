@@ -1,10 +1,10 @@
+use crate::message::FrameBatch;
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
+use crate::ZmqError;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use crate::message::FrameBatch;
-use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
-use crate::ZmqError;
 
 pub(crate) struct IngressDriver<'a> {
   sender_opt: Option<&'a PipeMessageSender>,
@@ -21,7 +21,11 @@ impl<'a> IngressDriver<'a> {
     sender_opt: Option<&'a PipeMessageSender>,
     ingress_buffer: &'a mut VecDeque<FrameBatch>,
   ) -> Self {
-    Self { sender_opt, ingress_buffer, fut: None }
+    Self {
+      sender_opt,
+      ingress_buffer,
+      fut: None,
+    }
   }
 }
 

@@ -52,7 +52,10 @@ impl ZmtpCodec {
 
   pub fn prime_with_prefix(&mut self, prefix: BytesMut) {
     if !prefix.is_empty() {
-      tracing::trace!(prefix_len = prefix.len(), "ZmtpCodec primed with prefix bytes");
+      tracing::trace!(
+        prefix_len = prefix.len(),
+        "ZmtpCodec primed with prefix bytes"
+      );
       self.prefix_bytes = Some(prefix);
     }
   }

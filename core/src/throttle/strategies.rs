@@ -58,15 +58,27 @@ mod additional_strategy_tests {
     config.max_imbalance = 110; // severity space = 100
 
     // Within healthy zone: deviation 5 < width 10
-    let state_healthy = ThrottleStateView { current_balance: 5, learned_balance: 0.0, config: &config };
+    let state_healthy = ThrottleStateView {
+      current_balance: 5,
+      learned_balance: 0.0,
+      config: &config,
+    };
     assert_eq!(linear_strategy(&state_healthy), 0.0);
 
     // 50% severity: deviation 60, severity = 50, max_sev = 100
-    let state_half = ThrottleStateView { current_balance: 60, learned_balance: 0.0, config: &config };
+    let state_half = ThrottleStateView {
+      current_balance: 60,
+      learned_balance: 0.0,
+      config: &config,
+    };
     assert_eq!(linear_strategy(&state_half), 0.5);
 
     // Beyond max: deviation 200, severity = 190, clamped to 1.0
-    let state_clamped = ThrottleStateView { current_balance: 200, learned_balance: 0.0, config: &config };
+    let state_clamped = ThrottleStateView {
+      current_balance: 200,
+      learned_balance: 0.0,
+      config: &config,
+    };
     assert_eq!(linear_strategy(&state_clamped), 1.0);
   }
 
@@ -78,7 +90,11 @@ mod additional_strategy_tests {
     config.curve_factor = 2.0;
 
     // deviation 50: x = 0.5, p = 0.5^2 = 0.25
-    let state = ThrottleStateView { current_balance: 50, learned_balance: 0.0, config: &config };
+    let state = ThrottleStateView {
+      current_balance: 50,
+      learned_balance: 0.0,
+      config: &config,
+    };
     assert_eq!(power_curve_strategy(&state), 0.25);
   }
 }

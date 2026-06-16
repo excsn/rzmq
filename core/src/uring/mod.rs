@@ -14,13 +14,13 @@ use tokio::task::spawn_blocking;
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "io-uring")]
-pub const DEFAULT_IO_URING_SND_BUFFER_COUNT: usize = 32;
+pub const DEFAULT_IO_URING_SND_BUFFER_COUNT: usize = 16;
 /// Default size (in bytes) for each buffer in the io_uring send buffer pool.
 #[cfg(feature = "io-uring")]
 pub const DEFAULT_IO_URING_SND_BUFFER_SIZE: usize = 65536;
 
 #[cfg(feature = "io-uring")]
-pub const DEFAULT_IO_URING_RECV_BUFFER_COUNT: usize = 32;
+pub const DEFAULT_IO_URING_RECV_BUFFER_COUNT: usize = 16;
 /// Default size (in bytes) for each buffer in the io_uring multishot receive pool.
 #[cfg(feature = "io-uring")]
 pub const DEFAULT_IO_URING_RECV_BUFFER_SIZE: usize = 65536;

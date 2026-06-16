@@ -170,7 +170,7 @@ impl fmt::Debug for SystemEvent {
         .field("parent_core_id", parent_core_id)
         .field("connection_identifier", connection_identifier)
         .field("peer_identity", peer_identity)
-        .field("peer_socket_type", peer_socket_type) 
+        .field("peer_socket_type", peer_socket_type)
         .finish(),
       SystemEvent::ConnectionAttemptFailed {
         parent_core_id,
@@ -183,7 +183,11 @@ impl fmt::Debug for SystemEvent {
         .field("error", error)
         .finish(),
       #[cfg(feature = "inproc")]
-      SystemEvent::InprocBindingRequest { target_inproc_name, connector_uri, .. } => f
+      SystemEvent::InprocBindingRequest {
+        target_inproc_name,
+        connector_uri,
+        ..
+      } => f
         .debug_struct("InprocBindingRequest")
         .field("target_inproc_name", target_inproc_name)
         .field("connector_uri", connector_uri)

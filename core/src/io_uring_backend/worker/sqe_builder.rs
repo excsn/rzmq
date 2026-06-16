@@ -1,8 +1,8 @@
 #![cfg(feature = "io-uring")]
 
+use super::socket_addr_to_sockaddr_storage;
 use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest, UserData};
 use crate::ZmqError;
-use super::socket_addr_to_sockaddr_storage;
 
 use std::mem;
 use std::net::SocketAddr;

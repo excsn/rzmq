@@ -1,7 +1,6 @@
 #![cfg(feature = "io-uring")]
 
-use super::{ExternalOpContext, UringWorker, cqe_processor};
-use crate::ZmqError;
+use super::{cqe_processor, ExternalOpContext, UringWorker};
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
   HandlerSqeBlueprint, UringWorkerInterface, WorkerIoConfig,
@@ -13,6 +12,7 @@ use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerS
 use crate::io_uring_backend::zmtp_handler::{ZmtpSmartConnection, ZmtpUringHandler};
 use crate::protocol::zmtp::engine::ZmtpEngine;
 use crate::uring::UringPollingStrategy;
+use crate::ZmqError;
 
 use crate::profiler::LoopProfiler;
 use crate::transport::endpoint::parse_endpoint;
@@ -76,7 +76,8 @@ impl UringWorker {
 
     trace!(
       "UringWorker: Handling external op request: {}, ud: {}",
-      op_name_str, user_data
+      op_name_str,
+      user_data
     );
 
     match request {
@@ -834,7 +835,8 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               } else {
                 trace!(
                   "UringWorker: Queued new standard read for FD {}. UD: {}",
-                  fd, user_data
+                  fd,
+                  user_data
                 );
               }
             }

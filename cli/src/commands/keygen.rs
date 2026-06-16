@@ -8,8 +8,8 @@ use std::{
 };
 
 use anyhow::{Context as AnyhowContext, Result};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::{SeedableRng, rngs::StdRng};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use rand::{rngs::StdRng, SeedableRng};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 // --- Generic Arguments Trait ---

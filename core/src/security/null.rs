@@ -1,6 +1,12 @@
-use crate::{security::{framer::{ISecureFramer, NullFramer}, mechanism::ProcessTokenAction}, Metadata, ZmqError};
+use crate::{
+  security::{
+    framer::{ISecureFramer, NullFramer},
+    mechanism::ProcessTokenAction,
+  },
+  Metadata, ZmqError,
+};
 
-use super::{IDataCipher, Mechanism, MechanismStatus, cipher::PassThroughDataCipher};
+use super::{cipher::PassThroughDataCipher, IDataCipher, Mechanism, MechanismStatus};
 
 #[derive(Debug)]
 pub struct NullMechanism;
@@ -51,7 +57,10 @@ impl Mechanism for NullMechanism {
     Ok(())
   }
 
-  fn into_framer(self: Box<Self>, max_msg_size: i64) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
+  fn into_framer(
+    self: Box<Self>,
+    max_msg_size: i64,
+  ) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     Ok((Box::new(NullFramer::new(max_msg_size)), None))
   }
 }

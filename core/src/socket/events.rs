@@ -22,7 +22,10 @@ pub enum SocketEvent {
   /// Initial connection attempt failed, retrying starts (if configured).
   ConnectDelayed { endpoint: String, error_msg: String },
   /// Retrying connection after delay.
-  ConnectRetried { endpoint: String, interval: Duration },
+  ConnectRetried {
+    endpoint: String,
+    interval: Duration,
+  },
   /// Connection attempt failed definitively after retries or immediately.
   ConnectFailed { endpoint: String, error_msg: String },
 

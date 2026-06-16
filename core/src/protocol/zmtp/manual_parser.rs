@@ -282,7 +282,10 @@ mod tests {
     // short frame: flags=0x00, len=5 → total 2 + 5
     assert_eq!(parser.peek_frame_len(&[0x00, 5]).unwrap(), Some(7));
     // payload bytes present beyond the header don't change the result
-    assert_eq!(parser.peek_frame_len(&[0x00, 5, b'a', b'b']).unwrap(), Some(7));
+    assert_eq!(
+      parser.peek_frame_len(&[0x00, 5, b'a', b'b']).unwrap(),
+      Some(7)
+    );
   }
 
   #[test]

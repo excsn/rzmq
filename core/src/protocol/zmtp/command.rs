@@ -113,7 +113,9 @@ impl ZmtpReady {
       // Read name
       let name_len = cursor.get_u8() as usize;
       if cursor.remaining() < name_len {
-        return Err(ZmqError::ProtocolViolation("Invalid metadata name length".into()));
+        return Err(ZmqError::ProtocolViolation(
+          "Invalid metadata name length".into(),
+        ));
       }
       let name_bytes = cursor.copy_to_bytes(name_len);
       let name = String::from_utf8(name_bytes.to_vec())
@@ -121,11 +123,15 @@ impl ZmtpReady {
 
       // Read value
       if cursor.remaining() < 4 {
-        return Err(ZmqError::ProtocolViolation("Invalid metadata value length".into()));
+        return Err(ZmqError::ProtocolViolation(
+          "Invalid metadata value length".into(),
+        ));
       }
       let value_len = cursor.get_u32() as usize; // Big Endian from get_u32
       if cursor.remaining() < value_len {
-        return Err(ZmqError::ProtocolViolation("Invalid metadata value length".into()));
+        return Err(ZmqError::ProtocolViolation(
+          "Invalid metadata value length".into(),
+        ));
       }
       let value_bytes = cursor.copy_to_bytes(value_len);
 

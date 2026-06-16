@@ -11,7 +11,9 @@ pub struct Blob {
 impl Blob {
   /// Creates an empty blob.
   pub fn new() -> Self {
-    Self { inner: Bytes::new() }
+    Self {
+      inner: Bytes::new(),
+    }
   }
 
   /// Creates a blob from `bytes::Bytes`.
@@ -67,7 +69,9 @@ impl From<&'static [u8]> for Blob {
 impl fmt::Debug for Blob {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     // Simple debug, avoid large output
-    f.debug_struct("Blob").field("len", &self.inner.len()).finish()
+    f.debug_struct("Blob")
+      .field("len", &self.inner.len())
+      .finish()
   }
 }
 

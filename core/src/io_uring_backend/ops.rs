@@ -1,8 +1,8 @@
 #![cfg(feature = "io-uring")]
 
 use crate::runtime::MailboxSyncSender;
-use crate::socket::ZmtpEngineConfig;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
+use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
 
 use std::fmt;
@@ -14,7 +14,7 @@ use fibre::{mpsc, oneshot};
 
 pub const HANDLER_INTERNAL_SEND_OP_UD: UserData = 0;
 
-pub const WAKEUP_STATE_ACTIVE: u8   = 0;
+pub const WAKEUP_STATE_ACTIVE: u8 = 0;
 pub const WAKEUP_STATE_SLEEPING: u8 = 1;
 pub const WAKEUP_STATE_SIGNALED: u8 = 2;
 
@@ -121,7 +121,6 @@ pub enum UringOpRequest {
 }
 
 impl UringOpRequest {
-  
   pub(crate) fn get_user_data_ref(&self) -> UserData {
     match self {
       Self::Nop { user_data, .. }
@@ -154,7 +153,9 @@ impl UringOpRequest {
     }
   }
 
-  pub(crate) fn get_reply_tx_ref(&self) -> Option<&oneshot::Sender<Result<UringOpCompletion, ZmqError>>> {
+  pub(crate) fn get_reply_tx_ref(
+    &self,
+  ) -> Option<&oneshot::Sender<Result<UringOpCompletion, ZmqError>>> {
     match self {
       Self::Nop { reply_tx, .. }
       | Self::InitializeBufferRing { reply_tx, .. }
@@ -191,7 +192,9 @@ impl fmt::Debug for UringOpRequest {
         .field("num_buffers", num_buffers)
         .field("buffer_capacity", buffer_capacity)
         .finish_non_exhaustive(),
-      UringOpRequest::RegisterRawBuffers { user_data, buffers, .. } => f
+      UringOpRequest::RegisterRawBuffers {
+        user_data, buffers, ..
+      } => f
         .debug_struct("RegisterRawBuffers")
         .field("user_data", user_data)
         .field("buffers_count", &buffers.len())
@@ -233,7 +236,13 @@ impl fmt::Debug for UringOpRequest {
         .field("user_data", user_data)
         .field("fd", fd)
         .finish_non_exhaustive(),
-      UringOpRequest::RegisterExternalZmtpFd { user_data, fd, is_server, endpoint_uri, .. } => f
+      UringOpRequest::RegisterExternalZmtpFd {
+        user_data,
+        fd,
+        is_server,
+        endpoint_uri,
+        ..
+      } => f
         .debug_struct("RegisterExternalZmtpFd")
         .field("user_data", user_data)
         .field("fd", fd)
@@ -314,9 +323,10 @@ pub enum UringOpCompletion {
 impl fmt::Debug for UringOpCompletion {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      UringOpCompletion::NopSuccess { user_data } => {
-        f.debug_struct("NopSuccess").field("user_data", user_data).finish()
-      }
+      UringOpCompletion::NopSuccess { user_data } => f
+        .debug_struct("NopSuccess")
+        .field("user_data", user_data)
+        .finish(),
       UringOpCompletion::InitializeBufferRingSuccess { user_data, bgid } => f
         .debug_struct("InitializeBufferRingSuccess")
         .field("user_data", user_data)

@@ -1,7 +1,9 @@
 #![cfg(feature = "io-uring")]
 
 use crate::io_uring_backend::ops::UserData;
-use crate::io_uring_backend::worker::internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType};
+use crate::io_uring_backend::worker::internal_op_tracker::{
+  InternalOpPayload, InternalOpTracker, InternalOpType,
+};
 
 use io_uring::{opcode, squeue, types};
 use std::os::fd::AsRawFd;
@@ -103,7 +105,9 @@ impl EventFdPoller {
         true // SQE pushed successfully
       }
       Err(_) => {
-        tracing::warn!("[EventFdPoller] Failed to push eventfd poll SQE (SQ full race?). Will retry.");
+        tracing::warn!(
+          "[EventFdPoller] Failed to push eventfd poll SQE (SQ full race?). Will retry."
+        );
         // is_poll_submitted remains false, so it will be retried.
         false // SQE not pushed
       }
@@ -193,7 +197,6 @@ impl EventFdPoller {
         // For now, we will still set up for a re-poll.
       }
 
-
       if !is_shutting_down {
         // Regardless of the outcome of the previous poll (success or failure),
         // we need to generate a new UserData for the *next* poll submission attempt.
@@ -210,7 +213,9 @@ impl EventFdPoller {
       } else {
         // If we are shutting down, we do NOT create a new poll operation.
         // We just handled the completion of the last one, and now the poller is idle.
-        tracing::debug!("[EventFdPoller] Worker is shutting down. Not preparing new poll operation.");
+        tracing::debug!(
+          "[EventFdPoller] Worker is shutting down. Not preparing new poll operation."
+        );
       }
 
       return true; // CQE was handled by this poller

@@ -1,14 +1,14 @@
 use bytes::{Buf, BufMut, BytesMut};
 
 use crate::{
-  Metadata, ZmqError,
   security::{
     framer::{ISecureFramer, NullFramer},
     mechanism::ProcessTokenAction,
   },
+  Metadata, ZmqError,
 };
 
-use super::{IDataCipher, Mechanism, MechanismStatus, cipher::PassThroughDataCipher};
+use super::{cipher::PassThroughDataCipher, IDataCipher, Mechanism, MechanismStatus};
 
 /// State for the PLAIN security mechanism handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,12 +339,18 @@ impl Mechanism for PlainMechanism {
     Ok(())
   }
 
-  fn into_framer(self: Box<Self>, max_msg_size: i64) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
+  fn into_framer(
+    self: Box<Self>,
+    max_msg_size: i64,
+  ) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     if self.status() != MechanismStatus::Ready {
       return Err(ZmqError::InvalidState(
         "PLAIN handshake not complete.".into(),
       ));
     }
-    Ok((Box::new(NullFramer::new(max_msg_size)), self.username.clone()))
+    Ok((
+      Box::new(NullFramer::new(max_msg_size)),
+      self.username.clone(),
+    ))
   }
 }

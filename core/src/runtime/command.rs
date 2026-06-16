@@ -112,7 +112,6 @@ pub enum Command {
   },
 
   // --- io_uring path: unified, URI-keyed commands ---
-
   /// Sent from the UringWorker to SocketCore when an io_uring connection's ZMTP handshake
   /// completes. SocketCore responds by calling `pipe_attached`, extracting a `PipeMessageSender`
   /// via `get_incoming_pipe_sender`, and sending `AttachIngressSender` back to the worker so
@@ -130,7 +129,10 @@ pub enum Command {
 
   /// Fatal error or connection closure from an io_uring connection, keyed by URI.
   #[cfg(feature = "io-uring")]
-  UringFdError { endpoint_uri: String, error: ZmqError },
+  UringFdError {
+    endpoint_uri: String,
+    error: ZmqError,
+  },
 }
 
 impl Command {

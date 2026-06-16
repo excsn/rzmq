@@ -10,183 +10,197 @@ use std::time::{Duration, Instant};
 #[cfg(debug_assertions)]
 #[derive(Debug, Default)]
 pub struct UringMetrics {
-    pub loop_iterations: AtomicU64,
-    pub sqes_submitted: AtomicU64,
-    pub cqes_reaped: AtomicU64,
-    pub wakeup_signals: AtomicU64,
-    pub eagain_errors: AtomicU64,
-    pub enobufs_errors: AtomicU64,
+  pub loop_iterations: AtomicU64,
+  pub sqes_submitted: AtomicU64,
+  pub cqes_reaped: AtomicU64,
+  pub wakeup_signals: AtomicU64,
+  pub eagain_errors: AtomicU64,
+  pub enobufs_errors: AtomicU64,
 
-    // Batching & Coalescing stats (pre-modeled for our future optimizations)
-    pub total_writes: AtomicU64,
-    pub total_messages: AtomicU64,
-    pub batch_size_1: AtomicU64,
-    pub batch_size_2_8: AtomicU64,
-    pub batch_size_9_16: AtomicU64,
-    pub batch_size_17_32: AtomicU64,
+  // Batching & Coalescing stats (pre-modeled for our future optimizations)
+  pub total_writes: AtomicU64,
+  pub total_messages: AtomicU64,
+  pub batch_size_1: AtomicU64,
+  pub batch_size_2_8: AtomicU64,
+  pub batch_size_9_16: AtomicU64,
+  pub batch_size_17_32: AtomicU64,
 
-    // Duty Cycle Timings (nanoseconds)
-    pub time_gather_ns: AtomicU64,
-    pub time_process_ns: AtomicU64,
-    pub time_reads_ns: AtomicU64,
-    pub time_submit_ns: AtomicU64,
-    pub time_cqe_ns: AtomicU64,
+  // Duty Cycle Timings (nanoseconds)
+  pub time_gather_ns: AtomicU64,
+  pub time_process_ns: AtomicU64,
+  pub time_reads_ns: AtomicU64,
+  pub time_submit_ns: AtomicU64,
+  pub time_cqe_ns: AtomicU64,
 
-    // Duty cycle / backpressure diagnostics
-    pub empty_loops: AtomicU64,
-    pub write_stalls: AtomicU64,
-    pub tokio_backpressures: AtomicU64,
-    pub send_pool_exhaustions: AtomicU64,
-    pub recv_ring_exhaustions: AtomicU64,
+  // Duty cycle / backpressure diagnostics
+  pub empty_loops: AtomicU64,
+  pub write_stalls: AtomicU64,
+  pub tokio_backpressures: AtomicU64,
+  pub send_pool_exhaustions: AtomicU64,
+  pub recv_ring_exhaustions: AtomicU64,
 
-    // CQE error breakdown
-    pub epipe_errors: AtomicU64,
-    pub ebadf_errors: AtomicU64,
-    pub ecanceled_errors: AtomicU64,
-    pub einval_errors: AtomicU64,
-    pub other_errors: AtomicU64,
+  // CQE error breakdown
+  pub epipe_errors: AtomicU64,
+  pub ebadf_errors: AtomicU64,
+  pub ecanceled_errors: AtomicU64,
+  pub einval_errors: AtomicU64,
+  pub other_errors: AtomicU64,
 
-    // Live queue & lock status (gauges, not counters)
-    pub write_in_flight_state: AtomicU64,
-    pub egress_queue_len: AtomicU64,
+  // Live queue & lock status (gauges, not counters)
+  pub write_in_flight_state: AtomicU64,
+  pub egress_queue_len: AtomicU64,
 }
 
 #[cfg(debug_assertions)]
 impl UringMetrics {
-    pub fn new() -> Self {
-        Self::default()
-    }
+  pub fn new() -> Self {
+    Self::default()
+  }
 
-    #[inline(always)]
-    pub fn record_write_batch(&self, count: u64) {
-        if count == 0 {
-            return;
-        }
-        self.total_writes.fetch_add(1, Ordering::Relaxed);
-        self.total_messages.fetch_add(count, Ordering::Relaxed);
-        if count == 1 {
-            self.batch_size_1.fetch_add(1, Ordering::Relaxed);
-        } else if count <= 8 {
-            self.batch_size_2_8.fetch_add(1, Ordering::Relaxed);
-        } else if count <= 16 {
-            self.batch_size_9_16.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.batch_size_17_32.fetch_add(1, Ordering::Relaxed);
-        }
+  #[inline(always)]
+  pub fn record_write_batch(&self, count: u64) {
+    if count == 0 {
+      return;
     }
+    self.total_writes.fetch_add(1, Ordering::Relaxed);
+    self.total_messages.fetch_add(count, Ordering::Relaxed);
+    if count == 1 {
+      self.batch_size_1.fetch_add(1, Ordering::Relaxed);
+    } else if count <= 8 {
+      self.batch_size_2_8.fetch_add(1, Ordering::Relaxed);
+    } else if count <= 16 {
+      self.batch_size_9_16.fetch_add(1, Ordering::Relaxed);
+    } else {
+      self.batch_size_17_32.fetch_add(1, Ordering::Relaxed);
+    }
+  }
 
-    #[inline(always)]
-    pub fn add_gather_time(&self, duration: Duration) {
-        self.time_gather_ns.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn add_gather_time(&self, duration: Duration) {
+    self
+      .time_gather_ns
+      .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn add_process_time(&self, duration: Duration) {
-        self.time_process_ns.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn add_process_time(&self, duration: Duration) {
+    self
+      .time_process_ns
+      .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn add_reads_time(&self, duration: Duration) {
-        self.time_reads_ns.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn add_reads_time(&self, duration: Duration) {
+    self
+      .time_reads_ns
+      .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn add_submit_time(&self, duration: Duration) {
-        self.time_submit_ns.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn add_submit_time(&self, duration: Duration) {
+    self
+      .time_submit_ns
+      .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn add_cqe_time(&self, duration: Duration) {
-        self.time_cqe_ns.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn add_cqe_time(&self, duration: Duration) {
+    self
+      .time_cqe_ns
+      .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_loop_iteration(&self) {
-        self.loop_iterations.fetch_add(1, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_loop_iteration(&self) {
+    self.loop_iterations.fetch_add(1, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_sqes_submitted(&self, count: u64) {
-        self.sqes_submitted.fetch_add(count, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_sqes_submitted(&self, count: u64) {
+    self.sqes_submitted.fetch_add(count, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_cqes_reaped(&self, count: u64) {
-        self.cqes_reaped.fetch_add(count, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_cqes_reaped(&self, count: u64) {
+    self.cqes_reaped.fetch_add(count, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_wakeup(&self) {
-        self.wakeup_signals.fetch_add(1, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_wakeup(&self) {
+    self.wakeup_signals.fetch_add(1, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_eagain(&self) {
-        self.eagain_errors.fetch_add(1, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_eagain(&self) {
+    self.eagain_errors.fetch_add(1, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_enobufs(&self) {
-        self.enobufs_errors.fetch_add(1, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_enobufs(&self) {
+    self.enobufs_errors.fetch_add(1, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_empty_loop(&self) {
-        self.empty_loops.fetch_add(1, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_empty_loop(&self) {
+    self.empty_loops.fetch_add(1, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_write_stall(&self) {
-        self.write_stalls.fetch_add(1, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_write_stall(&self) {
+    self.write_stalls.fetch_add(1, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_tokio_backpressure(&self) {
-        self.tokio_backpressures.fetch_add(1, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_tokio_backpressure(&self) {
+    self.tokio_backpressures.fetch_add(1, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_send_pool_exhaustion(&self) {
-        self.send_pool_exhaustions.fetch_add(1, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_send_pool_exhaustion(&self) {
+    self.send_pool_exhaustions.fetch_add(1, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_recv_ring_exhaustion(&self) {
-        self.recv_ring_exhaustions.fetch_add(1, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_recv_ring_exhaustion(&self) {
+    self.recv_ring_exhaustions.fetch_add(1, Ordering::Relaxed);
+  }
 
-    #[inline(always)]
-    pub fn record_cqe_errno(&self, errno: i32) {
-        match errno {
-            libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN => {
-                self.epipe_errors.fetch_add(1, Ordering::Relaxed);
-            }
-            libc::EBADF => {
-                self.ebadf_errors.fetch_add(1, Ordering::Relaxed);
-            }
-            libc::ECANCELED => {
-                self.ecanceled_errors.fetch_add(1, Ordering::Relaxed);
-            }
-            libc::EINVAL => {
-                self.einval_errors.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {
-                self.other_errors.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+  #[inline(always)]
+  pub fn record_cqe_errno(&self, errno: i32) {
+    match errno {
+      libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN => {
+        self.epipe_errors.fetch_add(1, Ordering::Relaxed);
+      }
+      libc::EBADF => {
+        self.ebadf_errors.fetch_add(1, Ordering::Relaxed);
+      }
+      libc::ECANCELED => {
+        self.ecanceled_errors.fetch_add(1, Ordering::Relaxed);
+      }
+      libc::EINVAL => {
+        self.einval_errors.fetch_add(1, Ordering::Relaxed);
+      }
+      _ => {
+        self.other_errors.fetch_add(1, Ordering::Relaxed);
+      }
     }
+  }
 
-    #[inline(always)]
-    pub fn record_queue_state(&self, write_in_flight: bool, egress_queue_len: usize) {
-        self.write_in_flight_state.store(write_in_flight as u64, Ordering::Relaxed);
-        self.egress_queue_len.store(egress_queue_len as u64, Ordering::Relaxed);
-    }
+  #[inline(always)]
+  pub fn record_queue_state(&self, write_in_flight: bool, egress_queue_len: usize) {
+    self
+      .write_in_flight_state
+      .store(write_in_flight as u64, Ordering::Relaxed);
+    self
+      .egress_queue_len
+      .store(egress_queue_len as u64, Ordering::Relaxed);
+  }
 }
 
 #[cfg(debug_assertions)]
 pub(crate) fn spawn_observability_thread(metrics: Arc<UringMetrics>) {
-    let pid = std::process::id();
-    std::thread::Builder::new()
+  let pid = std::process::id();
+  std::thread::Builder::new()
         .name("rzmq-uring-obs".into())
         .spawn(move || {
             let mut last_check = Instant::now();
@@ -335,24 +349,46 @@ pub struct UringMetrics;
 
 #[cfg(not(debug_assertions))]
 impl UringMetrics {
-    #[inline(always)] pub fn new() -> Self { Self }
-    #[inline(always)] pub fn record_write_batch(&self, _: u64) {}
-    #[inline(always)] pub fn add_gather_time(&self, _: std::time::Duration) {}
-    #[inline(always)] pub fn add_process_time(&self, _: std::time::Duration) {}
-    #[inline(always)] pub fn add_reads_time(&self, _: std::time::Duration) {}
-    #[inline(always)] pub fn add_submit_time(&self, _: std::time::Duration) {}
-    #[inline(always)] pub fn add_cqe_time(&self, _: std::time::Duration) {}
-    #[inline(always)] pub fn record_loop_iteration(&self) {}
-    #[inline(always)] pub fn record_sqes_submitted(&self, _: u64) {}
-    #[inline(always)] pub fn record_cqes_reaped(&self, _: u64) {}
-    #[inline(always)] pub fn record_wakeup(&self) {}
-    #[inline(always)] pub fn record_eagain(&self) {}
-    #[inline(always)] pub fn record_enobufs(&self) {}
-    #[inline(always)] pub fn record_empty_loop(&self) {}
-    #[inline(always)] pub fn record_write_stall(&self) {}
-    #[inline(always)] pub fn record_tokio_backpressure(&self) {}
-    #[inline(always)] pub fn record_send_pool_exhaustion(&self) {}
-    #[inline(always)] pub fn record_recv_ring_exhaustion(&self) {}
-    #[inline(always)] pub fn record_cqe_errno(&self, _: i32) {}
-    #[inline(always)] pub fn record_queue_state(&self, _: bool, _: usize) {}
+  #[inline(always)]
+  pub fn new() -> Self {
+    Self
+  }
+  #[inline(always)]
+  pub fn record_write_batch(&self, _: u64) {}
+  #[inline(always)]
+  pub fn add_gather_time(&self, _: std::time::Duration) {}
+  #[inline(always)]
+  pub fn add_process_time(&self, _: std::time::Duration) {}
+  #[inline(always)]
+  pub fn add_reads_time(&self, _: std::time::Duration) {}
+  #[inline(always)]
+  pub fn add_submit_time(&self, _: std::time::Duration) {}
+  #[inline(always)]
+  pub fn add_cqe_time(&self, _: std::time::Duration) {}
+  #[inline(always)]
+  pub fn record_loop_iteration(&self) {}
+  #[inline(always)]
+  pub fn record_sqes_submitted(&self, _: u64) {}
+  #[inline(always)]
+  pub fn record_cqes_reaped(&self, _: u64) {}
+  #[inline(always)]
+  pub fn record_wakeup(&self) {}
+  #[inline(always)]
+  pub fn record_eagain(&self) {}
+  #[inline(always)]
+  pub fn record_enobufs(&self) {}
+  #[inline(always)]
+  pub fn record_empty_loop(&self) {}
+  #[inline(always)]
+  pub fn record_write_stall(&self) {}
+  #[inline(always)]
+  pub fn record_tokio_backpressure(&self) {}
+  #[inline(always)]
+  pub fn record_send_pool_exhaustion(&self) {}
+  #[inline(always)]
+  pub fn record_recv_ring_exhaustion(&self) {}
+  #[inline(always)]
+  pub fn record_cqe_errno(&self, _: i32) {}
+  #[inline(always)]
+  pub fn record_queue_state(&self, _: bool, _: usize) {}
 }

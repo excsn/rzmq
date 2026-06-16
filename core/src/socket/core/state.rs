@@ -1,10 +1,10 @@
 use crate::message::FrameBatch;
 use crate::runtime::MailboxSender;
-use crate::socket::SocketEvent;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::events::MonitorSender;
 use crate::socket::options::SocketOptions;
 use crate::socket::types::SocketType;
+use crate::socket::SocketEvent;
 
 use fibre::mpmc::AsyncSender;
 use std::collections::{HashMap, HashSet};
@@ -216,34 +216,77 @@ impl CoreState {
         }
       };
       let event = match event {
-        SocketEvent::Listening { endpoint } =>
-          SocketEvent::Listening { endpoint: clean(endpoint) },
-        SocketEvent::BindFailed { endpoint, error_msg } =>
-          SocketEvent::BindFailed { endpoint: clean(endpoint), error_msg },
-        SocketEvent::Accepted { endpoint, peer_addr } =>
-          SocketEvent::Accepted { endpoint: clean(endpoint), peer_addr: clean(peer_addr) },
-        SocketEvent::AcceptFailed { endpoint, error_msg } =>
-          SocketEvent::AcceptFailed { endpoint: clean(endpoint), error_msg },
-        SocketEvent::Connected { endpoint, peer_addr } =>
-          SocketEvent::Connected { endpoint: clean(endpoint), peer_addr: clean(peer_addr) },
-        SocketEvent::ConnectDelayed { endpoint, error_msg } =>
-          SocketEvent::ConnectDelayed { endpoint: clean(endpoint), error_msg },
-        SocketEvent::ConnectRetried { endpoint, interval } =>
-          SocketEvent::ConnectRetried { endpoint: clean(endpoint), interval },
-        SocketEvent::ConnectFailed { endpoint, error_msg } =>
-          SocketEvent::ConnectFailed { endpoint: clean(endpoint), error_msg },
-        SocketEvent::Closed { endpoint } =>
-          SocketEvent::Closed { endpoint: clean(endpoint) },
-        SocketEvent::Disconnected { endpoint } =>
-          SocketEvent::Disconnected { endpoint: clean(endpoint) },
-        SocketEvent::HandshakeFailed { endpoint, error_msg } =>
-          SocketEvent::HandshakeFailed { endpoint: clean(endpoint), error_msg },
-        SocketEvent::HandshakeSucceeded { endpoint } =>
-          SocketEvent::HandshakeSucceeded { endpoint: clean(endpoint) },
-        SocketEvent::ConnectionCongested { endpoint } =>
-          SocketEvent::ConnectionCongested { endpoint: clean(endpoint) },
-        SocketEvent::ConnectionUncongested { endpoint } =>
-          SocketEvent::ConnectionUncongested { endpoint: clean(endpoint) },
+        SocketEvent::Listening { endpoint } => SocketEvent::Listening {
+          endpoint: clean(endpoint),
+        },
+        SocketEvent::BindFailed {
+          endpoint,
+          error_msg,
+        } => SocketEvent::BindFailed {
+          endpoint: clean(endpoint),
+          error_msg,
+        },
+        SocketEvent::Accepted {
+          endpoint,
+          peer_addr,
+        } => SocketEvent::Accepted {
+          endpoint: clean(endpoint),
+          peer_addr: clean(peer_addr),
+        },
+        SocketEvent::AcceptFailed {
+          endpoint,
+          error_msg,
+        } => SocketEvent::AcceptFailed {
+          endpoint: clean(endpoint),
+          error_msg,
+        },
+        SocketEvent::Connected {
+          endpoint,
+          peer_addr,
+        } => SocketEvent::Connected {
+          endpoint: clean(endpoint),
+          peer_addr: clean(peer_addr),
+        },
+        SocketEvent::ConnectDelayed {
+          endpoint,
+          error_msg,
+        } => SocketEvent::ConnectDelayed {
+          endpoint: clean(endpoint),
+          error_msg,
+        },
+        SocketEvent::ConnectRetried { endpoint, interval } => SocketEvent::ConnectRetried {
+          endpoint: clean(endpoint),
+          interval,
+        },
+        SocketEvent::ConnectFailed {
+          endpoint,
+          error_msg,
+        } => SocketEvent::ConnectFailed {
+          endpoint: clean(endpoint),
+          error_msg,
+        },
+        SocketEvent::Closed { endpoint } => SocketEvent::Closed {
+          endpoint: clean(endpoint),
+        },
+        SocketEvent::Disconnected { endpoint } => SocketEvent::Disconnected {
+          endpoint: clean(endpoint),
+        },
+        SocketEvent::HandshakeFailed {
+          endpoint,
+          error_msg,
+        } => SocketEvent::HandshakeFailed {
+          endpoint: clean(endpoint),
+          error_msg,
+        },
+        SocketEvent::HandshakeSucceeded { endpoint } => SocketEvent::HandshakeSucceeded {
+          endpoint: clean(endpoint),
+        },
+        SocketEvent::ConnectionCongested { endpoint } => SocketEvent::ConnectionCongested {
+          endpoint: clean(endpoint),
+        },
+        SocketEvent::ConnectionUncongested { endpoint } => SocketEvent::ConnectionUncongested {
+          endpoint: clean(endpoint),
+        },
       };
       if tx.try_send(event).is_err() {
         tracing::warn!(
@@ -306,7 +349,12 @@ mod reconnect_tests {
     for _ in 0..100 {
       let delay = state.on_connection_failure(base, max);
       // saturating_pow and saturating_mul prevent overflow; max cap keeps delay bounded
-      assert!(delay <= max, "Delay {:?} must not exceed max {:?}", delay, max);
+      assert!(
+        delay <= max,
+        "Delay {:?} must not exceed max {:?}",
+        delay,
+        max
+      );
     }
 
     assert_eq!(state.current_attempts, 100);

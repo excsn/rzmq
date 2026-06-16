@@ -69,7 +69,10 @@ unsafe impl Sync for SendBufferLease {}
 impl Drop for SendBufferLease {
   fn drop(&mut self) {
     if !self.released_to_worker.load(Ordering::Acquire) {
-      trace!("SendBufferLease {:?}: dropped before reaching worker — recycling.", self.id);
+      trace!(
+        "SendBufferLease {:?}: dropped before reaching worker — recycling.",
+        self.id
+      );
       self.pool.release_buffer(self.id);
     }
   }
@@ -116,10 +119,13 @@ impl SendBufferPool {
     let iovecs_to_register: Vec<libc::iovec> = slots.iter().map(|slot| slot.iovec()).collect();
 
     unsafe {
-      ring.submitter().register_buffers(&iovecs_to_register).map_err(|e| {
-        error!("SendBufferPool: Failed to register_buffers: {}", e);
-        ZmqError::Internal(format!("SendBufferPool: Failed to register_buffers: {}", e))
-      })?;
+      ring
+        .submitter()
+        .register_buffers(&iovecs_to_register)
+        .map_err(|e| {
+          error!("SendBufferPool: Failed to register_buffers: {}", e);
+          ZmqError::Internal(format!("SendBufferPool: Failed to register_buffers: {}", e))
+        })?;
     }
 
     info!(
@@ -127,14 +133,20 @@ impl SendBufferPool {
       count, capacity_per_buffer
     );
     Ok(Self {
-      inner: Mutex::new(SendBufferPoolInner { pool: slots, free_ids }),
+      inner: Mutex::new(SendBufferPoolInner {
+        pool: slots,
+        free_ids,
+      }),
     })
   }
 
   /// Attempts to acquire a free buffer, copies `data_to_copy` into it,
   /// and marks it as in kernel use.
   /// Returns the buffer's ID, a pointer to its data, and the length of data copied.
-  pub fn acquire_and_prep_buffer(&self, data_to_copy: &Bytes) -> Option<(RegisteredSendBufferId, *const u8, u32)> {
+  pub fn acquire_and_prep_buffer(
+    &self,
+    data_to_copy: &Bytes,
+  ) -> Option<(RegisteredSendBufferId, *const u8, u32)> {
     if data_to_copy.is_empty() {
       trace!("SendBufferPool: acquire_and_prep_buffer called with empty data, skipping.");
       return None; // Cannot SEND_ZC empty data
@@ -222,7 +234,10 @@ impl SendBufferPool {
         }
       }
     } else {
-      error!("SendBufferPool: Attempted to release an unknown buffer ID: {:?}", id);
+      error!(
+        "SendBufferPool: Attempted to release an unknown buffer ID: {:?}",
+        id
+      );
     }
   }
 
@@ -239,7 +254,10 @@ impl SendBufferPool {
     info!("SendBufferPool: Unregistering all send buffers.");
     ring.submitter().unregister_buffers().map_err(|e| {
       error!("SendBufferPool: Failed to unregister_buffers: {}", e);
-      ZmqError::Internal(format!("SendBufferPool: Failed to unregister_buffers: {}", e))
+      ZmqError::Internal(format!(
+        "SendBufferPool: Failed to unregister_buffers: {}",
+        e
+      ))
     })
   }
 }
@@ -252,8 +270,7 @@ mod pool_tests {
 
   fn create_test_ring_and_pool(count: usize, cap: usize) -> (IoUring, SendBufferPool) {
     let ring = IoUring::new(16).expect("Failed to initialize test io_uring");
-    let pool =
-      SendBufferPool::new(&ring, count, cap).expect("Failed to initialize SendBufferPool");
+    let pool = SendBufferPool::new(&ring, count, cap).expect("Failed to initialize SendBufferPool");
     (ring, pool)
   }
 
@@ -280,7 +297,11 @@ mod pool_tests {
     for i in 0..5usize {
       let data = Bytes::from(format!("new-payload-{}", i));
       let lease = pool.acquire_and_prep_buffer(&data);
-      assert!(lease.is_some(), "Buffer {} should be recycled and acquirable", i);
+      assert!(
+        lease.is_some(),
+        "Buffer {} should be recycled and acquirable",
+        i
+      );
     }
   }
 
@@ -304,7 +325,10 @@ mod pool_tests {
     pool.release_buffer(id1);
 
     let lease_recovered = pool.acquire_and_prep_buffer(&data);
-    assert!(lease_recovered.is_some(), "Should recover one buffer from pool");
+    assert!(
+      lease_recovered.is_some(),
+      "Should recover one buffer from pool"
+    );
     assert_eq!(
       lease_recovered.unwrap().0,
       id1,

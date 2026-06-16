@@ -80,7 +80,10 @@ impl Mechanism for CurveMechanism {
     }
   }
 
-  fn into_framer(self: Box<Self>, max_msg_size: i64) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
+  fn into_framer(
+    self: Box<Self>,
+    max_msg_size: i64,
+  ) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     if self.status != MechanismStatus::Ready {
       return Err(ZmqError::InvalidState("Curve handshake is not complete."));
     }

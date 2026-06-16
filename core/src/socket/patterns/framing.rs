@@ -116,7 +116,8 @@ mod tests {
   #[test]
   fn test_router_auto_encode() {
     // Case 1: Identity + Payload
-    let mut frames: FrameBatch = smallvec![Msg::from_static(b"Identity"), Msg::from_static(b"Payload")];
+    let mut frames: FrameBatch =
+      smallvec![Msg::from_static(b"Identity"), Msg::from_static(b"Payload")];
     router_auto_encode(&mut frames);
 
     assert_eq!(frames.len(), 3);

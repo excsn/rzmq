@@ -10,7 +10,9 @@ use parking_lot::Mutex;
 use tracing::{debug, error, info};
 
 static URING_WORKER_OP_TX: OnceCell<Mutex<Option<SignalingOpSender>>> = OnceCell::new();
-static URING_WORKER_JOIN_HANDLE: OnceCell<Mutex<Option<StdThreadJoinHandle<Result<(), ZmqError>>>>> = OnceCell::new();
+static URING_WORKER_JOIN_HANDLE: OnceCell<
+  Mutex<Option<StdThreadJoinHandle<Result<(), ZmqError>>>>,
+> = OnceCell::new();
 
 #[doc(hidden)]
 pub(crate) fn get_uring_worker_op_tx_mutex() -> &'static Mutex<Option<SignalingOpSender>> {

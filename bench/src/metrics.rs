@@ -69,9 +69,13 @@ impl BenchmarkCollector {
   #[inline]
   pub fn record_message(&self, bytes_len: usize) {
     self.messages_count.fetch_add(1, Ordering::Relaxed);
-    self.bytes_count.fetch_add(bytes_len as u64, Ordering::Relaxed);
+    self
+      .bytes_count
+      .fetch_add(bytes_len as u64, Ordering::Relaxed);
     self.interim_messages_count.fetch_add(1, Ordering::Relaxed);
-    self.interim_bytes_count.fetch_add(bytes_len as u64, Ordering::Relaxed);
+    self
+      .interim_bytes_count
+      .fetch_add(bytes_len as u64, Ordering::Relaxed);
   }
 
   // Merges a worker-local histogram into the shared one. Called once per
@@ -131,7 +135,12 @@ impl BenchmarkCollector {
   pub fn snapshot(&self, role: &str) -> BenchStats {
     let total_messages = self.messages_count.load(Ordering::Relaxed);
     let total_bytes = self.bytes_count.load(Ordering::Relaxed);
-    let elapsed_secs = self.measure_start.lock().elapsed().as_secs_f64().max(0.000001);
+    let elapsed_secs = self
+      .measure_start
+      .lock()
+      .elapsed()
+      .as_secs_f64()
+      .max(0.000001);
     let latency = self.histogram.as_ref().map(|m| {
       let hist = m.lock();
       LatencyReport {
@@ -144,7 +153,13 @@ impl BenchmarkCollector {
         max_ns: hist.max(),
       }
     });
-    BenchStats { role: role.to_string(), total_messages, total_bytes, elapsed_secs, latency }
+    BenchStats {
+      role: role.to_string(),
+      total_messages,
+      total_bytes,
+      elapsed_secs,
+      latency,
+    }
   }
 
   pub fn print_final_report(
@@ -157,7 +172,12 @@ impl BenchmarkCollector {
     let total_messages = self.messages_count.load(Ordering::Relaxed);
     let total_bytes = self.bytes_count.load(Ordering::Relaxed);
 
-    let elapsed = self.measure_start.lock().elapsed().as_secs_f64().max(0.000001);
+    let elapsed = self
+      .measure_start
+      .lock()
+      .elapsed()
+      .as_secs_f64()
+      .max(0.000001);
     let msg_sec = total_messages as f64 / elapsed;
     let total_mb = total_bytes as f64 / 1_048_576.0;
     let mb_sec = total_mb / elapsed;
@@ -198,21 +218,48 @@ impl BenchmarkCollector {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(1024);
 
-    let _ = writeln!(out, "\n========================================================");
-    let _ = writeln!(out, "               rzmq BENCHMARK FINAL REPORT              ");
-    let _ = writeln!(out, "========================================================");
+    let _ = writeln!(
+      out,
+      "\n========================================================"
+    );
+    let _ = writeln!(
+      out,
+      "               rzmq BENCHMARK FINAL REPORT              "
+    );
+    let _ = writeln!(
+      out,
+      "========================================================"
+    );
     let _ = writeln!(out, "{:<25} : {}", "Pattern", r.pattern);
     let _ = writeln!(out, "{:<25} : {}", "Role", r.role);
     let _ = writeln!(out, "{:<25} : {} bytes", "Message Size", r.msg_size_bytes);
-    let _ = writeln!(out, "{:<25} : {:.4} seconds", "Elapsed Time", r.elapsed_seconds);
+    let _ = writeln!(
+      out,
+      "{:<25} : {:.4} seconds",
+      "Elapsed Time", r.elapsed_seconds
+    );
     let _ = writeln!(out, "{:<25} : {}", "Total Messages", r.total_messages);
     let _ = writeln!(out, "{:<25} : {:.2} MB", "Total Data", r.total_megabytes);
-    let _ = writeln!(out, "--------------------------------------------------------");
-    let _ = writeln!(out, "{:<25} : {:.2} msg/s", "Throughput", r.throughput_msg_sec);
-    let _ = writeln!(out, "{:<25} : {:.2} MB/s", "Throughput Rate", r.throughput_mb_sec);
+    let _ = writeln!(
+      out,
+      "--------------------------------------------------------"
+    );
+    let _ = writeln!(
+      out,
+      "{:<25} : {:.2} msg/s",
+      "Throughput", r.throughput_msg_sec
+    );
+    let _ = writeln!(
+      out,
+      "{:<25} : {:.2} MB/s",
+      "Throughput Rate", r.throughput_mb_sec
+    );
 
     if let Some(ref lat) = r.latency_ns {
-      let _ = writeln!(out, "--------------------------------------------------------");
+      let _ = writeln!(
+        out,
+        "--------------------------------------------------------"
+      );
       let _ = writeln!(out, "Latency Distribution:");
       let _ = writeln!(out, "  {:<15} : {:>12}", "Min", fmt_ns(lat.min_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "p50 (Median)", fmt_ns(lat.p50_ns));
@@ -222,7 +269,10 @@ impl BenchmarkCollector {
       let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9", fmt_ns(lat.p999_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "Max", fmt_ns(lat.max_ns));
     }
-    let _ = writeln!(out, "========================================================\n");
+    let _ = writeln!(
+      out,
+      "========================================================\n"
+    );
 
     print!("{out}");
   }
@@ -322,57 +372,125 @@ fn print_combined_text(
 ) {
   use std::fmt::Write as _;
   let mut out = String::with_capacity(2048);
-  let _ = writeln!(out, "\n========================================================");
-  let _ = writeln!(out, "               rzmq BENCHMARK FINAL REPORT              ");
-  let _ = writeln!(out, "========================================================");
+  let _ = writeln!(
+    out,
+    "\n========================================================"
+  );
+  let _ = writeln!(
+    out,
+    "               rzmq BENCHMARK FINAL REPORT              "
+  );
+  let _ = writeln!(
+    out,
+    "========================================================"
+  );
   let _ = writeln!(out, "{:<25} : {}", "Pattern", pattern);
   let _ = writeln!(out, "{:<25} : {} bytes", "Message Size", msg_size);
-  let _ = writeln!(out, "--------------------------------------------------------");
+  let _ = writeln!(
+    out,
+    "--------------------------------------------------------"
+  );
 
   if let Some(srv) = server {
-    let _ = writeln!(out, "{:<25}   {:>18}   {:>18}", "", "CLIENT (sent)", "SERVER (recv)");
-    let _ = writeln!(out, "{:<25} : {:>18}   {:>18}", "Elapsed Time (s)",
-      format!("{:.4}", client.elapsed_secs), format!("{:.4}", srv.elapsed_secs));
-    let _ = writeln!(out, "{:<25} : {:>18}   {:>18}", "Total Messages",
-      client.total_messages, srv.total_messages);
-    let _ = writeln!(out, "{:<25} : {:>15.2} MB   {:>15.2} MB", "Total Data",
-      client.total_mb(), srv.total_mb());
-    let _ = writeln!(out, "--------------------------------------------------------");
-    let _ = writeln!(out, "{:<25} : {:>14.2} msg/s   {:>14.2} msg/s", "Throughput",
-      client.throughput_msg_sec(), srv.throughput_msg_sec());
-    let _ = writeln!(out, "{:<25} : {:>14.2} MB/s    {:>14.2} MB/s", "Throughput Rate",
-      client.throughput_mb_sec(), srv.throughput_mb_sec());
+    let _ = writeln!(
+      out,
+      "{:<25}   {:>18}   {:>18}",
+      "", "CLIENT (sent)", "SERVER (recv)"
+    );
+    let _ = writeln!(
+      out,
+      "{:<25} : {:>18}   {:>18}",
+      "Elapsed Time (s)",
+      format!("{:.4}", client.elapsed_secs),
+      format!("{:.4}", srv.elapsed_secs)
+    );
+    let _ = writeln!(
+      out,
+      "{:<25} : {:>18}   {:>18}",
+      "Total Messages", client.total_messages, srv.total_messages
+    );
+    let _ = writeln!(
+      out,
+      "{:<25} : {:>15.2} MB   {:>15.2} MB",
+      "Total Data",
+      client.total_mb(),
+      srv.total_mb()
+    );
+    let _ = writeln!(
+      out,
+      "--------------------------------------------------------"
+    );
+    let _ = writeln!(
+      out,
+      "{:<25} : {:>14.2} msg/s   {:>14.2} msg/s",
+      "Throughput",
+      client.throughput_msg_sec(),
+      srv.throughput_msg_sec()
+    );
+    let _ = writeln!(
+      out,
+      "{:<25} : {:>14.2} MB/s    {:>14.2} MB/s",
+      "Throughput Rate",
+      client.throughput_mb_sec(),
+      srv.throughput_mb_sec()
+    );
     if let Some(ref lat) = client.latency {
-      let _ = writeln!(out, "--------------------------------------------------------");
+      let _ = writeln!(
+        out,
+        "--------------------------------------------------------"
+      );
       let _ = writeln!(out, "  Latency (client round-trip)");
-      let _ = writeln!(out, "  {:<15} : {:>12}", "min",         fmt_ns(lat.min_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "min", fmt_ns(lat.min_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "p50 (Median)", fmt_ns(lat.p50_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "p90",         fmt_ns(lat.p90_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "p95",         fmt_ns(lat.p95_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "p99",         fmt_ns(lat.p99_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9",       fmt_ns(lat.p999_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "max",         fmt_ns(lat.max_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p90", fmt_ns(lat.p90_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p95", fmt_ns(lat.p95_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99", fmt_ns(lat.p99_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9", fmt_ns(lat.p999_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "max", fmt_ns(lat.max_ns));
     }
   } else {
-    let _ = writeln!(out, "{:<25} : {:.4} seconds", "Elapsed Time", client.elapsed_secs);
+    let _ = writeln!(
+      out,
+      "{:<25} : {:.4} seconds",
+      "Elapsed Time", client.elapsed_secs
+    );
     let _ = writeln!(out, "{:<25} : {}", "Total Messages", client.total_messages);
     let _ = writeln!(out, "{:<25} : {:.2} MB", "Total Data", client.total_mb());
-    let _ = writeln!(out, "--------------------------------------------------------");
-    let _ = writeln!(out, "{:<25} : {:.2} msg/s", "Throughput", client.throughput_msg_sec());
-    let _ = writeln!(out, "{:<25} : {:.2} MB/s", "Throughput Rate", client.throughput_mb_sec());
+    let _ = writeln!(
+      out,
+      "--------------------------------------------------------"
+    );
+    let _ = writeln!(
+      out,
+      "{:<25} : {:.2} msg/s",
+      "Throughput",
+      client.throughput_msg_sec()
+    );
+    let _ = writeln!(
+      out,
+      "{:<25} : {:.2} MB/s",
+      "Throughput Rate",
+      client.throughput_mb_sec()
+    );
     if let Some(ref lat) = client.latency {
-      let _ = writeln!(out, "--------------------------------------------------------");
+      let _ = writeln!(
+        out,
+        "--------------------------------------------------------"
+      );
       let _ = writeln!(out, "  Latency (client round-trip)");
-      let _ = writeln!(out, "  {:<15} : {:>12}", "min",          fmt_ns(lat.min_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "min", fmt_ns(lat.min_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "p50 (Median)", fmt_ns(lat.p50_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "p90",          fmt_ns(lat.p90_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "p95",          fmt_ns(lat.p95_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "p99",          fmt_ns(lat.p99_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9",        fmt_ns(lat.p999_ns));
-      let _ = writeln!(out, "  {:<15} : {:>12}", "max",          fmt_ns(lat.max_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p90", fmt_ns(lat.p90_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p95", fmt_ns(lat.p95_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99", fmt_ns(lat.p99_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9", fmt_ns(lat.p999_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "max", fmt_ns(lat.max_ns));
     }
   }
-  let _ = writeln!(out, "========================================================\n");
+  let _ = writeln!(
+    out,
+    "========================================================\n"
+  );
   print!("{out}");
 }
 
@@ -389,13 +507,25 @@ fn print_combined_json(client: &BenchStats, server: Option<&BenchStats>) {
 
 fn print_combined_csv(client: &BenchStats, server: Option<&BenchStats>) {
   println!("role,total_messages,total_bytes,elapsed_secs,throughput_msg_sec,throughput_mb_sec");
-  println!("{},{},{},{:.4},{:.2},{:.2}",
-    client.role, client.total_messages, client.total_bytes,
-    client.elapsed_secs, client.throughput_msg_sec(), client.throughput_mb_sec());
+  println!(
+    "{},{},{},{:.4},{:.2},{:.2}",
+    client.role,
+    client.total_messages,
+    client.total_bytes,
+    client.elapsed_secs,
+    client.throughput_msg_sec(),
+    client.throughput_mb_sec()
+  );
   if let Some(srv) = server {
-    println!("{},{},{},{:.4},{:.2},{:.2}",
-      srv.role, srv.total_messages, srv.total_bytes,
-      srv.elapsed_secs, srv.throughput_msg_sec(), srv.throughput_mb_sec());
+    println!(
+      "{},{},{},{:.4},{:.2},{:.2}",
+      srv.role,
+      srv.total_messages,
+      srv.total_bytes,
+      srv.elapsed_secs,
+      srv.throughput_msg_sec(),
+      srv.throughput_mb_sec()
+    );
   }
 }
 

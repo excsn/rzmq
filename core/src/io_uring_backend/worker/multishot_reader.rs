@@ -1,7 +1,7 @@
 #![cfg(feature = "io-uring")]
 
-use crate::ZmqError;
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
+use crate::ZmqError;
 
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringConnectionHandler, UringWorkerInterface,
@@ -215,7 +215,8 @@ impl MultishotReader {
         );
         self.active_op_user_data = None;
         self.is_active = false;
-        ops_to_return = owner_handler.process_ring_read_bytes(bytes::Bytes::new(), worker_interface);
+        ops_to_return =
+          owner_handler.process_ring_read_bytes(bytes::Bytes::new(), worker_interface);
         return Ok((ops_to_return, true));
       }
 
@@ -265,9 +266,15 @@ impl MultishotReader {
           cqe_ud
         );
         if let Err(e) = buffer_manager.reprovide_buffer(buffer_id) {
-          tracing::warn!("[MultishotReader FD={}] reprovide_buffer({}) on EOF failed: {:?}", self.fd, buffer_id, e);
+          tracing::warn!(
+            "[MultishotReader FD={}] reprovide_buffer({}) on EOF failed: {:?}",
+            self.fd,
+            buffer_id,
+            e
+          );
         }
-        ops_to_return = owner_handler.process_ring_read_bytes(bytes::Bytes::new(), worker_interface);
+        ops_to_return =
+          owner_handler.process_ring_read_bytes(bytes::Bytes::new(), worker_interface);
         // Fall through to MORE flag check; EOF means the multishot op should terminate.
       }
 

@@ -19,7 +19,7 @@ use crate::io_uring_backend::ops::{UringOpRequest, WAKEUP_STATE_ACTIVE};
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::io_uring_backend::UserData;
-use crate::uring::{UringPollingStrategy, global_state, UringConfig};
+use crate::uring::{global_state, UringConfig, UringPollingStrategy};
 use crate::ZmqError;
 
 use std::collections::{HashMap, VecDeque};
@@ -30,7 +30,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 
-use fibre::mpmc::{unbounded, AsyncSender, Sender as SyncSender, Receiver as SyncReceiver};
+use fibre::mpmc::{unbounded, AsyncSender, Receiver as SyncReceiver, Sender as SyncSender};
 use fibre::mpsc;
 use io_uring::opcode;
 use io_uring::IoUring;
@@ -44,7 +44,6 @@ pub(crate) use internal_op_tracker::{InternalOpPayload, InternalOpTracker, Inter
 pub(crate) use multishot_reader::MultishotReader;
 pub(crate) use observability::UringMetrics;
 
-
 #[derive(Debug, Default)]
 struct FdWork {
   /// Non-blocking ingress (read setup / cancel) blueprints — never gated by write_in_flight.
@@ -54,7 +53,10 @@ struct FdWork {
 }
 
 impl FdWork {
-  pub(crate) fn route_blueprints(&mut self, blueprints: impl IntoIterator<Item = HandlerSqeBlueprint>) {
+  pub(crate) fn route_blueprints(
+    &mut self,
+    blueprints: impl IntoIterator<Item = HandlerSqeBlueprint>,
+  ) {
     for bp in blueprints {
       if bp.is_ingress() {
         self.ingress_blueprints.push_back(bp);
@@ -69,7 +71,7 @@ impl FdWork {
 pub(crate) enum WorkerState {
   Running,
   Draining, // Shutdown initiated, processing in-flight completions only
-  CleaningUp, 
+  CleaningUp,
   Stopped,
 }
 
@@ -92,7 +94,8 @@ pub struct UringWorker {
   pub(crate) fd_to_mpsc_rx: HashMap<RawFd, Arc<mpsc::BoundedReceiver<OutgoingMessage>>>,
   /// Egress channels for `ZmtpUringHandler` connections (SocketCore → worker).
   /// Checked in the pre-sleep double-check to keep the worker awake when batches are pending.
-  pub(crate) fd_to_zmtp_egress_rx: HashMap<RawFd, Arc<mpsc::BoundedReceiver<crate::message::FrameBatch>>>,
+  pub(crate) fd_to_zmtp_egress_rx:
+    HashMap<RawFd, Arc<mpsc::BoundedReceiver<crate::message::FrameBatch>>>,
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
   cfg_send_buffer_count: usize, //TODO revisit
@@ -123,9 +126,18 @@ impl fmt::Debug for UringWorker {
       .field("op_rx_len", &self.op_rx.len())
       .field("op_rx_is_closed", &self.op_rx.is_closed())
       .field("buffer_manager_is_some", &self.buffer_manager.is_some())
-      .field("external_op_tracker_len", &self.external_op_tracker.in_flight.len())
-      .field("internal_op_tracker_len", &self.internal_op_tracker.op_to_details.len())
-      .field("default_buffer_ring_group_id_val", &self.default_buffer_ring_group_id_val)
+      .field(
+        "external_op_tracker_len",
+        &self.external_op_tracker.in_flight.len(),
+      )
+      .field(
+        "internal_op_tracker_len",
+        &self.internal_op_tracker.op_to_details.len(),
+      )
+      .field(
+        "default_buffer_ring_group_id_val",
+        &self.default_buffer_ring_group_id_val,
+      )
       .field("event_fd_poller", &self.event_fd_poller)
       .field("fd_to_mpsc_rx_len", &self.fd_to_mpsc_rx.len())
       .finish_non_exhaustive()
@@ -136,19 +148,29 @@ impl UringWorker {
   pub fn spawn_with_config(
     config: UringConfig,
     factories: Vec<Arc<dyn ProtocolHandlerFactory>>,
-  ) -> Result<(SignalingOpSender, std::thread::JoinHandle<Result<(), ZmqError>>), ZmqError> {
+  ) -> Result<
+    (
+      SignalingOpSender,
+      std::thread::JoinHandle<Result<(), ZmqError>>,
+    ),
+    ZmqError,
+  > {
     let (op_tx_sync, op_rx) = unbounded::<UringOpRequest>();
     let op_tx_async_for_signaler: AsyncSender<UringOpRequest> = op_tx_sync.to_async();
 
-    let event_fd_master_instance =
-      eventfd::EventFD::new(0, eventfd::EfdFlags::EFD_CLOEXEC | eventfd::EfdFlags::EFD_NONBLOCK).map_err(|e| {
-        error!("Failed to create master EventFD for UringWorker: {}", e);
-        ZmqError::Internal(format!("Master EventFD creation failed: {}", e))
-      })?;
+    let event_fd_master_instance = eventfd::EventFD::new(
+      0,
+      eventfd::EfdFlags::EFD_CLOEXEC | eventfd::EfdFlags::EFD_NONBLOCK,
+    )
+    .map_err(|e| {
+      error!("Failed to create master EventFD for UringWorker: {}", e);
+      ZmqError::Internal(format!("Master EventFD creation failed: {}", e))
+    })?;
 
     let worker_asleep = Arc::new(AtomicU8::new(WAKEUP_STATE_ACTIVE));
-    let pool_slot: Arc<once_cell::sync::OnceCell<Arc<crate::io_uring_backend::send_buffer_pool::SendBufferPool>>> =
-      Arc::new(once_cell::sync::OnceCell::new());
+    let pool_slot: Arc<
+      once_cell::sync::OnceCell<Arc<crate::io_uring_backend::send_buffer_pool::SendBufferPool>>,
+    > = Arc::new(once_cell::sync::OnceCell::new());
     let signaling_op_sender = SignalingOpSender::new(
       op_tx_async_for_signaler,
       event_fd_master_instance.clone(),
@@ -301,7 +323,7 @@ impl UringWorker {
   fn transition_to_draining(&mut self) {
     info!("UringWorker: Transitioning to DRAINING state.");
     self.state = WorkerState::Draining;
-    
+
     let mut sq_for_shutdown = unsafe { self.ring.submission_shared() };
 
     // Cancel all in-flight internal kernel operations.
@@ -438,7 +460,9 @@ pub(crate) fn sockaddr_storage_to_socket_addr(
         let port = u16::from_be(sa.sin6_port); // sin6_port is network order
         let flowinfo = u32::from_be(sa.sin6_flowinfo); // sin6_flowinfo is network order
         let scope_id = u32::from_be(sa.sin6_scope_id); // sin6_scope_id is network order
-        Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, flowinfo, scope_id)))
+        Ok(SocketAddr::V6(SocketAddrV6::new(
+          ip, port, flowinfo, scope_id,
+        )))
       } else {
         Err(std::io::Error::new(
           std::io::ErrorKind::InvalidInput,

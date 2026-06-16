@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use bytes::Bytes;
+use std::collections::VecDeque;
 
 pub(crate) struct EgressBuffer {
   chunks: VecDeque<(Bytes, usize)>, // (data, logical_message_count)
@@ -10,18 +10,27 @@ pub(crate) struct EgressBuffer {
 
 impl EgressBuffer {
   pub(crate) fn new() -> Self {
-    Self { chunks: VecDeque::new(), write_offset: 0, total_bytes: 0, message_count: 0 }
+    Self {
+      chunks: VecDeque::new(),
+      write_offset: 0,
+      total_bytes: 0,
+      message_count: 0,
+    }
   }
 
   pub(crate) fn push(&mut self, data: Bytes, msg_count: usize) {
-    if data.is_empty() { return; }
+    if data.is_empty() {
+      return;
+    }
     self.total_bytes += data.len();
     self.message_count += msg_count;
     self.chunks.push_back((data, msg_count));
   }
 
   pub(crate) fn push_priority(&mut self, data: Bytes) {
-    if data.is_empty() { return; }
+    if data.is_empty() {
+      return;
+    }
     self.total_bytes += data.len();
     // Control frames (PING/PONG) are outside HWM accounting — msg_count = 0.
     // Inject in front but after the current write_offset position of the head chunk.
@@ -141,8 +150,8 @@ mod tests {
   fn advance_spans_multiple_chunks() {
     let mut buf = EgressBuffer::new();
     buf.push(Bytes::from_static(b"0123456789"), 1); // 10 bytes
-    buf.push(Bytes::from_static(b"abcde"), 1);      //  5 bytes
-    buf.push(Bytes::from_static(b"XY"), 1);         //  2 bytes
+    buf.push(Bytes::from_static(b"abcde"), 1); //  5 bytes
+    buf.push(Bytes::from_static(b"XY"), 1); //  2 bytes
     assert_eq!(buf.pending_messages(), 3);
     // advance 12: consumes all of chunk[0] + 2 bytes of chunk[1]
     buf.advance(12);

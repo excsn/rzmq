@@ -122,12 +122,14 @@ impl ProvidedBufferRing {
         "ProvidedBufferRing: entries and buffer capacity must be non-zero".into(),
       ));
     }
-    let entry_count = requested_entries.checked_next_power_of_two().ok_or_else(|| {
-      ZmqError::Internal(format!(
-        "ProvidedBufferRing: entry count {} not representable as a power of two",
-        requested_entries
-      ))
-    })?;
+    let entry_count = requested_entries
+      .checked_next_power_of_two()
+      .ok_or_else(|| {
+        ZmqError::Internal(format!(
+          "ProvidedBufferRing: entry count {} not representable as a power of two",
+          requested_entries
+        ))
+      })?;
 
     let ring_layout =
       Layout::from_size_align(entry_count as usize * size_of::<BufRingEntry>(), 4096)
@@ -336,10 +338,18 @@ mod tests {
     // A sub-slice (as held by a parsed Msg) keeps the buffer alive.
     let slice = bytes.slice(1..4);
     drop(bytes);
-    assert_eq!(pool.free.lock().len(), 0, "buffer must not return while a slice lives");
+    assert_eq!(
+      pool.free.lock().len(),
+      0,
+      "buffer must not return while a slice lives"
+    );
     assert_eq!(&slice[..], b"ell");
     drop(slice);
-    assert_eq!(pool.free.lock().len(), 1, "buffer must return to the pool on final drop");
+    assert_eq!(
+      pool.free.lock().len(),
+      1,
+      "buffer must return to the pool on final drop"
+    );
   }
 
   #[test]
@@ -415,9 +425,7 @@ mod tests {
 
   fn socketpair() -> (RawFd, RawFd) {
     let mut fds = [0 as RawFd; 2];
-    let rc = unsafe {
-      libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
-    };
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
     assert_eq!(rc, 0, "socketpair failed");
     (fds[0], fds[1])
   }
@@ -437,8 +445,13 @@ mod tests {
     // 3 full cycles of the ring.
     for round in 0u8..(ENTRIES as u8 * 3) {
       let payload = [round; 64];
-      let written =
-        unsafe { libc::write(write_fd, payload.as_ptr() as *const libc::c_void, payload.len()) };
+      let written = unsafe {
+        libc::write(
+          write_fd,
+          payload.as_ptr() as *const libc::c_void,
+          payload.len(),
+        )
+      };
       assert_eq!(written, payload.len() as isize);
 
       let read_sqe = opcode::Recv::new(types::Fd(read_fd), std::ptr::null_mut(), CAPACITY as u32)
@@ -455,7 +468,11 @@ mod tests {
       let bid = cqueue::buffer_select(cqe.flags()).expect("CQE must carry a buffer id");
       let bytes = pbr.take(bid, cqe.result() as usize).expect("take");
       assert_eq!(bytes.len(), payload.len());
-      assert!(bytes.iter().all(|&b| b == round), "payload mismatch in round {}", round);
+      assert!(
+        bytes.iter().all(|&b| b == round),
+        "payload mismatch in round {}",
+        round
+      );
       // bytes drops here → buffer returns to the pool for the next rounds.
     }
 

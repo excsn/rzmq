@@ -138,7 +138,11 @@ impl AdaptiveThrottle {
     };
 
     // Periodic EMA nudge
-    let since = self.shared.ops_since_nudge.fetch_add(weight, Ordering::Relaxed) + weight;
+    let since = self
+      .shared
+      .ops_since_nudge
+      .fetch_add(weight, Ordering::Relaxed)
+      + weight;
     if since >= self.shared.config.nudge_interval_ops {
       let alpha = self.shared.config.adaptive_learning_rate;
       let old_learned = self.shared.learned_balance.load(Ordering::Relaxed);
@@ -271,8 +275,8 @@ fn active_should_throttle(guard: &ThrottleGuard) -> bool {
 
 #[cfg(test)]
 mod throttle_math_tests {
-  use super::*;
   use super::types::{Direction, Priority, ThrottleStateView};
+  use super::*;
   use std::sync::atomic::Ordering;
 
   #[test]
@@ -320,12 +324,18 @@ mod throttle_math_tests {
     };
 
     let base_p = (throttle.shared.config.strategy)(&state);
-    assert!(base_p > 0.0, "Expected non-zero base probability for imbalanced state");
+    assert!(
+      base_p > 0.0,
+      "Expected non-zero base probability for imbalanced state"
+    );
 
     // With Egress as priority and balance > learned, doing Ingress (non-priority)
     // should apply a 3x boost. Verify the multiplier matches config.
     let is_imbalanced_towards_priority = state.current_balance > state.learned_balance as i32;
-    assert!(is_imbalanced_towards_priority, "Expected imbalance: balance 150 > learned 0");
+    assert!(
+      is_imbalanced_towards_priority,
+      "Expected imbalance: balance 150 > learned 0"
+    );
 
     let boosted_p = base_p * throttle.shared.config.priority_boost_factor;
     assert!(

@@ -457,7 +457,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
       && interface.pending_egress_count < 16
     {
       self.coalesce_scratch.clear();
-      let limit = self.engine.config().sndbatch_count.max(1).min(32);
+      let limit = self.engine.config().sndbatch_count.max(1);
 
       while self.coalesce_scratch.len() < limit {
         match self.egress_rx.try_recv() {

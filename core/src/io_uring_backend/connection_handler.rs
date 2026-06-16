@@ -7,9 +7,9 @@ use crate::{Blob, ZmqError};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use crate::runtime::MailboxSyncSender;
 use crate::socket::connection_iface::ISocketConnection;
+use bytes::Bytes;
 
 pub use crate::io_uring_backend::ops::UserData;
 
@@ -178,7 +178,7 @@ pub trait UringConnectionHandler: Send {
 
   /// Checks if the handler is in a terminal (Closing, Closed, Error) state.
   fn is_closing_or_closed(&self) -> bool;
-  
+
   /// Called when the connection is first established and ready.
   /// Handler should return blueprints for initial I/O (e.g., start reading, send greeting).
   fn connection_ready(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps;
@@ -293,7 +293,6 @@ pub trait UringConnectionHandler: Send {
   /// Called by the worker when `ResumeConnection` is received from SocketCore.
   /// The handler clears throttle state and re-arms reads.
   fn resume_ingress(&mut self) {}
-
 }
 
 pub trait ProtocolHandlerFactory: Send + Sync + 'static {

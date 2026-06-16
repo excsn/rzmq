@@ -1,4 +1,4 @@
-use clap::{Parser, builder::TypedValueParser};
+use clap::{builder::TypedValueParser, Parser};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -21,7 +21,7 @@ pub enum KeygenSubcommands {
   /// Generate Noise_XX (X25519) keypair
   NoiseXx(NoiseXxArgs),
   /// Generate CURVE (Curve25519) keypair
-  Curve(CurveArgs), 
+  Curve(CurveArgs),
 }
 
 #[derive(Parser, Debug)]
