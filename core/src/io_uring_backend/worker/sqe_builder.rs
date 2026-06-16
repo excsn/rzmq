@@ -96,6 +96,7 @@ pub(crate) fn build_sqe_for_external_request(
     UringOpRequest::InitializeBufferRing { .. } |
     UringOpRequest::Listen { .. } | // Listen setup is complex, first Accept SQE is internal.
     UringOpRequest::RegisterExternalByteFd { .. } |
+    UringOpRequest::RegisterExternalZmtpFd { .. } |
     UringOpRequest::StartFdReadLoop { .. } |
     UringOpRequest::ShutdownConnectionHandler { .. } => {
         tracing::trace!(

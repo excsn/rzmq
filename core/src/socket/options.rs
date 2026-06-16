@@ -283,6 +283,7 @@ pub(crate) struct ZmtpEngineConfig {
   pub max_msg_size: i64,
   pub throttle_config: AdaptiveThrottleConfig,
   pub sndhwm: usize,
+  pub rcvhwm: usize,
   pub sndbatch_count: usize,
   pub sndbatch_bytes: usize,
   pub rcvbatch_count: usize,
@@ -324,6 +325,7 @@ impl Default for ZmtpEngineConfig {
       max_msg_size: -1, // -1 = unlimited, mirrors SocketOptions::maxmsgsize default
       throttle_config: AdaptiveThrottleConfig::default(),
       sndhwm: 256,
+      rcvhwm: 256,
       sndbatch_count: DEFAULT_SNDBATCH_COUNT,
       sndbatch_bytes: DEFAULT_SNDBATCH_BYTES,
       rcvbatch_count: DEFAULT_RCVBATCH_COUNT,
@@ -410,6 +412,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       max_msg_size: options.maxmsgsize,
       throttle_config: options.throttle_config.clone(),
       sndhwm: options.sndhwm,
+      rcvhwm: options.rcvhwm,
       sndbatch_count: options.sndbatch_count,
       sndbatch_bytes,
       rcvbatch_count: options.rcvbatch_count,
