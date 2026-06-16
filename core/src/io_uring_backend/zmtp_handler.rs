@@ -26,6 +26,7 @@ use crate::protocol::zmtp::{
 };
 use crate::runtime::Command;
 use crate::socket::connection_iface::ISocketConnection;
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::ZmqError;
 
 const ZC_SEND_THRESHOLD: usize = 1024;
@@ -110,8 +111,12 @@ pub(crate) struct ZmtpUringHandler {
     engine: ZmtpEngine,
     /// Egress channel receiver: SocketCore → handler (via ZmtpSmartConnection → egress_tx).
     egress_rx: Arc<fibre::mpsc::BoundedReceiver<FrameBatch>>,
-    /// Taken once on `HandshakeComplete` and forwarded to SocketCore in `UringConnectionEstablished`.
-    inbound_data_rx: Option<fibre::mpsc::BoundedAsyncReceiver<FrameBatch>>,
+    /// Direct ingress sender: delivers decoded messages straight to the socket's ReadyPipeQueue.
+    /// Set by `attach_ingress` after SocketCore completes pipe registration.
+    ingress_sender: Option<PipeMessageSender>,
+    /// True when the ingress pipe queue is full (rcvhwm). Reads are throttled until
+    /// SocketCore sends `ResumeConnection`.
+    is_throttled: bool,
     multishot_reader: Option<MultishotReader>,
     is_closing: bool,
     /// Non-blocking delayed close (replaces `thread::sleep`).
@@ -128,7 +133,6 @@ impl ZmtpUringHandler {
         worker_io_config: Arc<WorkerIoConfig>,
         engine: ZmtpEngine,
         egress_rx: Arc<fibre::mpsc::BoundedReceiver<FrameBatch>>,
-        inbound_data_rx: fibre::mpsc::BoundedAsyncReceiver<FrameBatch>,
         use_send_zerocopy: bool,
         use_recv_multishot: bool,
         send_buffer_slot_size: usize,
@@ -138,7 +142,8 @@ impl ZmtpUringHandler {
             worker_io_config,
             engine,
             egress_rx,
-            inbound_data_rx: Some(inbound_data_rx),
+            ingress_sender: None,
+            is_throttled: false,
             multishot_reader: None,
             is_closing: false,
             close_deadline: None,
@@ -191,26 +196,39 @@ impl ZmtpUringHandler {
         for app in output.app_actions {
             match app {
                 AppAction::HandshakeComplete { peer_identity, peer_socket_type } => {
-                    if let Some(inbound_rx) = self.inbound_data_rx.take() {
-                        let cmd = Command::UringConnectionEstablished {
-                            endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
-                            target_endpoint_uri: self.worker_io_config.target_endpoint_uri.clone(),
-                            connection_iface: self.worker_io_config.connection_iface.clone(),
-                            peer_identity,
-                            inbound_data_rx: Some(inbound_rx),
-                            fd: self.fd,
-                        };
-                        if let Err(e) = self.worker_io_config.socket_mailbox.try_send(cmd) {
-                            warn!(
-                                fd = self.fd,
-                                "ZmtpUringHandler: failed to send UringConnectionEstablished to SocketCore: {:?}", e
-                            );
-                        }
+                    let cmd = Command::UringConnectionEstablished {
+                        endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
+                        target_endpoint_uri: self.worker_io_config.target_endpoint_uri.clone(),
+                        connection_iface: self.worker_io_config.connection_iface.clone(),
+                        peer_identity,
+                        fd: self.fd,
+                    };
+                    if let Err(e) = self.worker_io_config.socket_mailbox.try_send(cmd) {
+                        warn!(
+                            fd = self.fd,
+                            "ZmtpUringHandler: failed to send UringConnectionEstablished to SocketCore: {:?}", e
+                        );
                     }
                 }
                 AppAction::DeliverMessage(batch) => {
-                    if let Err(_e) = self.worker_io_config.inbound_data_tx.try_send(batch) {
-                        trace!(fd = self.fd, "ZmtpUringHandler: inbound_data_tx full, dropping batch");
+                    if let Some(ref sender) = self.ingress_sender {
+                        match sender.try_send_sync(batch) {
+                            Ok(()) => {
+                                self.is_throttled = false;
+                            }
+                            Err(fibre::TrySendError::Full(_)) => {
+                                self.is_throttled = true;
+                                trace!(fd = self.fd, "ZmtpUringHandler: ingress queue full, throttling reads");
+                            }
+                            Err(fibre::TrySendError::Closed(_)) => {
+                                warn!(fd = self.fd, "ZmtpUringHandler: ingress sender closed, closing connection");
+                                ops.initiate_close_due_to_error = true;
+                            }
+                            Err(fibre::TrySendError::Sent(_)) => unreachable!(),
+                        }
+                    } else {
+                        // Ingress sender not yet attached — drop until AttachIngressSender arrives.
+                        trace!(fd = self.fd, "ZmtpUringHandler: dropping message — ingress sender not yet attached");
                     }
                 }
                 AppAction::PeerError(e) => {
@@ -442,7 +460,19 @@ impl UringConnectionHandler for ZmtpUringHandler {
     }
 
     fn should_throttle_reads(&self) -> bool {
-        false
+        self.is_throttled || self.is_closing
+    }
+
+    fn attach_ingress(&mut self, sender: PipeMessageSender) {
+        debug!(fd = self.fd, "ZmtpUringHandler: ingress sender attached");
+        self.ingress_sender = Some(sender);
+        // Clear any throttle that may have been set before the sender arrived.
+        self.is_throttled = false;
+    }
+
+    fn resume_ingress(&mut self) {
+        trace!(fd = self.fd, "ZmtpUringHandler: resume_ingress — clearing throttle");
+        self.is_throttled = false;
     }
 
     /// Returns true when there is pending egress data or a close deadline is armed,

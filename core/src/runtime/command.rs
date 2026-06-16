@@ -11,7 +11,6 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
-use fibre::mpsc::BoundedAsyncReceiver;
 use fibre::oneshot;
 use tokio::task::Id as TaskId;
 
@@ -115,19 +114,17 @@ pub enum Command {
   // --- io_uring path: unified, URI-keyed commands ---
 
   /// Sent from the UringWorker to SocketCore when an io_uring connection's ZMTP handshake
-  /// completes. Carries the URI, peer identity, and connection interface atomically, replacing
-  /// the old two-step NewConnectionEstablished + UringFdHandshakeComplete flow.
+  /// completes. SocketCore responds by calling `pipe_attached`, extracting a `PipeMessageSender`
+  /// via `get_incoming_pipe_sender`, and sending `AttachIngressSender` back to the worker so
+  /// the handler can deliver messages directly to the socket's `ReadyPipeQueue`.
   #[cfg(feature = "io-uring")]
   UringConnectionEstablished {
     endpoint_uri: String,
     target_endpoint_uri: String,
     connection_iface: Arc<dyn ISocketConnection>,
     peer_identity: Option<Blob>,
-    /// Dedicated per-connection inbound data channel. Taken once by command_processor
-    /// to spawn the UringPipeReader task, bypassing the control mailbox for data delivery.
-    inbound_data_rx: Option<BoundedAsyncReceiver<FrameBatch>>,
-    /// Raw file descriptor for this connection. Passed to UringPipeReader so it can send
-    /// `ResumeConnection { fd }` when the inbound channel drains below the LWM.
+    /// Raw file descriptor for this connection — used to route `AttachIngressSender`
+    /// to the correct worker handler.
     fd: RawFd,
   },
 

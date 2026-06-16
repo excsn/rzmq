@@ -2,6 +2,7 @@
 
 use crate::runtime::MailboxSyncSender;
 use crate::socket::ZmtpEngineConfig;
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::ZmqError;
 
 use std::fmt;
@@ -100,6 +101,23 @@ pub enum UringOpRequest {
     use_recv_multishot: bool,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
+  /// Delivers the `PipeMessageSender` to the `ZmtpUringHandler` after `pipe_attached`
+  /// completes on the SocketCore side. Until this arrives, the handler buffers or drops
+  /// incoming messages. After this the handler delivers directly to the socket's
+  /// `ReadyPipeQueue`, eliminating the intermediate `UringPipeReader` task.
+  AttachIngressSender {
+    user_data: UserData,
+    fd: RawFd,
+    ingress_sender: PipeMessageSender,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
+  },
+  /// Signals the handler to resume reading after HWM throttling. Sent by SocketCore
+  /// when the per-pipe queue drains below the low-water mark.
+  ResumeConnection {
+    user_data: UserData,
+    fd: RawFd,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
+  },
 }
 
 impl UringOpRequest {
@@ -113,6 +131,8 @@ impl UringOpRequest {
       | Self::Connect { user_data, .. }
       | Self::RegisterExternalByteFd { user_data, .. }
       | Self::RegisterExternalZmtpFd { user_data, .. }
+      | Self::AttachIngressSender { user_data, .. }
+      | Self::ResumeConnection { user_data, .. }
       | Self::StartFdReadLoop { user_data, .. }
       | Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
     }
@@ -127,6 +147,8 @@ impl UringOpRequest {
       Self::Connect { .. } => "Connect".to_string(),
       Self::RegisterExternalByteFd { .. } => "RegisterExternalByteFd".to_string(),
       Self::RegisterExternalZmtpFd { .. } => "RegisterExternalZmtpFd".to_string(),
+      Self::AttachIngressSender { .. } => "AttachIngressSender".to_string(),
+      Self::ResumeConnection { .. } => "ResumeConnection".to_string(),
       Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
       Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
     }
@@ -140,6 +162,8 @@ impl UringOpRequest {
       | Self::Listen { reply_tx, .. }
       | Self::RegisterExternalByteFd { reply_tx, .. }
       | Self::RegisterExternalZmtpFd { reply_tx, .. }
+      | Self::AttachIngressSender { reply_tx, .. }
+      | Self::ResumeConnection { reply_tx, .. }
       | Self::Connect { reply_tx, .. }
       | Self::StartFdReadLoop { reply_tx, .. }
       | Self::ShutdownConnectionHandler { reply_tx, .. } => Some(reply_tx),
@@ -216,6 +240,16 @@ impl fmt::Debug for UringOpRequest {
         .field("is_server", is_server)
         .field("endpoint_uri", endpoint_uri)
         .finish_non_exhaustive(),
+      UringOpRequest::AttachIngressSender { user_data, fd, .. } => f
+        .debug_struct("AttachIngressSender")
+        .field("user_data", user_data)
+        .field("fd", fd)
+        .finish_non_exhaustive(),
+      UringOpRequest::ResumeConnection { user_data, fd, .. } => f
+        .debug_struct("ResumeConnection")
+        .field("user_data", user_data)
+        .field("fd", fd)
+        .finish_non_exhaustive(),
     }
   }
 }
@@ -247,6 +281,14 @@ pub enum UringOpCompletion {
     fd: RawFd,
   },
   RegisterExternalZmtpFdSuccess {
+    user_data: UserData,
+    fd: RawFd,
+  },
+  AttachIngressSenderSuccess {
+    user_data: UserData,
+    fd: RawFd,
+  },
+  ResumeConnectionSuccess {
     user_data: UserData,
     fd: RawFd,
   },
@@ -313,6 +355,16 @@ impl fmt::Debug for UringOpCompletion {
         .finish(),
       UringOpCompletion::RegisterExternalZmtpFdSuccess { user_data, fd } => f
         .debug_struct("RegisterExternalZmtpFdSuccess")
+        .field("user_data", user_data)
+        .field("fd", fd)
+        .finish(),
+      UringOpCompletion::AttachIngressSenderSuccess { user_data, fd } => f
+        .debug_struct("AttachIngressSenderSuccess")
+        .field("user_data", user_data)
+        .field("fd", fd)
+        .finish(),
+      UringOpCompletion::ResumeConnectionSuccess { user_data, fd } => f
+        .debug_struct("ResumeConnectionSuccess")
         .field("user_data", user_data)
         .field("fd", fd)
         .finish(),

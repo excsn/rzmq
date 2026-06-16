@@ -1,6 +1,7 @@
 #![cfg(feature = "io-uring")]
 
 use crate::message::{FrameBatch, Msg};
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::{Blob, ZmqError};
 
 use std::os::unix::io::RawFd;
@@ -282,6 +283,15 @@ pub trait UringConnectionHandler: Send {
     false
   }
 
+  /// Called by the worker when `AttachIngressSender` is received from SocketCore.
+  /// The handler stores the sender and uses it to deliver inbound messages directly
+  /// to the socket's `ReadyPipeQueue`, bypassing any intermediate Tokio task.
+  fn attach_ingress(&mut self, _sender: PipeMessageSender) {}
+
+  /// Called by the worker when `ResumeConnection` is received from SocketCore.
+  /// The handler clears throttle state and re-arms reads.
+  fn resume_ingress(&mut self) {}
+
 }
 
 pub trait ProtocolHandlerFactory: Send + Sync + 'static {
@@ -294,9 +304,6 @@ pub trait ProtocolHandlerFactory: Send + Sync + 'static {
     worker_io_config: Arc<WorkerIoConfig>,
     protocol_config: &ProtocolConfig,
     is_server: bool,
-    // Dedicated inbound data channel receiver. Stored in the handler and taken once
-    // at handshake completion to be forwarded in UringConnectionEstablished.
-    inbound_data_rx: fibre::mpsc::BoundedAsyncReceiver<FrameBatch>,
   ) -> Result<Box<dyn UringConnectionHandler + Send>, String>;
 }
 
@@ -312,9 +319,6 @@ pub struct WorkerIoConfig {
   /// Synchronous sender to the parent SocketCore mailbox.
   /// Must be the sync variant so the UringWorker OS-thread can wake Tokio tasks correctly.
   pub socket_mailbox: MailboxSyncSender,
-  /// Dedicated data plane: sync sender used by the UringWorker OS thread to push decoded
-  /// message batches directly to the per-connection reader task, bypassing the control mailbox.
-  pub inbound_data_tx: fibre::mpsc::BoundedSender<FrameBatch>,
   /// Logical endpoint URI for this connection (e.g. "tcp://1.2.3.4:5678").
   pub endpoint_uri: String,
   /// The original target URI requested by the user.

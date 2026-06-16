@@ -204,6 +204,20 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
 
         Ok(())
     }
+
+    /// Non-blocking send. Returns `Err(TrySendError::Full)` if the pipe queue is at capacity.
+    /// Safe to call from a non-async context (e.g., the io_uring worker OS thread).
+    pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        self.sender.try_send(item)?;
+        // Signal the consumer only when transitioning from quiet to active.
+        if !self.is_activated.swap(true, Ordering::AcqRel) {
+            if self.activation_tx.try_send(self.pipe_id).is_err() {
+                // Activation channel full — reset flag so the next send can retry.
+                self.is_activated.store(false, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,14 +243,27 @@ impl PipeMessageSender {
         match self {
             Self::Direct(s) => s.send(batch).await,
             Self::Filtered { inner, trie } => {
-                let topic: &[u8] = batch
-                    .first()
-                    .and_then(|m| m.data())
-                    .unwrap_or(&[]);
-                if trie.matches(topic).await {
+                let topic: &[u8] = batch.first().and_then(|m| m.data()).unwrap_or(&[]);
+                if trie.matches(topic) {
                     inner.send(batch).await
                 } else {
                     Ok(()) // drop non-matching message; no HWM cost
+                }
+            }
+        }
+    }
+
+    /// Non-blocking send, safe to call from the io_uring worker OS thread.
+    /// Returns `Err(TrySendError::Full)` if the per-pipe queue is at capacity (HWM).
+    pub fn try_send_sync(&self, batch: FrameBatch) -> Result<(), TrySendError<FrameBatch>> {
+        match self {
+            Self::Direct(s) => s.try_send(batch),
+            Self::Filtered { inner, trie } => {
+                let topic: &[u8] = batch.first().and_then(|m| m.data()).unwrap_or(&[]);
+                if trie.matches(topic) {
+                    inner.try_send(batch)
+                } else {
+                    Ok(()) // subscription filter: drop silently, no HWM cost
                 }
             }
         }

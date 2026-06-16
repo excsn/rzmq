@@ -221,8 +221,7 @@ pub(crate) async fn process_socket_command(
       target_endpoint_uri,
       connection_iface,
       peer_identity,
-      inbound_data_rx,
-      ..
+      fd,
     } => {
       let is_outbound = {
         let cs = core_arc.core_state.read();
@@ -240,7 +239,7 @@ pub(crate) async fn process_socket_command(
         endpoint_type: EndpointType::Session,
         endpoint_uri: endpoint_uri.clone(),
         pipe_ids: Some((synthetic_write_id, synthetic_read_id)),
-        handle_id: synthetic_read_id, // Use read_id as the stable handle
+        handle_id: synthetic_read_id,
         target_endpoint_uri: Some(target_endpoint_uri),
         is_outbound_connection: is_outbound,
         connection_iface,
@@ -266,18 +265,34 @@ pub(crate) async fn process_socket_command(
         .await;
       socket_logic_strong.update_peer_identity(synthetic_read_id, peer_identity).await;
 
-      // Spawn a dedicated reader task for this connection's data plane. The task owns the
-      // async receiver and calls handle_pipe_event directly, so SocketCore's command mailbox
-      // is never blocked by data delivery backpressure.
-      if let Some(rx) = inbound_data_rx {
-        let task = tokio::spawn(run_uring_pipe_reader(
-          Arc::downgrade(&socket_logic_strong),
-          synthetic_read_id,
-          rx,
-        ));
-        core_arc.core_state.write()
-          .pipe_reader_task_handles
-          .insert(synthetic_read_id, task);
+      // Direct Ingress Handoff: extract the PipeMessageSender from the socket pattern and
+      // deliver it to the worker handler so it can push decoded messages straight to the
+      // ReadyPipeQueue — no intermediate UringPipeReader task needed.
+      if let Some(ingress_sender) = socket_logic_strong.get_incoming_pipe_sender(synthetic_read_id) {
+        match crate::uring::global_state::get_global_uring_worker_op_tx() {
+          Ok(worker_tx) => {
+            let ud = core_arc.context.inner().next_handle() as u64;
+            let (reply_tx, reply_rx) = oneshot::oneshot::<Result<crate::io_uring_backend::ops::UringOpCompletion, crate::ZmqError>>();
+            let req = crate::io_uring_backend::ops::UringOpRequest::AttachIngressSender {
+              user_data: ud,
+              fd,
+              ingress_sender,
+              reply_tx,
+            };
+            if let Err(e) = worker_tx.send(req).await {
+              tracing::warn!(handle=core_handle, %endpoint_uri, "AttachIngressSender send failed: {:?}", e);
+            } else if let Ok(reply) = reply_rx.await {
+              if let Ok(crate::io_uring_backend::ops::UringOpCompletion::AttachIngressSenderSuccess { .. }) = reply {
+                tracing::debug!(handle=core_handle, %endpoint_uri, "AttachIngressSender: success");
+              } else {
+                tracing::warn!(handle=core_handle, %endpoint_uri, "AttachIngressSender: unexpected reply: {:?}", reply);
+              }
+            }
+          }
+          Err(e) => {
+            tracing::warn!(handle=core_handle, %endpoint_uri, "AttachIngressSender: worker tx unavailable: {}", e);
+          }
+        }
       }
 
       core_arc.core_state.read().send_monitor_event(SocketEvent::HandshakeSucceeded {
@@ -1052,31 +1067,3 @@ async fn handle_new_connection_established(
   Ok(())
 }
 
-/// Dedicated per-connection reader task for io_uring connections.
-///
-/// Drains the inbound data channel and dispatches each batch to the socket pattern logic
-/// via `handle_pipe_event`. This is the UringFd equivalent of `PipeReadTask` — it keeps
-/// the control mailbox entirely free of data messages, so SocketCore remains responsive
-/// to Stop/Close commands regardless of application-level backpressure.
-///
-/// The task exits naturally when the sender side (ZmtpUringHandler) is dropped, i.e.,
-/// when the connection is closed or encounters a fatal error.
-#[cfg(feature = "io-uring")]
-async fn run_uring_pipe_reader(
-  socket_logic: std::sync::Weak<dyn ISocket>,
-  pipe_read_id: usize,
-  inbound_rx: fibre::mpsc::BoundedAsyncReceiver<FrameBatch>,
-) {
-  while let Ok(msgs) = inbound_rx.recv().await {
-    let Some(sl) = socket_logic.upgrade() else {
-      break;
-    };
-    let cmd = Command::PipeMessageBatchReceived {
-      pipe_id: pipe_read_id,
-      msgs,
-    };
-    if sl.handle_pipe_event(pipe_read_id, cmd).await.is_err() {
-      break;
-    }
-  }
-}

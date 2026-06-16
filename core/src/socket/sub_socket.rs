@@ -195,13 +195,13 @@ impl ISocket for SubSocket {
     match option {
       SUBSCRIBE => {
         tracing::debug!(handle = self.core.handle, topic = ?String::from_utf8_lossy(value), "Subscribing to topic");
-        self.subscriptions.subscribe(value).await;
+        self.subscriptions.subscribe(value);
         self.send_subscription_command_to_all(true, value).await;
         Ok(())
       }
       UNSUBSCRIBE => {
         tracing::debug!(handle = self.core.handle, topic = ?String::from_utf8_lossy(value), "Unsubscribing from topic");
-        if self.subscriptions.unsubscribe(value).await {
+        if self.subscriptions.unsubscribe(value) {
           self.send_subscription_command_to_all(false, value).await;
         }
         Ok(())
@@ -268,7 +268,7 @@ impl ISocket for SubSocket {
       self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
 
       // Send any existing subscriptions to the new peer.
-      let current_topics = self.subscriptions.get_all_topics().await;
+      let current_topics = self.subscriptions.get_all_topics();
       if !current_topics.is_empty() {
         tracing::debug!(
           handle = self.core.handle, uri = %endpoint_uri,

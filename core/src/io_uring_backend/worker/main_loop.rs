@@ -367,15 +367,9 @@ impl UringWorker {
       } => {
         let ProtocolConfig::Zmtp(engine_cfg) = protocol_config;
 
-        // All channels are sync — the worker OS thread never calls .await.
+        // Egress channel: SocketCore → handler. Sync — the worker OS thread never calls .await.
         let sndhwm = engine_cfg.sndhwm.max(1);
-        let (egress_tx, egress_rx) =
-            fibre::mpsc::bounded::<crate::message::FrameBatch>(sndhwm);
-        let (inbound_tx, inbound_rx_sync) =
-            fibre::mpsc::bounded::<crate::message::FrameBatch>(engine_cfg.rcvhwm.max(1));
-        // Convert the inbound receiver to async only for the Tokio-side UringConnectionEstablished
-        // command — the Tokio task reads from it asynchronously.
-        let inbound_async_rx = inbound_rx_sync.to_async();
+        let (egress_tx, egress_rx) = fibre::mpsc::bounded::<crate::message::FrameBatch>(sndhwm);
 
         let event_fd = self.event_fd_poller.clone_event_fd();
         let connection_iface = std::sync::Arc::new(ZmtpSmartConnection::new(
@@ -387,7 +381,6 @@ impl UringWorker {
 
         let worker_io_config = std::sync::Arc::new(WorkerIoConfig {
             socket_mailbox,
-            inbound_data_tx: inbound_tx,
             endpoint_uri,
             target_endpoint_uri,
             connection_iface,
@@ -402,7 +395,6 @@ impl UringWorker {
             worker_io_config,
             engine,
             std::sync::Arc::clone(&egress_rx_arc),
-            inbound_async_rx,
             use_zc,
             use_recv_multishot,
             if use_zc { self.cfg_send_buffer_size } else { 0 },
@@ -434,6 +426,39 @@ impl UringWorker {
               error: ZmqError::Internal(err_msg),
             }));
           }
+        }
+      }
+      UringOpRequest::AttachIngressSender {
+        user_data,
+        fd,
+        ingress_sender,
+        reply_tx,
+      } => {
+        if let Some(handler) = self.handler_manager.get_mut(fd) {
+          handler.attach_ingress(ingress_sender);
+          let _ = reply_tx.send(Ok(UringOpCompletion::AttachIngressSenderSuccess { user_data, fd }));
+        } else {
+          let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
+            user_data,
+            op_name: op_name_str,
+            error: ZmqError::InvalidArgument(format!("FD {} not managed", fd)),
+          }));
+        }
+      }
+      UringOpRequest::ResumeConnection {
+        user_data,
+        fd,
+        reply_tx,
+      } => {
+        if let Some(handler) = self.handler_manager.get_mut(fd) {
+          handler.resume_ingress();
+          let _ = reply_tx.send(Ok(UringOpCompletion::ResumeConnectionSuccess { user_data, fd }));
+        } else {
+          let _ = reply_tx.send(Ok(UringOpCompletion::OpError {
+            user_data,
+            op_name: op_name_str,
+            error: ZmqError::InvalidArgument(format!("FD {} not managed", fd)),
+          }));
         }
       }
       UringOpRequest::StartFdReadLoop {
