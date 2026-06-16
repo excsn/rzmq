@@ -8,6 +8,7 @@ mod handler_manager;
 mod internal_op_tracker;
 mod main_loop;
 mod multishot_reader;
+pub(crate) mod observability;
 mod sqe_builder;
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
@@ -41,6 +42,7 @@ pub(crate) use external_op_tracker::{ExternalOpContext, ExternalOpTracker};
 pub(crate) use handler_manager::HandlerManager;
 pub(crate) use internal_op_tracker::{InternalOpPayload, InternalOpTracker, InternalOpType};
 pub(crate) use multishot_reader::MultishotReader;
+pub(crate) use observability::UringMetrics;
 
 
 #[derive(Debug, Default)]
@@ -49,8 +51,6 @@ struct FdWork {
   pub(crate) ingress_blueprints: VecDeque<HandlerSqeBlueprint>,
   /// Sequential egress (data writes + cork + close) blueprints — write-serialized.
   pub(crate) egress_blueprints: VecDeque<HandlerSqeBlueprint>,
-  /// Serialization gate: true while a write SQE has been submitted but its CQE not yet reaped.
-  pub(crate) write_in_flight: bool,
 }
 
 impl FdWork {
@@ -112,6 +112,8 @@ pub struct UringWorker {
   pub(crate) mpsc_fds_scratch: Vec<RawFd>,
   /// Scratchpad for CQE entries to avoid hot-path heap allocations.
   pub(crate) cqe_scratch: Vec<io_uring::cqueue::Entry>,
+  /// Lock-free counters for the debug observability dashboard. Zero-sized no-op in release.
+  pub(crate) metrics: Arc<UringMetrics>,
 }
 
 impl fmt::Debug for UringWorker {
@@ -270,6 +272,7 @@ impl UringWorker {
               active_fds_scratch: Vec::with_capacity(256),
               mpsc_fds_scratch: Vec::with_capacity(256),
               cqe_scratch: Vec::with_capacity(256),
+              metrics: Arc::new(UringMetrics::default()),
             };
 
             {

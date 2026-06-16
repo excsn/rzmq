@@ -1,6 +1,8 @@
 #![cfg(feature = "io-uring")]
 
-use super::internal_op_tracker::{InternalOpDetails, InternalOpPayload, InternalOpType, PinnedEgressBatch};
+use super::internal_op_tracker::{
+  InternalOpDetails, InternalOpPayload, InternalOpType, PinnedEgressBatch,
+};
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringWorkerInterface,
 };
@@ -37,9 +39,18 @@ pub(crate) fn process_handler_blueprint(
   let worker_cfg_send_zerocopy_enabled = worker.cfg_send_zerocopy_enabled;
 
   if sq.is_full() {
-    debug!("CQE Processor: SQ full when processing blueprint for FD {} (race). Re-queueing.", fd);
+    debug!(
+      "CQE Processor: SQ full when processing blueprint for FD {} (race). Re-queueing.",
+      fd
+    );
     return Err(blueprint);
   }
+
+  #[cfg(debug_assertions)]
+  worker
+    .metrics
+    .sqes_submitted
+    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
   match blueprint {
     HandlerSqeBlueprint::RequestSetCork(enable) => {
@@ -52,21 +63,38 @@ pub(crate) fn process_handler_blueprint(
         std::mem::size_of_val(&cork_val) as u32,
       )
       .build();
-      let user_data = internal_ops.new_op_id(fd, InternalOpType::GenericHandlerOp, InternalOpPayload::None);
+      let user_data = internal_ops.new_op_id(
+        fd,
+        InternalOpType::GenericHandlerOp,
+        InternalOpPayload::None,
+      );
       entry = entry.user_data(user_data);
       unsafe {
         if sq.push(&entry).is_err() {
-          debug!("CQE Processor: SQ push failed for FD {} RequestSetCork (race). Re-queueing.", fd);
+          debug!(
+            "CQE Processor: SQ push failed for FD {} RequestSetCork (race). Re-queueing.",
+            fd
+          );
           internal_ops.take_op_details(user_data);
           return Err(HandlerSqeBlueprint::RequestSetCork(enable));
         } else {
-          trace!("CQE Processor: Queued SetSockOpt(cork={}) SQE (ud:{}) for FD {}.", enable, user_data, fd);
+          trace!(
+            "CQE Processor: Queued SetSockOpt(cork={}) SQE (ud:{}) for FD {}.",
+            enable, user_data, fd
+          );
         }
       }
       Ok(())
     }
 
-    HandlerSqeBlueprint::RequestSend { data, send_op_flags, originating_app_op_ud } => {
+    HandlerSqeBlueprint::RequestSend {
+      data,
+      send_op_flags,
+      originating_app_op_ud,
+      batch_count,
+    } => {
+      #[cfg(debug_assertions)]
+      worker.metrics.record_write_batch(batch_count as u64);
       let app_op_name_str = external_ops
         .get_op_context_ref(originating_app_op_ud)
         .map(|ctx| ctx.op_name.clone())
@@ -86,24 +114,44 @@ pub(crate) fn process_handler_blueprint(
       entry = entry.user_data(user_data);
       unsafe {
         if sq.push(&entry).is_err() {
-          debug!("CQE Processor: SQ push failed for FD {} RequestSend (race). Re-queueing.", fd);
+          debug!(
+            "CQE Processor: SQ push failed for FD {} RequestSend (race). Re-queueing.",
+            fd
+          );
           let dropped = internal_ops.take_op_details(user_data);
-          if let InternalOpPayload::SendBuffer { buffer, send_op_flags, app_op_ud, .. } = dropped.unwrap().payload {
+          if let InternalOpPayload::SendBuffer {
+            buffer,
+            send_op_flags,
+            app_op_ud,
+            ..
+          } = dropped.unwrap().payload
+          {
             return Err(HandlerSqeBlueprint::RequestSend {
               data: buffer,
               send_op_flags,
               originating_app_op_ud: app_op_ud.unwrap_or(HANDLER_INTERNAL_SEND_OP_UD),
+              batch_count,
             });
           }
           unreachable!("SendBuffer payload expected after RequestSend registration");
         } else {
-          trace!("CQE Processor: Queued Send SQE (ud:{}) for FD {}.", user_data, fd);
+          trace!(
+            "CQE Processor: Queued Send SQE (ud:{}) for FD {}.",
+            user_data, fd
+          );
         }
       }
       Ok(())
     }
 
-    HandlerSqeBlueprint::RequestSendZeroCopy { data_to_send, send_op_flags, originating_app_op_ud } => {
+    HandlerSqeBlueprint::RequestSendZeroCopy {
+      data_to_send,
+      send_op_flags,
+      originating_app_op_ud,
+      batch_count,
+    } => {
+      #[cfg(debug_assertions)]
+      worker.metrics.record_write_batch(batch_count as u64);
       let mut submitted_via_zc_path = false;
       let mut zc_entry: Option<squeue::Entry> = None;
       let mut op_payload = InternalOpPayload::None;
@@ -134,10 +182,16 @@ pub(crate) fn process_handler_blueprint(
             op_type = InternalOpType::SendZeroCopy;
             submitted_via_zc_path = true;
           } else {
-            debug!("CQE Processor: ZC Send - pool buffer unavailable for FD {}. Falling back.", fd);
+            debug!(
+              "CQE Processor: ZC Send - pool buffer unavailable for FD {}. Falling back.",
+              fd
+            );
           }
         } else {
-          debug!("CQE Processor: ZC Send - SendBufferPool not available for FD {}. Falling back.", fd);
+          debug!(
+            "CQE Processor: ZC Send - SendBufferPool not available for FD {}. Falling back.",
+            fd
+          );
         }
       }
 
@@ -167,10 +221,19 @@ pub(crate) fn process_handler_blueprint(
       entry = entry.user_data(user_data);
       unsafe {
         if sq.push(&entry).is_err() {
-          debug!("CQE Processor: SQ push failed for FD {} RequestSendZeroCopy (race). Re-queueing.", fd);
+          debug!(
+            "CQE Processor: SQ push failed for FD {} RequestSendZeroCopy (race). Re-queueing.",
+            fd
+          );
           let dropped = internal_ops.take_op_details(user_data).unwrap();
           let requeue = match dropped.payload {
-            InternalOpPayload::SendZeroCopy { send_buf_id, original_data, send_op_flags, app_op_ud, .. } => {
+            InternalOpPayload::SendZeroCopy {
+              send_buf_id,
+              original_data,
+              send_op_flags,
+              app_op_ud,
+              ..
+            } => {
               if let Some(pool) = &worker.send_buffer_pool {
                 pool.release_buffer(send_buf_id);
               }
@@ -178,35 +241,50 @@ pub(crate) fn process_handler_blueprint(
                 data: original_data,
                 send_op_flags,
                 originating_app_op_ud: app_op_ud,
+                batch_count,
               }
             }
-            InternalOpPayload::SendBuffer { buffer, send_op_flags, app_op_ud, .. } => {
-              HandlerSqeBlueprint::RequestSend {
-                data: buffer,
-                send_op_flags,
-                originating_app_op_ud: app_op_ud.unwrap_or(HANDLER_INTERNAL_SEND_OP_UD),
-              }
-            }
+            InternalOpPayload::SendBuffer {
+              buffer,
+              send_op_flags,
+              app_op_ud,
+              ..
+            } => HandlerSqeBlueprint::RequestSend {
+              data: buffer,
+              send_op_flags,
+              originating_app_op_ud: app_op_ud.unwrap_or(HANDLER_INTERNAL_SEND_OP_UD),
+              batch_count,
+            },
             _ => unreachable!("unexpected payload after RequestSendZeroCopy registration"),
           };
           return Err(requeue);
         } else {
-          trace!("CQE Processor: Queued SendZeroCopy/Send SQE (ud:{}) for FD {}.", user_data, fd);
+          trace!(
+            "CQE Processor: Queued SendZeroCopy/Send SQE (ud:{}) for FD {}.",
+            user_data, fd
+          );
         }
       }
       Ok(())
     }
 
-    HandlerSqeBlueprint::RequestSendRawVectored { bufs, send_op_flags } => {
+    HandlerSqeBlueprint::RequestSendRawVectored {
+      bufs,
+      send_op_flags,
+    } => {
       let total_len: usize = bufs.iter().map(|b| b.len()).sum();
 
       // Convert to a Box before taking the pointer. `into_boxed_slice()` may
       // reallocate to trim excess Vec capacity; by boxing first the heap address
       // is final and stable before `iov_ptr` is captured.
-      let iovecs_box: Box<[libc::iovec]> = bufs.iter().map(|b| libc::iovec {
-        iov_base: b.as_ptr() as *mut libc::c_void,
-        iov_len: b.len(),
-      }).collect::<Vec<_>>().into_boxed_slice();
+      let iovecs_box: Box<[libc::iovec]> = bufs
+        .iter()
+        .map(|b| libc::iovec {
+          iov_base: b.as_ptr() as *mut libc::c_void,
+          iov_len: b.len(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
       let iov_ptr = iovecs_box.as_ptr();
       let iov_len = iovecs_box.len() as u32;
 
@@ -222,7 +300,10 @@ pub(crate) fn process_handler_blueprint(
       entry = entry.user_data(user_data);
       unsafe {
         if sq.push(&entry).is_err() {
-          debug!("CQE Processor: SQ push failed for FD {} RequestSendRawVectored (race). Re-queueing.", fd);
+          debug!(
+            "CQE Processor: SQ push failed for FD {} RequestSendRawVectored (race). Re-queueing.",
+            fd
+          );
           let dropped = internal_ops.take_op_details(user_data).unwrap();
           if let InternalOpPayload::RawVectored(b) = dropped.payload {
             return Err(HandlerSqeBlueprint::RequestSendRawVectored {
@@ -232,7 +313,10 @@ pub(crate) fn process_handler_blueprint(
           }
           unreachable!();
         } else {
-          trace!("CQE Processor: Queued raw Writev SQE (ud:{}, iovecs:{}) for FD {}.", user_data, iov_len, fd);
+          trace!(
+            "CQE Processor: Queued raw Writev SQE (ud:{}, iovecs:{}) for FD {}.",
+            user_data, iov_len, fd
+          );
         }
       }
       Ok(())
@@ -240,12 +324,17 @@ pub(crate) fn process_handler_blueprint(
 
     HandlerSqeBlueprint::RequestSendZeroCopyLeased { id, ptr, len } => {
       let op_payload = InternalOpPayload::SendZeroCopyLeased { send_buf_id: id };
-      let mut entry = opcode::SendZc::new(types::Fd(fd), ptr, len).buf_index(Some(id.0)).build();
+      let mut entry = opcode::SendZc::new(types::Fd(fd), ptr, len)
+        .buf_index(Some(id.0))
+        .build();
       let user_data = internal_ops.new_op_id(fd, InternalOpType::SendZeroCopyLeased, op_payload);
       entry = entry.user_data(user_data);
       unsafe {
         if sq.push(&entry).is_err() {
-          debug!("CQE Processor: SQ push failed for FD {} RequestSendZeroCopyLeased (race). Re-queueing.", fd);
+          debug!(
+            "CQE Processor: SQ push failed for FD {} RequestSendZeroCopyLeased (race). Re-queueing.",
+            fd
+          );
           let dropped = internal_ops.take_op_details(user_data).unwrap();
           if let InternalOpPayload::SendZeroCopyLeased { send_buf_id } = dropped.payload {
             if let Some(pool) = send_buffer_pool {
@@ -254,7 +343,10 @@ pub(crate) fn process_handler_blueprint(
           }
           return Err(HandlerSqeBlueprint::RequestSendZeroCopyLeased { id, ptr, len });
         } else {
-          trace!("CQE Processor: Queued SendZcLeased SQE (ud:{}) for FD {}.", user_data, fd);
+          trace!(
+            "CQE Processor: Queued SendZcLeased SQE (ud:{}) for FD {}.",
+            user_data, fd
+          );
         }
       }
       Ok(())
@@ -266,11 +358,17 @@ pub(crate) fn process_handler_blueprint(
       entry = entry.user_data(user_data);
       unsafe {
         if sq.push(&entry).is_err() {
-          debug!("CQE Processor: SQ push failed for FD {} RequestClose (race). Re-queueing.", fd);
+          debug!(
+            "CQE Processor: SQ push failed for FD {} RequestClose (race). Re-queueing.",
+            fd
+          );
           internal_ops.take_op_details(user_data);
           return Err(HandlerSqeBlueprint::RequestClose);
         } else {
-          trace!("CQE Processor: Queued Close SQE (ud:{}) for FD {}.", user_data, fd);
+          trace!(
+            "CQE Processor: Queued Close SQE (ud:{}) for FD {}.",
+            user_data, fd
+          );
         }
       }
       Ok(())
@@ -284,28 +382,44 @@ pub(crate) fn process_handler_blueprint(
         );
         return Ok(());
       }
-      let op_user_data = internal_ops.new_op_id(fd, InternalOpType::RingReadMultishot, InternalOpPayload::None);
+      let op_user_data = internal_ops.new_op_id(
+        fd,
+        InternalOpType::RingReadMultishot,
+        InternalOpPayload::None,
+      );
       let entry = opcode::RecvMulti::new(types::Fd(fd), bgid)
         .build()
         .user_data(op_user_data);
       unsafe {
         if sq.push(&entry).is_err() {
-          debug!("CQE Processor: SQ push failed for FD {} RecvMulti (race). Re-queueing.", fd);
+          debug!(
+            "CQE Processor: SQ push failed for FD {} RecvMulti (race). Re-queueing.",
+            fd
+          );
           internal_ops.take_op_details(op_user_data);
           return Err(HandlerSqeBlueprint::RequestNewRingReadMultishot { fd: bp_fd, bgid });
         } else {
-          trace!("CQE Processor: Queued RecvMulti SQE (ud:{}) for FD {}.", op_user_data, fd);
+          trace!(
+            "CQE Processor: Queued RecvMulti SQE (ud:{}) for FD {}.",
+            op_user_data, fd
+          );
           if let Some(handler) = handler_manager.get_mut(fd) {
             handler.inform_multishot_reader_op_submitted(op_user_data, false, None);
           } else {
-            debug!("CQE Processor: Handler for FD {} not found after submitting RecvMulti.", fd);
+            debug!(
+              "CQE Processor: Handler for FD {} not found after submitting RecvMulti.",
+              fd
+            );
           }
         }
       }
       Ok(())
     }
 
-    HandlerSqeBlueprint::RequestNewAsyncCancel { fd: bp_fd, target_user_data } => {
+    HandlerSqeBlueprint::RequestNewAsyncCancel {
+      fd: bp_fd,
+      target_user_data,
+    } => {
       if bp_fd != fd {
         error!(
           "CQE Processor: FD mismatch in RequestNewAsyncCancel! Handler FD {}, Blueprint FD {}. Dropping.",
@@ -328,16 +442,26 @@ pub(crate) fn process_handler_blueprint(
             fd, target_user_data
           );
           internal_ops.take_op_details(cancel_op_user_data);
-          return Err(HandlerSqeBlueprint::RequestNewAsyncCancel { fd: bp_fd, target_user_data });
+          return Err(HandlerSqeBlueprint::RequestNewAsyncCancel {
+            fd: bp_fd,
+            target_user_data,
+          });
         } else {
           trace!(
             "CQE Processor: Queued AsyncCancel SQE (ud:{}, target_ud:{}) for FD {}.",
             cancel_op_user_data, target_user_data, fd
           );
           if let Some(handler) = handler_manager.get_mut(fd) {
-            handler.inform_multishot_reader_op_submitted(cancel_op_user_data, true, Some(target_user_data));
+            handler.inform_multishot_reader_op_submitted(
+              cancel_op_user_data,
+              true,
+              Some(target_user_data),
+            );
           } else {
-            debug!("CQE Processor: Handler for FD {} not found after submitting AsyncCancel.", fd);
+            debug!(
+              "CQE Processor: Handler for FD {} not found after submitting AsyncCancel.",
+              fd
+            );
           }
         }
       }
@@ -380,6 +504,7 @@ pub(crate) fn process_all_cqes(
       &mut worker.internal_op_tracker,
       is_worker_shutting_down,
     ) {
+      worker.metrics.record_wakeup();
       if worker
         .internal_op_tracker
         .take_op_details(cqe_user_data)
@@ -433,7 +558,9 @@ pub(crate) fn process_all_cqes(
             });
             if let Some(ref factory_id) = ext_op_ctx.protocol_handler_factory_id {
               let protocol_config = ext_op_ctx.protocol_config.as_ref().unwrap();
-              let socket_mailbox = ext_op_ctx.socket_mailbox.take()
+              let socket_mailbox = ext_op_ctx
+                .socket_mailbox
+                .take()
                 .expect("Connect op context missing socket_mailbox");
               // The UringOpRequest::Connect path is not used by tcp.rs (which uses
               // RegisterExternalFd). Use DummyConnection and derive URIs from peer addr.
@@ -541,7 +668,10 @@ pub(crate) fn process_all_cqes(
             .buffer_manager
             .as_ref()
             .expect("Recv BufferManager missing for multishot op");
-          let pending_egress = worker.work_map.get(&handler_fd_peeked).map_or(0, |w| w.egress_blueprints.len());
+          let pending_egress = worker
+            .work_map
+            .get(&handler_fd_peeked)
+            .map_or(0, |w| w.egress_blueprints.len());
           let io_config = handler.io_config().clone();
           let interface = UringWorkerInterface::new(
             handler_fd_peeked,
@@ -599,9 +729,7 @@ pub(crate) fn process_all_cqes(
       }
     }
 
-    if !is_multishot_read_pending_more
-      && !was_delegated_to_multishot_handler
-    {
+    if !is_multishot_read_pending_more && !was_delegated_to_multishot_handler {
       op_details_taken_for_final_processing =
         worker.internal_op_tracker.take_op_details(cqe_user_data);
     }
@@ -733,10 +861,12 @@ pub(crate) fn process_all_cqes(
             let (mailbox_for_close_notify, endpoint_uri_for_notify) = worker
               .handler_manager
               .get_mut(handler_fd)
-              .map(|h| (
-                h.io_config().socket_mailbox.clone(),
-                h.io_config().endpoint_uri.clone(),
-              ))
+              .map(|h| {
+                (
+                  h.io_config().socket_mailbox.clone(),
+                  h.io_config().endpoint_uri.clone(),
+                )
+              })
               .unzip();
             if let Some(mut h) = worker.handler_manager.remove_handler(handler_fd) {
               h.fd_has_been_closed();
@@ -791,25 +921,28 @@ pub(crate) fn process_all_cqes(
             continue; // Buffer released, nothing more to do for F_NOTIFY.
           }
 
-          // Clear the per-FD in-flight lock so the next queued write can be submitted.
-          // This allows 1-RTT zero-copy pipelining!
-          if let Some(work) = worker.work_map.get_mut(&handler_fd) {
-            work.write_in_flight = false;
-          }
-
           if cqe_result < 0 {
             let errno = -cqe_result;
 
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOBUFS {
+              if errno == libc::ENOBUFS {
+                worker.metrics.record_enobufs();
+              } else {
+                worker.metrics.record_eagain();
+              }
               // Non-destructive recovery: move payload out and re-queue to front of work_map.
               let blueprint_to_requeue = match op_details.payload {
-                InternalOpPayload::SendBuffer { buffer, send_op_flags, app_op_ud, .. } => {
-                  Some(HandlerSqeBlueprint::RequestSend {
-                    data: buffer,
-                    send_op_flags,
-                    originating_app_op_ud: app_op_ud.unwrap_or(HANDLER_INTERNAL_SEND_OP_UD),
-                  })
-                }
+                InternalOpPayload::SendBuffer {
+                  buffer,
+                  send_op_flags,
+                  app_op_ud,
+                  ..
+                } => Some(HandlerSqeBlueprint::RequestSend {
+                  data: buffer,
+                  send_op_flags,
+                  originating_app_op_ud: app_op_ud.unwrap_or(HANDLER_INTERNAL_SEND_OP_UD),
+                  batch_count: 0,
+                }),
                 InternalOpPayload::SendZeroCopy {
                   send_buf_id,
                   original_data,
@@ -822,16 +955,20 @@ pub(crate) fn process_all_cqes(
                       pool.release_buffer(send_buf_id);
                     }
                   } else {
-                    worker.internal_op_tracker.reinsert_for_notification(cqe_user_data, InternalOpDetails {
-                      fd: handler_fd,
-                      op_type: InternalOpType::SendZeroCopyLeased,
-                      payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
-                    });
+                    worker.internal_op_tracker.reinsert_for_notification(
+                      cqe_user_data,
+                      InternalOpDetails {
+                        fd: handler_fd,
+                        op_type: InternalOpType::SendZeroCopyLeased,
+                        payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                      },
+                    );
                   }
                   Some(HandlerSqeBlueprint::RequestSend {
                     data: original_data,
                     send_op_flags,
                     originating_app_op_ud: app_op_ud,
+                    batch_count: 0,
                   })
                 }
                 InternalOpPayload::RawVectored(batch) => {
@@ -846,21 +983,33 @@ pub(crate) fn process_all_cqes(
                       pool.release_buffer(send_buf_id);
                     }
                   } else {
-                    worker.internal_op_tracker.reinsert_for_notification(cqe_user_data, InternalOpDetails {
-                      fd: handler_fd,
-                      op_type: InternalOpType::SendZeroCopyLeased,
-                      payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
-                    });
+                    worker.internal_op_tracker.reinsert_for_notification(
+                      cqe_user_data,
+                      InternalOpDetails {
+                        fd: handler_fd,
+                        op_type: InternalOpType::SendZeroCopyLeased,
+                        payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                      },
+                    );
                   }
-                  error!(fd = handler_fd, errno, "EAGAIN on leased ZC send — no original data for retry. Closing.");
-                  worker.fds_needing_close_initiated_pass.push_back(handler_fd);
+                  error!(
+                    fd = handler_fd,
+                    errno, "EAGAIN on leased ZC send — no original data for retry. Closing."
+                  );
+                  worker
+                    .fds_needing_close_initiated_pass
+                    .push_back(handler_fd);
                   None
                 }
                 _ => None,
               };
 
               if let Some(blueprint) = blueprint_to_requeue {
-                trace!(fd = handler_fd, errno, "Send non-fatal error (EAGAIN/ENOBUFS): re-queuing payload to front of work_map.");
+                trace!(
+                  fd = handler_fd,
+                  errno,
+                  "Send non-fatal error (EAGAIN/ENOBUFS): re-queuing payload to front of work_map."
+                );
                 worker
                   .work_map
                   .entry(handler_fd)
@@ -868,8 +1017,13 @@ pub(crate) fn process_all_cqes(
                   .egress_blueprints
                   .push_front(blueprint);
               } else {
-                error!(fd = handler_fd, errno, "Send recovery failed: payload structure mismatch. Closing connection.");
-                worker.fds_needing_close_initiated_pass.push_back(handler_fd);
+                error!(
+                  fd = handler_fd,
+                  errno, "Send recovery failed: payload structure mismatch. Closing connection."
+                );
+                worker
+                  .fds_needing_close_initiated_pass
+                  .push_back(handler_fd);
               }
               continue;
             }
@@ -883,11 +1037,14 @@ pub(crate) fn process_all_cqes(
                     pool.release_buffer(send_buf_id);
                   }
                 } else {
-                  worker.internal_op_tracker.reinsert_for_notification(cqe_user_data, InternalOpDetails {
-                    fd: handler_fd,
-                    op_type: InternalOpType::SendZeroCopyLeased,
-                    payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
-                  });
+                  worker.internal_op_tracker.reinsert_for_notification(
+                    cqe_user_data,
+                    InternalOpDetails {
+                      fd: handler_fd,
+                      op_type: InternalOpType::SendZeroCopyLeased,
+                      payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                    },
+                  );
                 }
               }
               InternalOpPayload::RawVectored(_) => {}
@@ -895,7 +1052,9 @@ pub(crate) fn process_all_cqes(
             }
             let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(errno));
             error!(fd = handler_fd, error = %zmq_err, "Fatal write error during Send operation. Closing connection.");
-            worker.fds_needing_close_initiated_pass.push_back(handler_fd);
+            worker
+              .fds_needing_close_initiated_pass
+              .push_back(handler_fd);
             continue;
           }
 
@@ -916,31 +1075,43 @@ pub(crate) fn process_all_cqes(
               "Partial write: re-queuing remainder to front of work_map."
             );
             let requeue_blueprint = match op_details.payload {
-              InternalOpPayload::SendBuffer { buffer, send_op_flags, app_op_ud, .. } => {
-                HandlerSqeBlueprint::RequestSend {
-                  data: buffer.slice(bytes_written..),
-                  send_op_flags,
-                  originating_app_op_ud: app_op_ud.unwrap_or(HANDLER_INTERNAL_SEND_OP_UD),
-                }
-              }
+              InternalOpPayload::SendBuffer {
+                buffer,
+                send_op_flags,
+                app_op_ud,
+                ..
+              } => HandlerSqeBlueprint::RequestSend {
+                data: buffer.slice(bytes_written..),
+                send_op_flags,
+                originating_app_op_ud: app_op_ud.unwrap_or(HANDLER_INTERNAL_SEND_OP_UD),
+                batch_count: 0,
+              },
               InternalOpPayload::SendZeroCopy {
-                send_buf_id, original_data, send_op_flags, app_op_ud, ..
+                send_buf_id,
+                original_data,
+                send_op_flags,
+                app_op_ud,
+                ..
               } => {
                 if !is_initial_with_more {
                   if let Some(pool) = &worker.send_buffer_pool {
                     pool.release_buffer(send_buf_id);
                   }
                 } else {
-                  worker.internal_op_tracker.reinsert_for_notification(cqe_user_data, InternalOpDetails {
-                    fd: handler_fd,
-                    op_type: InternalOpType::SendZeroCopyLeased,
-                    payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
-                  });
+                  worker.internal_op_tracker.reinsert_for_notification(
+                    cqe_user_data,
+                    InternalOpDetails {
+                      fd: handler_fd,
+                      op_type: InternalOpType::SendZeroCopyLeased,
+                      payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                    },
+                  );
                 }
                 HandlerSqeBlueprint::RequestSend {
                   data: original_data.slice(bytes_written..),
                   send_op_flags,
                   originating_app_op_ud: app_op_ud,
+                  batch_count: 0,
                 }
               }
               InternalOpPayload::RawVectored(batch) => {
@@ -964,8 +1135,13 @@ pub(crate) fn process_all_cqes(
                 }
               }
               _ => {
-                error!(fd = handler_fd, "Partial write on unexpected payload type. Closing.");
-                worker.fds_needing_close_initiated_pass.push_back(handler_fd);
+                error!(
+                  fd = handler_fd,
+                  "Partial write on unexpected payload type. Closing."
+                );
+                worker
+                  .fds_needing_close_initiated_pass
+                  .push_back(handler_fd);
                 continue;
               }
             };
@@ -985,9 +1161,11 @@ pub(crate) fn process_all_cqes(
               app_op_name: Some(name),
               ..
             } => (*ud, name.clone()),
-            InternalOpPayload::SendZeroCopy { app_op_ud, app_op_name, .. } => {
-              (*app_op_ud, app_op_name.clone())
-            }
+            InternalOpPayload::SendZeroCopy {
+              app_op_ud,
+              app_op_name,
+              ..
+            } => (*app_op_ud, app_op_name.clone()),
             _ => (HANDLER_INTERNAL_SEND_OP_UD, String::new()),
           };
 
@@ -999,11 +1177,14 @@ pub(crate) fn process_all_cqes(
                   pool.release_buffer(send_buf_id);
                 }
               } else {
-                worker.internal_op_tracker.reinsert_for_notification(cqe_user_data, InternalOpDetails {
-                  fd: handler_fd,
-                  op_type: InternalOpType::SendZeroCopyLeased,
-                  payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
-                });
+                worker.internal_op_tracker.reinsert_for_notification(
+                  cqe_user_data,
+                  InternalOpDetails {
+                    fd: handler_fd,
+                    op_type: InternalOpType::SendZeroCopyLeased,
+                    payload: InternalOpPayload::SendZeroCopyLeased { send_buf_id },
+                  },
+                );
               }
             }
             _ => {}
@@ -1012,7 +1193,10 @@ pub(crate) fn process_all_cqes(
           if app_op_ud != HANDLER_INTERNAL_SEND_OP_UD {
             // Logic for notifying external operation completion
           } else if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
-            let pending_egress = worker.work_map.get(&handler_fd).map_or(0, |w| w.egress_blueprints.len());
+            let pending_egress = worker
+              .work_map
+              .get(&handler_fd)
+              .map_or(0, |w| w.egress_blueprints.len());
             let io_config = handler.io_config().clone();
             let interface = UringWorkerInterface::new(
               handler_fd,
@@ -1032,7 +1216,9 @@ pub(crate) fn process_all_cqes(
               new_work_generated.push((handler_fd, handler_output.sqe_blueprints));
             }
             if handler_output.initiate_close_due_to_error {
-              worker.fds_needing_close_initiated_pass.push_back(handler_fd);
+              worker
+                .fds_needing_close_initiated_pass
+                .push_back(handler_fd);
             }
           }
         }
@@ -1044,12 +1230,18 @@ pub(crate) fn process_all_cqes(
             && cqe_result == -(libc::ENOBUFS as i32)
             && cqueue::buffer_select(cqe_flags).is_none()
           {
-            trace!(fd = handler_fd, "RingRead: ENOBUFS — buffer ring temporarily exhausted; deferring to next cycle.");
+            trace!(
+              fd = handler_fd,
+              "RingRead: ENOBUFS — buffer ring temporarily exhausted; deferring to next cycle."
+            );
             continue;
           }
 
           if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
-            let pending_egress = worker.work_map.get(&handler_fd).map_or(0, |w| w.egress_blueprints.len());
+            let pending_egress = worker
+              .work_map
+              .get(&handler_fd)
+              .map_or(0, |w| w.egress_blueprints.len());
             let io_config = handler.io_config().clone();
             let interface = UringWorkerInterface::new(
               handler_fd,
@@ -1069,7 +1261,11 @@ pub(crate) fn process_all_cqes(
                   if bytes_read == 0 {
                     // EOF with buffer consumed — reprovide inline and send EOF sentinel.
                     if let Err(e) = bm.reprovide_buffer(bid) {
-                      tracing::warn!("cqe_processor: reprovide_buffer({}) on EOF failed: {:?}", bid, e);
+                      tracing::warn!(
+                        "cqe_processor: reprovide_buffer({}) on EOF failed: {:?}",
+                        bid,
+                        e
+                      );
                     }
                     handler.process_ring_read_bytes(bytes::Bytes::new(), &interface)
                   } else {
@@ -1124,7 +1320,9 @@ pub(crate) fn process_all_cqes(
             ud = cqe_user_data,
             "Handshake Safety Gate: multishot CQE not delegated to handler — forcing close"
           );
-          worker.fds_needing_close_initiated_pass.push_back(handler_fd);
+          worker
+            .fds_needing_close_initiated_pass
+            .push_back(handler_fd);
         }
         _ => { /* Other op types handled by peek-logic or are errors */ }
       }

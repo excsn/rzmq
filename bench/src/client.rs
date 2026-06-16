@@ -32,6 +32,8 @@ pub async fn run(args: Cli) -> Result<(), ZmqError> {
 }
 
 pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats, ZmqError> {
+  println!("[bench] Client PID: {}", std::process::id());
+
   let socket_type = match args.pattern {
     Pattern::ReqRep => SocketType::Req,
     Pattern::PushPull => SocketType::Push,

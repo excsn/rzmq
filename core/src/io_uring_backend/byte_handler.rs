@@ -307,12 +307,14 @@ impl UringConnectionHandler for UringByteHandler {
                 data_to_send: bytes,
                 send_op_flags: 0,
                 originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
+                batch_count: 1,
               }
             } else {
               HandlerSqeBlueprint::RequestSend {
                 data: bytes,
                 send_op_flags: 0,
                 originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
+                batch_count: 1,
               }
             };
             ops.sqe_blueprints.push(bp);

@@ -26,6 +26,7 @@ pub enum HandlerSqeBlueprint {
     data: Bytes,
     send_op_flags: i32,
     originating_app_op_ud: UserData,
+    batch_count: u32,
   },
   /// Request to send data via kernel zero-copy (`IORING_OP_SEND_ZC`). Falls back to
   /// a regular Send when the ZC pool is exhausted.
@@ -33,6 +34,7 @@ pub enum HandlerSqeBlueprint {
     data_to_send: Bytes,
     send_op_flags: i32,
     originating_app_op_ud: UserData,
+    batch_count: u32,
   },
   /// Protocol-agnostic scatter-gather write — issued as a single `writev` SQE.
   /// Emitted by `UringByteHandler` when the Tokio side sends a vectored `EgressChunk`.

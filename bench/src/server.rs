@@ -52,6 +52,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
     socket.set_option(SUBSCRIBE, b"").await?;
   }
 
+  println!("[bench] Server PID: {}", std::process::id());
   info!("Server binding socket to: {}...", args.endpoint);
   socket.bind(&args.endpoint).await?;
   info!("Server bound successfully. Starting operational loop.");
