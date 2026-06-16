@@ -440,8 +440,6 @@ pub(crate) fn process_all_cqes(
               let connect_endpoint_uri = format!("tcp://{}", peer_addr);
               let recv_buffer_manager = worker.buffer_manager.as_ref();
               let default_bgid_val_from_worker = worker.default_buffer_ring_group_id_val;
-              let (inbound_tx, inbound_rx_sync) = fibre::mpsc::bounded::<FrameBatch>(256);
-              let inbound_rx = inbound_rx_sync.to_async();
               match worker.handler_manager.create_and_add_handler(
                 connected_fd,
                 factory_id,
@@ -451,8 +449,6 @@ pub(crate) fn process_all_cqes(
                 connect_endpoint_uri,
                 String::new(),
                 std::sync::Arc::new(DummyConnection),
-                inbound_tx,
-                inbound_rx,
                 recv_buffer_manager,
                 default_bgid_val_from_worker,
                 cqe_user_data,
@@ -638,8 +634,6 @@ pub(crate) fn process_all_cqes(
               let peer_uri = crate::io_uring_backend::worker::get_peer_local_addr(client_fd)
                 .map(|(peer, _)| format!("tcp://{}", peer))
                 .unwrap_or_else(|_| format!("tcp-accepted-fd-{}", client_fd));
-              let (inbound_tx, inbound_rx_sync) = fibre::mpsc::bounded::<FrameBatch>(256);
-              let inbound_rx = inbound_rx_sync.to_async();
               match worker.handler_manager.create_and_add_handler(
                 client_fd,
                 &factory_id,
@@ -649,8 +643,6 @@ pub(crate) fn process_all_cqes(
                 peer_uri,
                 String::new(),
                 std::sync::Arc::new(DummyConnection),
-                inbound_tx,
-                inbound_rx,
                 worker.buffer_manager.as_ref(),
                 worker.default_buffer_ring_group_id_val,
                 0,

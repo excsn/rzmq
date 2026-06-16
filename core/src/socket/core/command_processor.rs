@@ -281,7 +281,7 @@ pub(crate) async fn process_socket_command(
             };
             if let Err(e) = worker_tx.send(req).await {
               tracing::warn!(handle=core_handle, %endpoint_uri, "AttachIngressSender send failed: {:?}", e);
-            } else if let Ok(reply) = reply_rx.await {
+            } else if let Ok(reply) = reply_rx.recv().await {
               if let Ok(crate::io_uring_backend::ops::UringOpCompletion::AttachIngressSenderSuccess { .. }) = reply {
                 tracing::debug!(handle=core_handle, %endpoint_uri, "AttachIngressSender: success");
               } else {

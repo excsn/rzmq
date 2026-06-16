@@ -99,10 +99,8 @@ impl UringByteHandler {
     use_recv_multishot: bool,
     send_buffer_slot_size: usize,
   ) -> Self {
-    let (dummy_tx, _dummy_rx) = fibre::mpsc::bounded::<FrameBatch>(1);
     let worker_io_config = Arc::new(WorkerIoConfig {
       socket_mailbox,
-      inbound_data_tx: dummy_tx,
       endpoint_uri,
       target_endpoint_uri,
       connection_iface: Arc::new(DummySocketConnection),
