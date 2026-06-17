@@ -100,7 +100,7 @@ pub struct Cli {
 
   /// The io_uring polling and spinning strategy to utilize
   #[cfg(feature = "io-uring")]
-  #[arg(long, value_enum, default_value_t = UringStrategy::Performance)]
+  #[arg(long, value_enum, default_value_t = UringStrategy::Balanced)]
   pub uring_strategy: UringStrategy,
 }
 

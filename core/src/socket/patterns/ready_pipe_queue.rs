@@ -1,3 +1,5 @@
+#[cfg(feature = "io-uring")]
+use std::sync::OnceLock;
 use std::collections::HashMap;
 use std::sync::{
   Arc,
@@ -40,7 +42,7 @@ struct PipeSlot<T: Send + 'static> {
   /// Prevents duplicate signals from flooding the activation queue.
   is_activated: Arc<AtomicBool>,
   #[cfg(feature = "io-uring")]
-  uring_wakeup: Arc<parking_lot::Mutex<Option<UringWakeup>>>,
+  uring_wakeup: Arc<OnceLock<UringWakeup>>,
 }
 
 impl<T: Send + 'static> PipeSlot<T> {
@@ -105,7 +107,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
     let (tx, rx) = bounded_async(capacity.max(1));
     let is_activated = Arc::new(AtomicBool::new(false));
     #[cfg(feature = "io-uring")]
-    let uring_wakeup = Arc::new(parking_lot::Mutex::new(None));
+    let uring_wakeup = Arc::new(OnceLock::new());
     pipes.insert(
       pipe_id,
       PipeSlot {
@@ -162,7 +164,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
               #[cfg(feature = "io-uring")]
               {
                 if slot.is_drained() {
-                  if let Some(wakeup) = &*slot.uring_wakeup.lock() {
+                  if let Some(wakeup) = slot.uring_wakeup.get() {
                     if wakeup.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
                       if wakeup
                         .worker_asleep
@@ -222,7 +224,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
             #[cfg(feature = "io-uring")]
             {
               if slot.is_drained() {
-                if let Some(wakeup) = &*slot.uring_wakeup.lock() {
+                if let Some(wakeup) = slot.uring_wakeup.get() {
                   if wakeup.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
                     if wakeup
                       .worker_asleep
@@ -274,13 +276,13 @@ pub(crate) struct ReadyPipeSender<T: Send + 'static> {
   pipe_id: usize,
   is_activated: Arc<AtomicBool>,
   #[cfg(feature = "io-uring")]
-  uring_wakeup: Arc<parking_lot::Mutex<Option<UringWakeup>>>,
+  uring_wakeup: Arc<OnceLock<UringWakeup>>,
 }
 
 impl<T: Send + 'static> ReadyPipeSender<T> {
   #[cfg(feature = "io-uring")]
   pub fn bind_uring_wakeup(&self, wakeup: UringWakeup) {
-    *self.uring_wakeup.lock() = Some(wakeup);
+    let _ = self.uring_wakeup.set(wakeup);
   }
 
   /// Send one item. Blocks if the per-pipe queue is at capacity (rcvhwm),
