@@ -744,6 +744,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             if let HandlerSqeBlueprint::RequestSendRawVectored {
               bufs,
               send_op_flags,
+              batch_count,
             } = &mut first_blueprint
             {
               if bufs.len() > libc::UIO_MAXIOV as usize {
@@ -753,6 +754,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                   .push_front(HandlerSqeBlueprint::RequestSendRawVectored {
                     bufs: remainder,
                     send_op_flags: *send_op_flags,
+                    batch_count: 0,
                   });
               }
             }

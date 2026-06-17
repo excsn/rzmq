@@ -1,6 +1,7 @@
 #![cfg(feature = "io-uring")]
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -162,6 +163,9 @@ pub(crate) struct ZmtpUringHandler {
   /// Direct ingress sender: delivers decoded messages straight to the socket's ReadyPipeQueue.
   /// Set by `attach_ingress` after SocketCore completes pipe registration.
   ingress_sender: Option<PipeMessageSender>,
+  /// FIFO spillover queue to stash complete ZMTP message batches when the main queue is congested.
+  /// Prevents silent message drops.
+  spillover: VecDeque<FrameBatch>,
   /// True when the ingress pipe queue is full (rcvhwm). Reads are throttled until
   /// SocketCore sends `ResumeConnection`.
   is_throttled: AtomicBool,
@@ -198,6 +202,7 @@ impl ZmtpUringHandler {
       engine,
       egress_rx,
       ingress_sender: None,
+      spillover: VecDeque::new(),
       is_throttled: AtomicBool::new(false),
       multishot_reader: None,
       is_closing: false,
@@ -282,26 +287,34 @@ impl ZmtpUringHandler {
         }
         AppAction::DeliverMessage(batch) => {
           if let Some(ref sender) = self.ingress_sender {
-            match sender.try_send_sync(batch) {
-              Ok(()) => {
-                self.is_throttled.store(false, Ordering::Release);
+            // FIFO Guard: if we already have stashed batches, we must append to spillover
+            // first to preserve strict FIFO delivery order.
+            if !self.spillover.is_empty() {
+              self.spillover.push_back(batch);
+              self.is_throttled.store(true, Ordering::Release);
+            } else {
+              match sender.try_send_sync(batch) {
+                Ok(()) => {
+                  self.is_throttled.store(false, Ordering::Release);
+                }
+                Err(fibre::TrySendError::Full(returned_batch)) => {
+                  // Stash the un-sent batch instead of dropping it on the floor!
+                  self.spillover.push_back(returned_batch);
+                  self.is_throttled.store(true, Ordering::Release);
+                  trace!(
+                    fd = self.fd,
+                    "ZmtpUringHandler: ingress queue full, stashed batch to spillover"
+                  );
+                }
+                Err(fibre::TrySendError::Closed(_)) => {
+                  warn!(
+                    fd = self.fd,
+                    "ZmtpUringHandler: ingress sender closed, closing connection"
+                  );
+                  ops.initiate_close_due_to_error = true;
+                }
+                Err(fibre::TrySendError::Sent(_)) => unreachable!(),
               }
-              Err(fibre::TrySendError::Full(_)) => {
-                self.is_throttled.store(true, Ordering::Release);
-                trace!(
-                  fd = self.fd,
-                  "ZmtpUringHandler: ingress queue full, throttling reads"
-                );
-                std::thread::yield_now();
-              }
-              Err(fibre::TrySendError::Closed(_)) => {
-                warn!(
-                  fd = self.fd,
-                  "ZmtpUringHandler: ingress sender closed, closing connection"
-                );
-                ops.initiate_close_due_to_error = true;
-              }
-              Err(fibre::TrySendError::Sent(_)) => unreachable!(),
             }
           } else {
             // Ingress sender not yet attached — drop until AttachIngressSender arrives.
@@ -334,6 +347,35 @@ impl ZmtpUringHandler {
       reader.prepare_cancel_intent()
     } else {
       None
+    }
+  }
+
+  /// Attempt to drain the stashed spillover batches into the socket's ReadyPipeQueue.
+  /// If the queue becomes congested again, it puts the batch back and maintains the throttle.
+  fn try_drain_spillover(&mut self) {
+    if self.spillover.is_empty() {
+      return;
+    }
+    if let Some(ref sender) = self.ingress_sender {
+      while let Some(batch) = self.spillover.pop_front() {
+        match sender.try_send_sync(batch) {
+          Ok(()) => {}
+          Err(fibre::TrySendError::Full(returned_batch)) => {
+            // Main queue is full again: put the batch back at the front and keep throttled
+            self.spillover.push_front(returned_batch);
+            self.is_throttled.store(true, Ordering::Release);
+            return;
+          }
+          Err(_) => {
+            // Receiver dropped; discard remainder.
+            self.spillover.clear();
+            return;
+          }
+        }
+      }
+      // Spillover fully flushed: we can safely clear the throttle flag
+      self.is_throttled.store(false, Ordering::Release);
+      trace!(fd = self.fd, "ZmtpUringHandler: spillover fully drained");
     }
   }
 }
@@ -438,6 +480,9 @@ impl UringConnectionHandler for ZmtpUringHandler {
       return HandlerIoOps::new();
     }
 
+    // (a) Try to flush stashed batches back into the queue first
+    self.try_drain_spillover();
+
     let mut ops = HandlerIoOps::new();
 
     // (a) Re-arm multishot read.
@@ -449,47 +494,59 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
 
+    // Low values - The worker becomes less willing to wait. The moment it accumulates 4 or 8 messages, it stops spinning, exits the loop, and commits the write.
+    // High values - The worker becomes highly aggressive about building large batches. It will continue to execute micro-spins until it reaches the larger target size.
+    const MICRO_COALESCE_THRESHOLD: usize = 16;
+
     // (b) Coalesce/Batch egress messages into a single, high-throughput write SQE.
     // Lock the queue draining if we currently have an unacknowledged write in-flight.
     if !self.is_closing
       && self.engine.phase == crate::protocol::zmtp::engine::ZmtpPhase::Data
       && !self.write_in_flight
-      && interface.pending_egress_count < 16
+      && interface.pending_egress_count < MICRO_COALESCE_THRESHOLD
     {
       self.coalesce_scratch.clear();
       let limit = self.engine.config().sndbatch_count.max(1);
+      let mut spin_attempts = 0;
 
       while self.coalesce_scratch.len() < limit {
         match self.egress_rx.try_recv() {
           Ok(batch) => {
             self.coalesce_scratch.push(batch);
           }
-          Err(_) => break,
+          Err(_) => {
+            // Adaptive Micro-Yielding: if we have some messages but are under-filled,
+            // execute a bounded CPU pause (spin_loop) to let the producer thread catch up.
+            // Only runs if the queue is active (not empty) and we haven't hit a healthy batch size (16).
+            if !self.coalesce_scratch.is_empty()
+              && self.coalesce_scratch.len() < MICRO_COALESCE_THRESHOLD
+              && spin_attempts < 4
+            {
+              spin_attempts += 1;
+              for _ in 0..32 {
+                std::hint::spin_loop(); // PAUSE instruction (low-power CPU yield)
+              }
+              continue; // Try reading from the channel again
+            }
+            break;
+          }
         }
       }
 
       if !self.coalesce_scratch.is_empty() {
-        self.write_in_flight = true; // Lock the local gate
+        self.write_in_flight = true; // Lock the pipeline gate for vectored writes
         let batch_count = self.coalesce_scratch.len() as u32;
-        match self.engine.frame_batch(&self.coalesce_scratch) {
-          Ok(data) => {
-            let use_zc = self.use_send_zerocopy && data.len() >= ZC_SEND_THRESHOLD;
-            let blueprint = if use_zc {
-              HandlerSqeBlueprint::RequestSendZeroCopy {
-                data_to_send: data,
+
+        // Use the zero-copy, vectored data path (scatter-gather via IORING_OP_WRITEV)
+        match self.engine.frame_batch_vectored(&self.coalesce_scratch) {
+          Ok(bufs) => {
+            ops
+              .sqe_blueprints
+              .push(HandlerSqeBlueprint::RequestSendRawVectored {
+                bufs,
                 send_op_flags: 0,
-                originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
                 batch_count,
-              }
-            } else {
-              HandlerSqeBlueprint::RequestSend {
-                data,
-                send_op_flags: 0,
-                originating_app_op_ud: HANDLER_INTERNAL_SEND_OP_UD,
-                batch_count,
-              }
-            };
-            ops.sqe_blueprints.push(blueprint);
+              });
           }
           Err(e) => {
             let _ = self
@@ -602,6 +659,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
     if self.is_closing {
       return true;
     }
+    // We must never read more from the kernel while we still have stashed batches to deliver
+    if !self.spillover.is_empty() {
+      return true;
+    }
     let throttled = self.is_throttled.load(Ordering::Acquire);
     if throttled {
       if let Some(ref sender) = self.ingress_sender {
@@ -636,9 +697,15 @@ impl UringConnectionHandler for ZmtpUringHandler {
   }
 
   /// Returns true when there is pending egress data or a close deadline is armed,
-  /// so the worker's pre-sleep double-check keeps it awake to process these.
+  /// or when we have stashed ingress data that can now flow.
   fn has_drainable_spillover(&self) -> bool {
-    !self.egress_rx.is_empty() || self.close_deadline.is_some()
+    let has_ingress_spillover = !self.spillover.is_empty()
+      && self
+        .ingress_sender
+        .as_ref()
+        .map_or(false, |s| !s.is_congested());
+
+    !self.egress_rx.is_empty() || self.close_deadline.is_some() || has_ingress_spillover
   }
 
   fn on_buffer_ring_exhausted(&mut self) {

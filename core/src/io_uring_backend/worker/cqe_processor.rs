@@ -275,7 +275,10 @@ pub(crate) fn process_handler_blueprint(
     HandlerSqeBlueprint::RequestSendRawVectored {
       bufs,
       send_op_flags,
+      batch_count,
     } => {
+      #[cfg(debug_assertions)]
+      worker.metrics.record_write_batch(batch_count as u64); 
       let total_len: usize = bufs.iter().map(|b| b.len()).sum();
 
       // Convert to a Box before taking the pointer. `into_boxed_slice()` may
@@ -313,6 +316,7 @@ pub(crate) fn process_handler_blueprint(
             return Err(HandlerSqeBlueprint::RequestSendRawVectored {
               bufs: b.payloads,
               send_op_flags: b.send_op_flags,
+              batch_count: 0,
             });
           }
           unreachable!();
@@ -993,6 +997,7 @@ pub(crate) fn process_all_cqes(
                   Some(HandlerSqeBlueprint::RequestSendRawVectored {
                     bufs: batch.payloads,
                     send_op_flags: batch.send_op_flags,
+                    batch_count: 0,
                   })
                 }
                 InternalOpPayload::SendZeroCopyLeased { send_buf_id } => {
@@ -1150,6 +1155,7 @@ pub(crate) fn process_all_cqes(
                 HandlerSqeBlueprint::RequestSendRawVectored {
                   bufs: remaining,
                   send_op_flags: batch.send_op_flags,
+                  batch_count: 0,
                 }
               }
               _ => {

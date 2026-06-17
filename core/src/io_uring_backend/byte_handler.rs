@@ -325,6 +325,7 @@ impl UringConnectionHandler for UringByteHandler {
               ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestSendRawVectored {
                 bufs: non_empty,
                 send_op_flags: 0,
+                batch_count: 1,
               });
             }
           }

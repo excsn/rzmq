@@ -41,6 +41,7 @@ pub enum HandlerSqeBlueprint {
   RequestSendRawVectored {
     bufs: Vec<Bytes>,
     send_op_flags: i32,
+    batch_count: u32,
   },
   /// Request to close the handler's FD. The UringWorker will build a Close SQE.
   RequestClose,
