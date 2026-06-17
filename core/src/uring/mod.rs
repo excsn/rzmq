@@ -6,8 +6,8 @@ use crate::error::ZmqError;
 use crate::io_uring_backend::connection_handler::ProtocolHandlerFactory;
 use crate::io_uring_backend::worker::UringWorker;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use once_cell::sync::OnceCell;
 use tokio::task::spawn_blocking;
@@ -106,11 +106,17 @@ impl Default for UringConfig {
       default_send_zerocopy: false,
       default_recv_multishot: true,
       default_recv_buffer_count: DEFAULT_IO_URING_RECV_BUFFER_COUNT,
-      default_recv_buffer_size: DEFAULT_IO_URING_RECV_BUFFER_SIZE,
+      default_recv_buffer_size: calculate_required_slot_size(
+        DEFAULT_IO_URING_RECV_BUFFER_SIZE,
+        crate::socket::options::DEFAULT_RCVBATCH_COUNT,
+      ),
       default_send_buffer_count: DEFAULT_IO_URING_SND_BUFFER_COUNT,
-      default_send_buffer_size: calculate_required_slot_size(DEFAULT_IO_URING_SND_BUFFER_SIZE, crate::socket::options::DEFAULT_SNDBATCH_COUNT),
-      sqpoll_enabled: true,
-      sqpoll_idle_ms: 2000,
+      default_send_buffer_size: calculate_required_slot_size(
+        DEFAULT_IO_URING_SND_BUFFER_SIZE,
+        crate::socket::options::DEFAULT_SNDBATCH_COUNT,
+      ),
+      sqpoll_enabled: false,
+      sqpoll_idle_ms: 1000,
       polling_strategy: UringPollingStrategy::balanced(),
     }
   }
@@ -137,13 +143,19 @@ mod tests {
   fn ultra_low_latency_never_sleeps() {
     assert!(matches!(
       UringPollingStrategy::ultra_low_latency(),
-      UringPollingStrategy::Tiered { deep_sleep_fallback: false, .. }
+      UringPollingStrategy::Tiered {
+        deep_sleep_fallback: false,
+        ..
+      }
     ));
   }
 
   #[test]
   fn low_power_is_immediate_sleep() {
-    assert_eq!(UringPollingStrategy::low_power(), UringPollingStrategy::ImmediateSleep);
+    assert_eq!(
+      UringPollingStrategy::low_power(),
+      UringPollingStrategy::ImmediateSleep
+    );
   }
 
   #[test]
@@ -151,7 +163,10 @@ mod tests {
     let cfg = UringConfig::default();
     assert!(matches!(
       cfg.polling_strategy,
-      UringPollingStrategy::Tiered { deep_sleep_fallback: true, .. }
+      UringPollingStrategy::Tiered {
+        deep_sleep_fallback: true,
+        ..
+      }
     ));
   }
 }
@@ -181,11 +196,14 @@ const NOT_INITIALIZED_ERROR_MSG: &str = "io_uring backend not initialized.";
 pub fn initialize_uring_backend(config: UringConfig) -> Result<(), ZmqError> {
   let init_result_ref: Result<&Result<(), ZmqError>, ZmqError> =
     URING_INIT_RESULT.get_or_try_init(|| -> Result<Result<(), ZmqError>, ZmqError> {
-      info!("Initializing global io_uring backend with config: {:?}", config);
+      info!(
+        "Initializing global io_uring backend with config: {:?}",
+        config
+      );
 
       let factories: Vec<Arc<dyn ProtocolHandlerFactory>> = vec![];
-      let (signaling_op_tx, worker_join_handle) =
-        UringWorker::spawn_with_config(config, factories).map_err(|e| {
+      let (signaling_op_tx, worker_join_handle) = UringWorker::spawn_with_config(config, factories)
+        .map_err(|e| {
           error!("Failed to spawn UringWorker: {}", e);
           e
         })?;
@@ -227,7 +245,10 @@ pub async fn shutdown_uring_backend() -> Result<(), ZmqError> {
   drop(taken_op_tx);
 
   // Join the worker thread.
-  if let Some(worker_handle) = global_state::get_uring_worker_join_handle_mutex().lock().take() {
+  if let Some(worker_handle) = global_state::get_uring_worker_join_handle_mutex()
+    .lock()
+    .take()
+  {
     debug!("io_uring::shutdown: Joining UringWorker thread...");
     spawn_blocking(move || match worker_handle.join() {
       Ok(Ok(())) => info!("UringWorker thread joined successfully."),
