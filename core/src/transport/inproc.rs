@@ -56,11 +56,6 @@ pub(crate) async fn connect_inproc(
     }
   };
 
-  let pipe_hwm = {
-    let s = core_arc.core_state.read();
-    s.options.rcvhwm.max(s.options.sndhwm).max(1)
-  };
-
   let socket_logic = match core_arc.get_socket_logic().await {
     Some(logic) => logic,
     None => {

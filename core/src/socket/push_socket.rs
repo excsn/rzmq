@@ -99,7 +99,9 @@ impl ISocket for PushSocket {
 
     let sndtimeo = self.cached_options.load().sndtimeo;
     let wait_for_peer = !matches!(sndtimeo, Some(d) if d.is_zero());
-    self.send_with_timeout(frames, wait_for_peer, sndtimeo).await
+    self
+      .send_with_timeout(frames, wait_for_peer, sndtimeo)
+      .await
   }
 
   async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
@@ -111,7 +113,9 @@ impl ISocket for PushSocket {
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     let result = delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec());
     if result.is_ok() {
-      self.cached_options.store(self.core.core_state.read().options.clone());
+      self
+        .cached_options
+        .store(self.core.core_state.read().options.clone());
     }
     result
   }
@@ -158,9 +162,15 @@ impl ISocket for PushSocket {
   ) {
     let (endpoint_uri_opt, connection_iface_opt) = {
       let core_s = self.core.core_state.read();
-      let uri = core_s.pipe_read_id_to_endpoint_uri.get(&pipe_read_id).cloned();
+      let uri = core_s
+        .pipe_read_id_to_endpoint_uri
+        .get(&pipe_read_id)
+        .cloned();
       let iface = uri.as_ref().and_then(|u| {
-        core_s.endpoints.get(u).map(|ep| ep.connection_iface.clone())
+        core_s
+          .endpoints
+          .get(u)
+          .map(|ep| ep.connection_iface.clone())
       });
       (uri, iface)
     };
@@ -172,8 +182,13 @@ impl ISocket for PushSocket {
         uri = %endpoint_uri,
         "PUSH attaching connection"
       );
-      self.pipe_read_to_endpoint_uri.write().insert(pipe_read_id, endpoint_uri.clone());
-      self.outgoing_orchestrator.add_connection(endpoint_uri, iface);
+      self
+        .pipe_read_to_endpoint_uri
+        .write()
+        .insert(pipe_read_id, endpoint_uri.clone());
+      self
+        .outgoing_orchestrator
+        .add_connection(endpoint_uri, iface);
     } else {
       tracing::warn!(
         handle = self.core.handle,
@@ -220,13 +235,22 @@ impl PushSocket {
   ) -> Result<(), ZmqError> {
     match sndtimeo {
       Some(d) if !d.is_zero() => {
-        match tokio_timeout(d, self.outgoing_orchestrator.route_message(fb, wait_for_peer)).await {
+        match tokio_timeout(
+          d,
+          self.outgoing_orchestrator.route_message(fb, wait_for_peer),
+        )
+        .await
+        {
           Ok(Ok(())) => Ok(()),
           Ok(Err((_, e))) => Err(e),
           Err(_) => Err(ZmqError::Timeout),
         }
       }
-      _ => match self.outgoing_orchestrator.route_message(fb, wait_for_peer).await {
+      _ => match self
+        .outgoing_orchestrator
+        .route_message(fb, wait_for_peer)
+        .await
+      {
         Ok(()) => Ok(()),
         Err((_, e)) => Err(e),
       },

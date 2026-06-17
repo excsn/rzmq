@@ -11,7 +11,6 @@ use crate::runtime::{mailbox, MailboxSender};
 use crate::socket::options::SocketOptions;
 use crate::socket::types::SocketType;
 use crate::socket::ISocket;
-pub(crate) use state::{EndpointInfo, EndpointType};
 pub(crate) use state::CoreState;
 use state::ShutdownCoordinator;
 
