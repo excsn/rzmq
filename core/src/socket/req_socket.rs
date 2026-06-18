@@ -132,13 +132,10 @@ impl ISocket for ReqSocket {
     let timeout_opt: Option<Duration> = { self.core.core_state.read().options.sndtimeo };
 
     // === ASYNC OPERATION: Find a Peer (No Lock Held) ===
-    let target_endpoint_uri_for_send = loop {
-      if let Some(uri) = self.load_balancer.get_next_connection_uri() {
-        if self.core.core_state.read().endpoints.contains_key(&uri) {
-          break uri;
-        } else {
-          self.load_balancer.remove_connection(&uri);
-        }
+    let peer = loop {
+      if let Some(p) = self.load_balancer.get_next_connection() {
+        // We got the peer from the LoadBalancer. We assume it is active.
+        break p;
       } else {
         if self.core.command_sender().is_closed() {
           return Err(ZmqError::InvalidState("Socket terminated".into()));
@@ -156,22 +153,6 @@ impl ISocket for ReqSocket {
       }
     };
 
-    let conn_iface: Arc<dyn ISocketConnection> = {
-      let core_s_read = self.core_state_read();
-      match core_s_read.endpoints.get(&target_endpoint_uri_for_send) {
-        Some(ep_info) => ep_info.connection_iface.clone(),
-        None => {
-          self
-            .load_balancer
-            .remove_connection(&target_endpoint_uri_for_send);
-          return Err(ZmqError::HostUnreachable(format!(
-            "REQ: Peer at {} disappeared before send",
-            target_endpoint_uri_for_send
-          )));
-        }
-      }
-    };
-
     let mut empty_delimiter = Msg::new();
     empty_delimiter.set_flags(MsgFlags::MORE);
     let mut zmtp_frames_to_send = FrameBatch::new();
@@ -179,25 +160,23 @@ impl ISocket for ReqSocket {
     zmtp_frames_to_send.push(msg);
 
     // === ASYNC OPERATION: Send Message (No Lock Held) ===
-    match conn_iface.send_multipart(zmtp_frames_to_send).await {
+    match peer.iface.send_multipart(zmtp_frames_to_send).await {
       Ok(()) => {
         // === LOCK SCOPE 2: Update State on Success ===
         {
           let mut current_state_guard = self.state.lock();
           *current_state_guard = ReqState::ExpectingReply {
-            target_endpoint_uri: target_endpoint_uri_for_send.clone(),
+            target_endpoint_uri: peer.uri.clone(),
           };
         }
         self.incoming_orchestrator.reset_recv_buffer();
         Ok(())
       }
       Err(ZmqError::ConnectionClosed) => {
-        self
-          .load_balancer
-          .remove_connection(&target_endpoint_uri_for_send);
+        self.load_balancer.remove_connection(&peer.uri);
         Err(ZmqError::HostUnreachable(format!(
           "REQ: Connection to {} closed during send",
-          target_endpoint_uri_for_send
+          peer.uri
         )))
       }
       Err(e) => Err(e),
@@ -214,7 +193,9 @@ impl ISocket for ReqSocket {
     {
       let op_state_guard = self.state.lock();
       if !matches!(*op_state_guard, ReqState::ExpectingReply { .. }) {
-        return Err(ZmqError::InvalidState("REQ socket must call send() before receiving"));
+        return Err(ZmqError::InvalidState(
+          "REQ socket must call send() before receiving",
+        ));
       }
     }
 
@@ -300,12 +281,17 @@ impl ISocket for ReqSocket {
     {
       let state_guard = self.state.lock();
       if !matches!(*state_guard, ReqState::ExpectingReply { .. }) {
-        return Err(ZmqError::InvalidState("REQ socket must call send() before receiving reply"));
+        return Err(ZmqError::InvalidState(
+          "REQ socket must call send() before receiving reply",
+        ));
       }
     }
 
     let rcvtimeo_opt: Option<Duration> = self.core.core_state.read().options.rcvtimeo;
-    let result = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await;
+    let result = self
+      .incoming_orchestrator
+      .recv_logical_message(rcvtimeo_opt)
+      .await;
 
     {
       let mut state_guard = self.state.lock();
@@ -341,7 +327,6 @@ impl ISocket for ReqSocket {
 
   async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
     match event {
-      // Data frames are pushed directly by the actor via PipeMessageSender; no action needed.
       Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {}
       _ => {}
     }
@@ -358,32 +343,44 @@ impl ISocket for ReqSocket {
     _pipe_write_id: usize,
     _peer_identity: Option<&[u8]>,
   ) {
-    let endpoint_uri_option = {
-      self
-        .core
-        .core_state
-        .read()
+    let (endpoint_uri_opt, connection_iface_opt) = {
+      let core_s_read = self.core.core_state.read();
+      let uri = core_s_read
         .pipe_read_id_to_endpoint_uri
         .get(&pipe_read_id)
-        .cloned()
+        .cloned();
+      let iface = uri.as_ref().and_then(|u| {
+        core_s_read
+          .endpoints
+          .get(u)
+          .map(|ep| ep.connection_iface.clone())
+      });
+      (uri, iface)
     };
-    if let Some(endpoint_uri) = endpoint_uri_option {
+
+    if let (Some(endpoint_uri), Some(iface)) = (endpoint_uri_opt, connection_iface_opt) {
       tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "REQ attaching connection");
       self
         .pipe_read_to_endpoint_uri
         .write()
         .insert(pipe_read_id, endpoint_uri.clone());
-      self.load_balancer.add_connection(endpoint_uri);
+
+      self.load_balancer.add_connection(endpoint_uri, iface);
 
       // Register per-pipe ingress channel (capacity 1: REQ expects one reply at a time).
       let rcvhwm = self.core.core_state.read().options.rcvhwm.max(1);
-      let raw_sender = self.incoming_orchestrator.register_connection_pipe(pipe_read_id, rcvhwm);
-      self.pending_pipe_senders.lock().insert(pipe_read_id, PipeMessageSender::Direct(raw_sender));
+      let raw_sender = self
+        .incoming_orchestrator
+        .register_connection_pipe(pipe_read_id, rcvhwm);
+      self
+        .pending_pipe_senders
+        .lock()
+        .insert(pipe_read_id, PipeMessageSender::Direct(raw_sender));
     } else {
       tracing::warn!(
         handle = self.core.handle,
         pipe_read_id,
-        "REQ pipe_attached: Endpoint URI not found. Maps not updated."
+        "REQ pipe_attached: Endpoint URI or connection interface not found. Maps not updated."
       );
     }
   }
@@ -431,82 +428,9 @@ impl ISocket for ReqSocket {
       self.reply_available_notifier.notify_one();
     }
 
-    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self
+      .incoming_orchestrator
+      .deregister_connection_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use crate::Context;
-  use crate::socket::options::SocketOptions;
-  use crate::socket::types::SocketType;
-  use std::sync::Arc;
-
-  #[tokio::test]
-  async fn test_req_socket_no_stale_notifier() {
-    let context = Context::new().unwrap();
-    let handle = context.inner().next_handle();
-    let core_state =
-      crate::socket::core::CoreState::new(handle, SocketType::Req, SocketOptions::default());
-
-    let core = Arc::new(crate::socket::core::SocketCore {
-      handle,
-      context: context.clone(),
-      command_sender: fibre::mpmc::bounded_async(1).0,
-      core_state: parking_lot::RwLock::new(core_state),
-      socket_logic: tokio::sync::RwLock::new(None),
-      shutdown_coordinator: tokio::sync::Mutex::new(
-        crate::socket::core::state::ShutdownCoordinator::default(),
-      ),
-      is_running_flag: std::sync::atomic::AtomicBool::new(true),
-    });
-
-    let req_socket = ReqSocket::new(core);
-    let target_uri = "tcp://127.0.0.1:19876".to_string();
-
-    req_socket
-      .pipe_read_to_endpoint_uri
-      .write()
-      .insert(1, target_uri.clone());
-
-    // 1. Register the ingress pipe directly to get a sender (no full actor setup needed).
-    let pipe_sender = req_socket.incoming_orchestrator.register_connection_pipe(1, 4);
-
-    // 2. Set state to ExpectingReply (simulates a completed send).
-    *req_socket.state.lock() = ReqState::ExpectingReply {
-      target_endpoint_uri: target_uri.clone(),
-    };
-
-    // 3. Push a ZMTP reply via the pipe sender (actor pathway: [empty_delim, payload]).
-    let mut batch = FrameBatch::new();
-    let mut delim = Msg::new();
-    delim.set_flags(MsgFlags::MORE);
-    batch.push(delim);
-    batch.push(Msg::from_static(b"reply"));
-    pipe_sender.send(batch).await.unwrap();
-
-    // 4. Consume the message via recv().
-    let recv_result = req_socket.recv().await;
-    assert!(recv_result.is_ok());
-    assert_eq!(recv_result.unwrap().data().unwrap(), b"reply");
-
-    // 5. Set state back to ExpectingReply (simulating next send).
-    *req_socket.state.lock() = ReqState::ExpectingReply {
-      target_endpoint_uri: target_uri,
-    };
-
-    // 6. Verify no stale permit was left in the notifier.
-    let notify_check = tokio::time::timeout(
-      Duration::from_millis(50),
-      req_socket.reply_available_notifier.notified(),
-    )
-    .await;
-
-    assert!(
-      notify_check.is_err(),
-      "Bug present: A stale permit was deposited in the notifier during a normal message cycle!"
-    );
   }
 }

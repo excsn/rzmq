@@ -286,6 +286,7 @@ pub(crate) struct ZmtpEngineConfig {
   pub rcvhwm: usize,
   pub sndbatch_count: usize,
   pub sndbatch_bytes: usize,
+  pub sndbatch_bytes_physical: usize,
   pub rcvbatch_count: usize,
   pub rcvbatch_bytes: usize,
 }
@@ -328,6 +329,7 @@ impl Default for ZmtpEngineConfig {
       rcvhwm: 256,
       sndbatch_count: DEFAULT_SNDBATCH_COUNT,
       sndbatch_bytes: DEFAULT_SNDBATCH_BYTES,
+      sndbatch_bytes_physical: DEFAULT_SNDBATCH_BYTES + (DEFAULT_SNDBATCH_COUNT * 9),
       rcvbatch_count: DEFAULT_RCVBATCH_COUNT,
       rcvbatch_bytes: DEFAULT_RCVBATCH_BYTES,
     }
@@ -379,6 +381,9 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
     #[cfg(not(feature = "io-uring"))]
     let sndbatch_bytes = options.sndbatch_bytes;
 
+    // Pre-calculate physical size including worst-case framing overhead on-demand
+    let sndbatch_bytes_physical = calculate_required_slot_size(sndbatch_bytes, options.sndbatch_count);
+
     ZmtpEngineConfig {
       routing_id: options.routing_id.clone(),
       socket_type_name: options.socket_type_name.clone(),
@@ -415,6 +420,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       rcvhwm: options.rcvhwm,
       sndbatch_count: options.sndbatch_count,
       sndbatch_bytes,
+      sndbatch_bytes_physical,
       rcvbatch_count: options.rcvbatch_count,
       rcvbatch_bytes: options.rcvbatch_bytes,
     }
@@ -780,4 +786,21 @@ pub(crate) fn retrieve_core_option_value(
 
         _ => Err(ZmqError::InvalidOption(option_id)),
     }
+}
+
+/// Calculates the minimum physical send-buffer slot size needed to hold a fully-framed
+/// ZMTP batch without allocation fallback.
+///
+/// Each ZMTP long frame (payload ≥ 256 bytes) costs 9 bytes of overhead; each short frame
+/// costs 2 bytes. This function computes the worst-case total and rounds up to a 4 KB page
+/// boundary for kernel/MMU efficiency.
+///
+/// Example: `calculate_required_slot_size(65_536, 128)` → 69_632 bytes (68 KB).
+pub fn calculate_required_slot_size(target_payload_bytes: usize, max_batch_count: usize) -> usize {
+  let max_long_frames = std::cmp::min(max_batch_count, target_payload_bytes / 256);
+  let long_frame_overhead = max_long_frames * 9;
+  let short_frame_overhead = max_batch_count.saturating_sub(max_long_frames) * 2;
+  let raw_physical_size = target_payload_bytes + long_frame_overhead + short_frame_overhead;
+  const PAGE_SIZE: usize = 4096;
+  ((raw_physical_size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE
 }

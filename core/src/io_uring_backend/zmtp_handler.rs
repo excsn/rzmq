@@ -115,7 +115,7 @@ impl ISocketConnection for ZmtpSmartConnection {
     }
   }
 
-  async fn try_send_multipart_owned(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
+  async fn send_multipart_owned(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
     match self.egress_tx.try_send(msgs) {
       Ok(()) => {
         self.signal_worker();

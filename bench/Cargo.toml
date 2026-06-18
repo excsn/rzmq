@@ -11,7 +11,7 @@ publish = false
 rzmq = { path = "../core" }
 
 # High-performance async channels (lock-free segmented block queue)
-fibre = { version = "^0.5" }
+fibre = { workspace = true }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }

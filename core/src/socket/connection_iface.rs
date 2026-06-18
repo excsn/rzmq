@@ -48,11 +48,16 @@ pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
   /// Attempts to send, returning ownership of `msgs` if the channel is immediately full
   /// (SNDTIMEO=0 path). For blocking/timed sends that time out, the message is consumed
   /// inside the dropped future and an empty batch is returned with the error.
-  async fn try_send_multipart_owned(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
+  async fn send_multipart_owned(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
     match self.send_multipart(msgs).await {
       Ok(()) => Ok(()),
       Err(e) => Err((FrameBatch::new(), e)),
     }
+  }
+
+  /// Synchronous fast-path. Returns Err with ownership if full or closed.
+  fn try_send_multipart_owned_sync(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
+    Err((msgs, ZmqError::ResourceLimitReached)) // Default fallback
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError>;

@@ -5,6 +5,7 @@ pub mod global_state;
 use crate::error::ZmqError;
 use crate::io_uring_backend::connection_handler::ProtocolHandlerFactory;
 use crate::io_uring_backend::worker::UringWorker;
+use crate::socket::options::calculate_required_slot_size;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -169,23 +170,6 @@ mod tests {
       }
     ));
   }
-}
-
-/// Calculates the minimum physical send-buffer slot size needed to hold a fully-framed
-/// ZMTP batch without allocation fallback.
-///
-/// Each ZMTP long frame (payload ≥ 256 bytes) costs 9 bytes of overhead; each short frame
-/// costs 2 bytes. This function computes the worst-case total and rounds up to a 4 KB page
-/// boundary for kernel/MMU efficiency.
-///
-/// Example: `calculate_required_slot_size(65_536, 128)` → 69_632 bytes (68 KB).
-pub fn calculate_required_slot_size(target_payload_bytes: usize, max_batch_count: usize) -> usize {
-  let max_long_frames = std::cmp::min(max_batch_count, target_payload_bytes / 256);
-  let long_frame_overhead = max_long_frames * 9;
-  let short_frame_overhead = max_batch_count.saturating_sub(max_long_frames) * 2;
-  let raw_physical_size = target_payload_bytes + long_frame_overhead + short_frame_overhead;
-  const PAGE_SIZE: usize = 4096;
-  ((raw_physical_size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE
 }
 
 static URING_INIT_RESULT: OnceCell<Result<(), ZmqError>> = OnceCell::new();

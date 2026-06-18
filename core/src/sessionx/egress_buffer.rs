@@ -6,6 +6,9 @@ pub(crate) struct EgressBuffer {
   write_offset: usize,
   total_bytes: usize,
   message_count: usize,
+  // Track the absolute peak values seen during the lifetime of this buffer
+  pub(crate) peak_messages: usize,
+  pub(crate) peak_bytes: usize,
 }
 
 impl EgressBuffer {
@@ -15,6 +18,8 @@ impl EgressBuffer {
       write_offset: 0,
       total_bytes: 0,
       message_count: 0,
+      peak_messages: 0,
+      peak_bytes: 0,
     }
   }
 
@@ -25,6 +30,18 @@ impl EgressBuffer {
     self.total_bytes += data.len();
     self.message_count += msg_count;
     self.chunks.push_back((data, msg_count));
+
+    // Update peak values
+    self.peak_messages = self.peak_messages.max(self.message_count);
+    self.peak_bytes = self.peak_bytes.max(self.total_bytes);
+  }
+
+  pub(crate) fn peak_messages(&self) -> usize {
+    self.peak_messages
+  }
+
+  pub(crate) fn peak_bytes(&self) -> usize {
+    self.peak_bytes
   }
 
   pub(crate) fn push_priority(&mut self, data: Bytes) {
@@ -46,25 +63,39 @@ impl EgressBuffer {
     self.chunks.front().map(|(c, _)| &c[self.write_offset..])
   }
 
-  /// Gathers up to `max` pending slices into `out` as `IoSlice` entries.
-  /// The first slice respects `write_offset`; subsequent slices start at byte 0.
-  /// Lifetimes ensure the slices cannot outlive the borrow on `self`.
-  pub(crate) fn current_slices<'a>(&'a self, max: usize, out: &mut Vec<std::io::IoSlice<'a>>) {
-    if self.chunks.is_empty() || max == 0 {
-      return;
+  /// Gathers pending slices into the provided stack-allocated array.
+  /// Returns the number of slices populated.
+  pub(crate) fn fill_slices<'a>(&'a self, out: &mut [std::io::IoSlice<'a>]) -> usize {
+    if self.chunks.is_empty() || out.is_empty() {
+      return 0;
     }
-    if let Some((front, _)) = self.chunks.front() {
-      out.push(std::io::IoSlice::new(&front[self.write_offset..]));
+
+    let mut iter = self.chunks.iter();
+    let mut count = 0;
+
+    if let Some((front, _)) = iter.next() {
+      out[count] = std::io::IoSlice::new(&front[self.write_offset..]);
+      count += 1;
     }
-    for (chunk, _) in self.chunks.iter().skip(1).take(max - 1) {
-      out.push(std::io::IoSlice::new(chunk));
+
+    for (chunk, _) in iter {
+      if count >= out.len() {
+        break;
+      }
+      out[count] = std::io::IoSlice::new(chunk);
+      count += 1;
     }
+    count
   }
 
   /// Advances the write cursor by `n` bytes, popping fully-consumed chunks and
   /// decrementing `message_count` for each popped chunk's logical message tally.
-  pub(crate) fn advance(&mut self, mut n: usize) {
+  /// Advances the write cursor by `n` bytes, popping fully-consumed chunks and
+  /// decrementing `message_count` for each popped chunk's logical message tally.
+  /// Returns the number of logical messages popped during this advancement.
+  pub(crate) fn advance(&mut self, mut n: usize) -> usize {
     self.total_bytes = self.total_bytes.saturating_sub(n);
+    let mut popped_messages = 0;
     while n > 0 {
       if let Some((front, _)) = self.chunks.front() {
         let remaining = front.len() - self.write_offset;
@@ -72,6 +103,7 @@ impl EgressBuffer {
           n -= remaining;
           let (_, mc) = self.chunks.pop_front().unwrap();
           self.message_count = self.message_count.saturating_sub(mc);
+          popped_messages += mc; // Accumulate popped messages
           self.write_offset = 0;
         } else {
           self.write_offset += n;
@@ -81,6 +113,7 @@ impl EgressBuffer {
         break;
       }
     }
+    popped_messages
   }
 
   pub(crate) fn pending_messages(&self) -> usize {

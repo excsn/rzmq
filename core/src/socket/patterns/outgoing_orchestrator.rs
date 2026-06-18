@@ -1,33 +1,25 @@
 use std::sync::Arc;
 
-use dashmap::DashMap;
-
 use crate::error::ZmqError;
 use crate::message::FrameBatch;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::patterns::LoadBalancer;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct OutgoingMessageOrchestrator {
   load_balancer: LoadBalancer,
-  active_connections: DashMap<String, Arc<dyn ISocketConnection>>,
 }
 
 impl OutgoingMessageOrchestrator {
   pub fn new() -> Self {
-    Self {
-      load_balancer: LoadBalancer::new(),
-      active_connections: DashMap::new(),
-    }
+    Self::default()
   }
 
   pub fn add_connection(&self, uri: String, iface: Arc<dyn ISocketConnection>) {
-    self.active_connections.insert(uri.clone(), iface);
-    self.load_balancer.add_connection(uri);
+    self.load_balancer.add_connection(uri, iface);
   }
 
   pub fn remove_connection(&self, uri: &str) {
-    self.active_connections.remove(uri);
     self.load_balancer.remove_connection(uri);
   }
 
@@ -52,19 +44,19 @@ impl OutgoingMessageOrchestrator {
     mut msgs: FrameBatch,
     wait_for_peer: bool,
   ) -> Result<(), (FrameBatch, ZmqError)> {
-    let mut max_attempts = self.load_balancer.connection_count().await.max(1);
+    let mut max_attempts = self.load_balancer.connection_count().max(1);
     let mut attempts: usize = 0;
 
     loop {
-      let uri = match self.load_balancer.get_next_connection_uri() {
-        Some(u) => u,
+      let peer = match self.load_balancer.get_next_connection() {
+        Some(p) => p,
         None => {
           if !wait_for_peer {
             return Err((msgs, ZmqError::ResourceLimitReached));
           }
           match self.load_balancer.wait_for_connection().await {
             Ok(()) => {
-              max_attempts = self.load_balancer.connection_count().await.max(1);
+              max_attempts = self.load_balancer.connection_count().max(1);
               attempts = 0;
               continue;
             }
@@ -73,21 +65,21 @@ impl OutgoingMessageOrchestrator {
         }
       };
 
-      let iface = match self.active_connections.get(&uri) {
-        Some(entry) => entry.value().clone(),
-        None => {
-          self.load_balancer.remove_connection(&uri);
-          continue;
-        }
-      };
-
-      match iface.try_send_multipart_owned(msgs).await {
+      // FAST PATH: Zero-allocation synchronous push
+      match peer.iface.try_send_multipart_owned_sync(msgs) {
         Ok(()) => return Ok(()),
-        Err((returned, ZmqError::ResourceLimitReached)) if !returned.is_empty() => {
+        Err((returned, ZmqError::ResourceLimitReached)) => {
           msgs = returned;
           attempts += 1;
           if attempts >= max_attempts {
-            return Err((msgs, ZmqError::ResourceLimitReached));
+            // SLOW PATH: All peers are full. Fall back to the async path to properly block.
+            match peer.iface.send_multipart_owned(msgs).await {
+              Ok(()) => return Ok(()),
+              Err((returned, ZmqError::ResourceLimitReached)) => {
+                return Err((returned, ZmqError::ResourceLimitReached));
+              }
+              Err((_, e)) => return Err((FrameBatch::new(), e)),
+            }
           }
         }
         Err((_, e)) => return Err((FrameBatch::new(), e)),

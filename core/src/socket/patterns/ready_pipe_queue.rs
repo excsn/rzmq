@@ -1,6 +1,6 @@
+use std::collections::HashMap;
 #[cfg(feature = "io-uring")]
 use std::sync::OnceLock;
-use std::collections::HashMap;
 use std::sync::{
   Arc,
   atomic::{AtomicBool, Ordering},
@@ -154,8 +154,16 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
           Some(slot) => match slot.rx.try_recv() {
             Ok(item) => {
               if slot.rx.is_empty() {
-                // No more items: allow the next send to re-activate.
+                // Allow next send to re-activate
                 slot.is_activated.store(false, Ordering::Release);
+
+                // Did a producer push an item after our try_recv
+                // but before we stored false?
+                if !slot.rx.is_empty() {
+                  if !slot.is_activated.swap(true, Ordering::AcqRel) {
+                    let _ = self.activation_tx.try_send(pipe_id);
+                  }
+                }
               } else {
                 // More items remain: re-queue for round-robin.
                 let _ = self.activation_tx.try_send(pipe_id);

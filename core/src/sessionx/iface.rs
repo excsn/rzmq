@@ -94,28 +94,33 @@ impl ISocketConnection for ScaConnectionIface {
     }
   }
 
-  async fn try_send_multipart_owned(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
+  async fn send_multipart_owned(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
     match self.pipe_sender.try_send(msgs) {
       Ok(()) => Ok(()),
       Err(TrySendError::Closed(returned)) => Err((returned, ZmqError::ConnectionClosed)),
       Err(TrySendError::Full(returned)) if self.sndtimeo == Some(Duration::ZERO) => {
         Err((returned, ZmqError::ResourceLimitReached))
       }
-      Err(TrySendError::Full(returned)) => {
-        match self.sndtimeo {
-          None => match self.pipe_sender.send(returned).await {
-            Ok(()) => Ok(()),
-            Err(_) => Err((FrameBatch::new(), ZmqError::ConnectionClosed)),
-          },
-          Some(duration) => {
-            match timeout(duration, self.pipe_sender.send(returned)).await {
-              Ok(Ok(())) => Ok(()),
-              Ok(Err(_)) => Err((FrameBatch::new(), ZmqError::ConnectionClosed)),
-              Err(_) => Err((FrameBatch::new(), ZmqError::Timeout)),
-            }
-          }
-        }
-      }
+      Err(TrySendError::Full(returned)) => match self.sndtimeo {
+        None => match self.pipe_sender.send(returned).await {
+          Ok(()) => Ok(()),
+          Err(_) => Err((FrameBatch::new(), ZmqError::ConnectionClosed)),
+        },
+        Some(duration) => match timeout(duration, self.pipe_sender.send(returned)).await {
+          Ok(Ok(())) => Ok(()),
+          Ok(Err(_)) => Err((FrameBatch::new(), ZmqError::ConnectionClosed)),
+          Err(_) => Err((FrameBatch::new(), ZmqError::Timeout)),
+        },
+      },
+      Err(TrySendError::Sent(_)) => unreachable!(),
+    }
+  }
+
+  fn try_send_multipart_owned_sync(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
+    match self.pipe_sender.try_send(msgs) {
+      Ok(()) => Ok(()),
+      Err(TrySendError::Full(returned)) => Err((returned, ZmqError::ResourceLimitReached)),
+      Err(TrySendError::Closed(returned)) => Err((returned, ZmqError::ConnectionClosed)),
       Err(TrySendError::Sent(_)) => unreachable!(),
     }
   }

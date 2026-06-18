@@ -6,6 +6,7 @@ members = ["bench", "cli", "core", "interop"]
 authors = ["Excerion Sun <dev@excsn.com>", "Norm O <normo.pub@gmail.com>"]
 
 [workspace.dependencies]
+fibre = { version = "^0.5" }
 x25519-dalek = { package = "xs_x25519-dalek", version = "^2.0", features = ["static_secrets"] }
 tracing = "^0.1"
 tracing-subscriber = { version = "^0.3", features = ["env-filter"] }

@@ -1,14 +1,22 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt;
-use std::net::SocketAddr; // Example key type
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 
 /// A type map for associating arbitrary typed data with a `Msg`.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Metadata {
-  // Use Arc for cheap cloning of metadata map itself
-  inner: Arc<tokio::sync::RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
+  // OnceLock ensures zero-allocation until get_or_init is called.
+  inner: OnceLock<Arc<tokio::sync::RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>>,
+}
+
+impl Default for Metadata {
+  fn default() -> Self {
+    Self {
+      inner: OnceLock::new(), // Zero cost, no heap allocation
+    }
+  }
 }
 
 impl Metadata {
@@ -18,68 +26,84 @@ impl Metadata {
   }
 
   /// Inserts a typed value into the map.
-  /// If the map did not have this type present, `None` is returned.
-  /// If the map did have this type present, the value is updated,
-  /// and the old value is returned.
   pub async fn insert_typed<T: Any + Send + Sync>(
-    &self, // Changed to &self as inner is Arc<RwLock>
+    &self,
     value: T,
   ) -> Option<Arc<dyn Any + Send + Sync>> {
-    let mut map = self.inner.write().await; // Async write lock
+    // Safely lazily allocate the Arc<RwLock<HashMap>> only on the first write
+    let map_arc = self
+      .inner
+      .get_or_init(|| Arc::new(tokio::sync::RwLock::new(HashMap::new())));
+
+    let mut map = map_arc.write().await;
     map.insert(TypeId::of::<T>(), Arc::new(value))
   }
 
   /// Gets an immutable reference to a typed value if present.
   pub async fn get<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
-    let map = self.inner.read().await; // Async read lock
-    map.get(&TypeId::of::<T>()).and_then(|arc_any| {
-      // Use Arc::downcast for safe casting
-      arc_any.clone().downcast::<T>().ok()
-    })
+    let map_arc = self.inner.get()?; // Returns None instantly if uninitialized
+    let map = map_arc.read().await;
+    map
+      .get(&TypeId::of::<T>())
+      .and_then(|arc_any| arc_any.clone().downcast::<T>().ok())
   }
 
   /// Checks if a value of type T is present.
   pub async fn contains<T: Any + Send + Sync>(&self) -> bool {
-    let map = self.inner.read().await;
+    let map_arc = match self.inner.get() {
+      Some(arc) => arc,
+      None => return false,
+    };
+    let map = map_arc.read().await;
     map.contains_key(&TypeId::of::<T>())
   }
 
   /// Removes a value of type T, returning it.
   pub async fn remove<T: Any + Send + Sync>(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-    let mut map = self.inner.write().await;
+    let map_arc = self.inner.get()?;
+    let mut map = map_arc.write().await;
     map.remove(&TypeId::of::<T>())
   }
 
   /// Checks if the metadata map is empty.
   pub async fn is_empty(&self) -> bool {
-    self.inner.read().await.is_empty()
+    let map_arc = match self.inner.get() {
+      Some(arc) => arc,
+      None => return true,
+    };
+    map_arc.read().await.is_empty()
   }
 
   /// Returns the number of entries in the metadata map.
   pub async fn len(&self) -> usize {
-    self.inner.read().await.len()
+    let map_arc = match self.inner.get() {
+      Some(arc) => arc,
+      None => return 0,
+    };
+    map_arc.read().await.len()
   }
 }
 
-// Manual debug implementation as RwLock doesn't impl Debug well
 impl fmt::Debug for Metadata {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    // Best effort: just indicate presence without locking in Debug
-    f.debug_struct("Metadata").finish_non_exhaustive()
+    if self.inner.get().is_some() {
+      f.debug_struct("Metadata")
+        .field("initialized", &true)
+        .finish_non_exhaustive()
+    } else {
+      f.debug_struct("Metadata")
+        .field("initialized", &false)
+        .finish_non_exhaustive()
+    }
   }
 }
 
-// --- Example Standard Metadata Key Types ---
-
-/// Metadata key for the network address of the peer.
+// --- Standard Metadata Key Types ---
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerAddress(pub SocketAddr);
 
-/// Metadata key for the authenticated User ID (e.g., from ZAP).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ZapUserId(pub String);
-
-// Add other standard keys as needed (e.g., RoutingId)
 
 #[cfg(test)]
 mod additional_metadata_tests {

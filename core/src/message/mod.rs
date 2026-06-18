@@ -14,4 +14,4 @@ use smallvec::SmallVec;
 
 /// A stack-allocated batch of message frames for a single logical ZMQ message.
 /// 99% of ZMQ messages fit within 4 frames (Identity, Delimiter, Payload, …).
-pub type FrameBatch = SmallVec<[Msg; 4]>;
+pub type FrameBatch = SmallVec<[Msg; 2]>;

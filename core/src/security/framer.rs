@@ -1,6 +1,6 @@
 use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg, MsgFlags};
-use crate::protocol::zmtp::{manual_parser::ZmtpManualParser, ZmtpCodec};
+use crate::protocol::zmtp::{ZmtpCodec, manual_parser::ZmtpManualParser};
 use crate::security::IDataCipher;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::Encoder;
@@ -100,11 +100,42 @@ impl ISecureFramer for NullFramer {
   }
 
   fn write_msg_batch(&mut self, batch: &[FrameBatch]) -> Result<Bytes, ZmqError> {
-    self.coalesce_buffer.clear();
-    let mut codec = ZmtpCodec::new();
+    self.coalesce_buffer.clear(); // Important for anti corruption
+
+    // 1. Pre-calculate required capacity to do exactly ONE allocation per batch
+    let mut total_len = 0;
     for msgs in batch {
       for msg in msgs {
-        codec.encode(msg.clone(), &mut self.coalesce_buffer)?;
+        let len = msg.size();
+        total_len += if len <= 255 { 2 + len } else { 9 + len };
+      }
+    }
+    self.coalesce_buffer.reserve(total_len);
+
+    // 2. Direct byte-writing loop (bypassing ZmtpCodec and Msg::clone entirely)
+    for msgs in batch {
+      for msg in msgs {
+        let data = msg.data().unwrap_or(&[]);
+        let size = data.len();
+        let flags = msg.flags();
+
+        let mut zmtp_flags = 0u8;
+        if flags.contains(MsgFlags::MORE) {
+          zmtp_flags |= crate::protocol::zmtp::command::ZMTP_FLAG_MORE;
+        }
+        if flags.contains(MsgFlags::COMMAND) {
+          zmtp_flags |= crate::protocol::zmtp::command::ZMTP_FLAG_COMMAND;
+        }
+
+        if size <= 255 {
+          self.coalesce_buffer.put_u8(zmtp_flags);
+          self.coalesce_buffer.put_u8(size as u8);
+        } else {
+          zmtp_flags |= crate::protocol::zmtp::command::ZMTP_FLAG_LONG;
+          self.coalesce_buffer.put_u8(zmtp_flags);
+          self.coalesce_buffer.put_u64(size as u64);
+        }
+        self.coalesce_buffer.put_slice(data);
       }
     }
     Ok(self.coalesce_buffer.split().freeze())
