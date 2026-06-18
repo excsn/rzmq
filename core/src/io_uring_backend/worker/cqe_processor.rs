@@ -46,12 +46,6 @@ pub(crate) fn process_handler_blueprint(
     return Err(blueprint);
   }
 
-  #[cfg(debug_assertions)]
-  worker
-    .metrics
-    .sqes_submitted
-    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
   match blueprint {
     HandlerSqeBlueprint::RequestSetCork(enable) => {
       let cork_val: i32 = if enable { 1 } else { 0 };
