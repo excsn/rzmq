@@ -141,6 +141,7 @@ pub struct UringWorkerInterface<'cfg_life> {
   // This is needed by the handler to correctly populate blueprints.
   pub current_external_op_ud: UserData,
   pub pending_egress_count: usize,
+  pub is_write_completion: bool,
 }
 
 impl<'cfg_life> UringWorkerInterface<'cfg_life> {
@@ -151,6 +152,7 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
     default_bgid_for_handler_use: Option<u16>,
     current_external_op_ud: UserData,
     pending_egress_count: usize,
+    is_write_completion: bool,
   ) -> Self {
     Self {
       fd,
@@ -159,6 +161,7 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
       default_bgid_for_handler_use,
       current_external_op_ud,
       pending_egress_count,
+      is_write_completion
     }
   }
   // Methods for handlers to get info, but not to directly queue ops.

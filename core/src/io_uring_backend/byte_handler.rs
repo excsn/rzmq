@@ -29,23 +29,15 @@ pub(crate) enum EgressChunk {
 }
 
 use crate::io_uring_backend::{
-  buffer_manager::BufferRingManager,
-  connection_handler::{
+  ZC_SEND_THRESHOLD, buffer_manager::BufferRingManager, connection_handler::{
     HandlerIoOps, HandlerSqeBlueprint, OutgoingMessage, UringConnectionHandler, UringWorkerInterface,
     WorkerIoConfig,
-  },
-  ops::{UserData, HANDLER_INTERNAL_SEND_OP_UD},
-  send_buffer_pool::{RegisteredSendBufferId, SendBufferLease, SendBufferPool},
-  worker::{InternalOpTracker, MultishotReader},
+  }, ops::{HANDLER_INTERNAL_SEND_OP_UD, UserData}, send_buffer_pool::{RegisteredSendBufferId, SendBufferLease, SendBufferPool}, worker::{InternalOpTracker, MultishotReader}
 };
 use crate::message::{FrameBatch, Msg};
 use crate::runtime::MailboxSyncSender;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::ZmqError;
-
-/// Minimum payload size (bytes) above which we attempt a zero-copy send.
-/// Below this threshold the `ioctl`/registration overhead outweighs the copy cost.
-const ZC_SEND_THRESHOLD: usize = 1024;
 
 #[derive(Debug)]
 struct DummySocketConnection;

@@ -1,6 +1,7 @@
 #![cfg(feature = "io-uring")]
 
-use super::{cqe_processor, ExternalOpContext, UringWorker};
+use super::{ExternalOpContext, UringWorker, cqe_processor};
+use crate::ZmqError;
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
   HandlerSqeBlueprint, UringWorkerInterface, WorkerIoConfig,
@@ -12,7 +13,6 @@ use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerS
 use crate::io_uring_backend::zmtp_handler::{ZmtpSmartConnection, ZmtpUringHandler};
 use crate::protocol::zmtp::engine::ZmtpEngine;
 use crate::uring::UringPollingStrategy;
-use crate::ZmqError;
 
 use crate::profiler::LoopProfiler;
 use crate::transport::endpoint::parse_endpoint;
@@ -31,7 +31,12 @@ use tracing::{debug, error, info, trace, warn};
 // Constants for the kernel polling strategy
 const KERNEL_POLL_INITIAL: Duration = Duration::from_millis(1);
 const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(128);
-const MAX_BATCHES_PER_ITERATION: usize = 64;
+const MAX_BATCHES_PER_ITERATION: usize = 512;
+
+//TODO Consider replacing this with user controlled socket option
+/// Maximum number of egress blueprints or channel messages processed in a single pass
+/// Larger numbers allow for deeper pipelining and better coalescing
+const DEFAULT_WORKER_BATCH_LIMIT: usize = 256;
 
 // Helper from the original `sqe_builder` module, now integrated here.
 fn socket_addr_to_sockaddr_storage(
@@ -76,8 +81,7 @@ impl UringWorker {
 
     trace!(
       "UringWorker: Handling external op request: {}, ud: {}",
-      op_name_str,
-      user_data
+      op_name_str, user_data
     );
 
     match request {
@@ -598,7 +602,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           let pending_count = worker.work_map.get(&fd).map_or(0, |w| {
             w.ingress_blueprints.len() + w.egress_blueprints.len()
           });
-          if pending_count >= 16 {
+          if pending_count >= DEFAULT_WORKER_BATCH_LIMIT {
             continue; // Backpressure: leave messages in the bounded channel
           }
           if let Some(handler) = worker.handler_manager.get_mut(fd) {
@@ -618,6 +622,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                   worker.default_buffer_ring_group_id_val,
                   0,
                   pending_egress,
+                  false,
                 );
                 let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
                 worker
@@ -626,7 +631,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                   .or_default()
                   .route_blueprints(ops_output.sqe_blueprints);
                 converted += 1;
-                if converted >= 16 {
+                if converted >= DEFAULT_WORKER_BATCH_LIMIT {
                   break;
                 }
               }
@@ -679,6 +684,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               worker.default_buffer_ring_group_id_val,
               0,
               pending_egress,
+              false,
             );
             let close_io_ops = handler.close_initiated(&interface);
             if !close_io_ops.sqe_blueprints.is_empty() {
@@ -835,10 +841,15 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 );
                 break;
               } else {
+                #[cfg(debug_assertions)]
+                worker
+                  .metrics
+                  .sqe_op_read
+                  .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                 trace!(
                   "UringWorker: Queued new standard read for FD {}. UD: {}",
-                  fd,
-                  user_data
+                  fd, user_data
                 );
               }
             }
@@ -861,7 +872,13 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
         {
           let mut sq = unsafe { worker.ring.submission_shared() };
-          worker.event_fd_poller.try_submit_initial_poll_sqe(&mut sq);
+          if worker.event_fd_poller.try_submit_initial_poll_sqe(&mut sq) {
+            #[cfg(debug_assertions)]
+            worker
+              .metrics
+              .sqe_op_eventfd
+              .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          }
         }
 
         let sq_len = unsafe { worker.ring.submission_shared().len() };

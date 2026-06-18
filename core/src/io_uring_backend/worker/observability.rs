@@ -1,9 +1,9 @@
 #![cfg(feature = "io-uring")]
 
 #[cfg(debug_assertions)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(debug_assertions)]
 use std::sync::Arc;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(debug_assertions)]
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,12 @@ pub struct UringMetrics {
   pub ecanceled_errors: AtomicU64,
   pub einval_errors: AtomicU64,
   pub other_errors: AtomicU64,
+
+  pub sqe_op_read: AtomicU64,
+  pub sqe_op_write: AtomicU64,
+  pub sqe_op_poll: AtomicU64,
+  pub sqe_op_eventfd: AtomicU64,
+  pub sqe_op_other: AtomicU64,
 
   // Live queue & lock status (gauges, not counters)
   pub write_in_flight_state: AtomicU64,
@@ -310,6 +316,24 @@ pub(crate) fn spawn_observability_thread(metrics: Arc<UringMetrics>) {
                     r_epipe, r_ebadf, r_ecanceled, r_einval, r_other_errs,
                     inflight_lock, q_len
                 );
+
+                let op_read  = metrics.sqe_op_read.load(Ordering::Relaxed);
+                let op_write = metrics.sqe_op_write.load(Ordering::Relaxed);
+                let op_poll  = metrics.sqe_op_poll.load(Ordering::Relaxed);
+                let op_evfd  = metrics.sqe_op_eventfd.load(Ordering::Relaxed);
+                let op_other = metrics.sqe_op_other.load(Ordering::Relaxed);
+
+                println!(
+                    "[uring-ops PID:{}] OP_READ/s={} OP_WRITE/s={} OP_POLL/s={} OP_EVENTFD/s={} OP_OTHER/s={}",
+                    pid, op_read, op_write, op_poll, op_evfd, op_other
+                );
+
+                // Reset them for the next second's rate calculation
+                metrics.sqe_op_read.store(0, Ordering::Relaxed);
+                metrics.sqe_op_write.store(0, Ordering::Relaxed);
+                metrics.sqe_op_poll.store(0, Ordering::Relaxed);
+                metrics.sqe_op_eventfd.store(0, Ordering::Relaxed);
+                metrics.sqe_op_other.store(0, Ordering::Relaxed);
 
                 last_check   = now;
                 last_loops   = loops;

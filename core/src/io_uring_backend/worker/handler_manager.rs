@@ -108,6 +108,7 @@ impl HandlerManager {
       default_bgid_val_from_worker,
       originating_op_ud_for_connection,
       0,
+      false,
     );
 
     let initial_ops = handler_box.connection_ready(&interface_for_ready);
@@ -139,6 +140,7 @@ impl HandlerManager {
       default_bgid,
       originating_op_ud,
       0,
+      false,
     );
     let initial_ops = handler.connection_ready(&interface);
     self.handlers.insert(fd, handler);
@@ -200,6 +202,7 @@ impl HandlerManager {
         default_bgid_val_from_worker,
         PREPARE_SQES_SENTINEL_UD,
         pending_egress,
+        false,
       );
       trace!("HandlerManager: Calling prepare_sqes for FD {}", fd);
       let handler_output = handler.prepare_sqes(&interface);

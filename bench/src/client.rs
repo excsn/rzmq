@@ -276,8 +276,8 @@ async fn run_throughput_worker(
   socket.set_option(SNDHWM, hwm as i32).await?;
   socket.set_option(TCP_CORK, cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
-  socket.set_option(SNDBUF, 65536i32).await?;
-  socket.set_option(RCVBUF, 65536i32).await?;
+  socket.set_option(SNDBUF, 4 * 1024 * 1024i32).await?;
+  socket.set_option(RCVBUF, 4 * 1024 * 1024i32).await?;
 
   #[cfg(feature = "io-uring")]
   if use_io_uring {

@@ -67,7 +67,7 @@ pub struct Cli {
   pub pipeline: usize,
 
   /// High-Water Mark (HWM) limit applied to socket queues
-  #[arg(long, default_value_t = 1000)]
+  #[arg(long, default_value_t = 1024)]
   pub hwm: usize,
 
   /// Enable TCP_CORK on Linux to aggregate small packets

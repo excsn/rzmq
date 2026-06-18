@@ -30,8 +30,8 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
   socket.set_option(RCVHWM, args.hwm as i32).await?;
   socket.set_option(TCP_CORK, args.cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
-  socket.set_option(SNDBUF, 65536i32).await?;
-  socket.set_option(RCVBUF, 65536i32).await?;
+  socket.set_option(SNDBUF, 4 * 1024 * 1024i32).await?;
+  socket.set_option(RCVBUF, 4 * 1024 * 1024i32).await?;
 
   // Configure Linux-specific io_uring options if compiled and enabled
   #[cfg(feature = "io-uring")]

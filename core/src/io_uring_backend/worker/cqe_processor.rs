@@ -6,12 +6,12 @@ use super::internal_op_tracker::{
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringWorkerInterface,
 };
-use crate::io_uring_backend::ops::{UringOpCompletion, UserData, HANDLER_INTERNAL_SEND_OP_UD};
-use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
+use crate::io_uring_backend::ops::{HANDLER_INTERNAL_SEND_OP_UD, UringOpCompletion, UserData};
 use crate::io_uring_backend::worker::UringWorker;
+use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
 use crate::message::{FrameBatch, Msg};
 use crate::socket::connection_iface::DummyConnection;
-use crate::{uring, Command, ZmqError};
+use crate::{Command, ZmqError, uring};
 
 use io_uring::cqueue::Entry;
 use io_uring::{cqueue, opcode, squeue, types};
@@ -69,6 +69,7 @@ pub(crate) fn process_handler_blueprint(
         InternalOpPayload::None,
       );
       entry = entry.user_data(user_data);
+
       unsafe {
         if sq.push(&entry).is_err() {
           debug!(
@@ -78,11 +79,15 @@ pub(crate) fn process_handler_blueprint(
           internal_ops.take_op_details(user_data);
           return Err(HandlerSqeBlueprint::RequestSetCork(enable));
         } else {
+          #[cfg(debug_assertions)]
+          worker
+            .metrics
+            .sqe_op_other
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
           trace!(
             "CQE Processor: Queued SetSockOpt(cork={}) SQE (ud:{}) for FD {}.",
-            enable,
-            user_data,
-            fd
+            enable, user_data, fd
           );
         }
       }
@@ -114,6 +119,7 @@ pub(crate) fn process_handler_blueprint(
         .build();
       let user_data = internal_ops.new_op_id(fd, InternalOpType::Send, op_payload);
       entry = entry.user_data(user_data);
+
       unsafe {
         if sq.push(&entry).is_err() {
           debug!(
@@ -137,10 +143,15 @@ pub(crate) fn process_handler_blueprint(
           }
           unreachable!("SendBuffer payload expected after RequestSend registration");
         } else {
+          #[cfg(debug_assertions)]
+          worker
+            .metrics
+            .sqe_op_write
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
           trace!(
             "CQE Processor: Queued Send SQE (ud:{}) for FD {}.",
-            user_data,
-            fd
+            user_data, fd
           );
         }
       }
@@ -222,6 +233,7 @@ pub(crate) fn process_handler_blueprint(
       let mut entry = zc_entry.expect("entry set in both ZC and fallback paths");
       let user_data = internal_ops.new_op_id(fd, op_type, op_payload);
       entry = entry.user_data(user_data);
+
       unsafe {
         if sq.push(&entry).is_err() {
           debug!(
@@ -262,10 +274,14 @@ pub(crate) fn process_handler_blueprint(
           };
           return Err(requeue);
         } else {
+          #[cfg(debug_assertions)]
+          worker
+            .metrics
+            .sqe_op_write
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
           trace!(
             "CQE Processor: Queued SendZeroCopy/Send SQE (ud:{}) for FD {}.",
-            user_data,
-            fd
+            user_data, fd
           );
         }
       }
@@ -278,7 +294,7 @@ pub(crate) fn process_handler_blueprint(
       batch_count,
     } => {
       #[cfg(debug_assertions)]
-      worker.metrics.record_write_batch(batch_count as u64); 
+      worker.metrics.record_write_batch(batch_count as u64);
       let total_len: usize = bufs.iter().map(|b| b.len()).sum();
 
       // Convert to a Box before taking the pointer. `into_boxed_slice()` may
@@ -305,6 +321,7 @@ pub(crate) fn process_handler_blueprint(
       let user_data = internal_ops.new_op_id(fd, InternalOpType::SendRawVectored, op_payload);
       let mut entry = opcode::Writev::new(types::Fd(fd), iov_ptr, iov_len).build();
       entry = entry.user_data(user_data);
+
       unsafe {
         if sq.push(&entry).is_err() {
           debug!(
@@ -321,11 +338,15 @@ pub(crate) fn process_handler_blueprint(
           }
           unreachable!();
         } else {
+          #[cfg(debug_assertions)]
+          worker
+            .metrics
+            .sqe_op_write
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
           trace!(
             "CQE Processor: Queued raw Writev SQE (ud:{}, iovecs:{}) for FD {}.",
-            user_data,
-            iov_len,
-            fd
+            user_data, iov_len, fd
           );
         }
       }
@@ -339,6 +360,7 @@ pub(crate) fn process_handler_blueprint(
         .build();
       let user_data = internal_ops.new_op_id(fd, InternalOpType::SendZeroCopyLeased, op_payload);
       entry = entry.user_data(user_data);
+
       unsafe {
         if sq.push(&entry).is_err() {
           debug!(
@@ -353,10 +375,14 @@ pub(crate) fn process_handler_blueprint(
           }
           return Err(HandlerSqeBlueprint::RequestSendZeroCopyLeased { id, ptr, len });
         } else {
+          #[cfg(debug_assertions)]
+          worker
+            .metrics
+            .sqe_op_write
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
           trace!(
             "CQE Processor: Queued SendZcLeased SQE (ud:{}) for FD {}.",
-            user_data,
-            fd
+            user_data, fd
           );
         }
       }
@@ -367,6 +393,7 @@ pub(crate) fn process_handler_blueprint(
       let mut entry = opcode::Close::new(types::Fd(fd)).build();
       let user_data = internal_ops.new_op_id(fd, InternalOpType::CloseFd, InternalOpPayload::None);
       entry = entry.user_data(user_data);
+
       unsafe {
         if sq.push(&entry).is_err() {
           debug!(
@@ -376,10 +403,15 @@ pub(crate) fn process_handler_blueprint(
           internal_ops.take_op_details(user_data);
           return Err(HandlerSqeBlueprint::RequestClose);
         } else {
+          #[cfg(debug_assertions)]
+          worker
+            .metrics
+            .sqe_op_other
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
           trace!(
             "CQE Processor: Queued Close SQE (ud:{}) for FD {}.",
-            user_data,
-            fd
+            user_data, fd
           );
         }
       }
@@ -402,6 +434,7 @@ pub(crate) fn process_handler_blueprint(
       let entry = opcode::RecvMulti::new(types::Fd(fd), bgid)
         .build()
         .user_data(op_user_data);
+
       unsafe {
         if sq.push(&entry).is_err() {
           debug!(
@@ -411,10 +444,15 @@ pub(crate) fn process_handler_blueprint(
           internal_ops.take_op_details(op_user_data);
           return Err(HandlerSqeBlueprint::RequestNewRingReadMultishot { fd: bp_fd, bgid });
         } else {
+          #[cfg(debug_assertions)]
+          worker
+            .metrics
+            .sqe_op_read
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
           trace!(
             "CQE Processor: Queued RecvMulti SQE (ud:{}) for FD {}.",
-            op_user_data,
-            fd
+            op_user_data, fd
           );
           if let Some(handler) = handler_manager.get_mut(fd) {
             handler.inform_multishot_reader_op_submitted(op_user_data, false, None);
@@ -448,6 +486,7 @@ pub(crate) fn process_handler_blueprint(
       let entry = opcode::AsyncCancel::new(target_user_data)
         .build()
         .user_data(cancel_op_user_data);
+
       unsafe {
         if sq.push(&entry).is_err() {
           debug!(
@@ -460,11 +499,15 @@ pub(crate) fn process_handler_blueprint(
             target_user_data,
           });
         } else {
+          #[cfg(debug_assertions)]
+          worker
+            .metrics
+            .sqe_op_other
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
           trace!(
             "CQE Processor: Queued AsyncCancel SQE (ud:{}, target_ud:{}) for FD {}.",
-            cancel_op_user_data,
-            target_user_data,
-            fd
+            cancel_op_user_data, target_user_data, fd
           );
           if let Some(handler) = handler_manager.get_mut(fd) {
             handler.inform_multishot_reader_op_submitted(
@@ -510,9 +553,7 @@ pub(crate) fn process_all_cqes(
 
     trace!(
       "[CQE Proc] CQE: ud={}, res={}, flags={:x}",
-      cqe_user_data,
-      cqe_result,
-      cqe_flags
+      cqe_user_data, cqe_result, cqe_flags
     );
 
     if worker.event_fd_poller.handle_cqe_if_matches(
@@ -538,9 +579,7 @@ pub(crate) fn process_all_cqes(
     if let Some(mut ext_op_ctx) = worker.external_op_tracker.take_op(cqe_user_data) {
       trace!(
         "[CQE Proc] EXTERNAL op '{}' (ud:{}, res:{})",
-        ext_op_ctx.op_name,
-        cqe_user_data,
-        cqe_result
+        ext_op_ctx.op_name, cqe_user_data, cqe_result
       );
       let completion_to_send: UringOpCompletion = if cqe_result < 0 {
         let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
@@ -699,6 +738,7 @@ pub(crate) fn process_all_cqes(
             worker.default_buffer_ring_group_id_val,
             cqe_user_data,
             pending_egress,
+            false,
           );
           if let Some(delegation_result) = handler.delegate_cqe_to_multishot_reader(
             &cqe,
@@ -758,10 +798,7 @@ pub(crate) fn process_all_cqes(
       let op_type = op_details.op_type;
       trace!(
         "[CQE Proc] INTERNAL op (ud:{}, type:{:?}, fd:{}, res:{}) - Final Processing",
-        cqe_user_data,
-        op_type,
-        handler_fd,
-        cqe_result
+        cqe_user_data, op_type, handler_fd, cqe_result
       );
 
       match op_type {
@@ -1229,6 +1266,7 @@ pub(crate) fn process_all_cqes(
               worker.default_buffer_ring_group_id_val,
               cqe_user_data,
               pending_egress,
+              true,
             );
             let handler_output = handler.handle_internal_sqe_completion(
               cqe_user_data,
@@ -1274,6 +1312,7 @@ pub(crate) fn process_all_cqes(
               worker.default_buffer_ring_group_id_val,
               cqe_user_data,
               pending_egress,
+              false,
             );
             let handler_output: HandlerIoOps = if op_type == InternalOpType::RingRead
               && cqueue::buffer_select(cqe_flags).is_some()

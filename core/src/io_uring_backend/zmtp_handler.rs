@@ -12,6 +12,7 @@ use bytes::Bytes;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::ZmqError;
+use crate::io_uring_backend::ZC_SEND_THRESHOLD;
 use crate::io_uring_backend::{
   buffer_manager::BufferRingManager,
   connection_handler::{
@@ -29,7 +30,9 @@ use crate::runtime::Command;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 
-const ZC_SEND_THRESHOLD: usize = 1024;
+// Low values - The worker becomes less willing to wait. The moment it accumulates 4 or 8 messages, it stops spinning, exits the loop, and commits the write.
+// High values - The worker becomes highly aggressive about building large batches. It will continue to execute micro-spins until it reaches the larger target size.
+const MICRO_COALESCE_THRESHOLD: usize = 16;
 
 pub(crate) struct ZmtpSmartConnection {
   fd: RawFd,
@@ -179,7 +182,7 @@ pub(crate) struct ZmtpUringHandler {
   send_buffer_slot_size: usize,
   /// Reusable scratch space for coalescing egress batches — avoids per-cycle heap allocation.
   coalesce_scratch: Vec<FrameBatch>,
-  write_in_flight: bool,
+  write_in_flight: u32,
   event_fd: eventfd::EventFD,
   worker_asleep: Arc<AtomicU8>,
 }
@@ -211,7 +214,7 @@ impl ZmtpUringHandler {
       use_recv_multishot,
       send_buffer_slot_size,
       coalesce_scratch: Vec::with_capacity(32),
-      write_in_flight: false,
+      write_in_flight: 0,
       event_fd,
       worker_asleep,
     }
@@ -456,10 +459,13 @@ impl UringConnectionHandler for ZmtpUringHandler {
     _sqe_user_data: UserData,
     cqe_result: i32,
     _cqe_flags: u32,
-    _interface: &UringWorkerInterface<'_>,
+    interface: &UringWorkerInterface<'_>,
   ) -> HandlerIoOps {
-    // Unlock the local serialization gate upon write completion
-    self.write_in_flight = false;
+    if interface.is_write_completion {
+      // Unlock the local serialization gate upon write completion
+      self.write_in_flight = self.write_in_flight.saturating_sub(1);
+      // println!("write in flight completed {:?}", self.write_in_flight);
+    }
 
     if cqe_result < 0 {
       error!(
@@ -494,50 +500,43 @@ impl UringConnectionHandler for ZmtpUringHandler {
       }
     }
 
-    // Low values - The worker becomes less willing to wait. The moment it accumulates 4 or 8 messages, it stops spinning, exits the loop, and commits the write.
-    // High values - The worker becomes highly aggressive about building large batches. It will continue to execute micro-spins until it reaches the larger target size.
-    const MICRO_COALESCE_THRESHOLD: usize = 16;
-
     // (b) Coalesce/Batch egress messages into a single, high-throughput write SQE.
     // Lock the queue draining if we currently have an unacknowledged write in-flight.
     if !self.is_closing
       && self.engine.phase == crate::protocol::zmtp::engine::ZmtpPhase::Data
-      && !self.write_in_flight
+      && self.write_in_flight < 1
       && interface.pending_egress_count < MICRO_COALESCE_THRESHOLD
     {
       self.coalesce_scratch.clear();
       let limit = self.engine.config().sndbatch_count.max(1);
-      let mut spin_attempts = 0;
 
-      while self.coalesce_scratch.len() < limit {
-        match self.egress_rx.try_recv() {
-          Ok(batch) => {
-            self.coalesce_scratch.push(batch);
-          }
-          Err(_) => {
-            // Adaptive Micro-Yielding: if we have some messages but are under-filled,
-            // execute a bounded CPU pause (spin_loop) to let the producer thread catch up.
-            // Only runs if the queue is active (not empty) and we haven't hit a healthy batch size (16).
-            if !self.coalesce_scratch.is_empty()
-              && self.coalesce_scratch.len() < MICRO_COALESCE_THRESHOLD
-              && spin_attempts < 4
-            {
-              spin_attempts += 1;
-              for _ in 0..32 {
-                std::hint::spin_loop(); // PAUSE instruction (low-power CPU yield)
-              }
-              continue; // Try reading from the channel again
-            }
-            break;
-          }
-        }
+      // BULK DRAIN: Acquire channel synchronization lock exactly once.
+      // First fast non-blocking bulk drain
+      let mut drained = self
+        .egress_rx
+        .try_recv_batch_mut(&mut self.coalesce_scratch, limit)
+        .unwrap_or(0);
+
+      // OPPORTUNISTIC DOUBLE-DRAIN:
+      // If we pulled an underfilled batch, execute a micro-pause (one instruction)
+      // to let the active producer task's concurrent write settle in the ring buffer,
+      // then perform one final bulk drain to top off our batch.
+      if drained > 0 && drained < limit {
+        std::hint::spin_loop(); // PAUSE instruction (low-power CPU pipeline pause)
+
+        let additional = self
+          .egress_rx
+          .try_recv_batch_mut(&mut self.coalesce_scratch, limit - drained)
+          .unwrap_or(0);
+
+        drained += additional;
       }
 
-      if !self.coalesce_scratch.is_empty() {
-        self.write_in_flight = true; // Lock the pipeline gate for vectored writes
-        let batch_count = self.coalesce_scratch.len() as u32;
+      if drained > 0 {
+        self.write_in_flight += 1; // Lock the pipeline gate for vectored writes
+        let batch_count = drained as u32;
 
-        // Use the zero-copy, vectored data path (scatter-gather via IORING_OP_WRITEV)
+        // Generate one highly-coalesced scatter-gather writev SQE
         match self.engine.frame_batch_vectored(&self.coalesce_scratch) {
           Ok(bufs) => {
             ops
@@ -659,6 +658,17 @@ impl UringConnectionHandler for ZmtpUringHandler {
     if self.is_closing {
       return true;
     }
+    
+    // PUSH and PUB sockets never receive payload data in the Data phase.
+    // This drops the EAGAIN CQE storm to exactly 0.
+    let socket_type = self.engine.config().socket_type_name.as_str();
+    if (socket_type == "PUSH" || socket_type == "PUB")
+      && self.engine.phase == crate::protocol::zmtp::engine::ZmtpPhase::Data
+    {
+      return true;
+    }
+
+
     // We must never read more from the kernel while we still have stashed batches to deliver
     if !self.spillover.is_empty() {
       return true;

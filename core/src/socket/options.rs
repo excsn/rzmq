@@ -3,9 +3,9 @@ use std::time::Duration;
 use crate::throttle::types::AdaptiveThrottleConfig;
 use crate::{Blob, CoreState, ZmqError};
 
-pub const DEFAULT_SNDBATCH_COUNT: usize = 32;
+pub const DEFAULT_SNDBATCH_COUNT: usize = 64;
 pub const DEFAULT_SNDBATCH_BYTES: usize = 256 * 1024; // 256 KB
-pub const DEFAULT_RCVBATCH_COUNT: usize = 32;
+pub const DEFAULT_RCVBATCH_COUNT: usize = 64;
 pub const DEFAULT_RCVBATCH_BYTES: usize = 256 * 1024; // 256 KB;
 
 // Use values consistent with libzmq where possible
