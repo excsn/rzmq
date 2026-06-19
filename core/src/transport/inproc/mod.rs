@@ -1,4 +1,9 @@
-#![cfg(feature = "inproc")]
+pub(crate) mod connection;
+pub(crate) mod handshake;
+pub(crate) mod types;
+
+pub(crate) use connection::DirectInprocConnection;
+pub(crate) use types::{InprocHandshakeRequest, InprocHandshakeResponse};
 
 use crate::context::Context;
 use crate::error::ZmqError;
@@ -35,7 +40,6 @@ pub(crate) async fn connect_inproc(
   let connector_uri_str = format!("inproc://{}", name);
   tracing::debug!(connector_core_handle, inproc_name = %name, "Attempting inproc connect via SCAX");
 
-  // Verify the binder exists
   let _binder_info = match core_arc.context.inner().lookup_inproc(&name) {
     Some(info) => info,
     None => {
@@ -74,7 +78,6 @@ pub(crate) async fn connect_inproc(
     }
   };
 
-  // Create the in-memory duplex pipe; binder gets one half, connector the other.
   let pipe_hwm = {
     let s = core_arc.core_state.read();
     match s.socket_type {
@@ -88,10 +91,7 @@ pub(crate) async fn connect_inproc(
   let buf_size = inproc_buffer_size(pipe_hwm);
   let (connector_stream_end, binder_stream_end) = tokio::io::duplex(buf_size);
 
-  // Spawn connector-side SCAX
   let sca_handle_id = core_arc.context.inner().next_handle();
-  // Each connection gets a unique key so multiple connectors to the same inproc name
-  // don't collide in the endpoints map.
   let connection_specific_uri = format!("inproc://{}#{}", name, sca_handle_id);
   let engine_conf = Arc::new(ZmtpEngineConfig::from(&*core_arc.core_state.read().options));
   let actor_conf = ActorConfigX {
@@ -114,8 +114,6 @@ pub(crate) async fn connect_inproc(
     None,
   );
 
-  // Publish InprocBindingRequest so the binder's SocketCore spawns its own SCAX.
-  // connector_uri carries the unique URI so the binder registers a distinct endpoint key.
   let (reply_tx, reply_rx) = oneshot::oneshot();
   let request_event = SystemEvent::InprocBindingRequest {
     target_inproc_name: name.clone(),
@@ -139,7 +137,7 @@ pub(crate) async fn connect_inproc(
       let cmd = Command::NewConnectionEstablished {
         endpoint_uri: connection_specific_uri.clone(),
         target_endpoint_uri: connector_uri_str.clone(),
-        connection_iface: None, // SocketCore creates ScaConnectionIface
+        connection_iface: None,
         interaction_model: ConnectionInteractionModel::ViaSca {
           sca_mailbox: command_sender_for_sca,
           sca_handle_id,
@@ -201,9 +199,6 @@ pub(crate) async fn unbind_inproc(name: &str, context: &Context) {
   context.inner().unregister_inproc(name);
 }
 
-/// Fallback called when `handle_user_disconnect` cannot find the endpoint in the map.
-/// For SCAX-backed connections the standard path via `ScaConnectionIface::close_connection`
-/// handles all teardown; this path only fires when the connection was never fully established.
 pub(crate) async fn disconnect_inproc(
   endpoint_uri: &str,
   core_arc: Arc<SocketCore>,
@@ -216,12 +211,6 @@ pub(crate) async fn disconnect_inproc(
   Ok(())
 }
 
-/// Calculates the duplex buffer size for an inproc connection based on the pipe's HWM.
-///
-/// Uses a sub-linear (square-root equivalent) scaling model: `8 KB * 2^(ilog2(hwm)/2)`.
-/// This decelerates growth as HWM increases, preventing memory blowouts while still
-/// differentiating meaningfully between HWM values across the full range (1–16384+).
-/// At the default HWM of 256 this yields 128 KB vs. the old formula's 2 MB.
 fn inproc_buffer_size(pipe_hwm: usize) -> usize {
   const BASE: usize = 8192;
   const MAX: usize = 1024 * 1024;
