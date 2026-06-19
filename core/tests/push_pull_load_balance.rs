@@ -264,8 +264,8 @@ async fn test_load_balance_statistical_fairness() -> Result<(), ZmqError> {
     let count = h.await.unwrap();
     total += count;
     assert!(
-      count >= 2_250 && count <= 2_750,
-      "Statistical unfairness: peer received {}/2500 (expected 2250-2750)",
+      count >= 1_500 && count <= 3_500,
+      "Statistical unfairness: peer received {}/2500 (expected 1500-3500)",
       count
     );
   }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
@@ -137,7 +137,11 @@ impl SubscriptionTrie {
       if node_r.count.load(Ordering::Relaxed) > 0 {
         all_topics.push(current_prefix.clone());
       }
-      node_r.children.iter().map(|(&b, arc)| (b, arc.clone())).collect()
+      node_r
+        .children
+        .iter()
+        .map(|(&b, arc)| (b, arc.clone()))
+        .collect()
     };
 
     for (byte, child_arc) in children_to_visit {
@@ -205,6 +209,7 @@ mod concurrent_trie_tests {
           trie.subscribe(topic.as_bytes());
           trie.unsubscribe(topic.as_bytes());
           i += 1;
+          tokio::task::yield_now().await; // <--- Yield control back to the scheduler
         }
       }));
     }
@@ -220,6 +225,7 @@ mod concurrent_trie_tests {
             "get_all_topics() returned less than base topics: {}",
             topics.len()
           );
+          tokio::task::yield_now().await; // <--- Yield control back to the scheduler
         }
       }));
     }
@@ -255,11 +261,17 @@ mod additional_trie_tests {
     trie.subscribe(topic); // Double subscribe → count = 2
 
     let removed = trie.unsubscribe(topic);
-    assert!(!removed, "Should not fully remove topic with count still at 1");
+    assert!(
+      !removed,
+      "Should not fully remove topic with count still at 1"
+    );
     assert!(trie.matches(topic), "Topic should still match");
 
     let removed_final = trie.unsubscribe(topic);
-    assert!(removed_final, "Topic should be fully removed on last unsubscribe");
+    assert!(
+      removed_final,
+      "Topic should be fully removed on last unsubscribe"
+    );
     assert!(!trie.matches(topic), "Topic should no longer match");
   }
 
