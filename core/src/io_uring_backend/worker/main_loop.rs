@@ -16,6 +16,7 @@ use crate::uring::UringPollingStrategy;
 
 use crate::profiler::LoopProfiler;
 use crate::transport::endpoint::parse_endpoint;
+use crate::{counter, declare_timer, metric_time_phase, spawn_uring_observability};
 
 use std::collections::VecDeque;
 use std::mem;
@@ -562,8 +563,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
     worker.ring.as_raw_fd()
   );
 
-  #[cfg(debug_assertions)]
-  super::observability::spawn_observability_thread(std::sync::Arc::clone(&worker.metrics));
+  spawn_uring_observability!(worker.metrics);
 
   let mut profiler = LoopProfiler::new(Duration::from_millis(10), 10000);
   let mut kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
@@ -578,11 +578,15 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           continue;
         }
 
-        // --- PHASE 1: GATHER ALL WORK ---
-        profiler.mark_segment_end_and_start_new("gather_work");
-        #[cfg(debug_assertions)]
-        let mut t_phase = std::time::Instant::now();
+        // Cross-phase variables shared across all phase blocks.
+        declare_timer!(t_phase);
         let mut work_was_available = !worker.work_map.is_empty();
+        let mut sqes_submitted_to_kernel_this_batch = 0usize;
+        let mut cqe_processed_count = 0usize;
+
+        // --- PHASE 1: GATHER ALL WORK ---
+        {
+        let _profg = profiler.profile(0, "gather_work");
 
         // 1a. Drain external commands
         while let Ok(request) = worker.op_rx.try_recv() {
@@ -697,15 +701,12 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           }
         }
 
-        #[cfg(debug_assertions)]
-        {
-          worker.metrics.add_gather_time(t_phase.elapsed());
-          t_phase = std::time::Instant::now();
-        }
+        metric_time_phase!(worker.metrics, time_gather_ns, t_phase);
+        } // end gather_work
 
         // --- PHASE 2: PROCESS THE WORK MAP WITH A BUDGET ---
-        let t_start = std::time::Instant::now();
-        profiler.mark_segment_end_and_start_new("process_work_map");
+        {
+        let _profg = profiler.profile(1, "process_work_map");
         let mut batches_processed_this_iteration = 0;
         worker.active_fds_scratch.clear();
         worker
@@ -786,16 +787,12 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             break;
           }
         }
-        #[cfg(debug_assertions)]
-        worker.metrics.add_process_time(t_start.elapsed());
+        metric_time_phase!(worker.metrics, time_process_ns, t_phase);
+        } // end process_work_map
 
         // --- PHASE 3: ENSURE READS ---
-        #[cfg(debug_assertions)]
         {
-          worker.metrics.add_process_time(t_phase.elapsed());
-          t_phase = std::time::Instant::now();
-        }
-        profiler.mark_segment_end_and_start_new("ensure_reads");
+        let _profg = profiler.profile(2, "ensure_reads");
         worker
           .handler_manager
           .fill_active_fds(&mut worker.active_fds_scratch);
@@ -841,12 +838,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 );
                 break;
               } else {
-                #[cfg(debug_assertions)]
-                worker
-                  .metrics
-                  .sqe_op_read
-                  .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
+                counter!(worker.metrics, sqe_op_read, inc);
                 trace!(
                   "UringWorker: Queued new standard read for FD {}. UD: {}",
                   fd, user_data
@@ -862,27 +854,22 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         }
         drop(sq);
 
+        metric_time_phase!(worker.metrics, time_reads_ns, t_phase);
+        } // end ensure_reads
+
         // --- PHASE 4 & 5: SUBMIT AND IDLE ---
-        #[cfg(debug_assertions)]
         {
-          worker.metrics.add_reads_time(t_phase.elapsed());
-          t_phase = std::time::Instant::now();
-        }
-        profiler.mark_segment_end_and_start_new("submit_and_idle");
+        let _profg = profiler.profile(3, "submit_and_idle");
 
         {
           let mut sq = unsafe { worker.ring.submission_shared() };
           if worker.event_fd_poller.try_submit_initial_poll_sqe(&mut sq) {
-            #[cfg(debug_assertions)]
-            worker
-              .metrics
-              .sqe_op_eventfd
-              .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            counter!(worker.metrics, sqe_op_eventfd, inc);
           }
         }
 
         let sq_len = unsafe { worker.ring.submission_shared().len() };
-        let mut sqes_submitted_to_kernel_this_batch = 0;
+        sqes_submitted_to_kernel_this_batch = 0;
         let needs_wait = !work_was_available
           && sq_len == 0
           && unsafe { worker.ring.completion_shared().is_empty() };
@@ -1034,13 +1021,9 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           }
         }
 
-        #[cfg(debug_assertions)]
-        {
-          worker.metrics.add_submit_time(t_phase.elapsed());
-          t_phase = std::time::Instant::now();
-        }
+        metric_time_phase!(worker.metrics, time_submit_ns, t_phase);
 
-        let (cqe_processed_count, newly_generated_work) =
+        let (cqe_count, newly_generated_work) =
           match cqe_processor::process_all_cqes(worker, false) {
             Ok(result) => result,
             Err(e) => {
@@ -1048,6 +1031,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               return Err(e);
             }
           };
+        cqe_processed_count = cqe_count;
 
         if !newly_generated_work.is_empty() {
           work_was_available = true;
@@ -1060,17 +1044,14 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           }
         }
 
-        #[cfg(debug_assertions)]
-        {
-          worker.metrics.add_cqe_time(t_phase.elapsed());
-          worker
-            .metrics
-            .record_cqes_reaped(cqe_processed_count as u64);
-          worker
-            .metrics
-            .record_sqes_submitted(sqes_submitted_to_kernel_this_batch as u64);
-          worker.metrics.record_loop_iteration();
+        metric_time_phase!(worker.metrics, time_cqe_ns, t_phase);
+        counter!(worker.metrics, cqes_reaped, add, cqe_processed_count as u64);
+        counter!(worker.metrics, sqes_submitted, add, sqes_submitted_to_kernel_this_batch as u64);
+        counter!(worker.metrics, loop_iterations, inc);
 
+        #[cfg(any(debug_assertions, feature = "diagnostics"))]
+        {
+          use std::sync::atomic::Ordering;
           let writes_in_flight = worker
             .internal_op_tracker
             .op_to_details
@@ -1091,8 +1072,14 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             .sum();
           worker
             .metrics
-            .record_queue_state(writes_in_flight, total_egress_q);
+            .write_in_flight_state
+            .store(writes_in_flight as u64, Ordering::Relaxed);
+          worker
+            .metrics
+            .egress_queue_len
+            .store(total_egress_q as u64, Ordering::Relaxed);
         }
+        } // end submit_and_idle
 
         if sqes_submitted_to_kernel_this_batch == 0
           && cqe_processed_count == 0

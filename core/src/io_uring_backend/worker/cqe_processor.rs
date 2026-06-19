@@ -11,7 +11,7 @@ use crate::io_uring_backend::worker::UringWorker;
 use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
 use crate::message::{FrameBatch, Msg};
 use crate::socket::connection_iface::DummyConnection;
-use crate::{Command, ZmqError, uring};
+use crate::{Command, ZmqError, uring, counter, metric_record_write_batch};
 
 use io_uring::cqueue::Entry;
 use io_uring::{cqueue, opcode, squeue, types};
@@ -73,12 +73,7 @@ pub(crate) fn process_handler_blueprint(
           internal_ops.take_op_details(user_data);
           return Err(HandlerSqeBlueprint::RequestSetCork(enable));
         } else {
-          #[cfg(debug_assertions)]
-          worker
-            .metrics
-            .sqe_op_other
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
+          counter!(worker.metrics, sqe_op_other, inc);
           trace!(
             "CQE Processor: Queued SetSockOpt(cork={}) SQE (ud:{}) for FD {}.",
             enable, user_data, fd
@@ -94,8 +89,7 @@ pub(crate) fn process_handler_blueprint(
       originating_app_op_ud,
       batch_count,
     } => {
-      #[cfg(debug_assertions)]
-      worker.metrics.record_write_batch(batch_count as u64);
+      metric_record_write_batch!(worker.metrics, batch_count as u64);
       let app_op_name_str = external_ops
         .get_op_context_ref(originating_app_op_ud)
         .map(|ctx| ctx.op_name.clone())
@@ -137,12 +131,7 @@ pub(crate) fn process_handler_blueprint(
           }
           unreachable!("SendBuffer payload expected after RequestSend registration");
         } else {
-          #[cfg(debug_assertions)]
-          worker
-            .metrics
-            .sqe_op_write
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
+          counter!(worker.metrics, sqe_op_write, inc);
           trace!(
             "CQE Processor: Queued Send SQE (ud:{}) for FD {}.",
             user_data, fd
@@ -158,8 +147,7 @@ pub(crate) fn process_handler_blueprint(
       originating_app_op_ud,
       batch_count,
     } => {
-      #[cfg(debug_assertions)]
-      worker.metrics.record_write_batch(batch_count as u64);
+      metric_record_write_batch!(worker.metrics, batch_count as u64);
       let mut submitted_via_zc_path = false;
       let mut zc_entry: Option<squeue::Entry> = None;
       let mut op_payload = InternalOpPayload::None;
@@ -268,11 +256,7 @@ pub(crate) fn process_handler_blueprint(
           };
           return Err(requeue);
         } else {
-          #[cfg(debug_assertions)]
-          worker
-            .metrics
-            .sqe_op_write
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          counter!(worker.metrics, sqe_op_write, inc);
           trace!(
             "CQE Processor: Queued SendZeroCopy/Send SQE (ud:{}) for FD {}.",
             user_data, fd
@@ -287,8 +271,7 @@ pub(crate) fn process_handler_blueprint(
       send_op_flags,
       batch_count,
     } => {
-      #[cfg(debug_assertions)]
-      worker.metrics.record_write_batch(batch_count as u64);
+      metric_record_write_batch!(worker.metrics, batch_count as u64);
       let total_len: usize = bufs.iter().map(|b| b.len()).sum();
 
       // Convert to a Box before taking the pointer. `into_boxed_slice()` may
@@ -332,12 +315,7 @@ pub(crate) fn process_handler_blueprint(
           }
           unreachable!();
         } else {
-          #[cfg(debug_assertions)]
-          worker
-            .metrics
-            .sqe_op_write
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
+          counter!(worker.metrics, sqe_op_write, inc);
           trace!(
             "CQE Processor: Queued raw Writev SQE (ud:{}, iovecs:{}) for FD {}.",
             user_data, iov_len, fd
@@ -369,11 +347,7 @@ pub(crate) fn process_handler_blueprint(
           }
           return Err(HandlerSqeBlueprint::RequestSendZeroCopyLeased { id, ptr, len });
         } else {
-          #[cfg(debug_assertions)]
-          worker
-            .metrics
-            .sqe_op_write
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          counter!(worker.metrics, sqe_op_write, inc);
           trace!(
             "CQE Processor: Queued SendZcLeased SQE (ud:{}) for FD {}.",
             user_data, fd
@@ -397,12 +371,7 @@ pub(crate) fn process_handler_blueprint(
           internal_ops.take_op_details(user_data);
           return Err(HandlerSqeBlueprint::RequestClose);
         } else {
-          #[cfg(debug_assertions)]
-          worker
-            .metrics
-            .sqe_op_other
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
+          counter!(worker.metrics, sqe_op_other, inc);
           trace!(
             "CQE Processor: Queued Close SQE (ud:{}) for FD {}.",
             user_data, fd
@@ -438,12 +407,7 @@ pub(crate) fn process_handler_blueprint(
           internal_ops.take_op_details(op_user_data);
           return Err(HandlerSqeBlueprint::RequestNewRingReadMultishot { fd: bp_fd, bgid });
         } else {
-          #[cfg(debug_assertions)]
-          worker
-            .metrics
-            .sqe_op_read
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
+          counter!(worker.metrics, sqe_op_read, inc);
           trace!(
             "CQE Processor: Queued RecvMulti SQE (ud:{}) for FD {}.",
             op_user_data, fd
@@ -493,12 +457,7 @@ pub(crate) fn process_handler_blueprint(
             target_user_data,
           });
         } else {
-          #[cfg(debug_assertions)]
-          worker
-            .metrics
-            .sqe_op_other
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
+          counter!(worker.metrics, sqe_op_other, inc);
           trace!(
             "CQE Processor: Queued AsyncCancel SQE (ud:{}, target_ud:{}) for FD {}.",
             cancel_op_user_data, target_user_data, fd
@@ -556,7 +515,7 @@ pub(crate) fn process_all_cqes(
       &mut worker.internal_op_tracker,
       is_worker_shutting_down,
     ) {
-      worker.metrics.record_wakeup();
+      counter!(worker.metrics, wakeup_signals, inc);
       if worker
         .internal_op_tracker
         .take_op_details(cqe_user_data)
@@ -979,9 +938,9 @@ pub(crate) fn process_all_cqes(
 
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOBUFS {
               if errno == libc::ENOBUFS {
-                worker.metrics.record_enobufs();
+                counter!(worker.metrics, enobufs_errors, inc);
               } else {
-                worker.metrics.record_eagain();
+                counter!(worker.metrics, eagain_errors, inc);
               }
               // Non-destructive recovery: move payload out and re-queue to front of work_map.
               let blueprint_to_requeue = match op_details.payload {

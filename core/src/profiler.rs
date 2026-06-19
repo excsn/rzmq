@@ -1,116 +1,120 @@
-// Conditional imports for profiling, only active when debug_assertions is true
 #[cfg(debug_assertions)]
-use std::time::{Duration, Instant};
-#[cfg(debug_assertions)]
-use std::vec::Vec;
-#[cfg(debug_assertions)]
-use tracing; // Assuming tracing is used for logging (already a dependency) // Explicit import for clarity if needed
+mod active {
+  use std::time::{Duration, Instant};
 
-// --- LoopProfiler definition: Active version for debug builds ---
-#[cfg(debug_assertions)]
-#[derive(Debug)]
-pub(crate) struct SegmentTiming {
-  label: &'static str,
-  duration: Duration,
-}
+  const MAX_SEGMENTS: usize = 8;
 
-#[cfg(debug_assertions)]
-#[derive(Debug)]
-pub(crate) struct LoopProfiler {
-  loop_start_time: Instant,
-  current_segment_start_time: Instant,
-  current_segment_label: &'static str,
-  segment_timings: Vec<SegmentTiming>,
-  threshold: Duration, // Only log if total loop time exceeds this
-  log_counter: usize,
-  log_interval: usize, // Log every N iterations if below threshold (if > 0)
-}
-
-#[cfg(debug_assertions)]
-impl LoopProfiler {
-  const INITIAL_SEGMENT_LABEL: &'static str = "loop_setup";
-
-  pub fn new(threshold: Duration, log_interval: usize) -> Self {
-    let now = Instant::now();
-    Self {
-      loop_start_time: now,
-      current_segment_start_time: now,
-      current_segment_label: Self::INITIAL_SEGMENT_LABEL,
-      segment_timings: Vec::with_capacity(10), // Pre-allocate
-      threshold,
-      log_counter: 0,
-      log_interval,
-    }
+  pub struct ProfileGuard<'a> {
+    profiler: &'a mut LoopProfiler,
+    index: usize,
+    start_time: Instant,
   }
 
-  pub fn loop_start(&mut self) {
-    self.loop_start_time = Instant::now();
-    self.current_segment_start_time = self.loop_start_time;
-    self.current_segment_label = Self::INITIAL_SEGMENT_LABEL;
-    self.segment_timings.clear();
-  }
-
-  pub fn mark_segment_end_and_start_new(&mut self, next_segment_label: &'static str) {
-    let now = Instant::now();
-    let ended_segment_duration = now.duration_since(self.current_segment_start_time);
-    self.segment_timings.push(SegmentTiming {
-      label: self.current_segment_label,
-      duration: ended_segment_duration,
-    });
-    self.current_segment_start_time = now;
-    self.current_segment_label = next_segment_label;
-  }
-
-  pub fn log_and_reset_for_next_loop(&mut self) {
-    let loop_end_time = Instant::now();
-    let final_segment_duration = loop_end_time.duration_since(self.current_segment_start_time);
-    self.segment_timings.push(SegmentTiming {
-      label: self.current_segment_label,
-      duration: final_segment_duration,
-    });
-
-    let total_loop_duration = loop_end_time.duration_since(self.loop_start_time);
-    self.log_counter = self.log_counter.wrapping_add(1);
-
-    if total_loop_duration > self.threshold
-      || (self.log_interval > 0 && self.log_counter % self.log_interval == 0)
-    {
-      let mut log_output = format!("[UringWorker Latency] Total: {:?}", total_loop_duration);
-      for timing in &self.segment_timings {
-        if timing.duration > Duration::from_micros(1) || timing.duration.as_nanos() > 0 {
-          log_output.push_str(&format!(", {}: {:?}", timing.label, timing.duration));
-        } else if total_loop_duration > Duration::ZERO {
-          log_output.push_str(&format!(", {}: ~0us", timing.label));
-        }
+  impl<'a> Drop for ProfileGuard<'a> {
+    #[inline(always)]
+    fn drop(&mut self) {
+      let elapsed = self.start_time.elapsed();
+      if self.index < MAX_SEGMENTS {
+        self.profiler.durations[self.index] = elapsed;
       }
-      // Use a specific tracing target for these latency logs
-      tracing::trace!(target: "rzmq::worker_latency", "{}", log_output);
+    }
+  }
+
+  pub struct LoopProfiler {
+    pub(super) loop_start_time: Instant,
+    pub(super) durations: [Duration; MAX_SEGMENTS],
+    pub(super) labels: [&'static str; MAX_SEGMENTS],
+    pub(super) threshold: Duration,
+    pub(super) log_counter: usize,
+    pub(super) log_interval: usize,
+  }
+
+  impl LoopProfiler {
+    pub fn new(threshold: Duration, log_interval: usize) -> Self {
+      Self {
+        loop_start_time: Instant::now(),
+        durations: [Duration::ZERO; MAX_SEGMENTS],
+        labels: [""; MAX_SEGMENTS],
+        threshold,
+        log_counter: 0,
+        log_interval,
+      }
     }
 
-    self.loop_start(); // Reset for the next loop iteration
+    #[inline(always)]
+    pub fn loop_start(&mut self) {
+      self.loop_start_time = Instant::now();
+      self.durations = [Duration::ZERO; MAX_SEGMENTS];
+    }
+
+    #[inline(always)]
+    pub fn profile(&mut self, index: usize, label: &'static str) -> ProfileGuard<'_> {
+      if index < MAX_SEGMENTS {
+        self.labels[index] = label;
+      }
+      ProfileGuard {
+        profiler: self,
+        index,
+        start_time: Instant::now(),
+      }
+    }
+
+    pub fn log_and_reset_for_next_loop(&mut self) {
+      let total_loop_duration = self.loop_start_time.elapsed();
+      self.log_counter = self.log_counter.wrapping_add(1);
+
+      if total_loop_duration > self.threshold
+        || (self.log_interval > 0 && self.log_counter % self.log_interval == 0)
+      {
+        tracing::trace!(
+          target: "rzmq::worker_latency",
+          total_us = total_loop_duration.as_micros(),
+          s0_label = self.labels[0], s0_us = self.durations[0].as_micros(),
+          s1_label = self.labels[1], s1_us = self.durations[1].as_micros(),
+          s2_label = self.labels[2], s2_us = self.durations[2].as_micros(),
+          s3_label = self.labels[3], s3_us = self.durations[3].as_micros(),
+          s4_label = self.labels[4], s4_us = self.durations[4].as_micros(),
+          s5_label = self.labels[5], s5_us = self.durations[5].as_micros(),
+          s6_label = self.labels[6], s6_us = self.durations[6].as_micros(),
+          s7_label = self.labels[7], s7_us = self.durations[7].as_micros(),
+        );
+      }
+      self.loop_start();
+    }
   }
 }
 
-// --- LoopProfiler definition: Stub version for release builds (not debug_assertions) ---
 #[cfg(not(debug_assertions))]
-#[derive(Debug, Clone, Copy)] // Can be Copy if it's a ZST
-pub(crate) struct LoopProfiler; // Zero-sized type
+mod stub {
+  use std::time::Duration;
 
-#[cfg(not(debug_assertions))]
-impl LoopProfiler {
-  // Constructor takes same args but does nothing with them, returns ZST
-  #[inline(always)] // Hint to compiler to optimize away
-  pub fn new(_threshold: std::time::Duration, _log_interval: usize) -> Self {
-    LoopProfiler
+  #[derive(Debug, Clone, Copy, Default)]
+  pub struct ProfileGuard;
+
+  #[derive(Debug, Clone, Copy, Default)]
+  pub struct LoopProfiler;
+
+  impl LoopProfiler {
+    #[inline(always)]
+    pub fn new(_threshold: Duration, _log_interval: usize) -> Self {
+      LoopProfiler
+    }
+
+    #[inline(always)]
+    pub fn loop_start(&mut self) {}
+
+    #[inline(always)]
+    pub fn profile(&mut self, _index: usize, _label: &'static str) -> ProfileGuard {
+      ProfileGuard
+    }
+
+    #[inline(always)]
+    pub fn log_and_reset_for_next_loop(&mut self) {}
   }
-
-  // Methods are no-ops, should be optimized out by the compiler
-  #[inline(always)]
-  pub fn loop_start(&mut self) {}
-
-  #[inline(always)]
-  pub fn mark_segment_end_and_start_new(&mut self, _next_segment_label: &'static str) {}
-
-  #[inline(always)]
-  pub fn log_and_reset_for_next_loop(&mut self) {}
 }
+
+#[cfg(debug_assertions)]
+pub(crate) use active::{LoopProfiler, ProfileGuard};
+
+#[cfg(not(debug_assertions))]
+pub(crate) use stub::{LoopProfiler, ProfileGuard};

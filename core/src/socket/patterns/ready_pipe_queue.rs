@@ -840,6 +840,11 @@ mod cancellation_safety_tests {
 
     consumer.await.unwrap();
     stop.store(true, Ordering::Release);
+    // Abort producers that may be blocked in slot.tx.send().await after the
+    // consumer exited. RAII SendReservation rolls back reserved_count on abort.
+    for t in &tasks {
+      t.abort();
+    }
     for t in tasks {
       let _ = t.await;
     }

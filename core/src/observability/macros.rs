@@ -1,13 +1,24 @@
-/// Increment or load a counter in the global metrics struct.
+/// Increment, decrement, or load a counter.
 ///
-/// Add form (zero-cost no-op in non-debug, non-diagnostics builds):
-///   `counter!(global, field_name, add, value)`
+/// Flat source increment (zero-cost no-op in non-debug, non-diagnostics builds):
+///   `counter!(source_expr, field_name, inc)`
+///
+/// Flat source add:
 ///   `counter!(source_expr, field_name, add, value)`
+///   `counter!(global, field_name, add, value)`
 ///
-/// Load form (returns 0 in non-debug builds):
+/// Load form (returns 0 in non-debug/non-diagnostics builds):
 ///   `counter!(global, field_name, load)`
 #[macro_export]
 macro_rules! counter {
+  ($source:expr, $field:ident, inc) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    {
+      $source
+        .$field
+        .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    }
+  };
   (global, $field:ident, add, $val:expr) => {
     #[cfg(any(debug_assertions, feature = "diagnostics"))]
     {
@@ -36,6 +47,121 @@ macro_rules! counter {
       0u64
     }
   }};
+}
+
+/// Record a write batch: categorizes by size and increments total_writes + total_messages.
+/// Compiles to nothing when diagnostics are disabled.
+#[macro_export]
+macro_rules! metric_record_write_batch {
+  ($source:expr, $count:expr) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    {
+      let count = $count;
+      if count > 0 {
+        $source
+          .total_writes
+          .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        $source
+          .total_messages
+          .fetch_add(count, ::std::sync::atomic::Ordering::Relaxed);
+        if count == 1 {
+          $source
+            .batch_size_1
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        } else if count <= 8 {
+          $source
+            .batch_size_2_8
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        } else if count <= 16 {
+          $source
+            .batch_size_9_16
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        } else {
+          $source
+            .batch_size_17_32
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        }
+      }
+    }
+  };
+}
+
+/// Categorize a CQE errno into the appropriate error counter.
+/// Compiles to nothing when diagnostics are disabled.
+#[macro_export]
+macro_rules! metric_cqe_errno {
+  ($source:expr, $errno:expr) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    {
+      let errno = $errno;
+      match errno {
+        libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN => {
+          $source
+            .epipe_errors
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        }
+        libc::EBADF => {
+          $source
+            .ebadf_errors
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        }
+        libc::ECANCELED => {
+          $source
+            .ecanceled_errors
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        }
+        libc::EINVAL => {
+          $source
+            .einval_errors
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {
+          $source
+            .other_errors
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        }
+      }
+    }
+  };
+}
+
+/// Declare a mutable `Instant` timer only when diagnostics are enabled.
+/// In release builds without `diagnostics`, expands to nothing — no stack allocation.
+#[macro_export]
+macro_rules! declare_timer {
+  ($timer_name:ident) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    let mut $timer_name = ::std::time::Instant::now();
+  };
+}
+
+/// Measure elapsed time since `$timer_name`, add it to `$source.$field`, then reset the timer.
+/// Compiles to nothing when diagnostics are disabled.
+#[macro_export]
+macro_rules! metric_time_phase {
+  ($source:expr, $field:ident, $timer_name:ident) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    {
+      let elapsed = $timer_name.elapsed();
+      $source
+        .$field
+        .fetch_add(elapsed.as_nanos() as u64, ::std::sync::atomic::Ordering::Relaxed);
+      $timer_name = ::std::time::Instant::now();
+    }
+  };
+}
+
+/// Spawn the background io_uring observability thread.
+/// Compiles to nothing when neither `debug_assertions` nor `diagnostics` is active,
+/// or when the `io-uring` feature is not enabled.
+#[macro_export]
+macro_rules! spawn_uring_observability {
+  ($metrics:expr) => {
+    #[cfg(all(feature = "io-uring", any(debug_assertions, feature = "diagnostics")))]
+    {
+      $crate::observability::uring::spawn_observability_thread(::std::sync::Arc::clone(&$metrics));
+    }
+  };
 }
 
 /// Periodic session-actor diagnostic dump.
