@@ -7,9 +7,9 @@ pub(crate) struct AddressedIngressEngine {
 }
 
 impl AddressedIngressEngine {
-  pub fn new() -> Self {
+  pub fn new(activation_capacity: usize) -> Self {
     Self {
-      queue: ReadyPipeQueue::new(4096),
+      queue: ReadyPipeQueue::new(activation_capacity),
     }
   }
 

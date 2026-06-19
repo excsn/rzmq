@@ -28,10 +28,11 @@ pub(crate) struct SubSocket {
 
 impl SubSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
+    let max_conn = core.core_state.read().options.max_connections.unwrap_or(1024);
     Self {
       core,
       subscriptions: Arc::new(SubscriptionTrie::new()),
-      ingress_engine: AnonymousIngressEngine::new(),
+      ingress_engine: AnonymousIngressEngine::new(max_conn),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
     }

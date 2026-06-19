@@ -11,9 +11,9 @@ pub(crate) struct AnonymousIngressEngine {
 }
 
 impl AnonymousIngressEngine {
-  pub fn new() -> Self {
+  pub fn new(activation_capacity: usize) -> Self {
     Self {
-      queue: ReadyPipeQueue::new(4096),
+      queue: ReadyPipeQueue::new(activation_capacity),
       local_cache: Mutex::new(None),
     }
   }

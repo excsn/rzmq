@@ -39,9 +39,10 @@ pub(crate) struct RepSocket {
 
 impl RepSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
+    let max_conn = core.core_state.read().options.max_connections.unwrap_or(1024);
     Self {
       core,
-      ingress_engine: AddressedIngressEngine::new(),
+      ingress_engine: AddressedIngressEngine::new(max_conn),
       pending_pipe_senders: ParkingLotMutex::new(HashMap::new()),
       state: ParkingLotMutex::new(RepState::ReadyToReceive),
       pipe_read_id_to_endpoint_uri: RwLock::new(HashMap::new()),

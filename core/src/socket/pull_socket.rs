@@ -22,9 +22,10 @@ pub(crate) struct PullSocket {
 
 impl PullSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
+    let max_conn = core.core_state.read().options.max_connections.unwrap_or(1024);
     Self {
       core,
-      ingress_engine: AnonymousIngressEngine::new(),
+      ingress_engine: AnonymousIngressEngine::new(max_conn),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
     }
   }

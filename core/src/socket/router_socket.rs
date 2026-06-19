@@ -44,10 +44,11 @@ pub(crate) struct RouterSocket {
 
 impl RouterSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
+    let max_conn = core.core_state.read().options.max_connections.unwrap_or(1024);
     Self {
       core,
       router_map_for_send: RouterMap::new(),
-      ingress_engine: AddressedIngressEngine::new(),
+      ingress_engine: AddressedIngressEngine::new(max_conn),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       frame_recv_buffer: ParkingMutex::new(None),
       pipe_to_identity_shared_map: Arc::new(DashMap::new()),
