@@ -320,10 +320,13 @@ impl ZmtpUringHandler {
               }
             }
           } else {
-            // Ingress sender not yet attached — drop until AttachIngressSender arrives.
+            // Stash the message in the spillover queue instead of dropping it.
+            // When SocketCore attaches the pipe, the worker will flush this queue.
+            self.spillover.push_back(batch);
+            self.is_throttled.store(true, Ordering::Release);
             trace!(
               fd = self.fd,
-              "ZmtpUringHandler: dropping message — ingress sender not yet attached"
+              "ZmtpUringHandler: stashed early message to spillover — waiting for ingress sender"
             );
           }
         }
