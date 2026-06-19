@@ -12,7 +12,7 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
-use crate::socket::patterns::IncomingMessageOrchestrator;
+use crate::socket::patterns::AddressedIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 
 #[derive(Debug, Clone)]
@@ -31,7 +31,7 @@ enum RepState {
 #[derive(Debug)]
 pub(crate) struct RepSocket {
   core: Arc<SocketCore>,
-  incoming_orchestrator: IncomingMessageOrchestrator,
+  ingress_engine: AddressedIngressEngine,
   pending_pipe_senders: ParkingLotMutex<HashMap<usize, PipeMessageSender>>,
   state: ParkingLotMutex<RepState>,
   pipe_read_id_to_endpoint_uri: RwLock<HashMap<usize, String>>,
@@ -39,10 +39,9 @@ pub(crate) struct RepSocket {
 
 impl RepSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let orchestrator = IncomingMessageOrchestrator::new(core.handle);
     Self {
       core,
-      incoming_orchestrator: orchestrator,
+      ingress_engine: AddressedIngressEngine::new(),
       pending_pipe_senders: ParkingLotMutex::new(HashMap::new()),
       state: ParkingLotMutex::new(RepState::ReadyToReceive),
       pipe_read_id_to_endpoint_uri: RwLock::new(HashMap::new()),
@@ -81,7 +80,7 @@ impl RepSocket {
     rcvtimeo_opt: Option<Duration>,
   ) -> Result<(PeerInfo, FrameBatch), ZmqError> {
     let (pipe_read_id, raw_batch) =
-      self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await?;
+      self.ingress_engine.recv_logical_message(rcvtimeo_opt).await?;
 
     let target_endpoint_uri = self
       .core_state_read()
@@ -134,7 +133,6 @@ impl ISocket for RepSocket {
     if msg.is_more() {
       msg.set_flags(msg.flags() & !MsgFlags::MORE);
     }
-    self.incoming_orchestrator.reset_recv_buffer();
     let mut fb = FrameBatch::new();
     fb.push(msg);
     self.send_multipart(fb).await
@@ -166,8 +164,6 @@ impl ISocket for RepSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    self.incoming_orchestrator.reset_recv_buffer();
-
     let mut user_payload_frames = payload_frames;
     if user_payload_frames.is_empty() {
       user_payload_frames.push(Msg::new());
@@ -255,7 +251,7 @@ impl ISocket for RepSocket {
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
     match command {
       Command::Stop => {
-        self.incoming_orchestrator.close().await;
+        self.ingress_engine.close();
       }
       _ => return Ok(false),
     }
@@ -293,8 +289,8 @@ impl ISocket for RepSocket {
       self.pipe_read_id_to_endpoint_uri.write().insert(pipe_read_id, endpoint_uri);
 
       let rcvhwm = self.core_state_read().options.rcvhwm.max(1);
-      let raw_sender = self.incoming_orchestrator.register_connection_pipe(pipe_read_id, rcvhwm);
-      self.pending_pipe_senders.lock().insert(pipe_read_id, PipeMessageSender::Direct(raw_sender));
+      let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm);
+      self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
     } else {
       tracing::warn!(
         handle = self.core.handle, pipe_read_id,
@@ -327,7 +323,7 @@ impl ISocket for RepSocket {
       }
     }
 
-    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self.ingress_engine.deregister_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }
 }

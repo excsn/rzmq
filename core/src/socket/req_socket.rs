@@ -5,7 +5,7 @@ use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::LoadBalancer;
-use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use crate::socket::patterns::AddressedIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::{Blob, delegate_to_core};
 
@@ -28,7 +28,7 @@ enum ReqState {
 pub(crate) struct ReqSocket {
   core: Arc<SocketCore>,
   load_balancer: LoadBalancer,
-  incoming_orchestrator: IncomingMessageOrchestrator,
+  ingress_engine: AddressedIngressEngine,
   pending_pipe_senders: ParkingLotMutex<HashMap<usize, PipeMessageSender>>,
   state: ParkingLotMutex<ReqState>,
   reply_available_notifier: Arc<Notify>,
@@ -37,11 +37,10 @@ pub(crate) struct ReqSocket {
 
 impl ReqSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let orchestrator = IncomingMessageOrchestrator::new(core.handle);
     Self {
       core,
       load_balancer: LoadBalancer::new(),
-      incoming_orchestrator: orchestrator,
+      ingress_engine: AddressedIngressEngine::new(),
       pending_pipe_senders: ParkingLotMutex::new(HashMap::new()),
       state: ParkingLotMutex::new(ReqState::ReadyToSend),
       reply_available_notifier: Arc::new(Notify::new()),
@@ -169,7 +168,6 @@ impl ISocket for ReqSocket {
             target_endpoint_uri: peer.uri.clone(),
           };
         }
-        self.incoming_orchestrator.reset_recv_buffer();
         Ok(())
       }
       Err(ZmqError::ConnectionClosed) => {
@@ -209,7 +207,7 @@ impl ISocket for ReqSocket {
           tracing::debug!("REQ recv: Notifier signaled, core not running.");
           received_msg_result = Err(ZmqError::ConnectionClosed);
         } else {
-          match self.incoming_orchestrator.recv_logical_message(Some(Duration::ZERO)).await {
+          match self.ingress_engine.recv_logical_message(Some(Duration::ZERO)).await {
             Ok((_, batch)) => {
               match self.process_incoming_zmtp_message_for_req(0, batch) {
                 Ok(mut payload) => {
@@ -232,7 +230,7 @@ impl ISocket for ReqSocket {
           }
         }
       }
-      res = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt) => {
+      res = self.ingress_engine.recv_logical_message(rcvtimeo_opt) => {
         received_msg_result = match res {
           Ok((_, batch)) => {
             match self.process_incoming_zmtp_message_for_req(0, batch) {
@@ -288,10 +286,7 @@ impl ISocket for ReqSocket {
     }
 
     let rcvtimeo_opt: Option<Duration> = self.core.core_state.read().options.rcvtimeo;
-    let result = self
-      .incoming_orchestrator
-      .recv_logical_message(rcvtimeo_opt)
-      .await;
+    let result = self.ingress_engine.recv_logical_message(rcvtimeo_opt).await;
 
     {
       let mut state_guard = self.state.lock();
@@ -317,6 +312,7 @@ impl ISocket for ReqSocket {
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
     match command {
       Command::Stop => {
+        self.ingress_engine.close();
         self.reply_available_notifier.notify_waiters();
       }
       _ => return Ok(false),
@@ -369,13 +365,8 @@ impl ISocket for ReqSocket {
 
       // Register per-pipe ingress channel (capacity 1: REQ expects one reply at a time).
       let rcvhwm = self.core.core_state.read().options.rcvhwm.max(1);
-      let raw_sender = self
-        .incoming_orchestrator
-        .register_connection_pipe(pipe_read_id, rcvhwm);
-      self
-        .pending_pipe_senders
-        .lock()
-        .insert(pipe_read_id, PipeMessageSender::Direct(raw_sender));
+      let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm);
+      self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
     } else {
       tracing::warn!(
         handle = self.core.handle,
@@ -428,9 +419,7 @@ impl ISocket for ReqSocket {
       self.reply_available_notifier.notify_one();
     }
 
-    self
-      .incoming_orchestrator
-      .deregister_connection_pipe(pipe_read_id);
+    self.ingress_engine.deregister_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }
 }

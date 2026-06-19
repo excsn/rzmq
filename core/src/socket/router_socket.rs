@@ -6,7 +6,7 @@ use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::SocketCore;
 use crate::socket::options::{AUTO_DELIMITER, ROUTER_MANDATORY};
-use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use crate::socket::patterns::AddressedIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::socket::patterns::{FramingLatch, RouterMap, WritePipeCoordinator, router_auto_decode, router_auto_encode};
 
@@ -33,7 +33,7 @@ struct ActiveFragmentedSend {
 pub(crate) struct RouterSocket {
   core: Arc<SocketCore>,
   router_map_for_send: RouterMap,
-  incoming_orchestrator: IncomingMessageOrchestrator,
+  ingress_engine: AddressedIngressEngine,
   pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
   frame_recv_buffer: ParkingMutex<Option<VecDeque<Msg>>>,
   pipe_to_identity_shared_map: Arc<DashMap<usize, Blob>>,
@@ -44,12 +44,10 @@ pub(crate) struct RouterSocket {
 
 impl RouterSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let orchestrator = IncomingMessageOrchestrator::new(core.handle);
-
     Self {
       core,
       router_map_for_send: RouterMap::new(),
-      incoming_orchestrator: orchestrator,
+      ingress_engine: AddressedIngressEngine::new(),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       frame_recv_buffer: ParkingMutex::new(None),
       pipe_to_identity_shared_map: Arc::new(DashMap::new()),
@@ -391,7 +389,7 @@ impl ISocket for RouterSocket {
     }
     // Slow path: fetch next complete raw batch, process, return first frame.
     let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
-    let (pipe_read_id, raw_batch) = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await?;
+    let (pipe_read_id, raw_batch) = self.ingress_engine.recv_logical_message(rcvtimeo_opt).await?;
     let (identity_blob, payload) = self.process_incoming_zmtp_message(pipe_read_id, raw_batch)?;
     let mut app_frames = Self::transform_qitem_to_app_frames(identity_blob, payload);
     if app_frames.is_empty() {
@@ -541,7 +539,7 @@ impl ISocket for RouterSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
-    let (pipe_read_id, raw_batch) = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await?;
+    let (pipe_read_id, raw_batch) = self.ingress_engine.recv_logical_message(rcvtimeo_opt).await?;
     let (identity_blob, payload) = self.process_incoming_zmtp_message(pipe_read_id, raw_batch)?;
     Ok(Self::transform_qitem_to_app_frames(identity_blob, payload))
   }
@@ -576,7 +574,7 @@ impl ISocket for RouterSocket {
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
     match command {
       Command::Stop => {
-        self.incoming_orchestrator.close().await;
+        self.ingress_engine.close();
       }
       _ => return Ok(false),
     }
@@ -638,8 +636,8 @@ impl ISocket for RouterSocket {
 
       // Register per-pipe ingress channel.
       let rcvhwm = self.core.core_state.read().options.rcvhwm.max(1);
-      let raw_sender = self.incoming_orchestrator.register_connection_pipe(pipe_read_id, rcvhwm);
-      self.pending_pipe_senders.lock().insert(pipe_read_id, PipeMessageSender::Direct(raw_sender));
+      let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm);
+      self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
     } else {
       tracing::warn!(
         handle = self.core.handle,
@@ -736,7 +734,7 @@ impl ISocket for RouterSocket {
       }
     }
 
-    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self.ingress_engine.deregister_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }
 }

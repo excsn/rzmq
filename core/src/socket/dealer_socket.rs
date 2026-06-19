@@ -6,7 +6,7 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
 use crate::socket::options::AUTO_DELIMITER;
-use crate::socket::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
+use crate::socket::patterns::AddressedIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::socket::patterns::{FramingLatch, dealer_auto_decode, dealer_auto_encode};
 
@@ -112,7 +112,7 @@ impl DealerSocketOutgoingProcessor {
 pub(crate) struct DealerSocket {
   core: Arc<SocketCore>,
   outgoing_orchestrator: Arc<OutgoingMessageOrchestrator>,
-  incoming_orchestrator: IncomingMessageOrchestrator,
+  ingress_engine: AddressedIngressEngine,
   pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
   frame_recv_buffer: ParkingMutex<Option<VecDeque<Msg>>>,
   pipe_read_to_endpoint_uri: ParkingLotRwLock<HashMap<usize, String>>,
@@ -143,12 +143,10 @@ impl DealerSocket {
     };
 
     let processor_jh = tokio::spawn(processor.run());
-    let incoming_orchestrator = IncomingMessageOrchestrator::new(core.handle);
-
     Self {
       core,
       outgoing_orchestrator: orchestrator_arc,
-      incoming_orchestrator,
+      ingress_engine: AddressedIngressEngine::new(),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       frame_recv_buffer: ParkingMutex::new(None),
       pipe_read_to_endpoint_uri: ParkingLotRwLock::new(HashMap::new()),
@@ -430,7 +428,7 @@ impl ISocket for DealerSocket {
       }
     }
     let rcvtimeo_opt: Option<Duration> = self.core.core_state.read().options.rcvtimeo;
-    let (_, batch) = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await?;
+    let (_, batch) = self.ingress_engine.recv_logical_message(rcvtimeo_opt).await?;
     let mut stripped = self.process_incoming_zmtp_message_for_dealer(0, batch)?;
     if stripped.is_empty() {
       return Ok(Msg::new());
@@ -449,7 +447,7 @@ impl ISocket for DealerSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = self.core.core_state.read().options.rcvtimeo;
-    let (_, batch) = self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await?;
+    let (_, batch) = self.ingress_engine.recv_logical_message(rcvtimeo_opt).await?;
     self.process_incoming_zmtp_message_for_dealer(0, batch)
   }
 
@@ -474,7 +472,7 @@ impl ISocket for DealerSocket {
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
     match command {
       Command::Stop => {
-        self.incoming_orchestrator.close().await;
+        self.ingress_engine.close();
         self.outgoing_orchestrator.deactivate();
         self.processor_stop_signal.notify_one();
         if let Some(handle) = self.processor_task_handle.lock().await.take() {
@@ -528,8 +526,8 @@ impl ISocket for DealerSocket {
       self.outgoing_orchestrator.add_connection(endpoint_uri.clone(), iface);
 
       let rcvhwm = self.core.core_state.read().options.rcvhwm.max(1);
-      let raw_sender = self.incoming_orchestrator.register_connection_pipe(pipe_read_id, rcvhwm);
-      self.pending_pipe_senders.lock().insert(pipe_read_id, PipeMessageSender::Direct(raw_sender));
+      let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm);
+      self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
 
       self.peer_availability_notifier.notify_one();
       self.outgoing_queue_activity_notifier.notify_one();
@@ -556,7 +554,7 @@ impl ISocket for DealerSocket {
       self.outgoing_orchestrator.remove_connection(&endpoint_uri);
     }
 
-    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self.ingress_engine.deregister_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
     self.peer_availability_notifier.notify_waiters();
   }

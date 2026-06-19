@@ -12,7 +12,7 @@ use fibre::mpmc::{AsyncReceiver, AsyncSender, bounded_async};
 use fibre::{RecvError, TryRecvError, TrySendError};
 
 use crate::error::ZmqError;
-use crate::message::{FrameBatch, Msg};
+use crate::message::FrameBatch;
 use crate::socket::patterns::trie::SubscriptionTrie;
 
 #[cfg(feature = "io-uring")]
@@ -354,15 +354,20 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
 
 /// The producer handle stored in a session actor for its ingress pipe.
 ///
-/// `Direct` is used by all non-filtering sockets (PULL, DEALER, REQ, REP, ROUTER).
-/// `Filtered` is used by SUB: the subscription trie is consulted inline before
+/// `DirectAnonymous` is used by PULL sockets (no filtering, no routing context needed).
+/// `FilteredAnonymous` is used by SUB: the subscription trie is consulted inline before
 /// forwarding so that non-matching messages are dropped at the producer, keeping
 /// per-pipe HWM accounting limited to messages the application will actually see.
+/// `DirectAddressed` is used by REQ, REP, DEALER, and ROUTER: the pipe_id is preserved
+/// through delivery so that the socket can route replies to the correct peer.
 pub(crate) enum PipeMessageSender {
-  Direct(ReadyPipeSender<FrameBatch>),
-  Filtered {
-    inner: ReadyPipeSender<FrameBatch>,
+  DirectAnonymous(ReadyPipeSender<FrameBatch>),
+  FilteredAnonymous {
+    sender: ReadyPipeSender<FrameBatch>,
     trie: Arc<SubscriptionTrie>,
+  },
+  DirectAddressed {
+    sender: ReadyPipeSender<FrameBatch>,
   },
 }
 
@@ -370,22 +375,24 @@ impl PipeMessageSender {
   #[cfg(feature = "io-uring")]
   pub fn bind_uring_wakeup(&mut self, wakeup: UringWakeup) {
     match self {
-      Self::Direct(s) => s.bind_uring_wakeup(wakeup),
-      Self::Filtered { inner, .. } => inner.bind_uring_wakeup(wakeup),
+      Self::DirectAnonymous(s) => s.bind_uring_wakeup(wakeup),
+      Self::FilteredAnonymous { sender, .. } => sender.bind_uring_wakeup(wakeup),
+      Self::DirectAddressed { sender } => sender.bind_uring_wakeup(wakeup),
     }
   }
 
   pub async fn send(&self, batch: FrameBatch) -> Result<(), ZmqError> {
     match self {
-      Self::Direct(s) => s.send(batch).await,
-      Self::Filtered { inner, trie } => {
+      Self::DirectAnonymous(s) => s.send(batch).await,
+      Self::FilteredAnonymous { sender, trie } => {
         let topic: &[u8] = batch.first().and_then(|m| m.data()).unwrap_or(&[]);
         if trie.matches(topic) {
-          inner.send(batch).await
+          sender.send(batch).await
         } else {
           Ok(()) // drop non-matching message; no HWM cost
         }
       }
+      Self::DirectAddressed { sender } => sender.send(batch).await,
     }
   }
 
@@ -393,43 +400,48 @@ impl PipeMessageSender {
   /// Returns `Err(TrySendError::Full)` if the per-pipe queue is at capacity (HWM).
   pub fn try_send_sync(&self, batch: FrameBatch) -> Result<(), TrySendError<FrameBatch>> {
     match self {
-      Self::Direct(s) => s.try_send(batch),
-      Self::Filtered { inner, trie } => {
+      Self::DirectAnonymous(s) => s.try_send(batch),
+      Self::FilteredAnonymous { sender, trie } => {
         let topic: &[u8] = batch.first().and_then(|m| m.data()).unwrap_or(&[]);
         if trie.matches(topic) {
-          inner.try_send(batch)
+          sender.try_send(batch)
         } else {
           Ok(()) // subscription filter: drop silently, no HWM cost
         }
       }
+      Self::DirectAddressed { sender } => sender.try_send(batch),
     }
   }
 
   pub fn len(&self) -> usize {
     match self {
-      Self::Direct(s) => s.len(),
-      Self::Filtered { inner, .. } => inner.len(),
+      Self::DirectAnonymous(s) => s.len(),
+      Self::FilteredAnonymous { sender, .. } => sender.len(),
+      Self::DirectAddressed { sender } => sender.len(),
     }
   }
 
   pub fn capacity(&self) -> usize {
     match self {
-      Self::Direct(s) => s.capacity(),
-      Self::Filtered { inner, .. } => inner.capacity(),
+      Self::DirectAnonymous(s) => s.capacity(),
+      Self::FilteredAnonymous { sender, .. } => sender.capacity(),
+      Self::DirectAddressed { sender } => sender.capacity(),
     }
   }
 
   pub fn is_congested(&self) -> bool {
     match self {
-      Self::Direct(s) => s.is_congested(),
-      Self::Filtered { inner, .. } => inner.is_congested(),
+      Self::DirectAnonymous(s) => s.is_congested(),
+      Self::FilteredAnonymous { sender, .. } => sender.is_congested(),
+      Self::DirectAddressed { sender } => sender.is_congested(),
     }
   }
 
   pub fn is_drained(&self) -> bool {
     match self {
-      Self::Direct(s) => s.is_drained(),
-      Self::Filtered { inner, .. } => inner.is_drained(),
+      Self::DirectAnonymous(s) => s.is_drained(),
+      Self::FilteredAnonymous { sender, .. } => sender.is_drained(),
+      Self::DirectAddressed { sender } => sender.is_drained(),
     }
   }
 }
@@ -437,8 +449,9 @@ impl PipeMessageSender {
 impl std::fmt::Debug for PipeMessageSender {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      Self::Direct(_) => write!(f, "PipeMessageSender::Direct"),
-      Self::Filtered { .. } => write!(f, "PipeMessageSender::Filtered"),
+      Self::DirectAnonymous(_) => write!(f, "PipeMessageSender::DirectAnonymous"),
+      Self::FilteredAnonymous { .. } => write!(f, "PipeMessageSender::FilteredAnonymous"),
+      Self::DirectAddressed { .. } => write!(f, "PipeMessageSender::DirectAddressed"),
     }
   }
 }

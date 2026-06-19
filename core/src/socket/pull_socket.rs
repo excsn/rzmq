@@ -10,22 +10,21 @@ use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
-use crate::socket::patterns::IncomingMessageOrchestrator;
+use crate::socket::patterns::AnonymousIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 
 #[derive(Debug)]
 pub(crate) struct PullSocket {
   core: Arc<SocketCore>,
-  incoming_orchestrator: IncomingMessageOrchestrator,
+  ingress_engine: AnonymousIngressEngine,
   pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
 }
 
 impl PullSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let incoming_orchestrator = IncomingMessageOrchestrator::new(core.handle);
     Self {
       core,
-      incoming_orchestrator,
+      ingress_engine: AnonymousIngressEngine::new(),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
     }
   }
@@ -66,7 +65,7 @@ impl ISocket for PullSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
-    self.incoming_orchestrator.recv_frame(rcvtimeo_opt).await.map(|(_, msg)| msg)
+    self.ingress_engine.recv(rcvtimeo_opt).await
   }
 
   async fn send_multipart(&self, _frames: FrameBatch) -> Result<(), ZmqError> {
@@ -78,7 +77,7 @@ impl ISocket for PullSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
-    self.incoming_orchestrator.recv_logical_message(rcvtimeo_opt).await.map(|(_, fb)| fb)
+    self.ingress_engine.recv_multipart(rcvtimeo_opt).await
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -99,7 +98,7 @@ impl ISocket for PullSocket {
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
     match command {
       Command::Stop => {
-        self.incoming_orchestrator.close().await;
+        self.ingress_engine.close();
       }
       _ => return Ok(false),
     }
@@ -128,14 +127,13 @@ impl ISocket for PullSocket {
   ) {
     tracing::debug!(handle = self.core.handle, pipe_read_id, "PULL attaching pipe");
     let rcvhwm = self.core.core_state.read().options.rcvhwm.max(1);
-    let raw_sender = self.incoming_orchestrator.register_connection_pipe(pipe_read_id, rcvhwm);
-    let sender = PipeMessageSender::Direct(raw_sender);
+    let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm);
     self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {
     tracing::debug!(handle = self.core.handle, pipe_read_id, "PULL detaching pipe");
-    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self.ingress_engine.deregister_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }
 

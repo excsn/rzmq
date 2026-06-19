@@ -5,8 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::{Mutex as ParkingMutex, RwLock, RwLockReadGuard};
 
-use super::patterns::incoming_orchestrator::IncomingMessageOrchestrator;
-use super::patterns::ready_pipe_queue::PipeMessageSender;
+use crate::socket::patterns::AnonymousIngressEngine;
+use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
@@ -21,18 +21,17 @@ use crate::{Blob, delegate_to_core};
 pub(crate) struct SubSocket {
   core: Arc<SocketCore>,
   subscriptions: Arc<SubscriptionTrie>,
-  incoming_orchestrator: IncomingMessageOrchestrator,
+  ingress_engine: AnonymousIngressEngine,
   pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
 }
 
 impl SubSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let orchestrator = IncomingMessageOrchestrator::new(core.handle);
     Self {
       core,
       subscriptions: Arc::new(SubscriptionTrie::new()),
-      incoming_orchestrator: orchestrator,
+      ingress_engine: AnonymousIngressEngine::new(),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
     }
@@ -153,11 +152,7 @@ impl ISocket for SubSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
-    self
-      .incoming_orchestrator
-      .recv_frame(rcvtimeo_opt)
-      .await
-      .map(|(_, msg)| msg)
+    self.ingress_engine.recv(rcvtimeo_opt).await
   }
 
   async fn send_multipart(&self, _frames: FrameBatch) -> Result<(), ZmqError> {
@@ -169,11 +164,7 @@ impl ISocket for SubSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
-    self
-      .incoming_orchestrator
-      .recv_logical_message(rcvtimeo_opt)
-      .await
-      .map(|(_, batch)| batch)
+    self.ingress_engine.recv_multipart(rcvtimeo_opt).await
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
@@ -217,7 +208,7 @@ impl ISocket for SubSocket {
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
     match command {
       Command::Stop => {
-        self.incoming_orchestrator.close().await;
+        self.ingress_engine.close();
       }
       _ => return Ok(false),
     }
@@ -258,13 +249,7 @@ impl ISocket for SubSocket {
 
       // Register per-pipe ingress channel and create a filtered sender.
       let rcvhwm = self.core_state_read().options.rcvhwm.max(1);
-      let raw_sender = self
-        .incoming_orchestrator
-        .register_connection_pipe(pipe_read_id, rcvhwm);
-      let sender = PipeMessageSender::Filtered {
-        inner: raw_sender,
-        trie: Arc::clone(&self.subscriptions),
-      };
+      let sender = self.ingress_engine.register_pipe_filtered(pipe_read_id, rcvhwm, Arc::clone(&self.subscriptions));
       self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
 
       // Send any existing subscriptions to the new peer.
@@ -315,7 +300,7 @@ impl ISocket for SubSocket {
       tracing::trace!(handle = self.core.handle, pipe_read_id, uri = %uri, "SUB removed endpoint_uri mapping");
     }
 
-    self.incoming_orchestrator.deregister_connection_pipe(pipe_read_id);
+    self.ingress_engine.deregister_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }
 }
