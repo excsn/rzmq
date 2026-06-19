@@ -18,7 +18,9 @@ pub(crate) fn validate_socket_compatibility(
   if compatible {
     Ok(())
   } else {
-    Err(ZmqError::InvalidSocketType("Incompatible inproc socket patterns"))
+    Err(ZmqError::InvalidSocketType(
+      "Incompatible inproc socket patterns",
+    ))
   }
 }
 

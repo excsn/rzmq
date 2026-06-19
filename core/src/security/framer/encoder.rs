@@ -151,6 +151,9 @@ mod tests {
 
     let original_ptr = batch[0][0].data().unwrap().as_ptr();
     let vectored_ptr = slices[1].as_ref().as_ptr();
-    assert_eq!(original_ptr, vectored_ptr, "Zero-copy pointer matching failed!");
+    assert_eq!(
+      original_ptr, vectored_ptr,
+      "Zero-copy pointer matching failed!"
+    );
   }
 }

@@ -2,8 +2,8 @@
 
 #[cfg(any(debug_assertions, feature = "diagnostics"))]
 pub mod active {
-  use std::sync::Arc;
   use std::sync::atomic::{AtomicU64, Ordering};
+  use std::sync::Arc;
   use std::time::{Duration, Instant};
 
   #[derive(Debug, Default)]

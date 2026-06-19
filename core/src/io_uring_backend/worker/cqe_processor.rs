@@ -6,12 +6,12 @@ use super::internal_op_tracker::{
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringWorkerInterface,
 };
-use crate::io_uring_backend::ops::{HANDLER_INTERNAL_SEND_OP_UD, UringOpCompletion, UserData};
-use crate::io_uring_backend::worker::UringWorker;
+use crate::io_uring_backend::ops::{UringOpCompletion, UserData, HANDLER_INTERNAL_SEND_OP_UD};
 use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
+use crate::io_uring_backend::worker::UringWorker;
 use crate::message::{FrameBatch, Msg};
 use crate::socket::connection_iface::DummyConnection;
-use crate::{Command, ZmqError, uring, counter, metric_record_write_batch};
+use crate::{counter, metric_record_write_batch, uring, Command, ZmqError};
 
 use io_uring::cqueue::Entry;
 use io_uring::{cqueue, opcode, squeue, types};
@@ -76,7 +76,9 @@ pub(crate) fn process_handler_blueprint(
           counter!(worker.metrics, sqe_op_other, inc);
           trace!(
             "CQE Processor: Queued SetSockOpt(cork={}) SQE (ud:{}) for FD {}.",
-            enable, user_data, fd
+            enable,
+            user_data,
+            fd
           );
         }
       }
@@ -134,7 +136,8 @@ pub(crate) fn process_handler_blueprint(
           counter!(worker.metrics, sqe_op_write, inc);
           trace!(
             "CQE Processor: Queued Send SQE (ud:{}) for FD {}.",
-            user_data, fd
+            user_data,
+            fd
           );
         }
       }
@@ -259,7 +262,8 @@ pub(crate) fn process_handler_blueprint(
           counter!(worker.metrics, sqe_op_write, inc);
           trace!(
             "CQE Processor: Queued SendZeroCopy/Send SQE (ud:{}) for FD {}.",
-            user_data, fd
+            user_data,
+            fd
           );
         }
       }
@@ -318,7 +322,9 @@ pub(crate) fn process_handler_blueprint(
           counter!(worker.metrics, sqe_op_write, inc);
           trace!(
             "CQE Processor: Queued raw Writev SQE (ud:{}, iovecs:{}) for FD {}.",
-            user_data, iov_len, fd
+            user_data,
+            iov_len,
+            fd
           );
         }
       }
@@ -350,7 +356,8 @@ pub(crate) fn process_handler_blueprint(
           counter!(worker.metrics, sqe_op_write, inc);
           trace!(
             "CQE Processor: Queued SendZcLeased SQE (ud:{}) for FD {}.",
-            user_data, fd
+            user_data,
+            fd
           );
         }
       }
@@ -374,7 +381,8 @@ pub(crate) fn process_handler_blueprint(
           counter!(worker.metrics, sqe_op_other, inc);
           trace!(
             "CQE Processor: Queued Close SQE (ud:{}) for FD {}.",
-            user_data, fd
+            user_data,
+            fd
           );
         }
       }
@@ -410,7 +418,8 @@ pub(crate) fn process_handler_blueprint(
           counter!(worker.metrics, sqe_op_read, inc);
           trace!(
             "CQE Processor: Queued RecvMulti SQE (ud:{}) for FD {}.",
-            op_user_data, fd
+            op_user_data,
+            fd
           );
           if let Some(handler) = handler_manager.get_mut(fd) {
             handler.inform_multishot_reader_op_submitted(op_user_data, false, None);
@@ -460,7 +469,9 @@ pub(crate) fn process_handler_blueprint(
           counter!(worker.metrics, sqe_op_other, inc);
           trace!(
             "CQE Processor: Queued AsyncCancel SQE (ud:{}, target_ud:{}) for FD {}.",
-            cancel_op_user_data, target_user_data, fd
+            cancel_op_user_data,
+            target_user_data,
+            fd
           );
           if let Some(handler) = handler_manager.get_mut(fd) {
             handler.inform_multishot_reader_op_submitted(
@@ -506,7 +517,9 @@ pub(crate) fn process_all_cqes(
 
     trace!(
       "[CQE Proc] CQE: ud={}, res={}, flags={:x}",
-      cqe_user_data, cqe_result, cqe_flags
+      cqe_user_data,
+      cqe_result,
+      cqe_flags
     );
 
     if worker.event_fd_poller.handle_cqe_if_matches(
@@ -532,7 +545,9 @@ pub(crate) fn process_all_cqes(
     if let Some(mut ext_op_ctx) = worker.external_op_tracker.take_op(cqe_user_data) {
       trace!(
         "[CQE Proc] EXTERNAL op '{}' (ud:{}, res:{})",
-        ext_op_ctx.op_name, cqe_user_data, cqe_result
+        ext_op_ctx.op_name,
+        cqe_user_data,
+        cqe_result
       );
       let completion_to_send: UringOpCompletion = if cqe_result < 0 {
         let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(-cqe_result));
@@ -751,7 +766,10 @@ pub(crate) fn process_all_cqes(
       let op_type = op_details.op_type;
       trace!(
         "[CQE Proc] INTERNAL op (ud:{}, type:{:?}, fd:{}, res:{}) - Final Processing",
-        cqe_user_data, op_type, handler_fd, cqe_result
+        cqe_user_data,
+        op_type,
+        handler_fd,
+        cqe_result
       );
 
       match op_type {

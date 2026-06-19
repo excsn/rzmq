@@ -37,7 +37,10 @@ mod tests {
 
   fn dummy_handshake_request(
     socket_type: SocketType,
-  ) -> (InprocHandshakeRequest, oneshot::Receiver<Result<InprocHandshakeResponse, ZmqError>>) {
+  ) -> (
+    InprocHandshakeRequest,
+    oneshot::Receiver<Result<InprocHandshakeResponse, ZmqError>>,
+  ) {
     let (tx_to_connector, _) = fibre::mpmc::bounded_async::<FrameBatch>(1);
     let (reply_tx, reply_rx) = oneshot::oneshot();
 

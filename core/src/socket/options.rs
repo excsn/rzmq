@@ -45,8 +45,8 @@ pub const PLAIN_PASSWORD: i32 = 46;
 pub const NOISE_XX_ENABLED: i32 = 1202; // Boolean (0 or 1)
 pub const NOISE_XX_STATIC_SECRET_KEY: i32 = 1200; // Expects 32-byte secret key
 pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201; // Client uses this for server's PK, expects 32-byte public key
-// Optional: For server, a list of allowed client public keys (if not using ZAP for this)
-// pub const NOISE_XX_ALLOWED_PEERS: i32 = 1203; // Would take a list of PKs
+                                                         // Optional: For server, a list of allowed client public keys (if not using ZAP for this)
+                                                         // pub const NOISE_XX_ALLOWED_PEERS: i32 = 1203; // Would take a list of PKs
 
 // Security/CURVE
 pub const CURVE_SERVER: i32 = 47; // Matches libzmq's ZMQ_CURVE_SERVER
@@ -340,22 +340,32 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
   fn from(options: &SocketOptions) -> Self {
     // Determine if any security mechanism is active.
     let security_enabled = {
-        #[cfg(feature = "plain")]
-        { options.plain_options.enabled }
-        #[cfg(not(feature = "plain"))]
-        { false }
-    }
-    || {
-        #[cfg(feature = "noise_xx")]
-        { options.noise_xx_options.enabled }
-        #[cfg(not(feature = "noise_xx"))]
-        { false }
-    }
-    || {
-        #[cfg(feature = "curve")]
-        { options.curve_options.enabled }
-        #[cfg(not(feature = "curve"))]
-        { false }
+      #[cfg(feature = "plain")]
+      {
+        options.plain_options.enabled
+      }
+      #[cfg(not(feature = "plain"))]
+      {
+        false
+      }
+    } || {
+      #[cfg(feature = "noise_xx")]
+      {
+        options.noise_xx_options.enabled
+      }
+      #[cfg(not(feature = "noise_xx"))]
+      {
+        false
+      }
+    } || {
+      #[cfg(feature = "curve")]
+      {
+        options.curve_options.enabled
+      }
+      #[cfg(not(feature = "curve"))]
+      {
+        false
+      }
     };
 
     // When zero-copy sends are enabled, clamp sndbatch_bytes to DEFAULT_IO_URING_SND_BUFFER_SIZE.
@@ -382,7 +392,8 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
     let sndbatch_bytes = options.sndbatch_bytes;
 
     // Pre-calculate physical size including worst-case framing overhead on-demand
-    let sndbatch_bytes_physical = calculate_required_slot_size(sndbatch_bytes, options.sndbatch_count);
+    let sndbatch_bytes_physical =
+      calculate_required_slot_size(sndbatch_bytes, options.sndbatch_count);
 
     ZmtpEngineConfig {
       routing_id: options.routing_id.clone(),

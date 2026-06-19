@@ -161,7 +161,7 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
       default_bgid_for_handler_use,
       current_external_op_ud,
       pending_egress_count,
-      is_write_completion
+      is_write_completion,
     }
   }
   // Methods for handlers to get info, but not to directly queue ops.

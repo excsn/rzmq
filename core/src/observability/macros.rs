@@ -143,9 +143,10 @@ macro_rules! metric_time_phase {
     #[cfg(any(debug_assertions, feature = "diagnostics"))]
     {
       let elapsed = $timer_name.elapsed();
-      $source
-        .$field
-        .fetch_add(elapsed.as_nanos() as u64, ::std::sync::atomic::Ordering::Relaxed);
+      $source.$field.fetch_add(
+        elapsed.as_nanos() as u64,
+        ::std::sync::atomic::Ordering::Relaxed,
+      );
       $timer_name = ::std::time::Instant::now();
     }
   };

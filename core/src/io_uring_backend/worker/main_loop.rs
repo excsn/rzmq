@@ -1,7 +1,6 @@
 #![cfg(feature = "io-uring")]
 
-use super::{ExternalOpContext, UringWorker, cqe_processor};
-use crate::ZmqError;
+use super::{cqe_processor, ExternalOpContext, UringWorker};
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
   HandlerSqeBlueprint, UringWorkerInterface, WorkerIoConfig,
@@ -13,6 +12,7 @@ use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerS
 use crate::io_uring_backend::zmtp_handler::{ZmtpSmartConnection, ZmtpUringHandler};
 use crate::protocol::zmtp::engine::ZmtpEngine;
 use crate::uring::UringPollingStrategy;
+use crate::ZmqError;
 
 use crate::profiler::LoopProfiler;
 use crate::transport::endpoint::parse_endpoint;
@@ -82,7 +82,8 @@ impl UringWorker {
 
     trace!(
       "UringWorker: Handling external op request: {}, ud: {}",
-      op_name_str, user_data
+      op_name_str,
+      user_data
     );
 
     match request {
@@ -586,499 +587,506 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
         // --- PHASE 1: GATHER ALL WORK ---
         {
-        let _profg = profiler.profile(0, "gather_work");
+          let _profg = profiler.profile(0, "gather_work");
 
-        // 1a. Drain external commands
-        while let Ok(request) = worker.op_rx.try_recv() {
-          work_was_available = true;
-          worker.process_external_op_request(request);
-        }
-
-        // 1b. Drain application data — convert to blueprints immediately so egress ordering
-        //     is preserved when close_initiated appends RequestClose in Phase 1d.
-        worker.mpsc_fds_scratch.clear();
-        worker
-          .mpsc_fds_scratch
-          .extend(worker.fd_to_mpsc_rx.keys().copied());
-
-        for i in 0..worker.mpsc_fds_scratch.len() {
-          let fd = worker.mpsc_fds_scratch[i];
-          let pending_count = worker.work_map.get(&fd).map_or(0, |w| {
-            w.ingress_blueprints.len() + w.egress_blueprints.len()
-          });
-          if pending_count >= DEFAULT_WORKER_BATCH_LIMIT {
-            continue; // Backpressure: leave messages in the bounded channel
+          // 1a. Drain external commands
+          while let Ok(request) = worker.op_rx.try_recv() {
+            work_was_available = true;
+            worker.process_external_op_request(request);
           }
-          if let Some(handler) = worker.handler_manager.get_mut(fd) {
-            let io_config = handler.io_config().clone();
-            if let Some(rx) = worker.fd_to_mpsc_rx.get(&fd) {
-              let mut converted = 0usize;
-              while let Ok(msg_parts) = rx.try_recv() {
-                work_was_available = true;
-                let pending_egress = worker
-                  .work_map
-                  .get(&fd)
-                  .map_or(0, |w| w.egress_blueprints.len());
-                let interface = UringWorkerInterface::new(
-                  fd,
-                  &io_config,
-                  worker.buffer_manager.as_ref(),
-                  worker.default_buffer_ring_group_id_val,
-                  0,
-                  pending_egress,
-                  false,
-                );
-                let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
-                worker
-                  .work_map
-                  .entry(fd)
-                  .or_default()
-                  .route_blueprints(ops_output.sqe_blueprints);
-                converted += 1;
-                if converted >= DEFAULT_WORKER_BATCH_LIMIT {
-                  break;
+
+          // 1b. Drain application data — convert to blueprints immediately so egress ordering
+          //     is preserved when close_initiated appends RequestClose in Phase 1d.
+          worker.mpsc_fds_scratch.clear();
+          worker
+            .mpsc_fds_scratch
+            .extend(worker.fd_to_mpsc_rx.keys().copied());
+
+          for i in 0..worker.mpsc_fds_scratch.len() {
+            let fd = worker.mpsc_fds_scratch[i];
+            let pending_count = worker.work_map.get(&fd).map_or(0, |w| {
+              w.ingress_blueprints.len() + w.egress_blueprints.len()
+            });
+            if pending_count >= DEFAULT_WORKER_BATCH_LIMIT {
+              continue; // Backpressure: leave messages in the bounded channel
+            }
+            if let Some(handler) = worker.handler_manager.get_mut(fd) {
+              let io_config = handler.io_config().clone();
+              if let Some(rx) = worker.fd_to_mpsc_rx.get(&fd) {
+                let mut converted = 0usize;
+                while let Ok(msg_parts) = rx.try_recv() {
+                  work_was_available = true;
+                  let pending_egress = worker
+                    .work_map
+                    .get(&fd)
+                    .map_or(0, |w| w.egress_blueprints.len());
+                  let interface = UringWorkerInterface::new(
+                    fd,
+                    &io_config,
+                    worker.buffer_manager.as_ref(),
+                    worker.default_buffer_ring_group_id_val,
+                    0,
+                    pending_egress,
+                    false,
+                  );
+                  let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
+                  worker
+                    .work_map
+                    .entry(fd)
+                    .or_default()
+                    .route_blueprints(ops_output.sqe_blueprints);
+                  converted += 1;
+                  if converted >= DEFAULT_WORKER_BATCH_LIMIT {
+                    break;
+                  }
                 }
               }
             }
           }
-        }
 
-        // 1c. Poll handlers for periodic work
-        let handler_ops_list = worker.handler_manager.prepare_all_handler_io_ops(
-          worker.buffer_manager.as_ref(),
-          worker.default_buffer_ring_group_id_val,
-          |fd| {
-            worker
-              .work_map
-              .get(&fd)
-              .map_or(0, |w| w.egress_blueprints.len())
-          },
-        );
-        if !handler_ops_list.is_empty() {
-          work_was_available = true;
-        }
-        for (fd, ops) in handler_ops_list {
-          if !ops.sqe_blueprints.is_empty() {
-            worker
-              .work_map
-              .entry(fd)
-              .or_default()
-              .route_blueprints(ops.sqe_blueprints);
-          }
-          if ops.initiate_close_due_to_error
-            && !worker.fds_needing_close_initiated_pass.contains(&fd)
-          {
-            worker.fds_needing_close_initiated_pass.push_back(fd);
-          }
-        }
-
-        // 1d. Process FDs flagged for closure
-        while let Some(fd_to_close) = worker.fds_needing_close_initiated_pass.pop_front() {
-          work_was_available = true;
-          if let Some(handler) = worker.handler_manager.get_mut(fd_to_close) {
-            let io_config = handler.io_config().clone();
-            let pending_egress = worker
-              .work_map
-              .get(&fd_to_close)
-              .map_or(0, |w| w.egress_blueprints.len());
-            let interface = UringWorkerInterface::new(
-              fd_to_close,
-              &io_config,
-              worker.buffer_manager.as_ref(),
-              worker.default_buffer_ring_group_id_val,
-              0,
-              pending_egress,
-              false,
-            );
-            let close_io_ops = handler.close_initiated(&interface);
-            if !close_io_ops.sqe_blueprints.is_empty() {
+          // 1c. Poll handlers for periodic work
+          let handler_ops_list = worker.handler_manager.prepare_all_handler_io_ops(
+            worker.buffer_manager.as_ref(),
+            worker.default_buffer_ring_group_id_val,
+            |fd| {
               worker
                 .work_map
-                .entry(fd_to_close)
+                .get(&fd)
+                .map_or(0, |w| w.egress_blueprints.len())
+            },
+          );
+          if !handler_ops_list.is_empty() {
+            work_was_available = true;
+          }
+          for (fd, ops) in handler_ops_list {
+            if !ops.sqe_blueprints.is_empty() {
+              worker
+                .work_map
+                .entry(fd)
                 .or_default()
-                .route_blueprints(close_io_ops.sqe_blueprints);
+                .route_blueprints(ops.sqe_blueprints);
+            }
+            if ops.initiate_close_due_to_error
+              && !worker.fds_needing_close_initiated_pass.contains(&fd)
+            {
+              worker.fds_needing_close_initiated_pass.push_back(fd);
             }
           }
-        }
 
-        metric_time_phase!(worker.metrics, time_gather_ns, t_phase);
+          // 1d. Process FDs flagged for closure
+          while let Some(fd_to_close) = worker.fds_needing_close_initiated_pass.pop_front() {
+            work_was_available = true;
+            if let Some(handler) = worker.handler_manager.get_mut(fd_to_close) {
+              let io_config = handler.io_config().clone();
+              let pending_egress = worker
+                .work_map
+                .get(&fd_to_close)
+                .map_or(0, |w| w.egress_blueprints.len());
+              let interface = UringWorkerInterface::new(
+                fd_to_close,
+                &io_config,
+                worker.buffer_manager.as_ref(),
+                worker.default_buffer_ring_group_id_val,
+                0,
+                pending_egress,
+                false,
+              );
+              let close_io_ops = handler.close_initiated(&interface);
+              if !close_io_ops.sqe_blueprints.is_empty() {
+                worker
+                  .work_map
+                  .entry(fd_to_close)
+                  .or_default()
+                  .route_blueprints(close_io_ops.sqe_blueprints);
+              }
+            }
+          }
+
+          metric_time_phase!(worker.metrics, time_gather_ns, t_phase);
         } // end gather_work
 
         // --- PHASE 2: PROCESS THE WORK MAP WITH A BUDGET ---
         {
-        let _profg = profiler.profile(1, "process_work_map");
-        let mut batches_processed_this_iteration = 0;
-        worker.active_fds_scratch.clear();
-        worker
-          .active_fds_scratch
-          .extend(worker.work_map.keys().copied());
+          let _profg = profiler.profile(1, "process_work_map");
+          let mut batches_processed_this_iteration = 0;
+          worker.active_fds_scratch.clear();
+          worker
+            .active_fds_scratch
+            .extend(worker.work_map.keys().copied());
 
-        for i in 0..worker.active_fds_scratch.len() {
-          let fd = worker.active_fds_scratch[i];
-          if batches_processed_this_iteration >= MAX_BATCHES_PER_ITERATION {
-            break;
-          }
-          if unsafe { worker.ring.submission_shared().is_full() } {
-            break;
-          }
-
-          let mut work = worker.work_map.remove(&fd).unwrap_or_default();
-          let mut stop_processing_this_fd = false;
-
-          // Pass 1: Ingress Pipeline
-          while let Some(ingress_bp) = work.ingress_blueprints.pop_front() {
+          for i in 0..worker.active_fds_scratch.len() {
+            let fd = worker.active_fds_scratch[i];
+            if batches_processed_this_iteration >= MAX_BATCHES_PER_ITERATION {
+              break;
+            }
             if unsafe { worker.ring.submission_shared().is_full() } {
-              work.ingress_blueprints.push_front(ingress_bp);
-              break;
-            }
-            if let Err(returned_bp) =
-              cqe_processor::process_handler_blueprint(worker, fd, ingress_bp)
-            {
-              work.ingress_blueprints.push_front(returned_bp);
-              break;
-            }
-            batches_processed_this_iteration += 1;
-          }
-
-          // Pass 2: Egress Pipeline (No more loop-breaking serialization gates!)
-          while let Some(mut first_blueprint) = work.egress_blueprints.pop_front() {
-            if unsafe { worker.ring.submission_shared().is_full() } {
-              work.egress_blueprints.push_front(first_blueprint);
-              stop_processing_this_fd = true;
               break;
             }
 
-            if let HandlerSqeBlueprint::RequestSendRawVectored {
-              bufs,
-              send_op_flags,
-              batch_count,
-            } = &mut first_blueprint
-            {
-              if bufs.len() > libc::UIO_MAXIOV as usize {
-                let remainder = bufs.split_off(libc::UIO_MAXIOV as usize);
-                work
-                  .egress_blueprints
-                  .push_front(HandlerSqeBlueprint::RequestSendRawVectored {
-                    bufs: remainder,
-                    send_op_flags: *send_op_flags,
-                    batch_count: 0,
-                  });
+            let mut work = worker.work_map.remove(&fd).unwrap_or_default();
+            let mut stop_processing_this_fd = false;
+
+            // Pass 1: Ingress Pipeline
+            while let Some(ingress_bp) = work.ingress_blueprints.pop_front() {
+              if unsafe { worker.ring.submission_shared().is_full() } {
+                work.ingress_blueprints.push_front(ingress_bp);
+                break;
               }
+              if let Err(returned_bp) =
+                cqe_processor::process_handler_blueprint(worker, fd, ingress_bp)
+              {
+                work.ingress_blueprints.push_front(returned_bp);
+                break;
+              }
+              batches_processed_this_iteration += 1;
             }
 
-            let blueprint_to_submit = first_blueprint;
+            // Pass 2: Egress Pipeline (No more loop-breaking serialization gates!)
+            while let Some(mut first_blueprint) = work.egress_blueprints.pop_front() {
+              if unsafe { worker.ring.submission_shared().is_full() } {
+                work.egress_blueprints.push_front(first_blueprint);
+                stop_processing_this_fd = true;
+                break;
+              }
 
-            if let Err(returned_bp) =
-              cqe_processor::process_handler_blueprint(worker, fd, blueprint_to_submit)
-            {
-              work.egress_blueprints.push_front(returned_bp);
-              stop_processing_this_fd = true;
+              if let HandlerSqeBlueprint::RequestSendRawVectored {
+                bufs,
+                send_op_flags,
+                batch_count,
+              } = &mut first_blueprint
+              {
+                if bufs.len() > libc::UIO_MAXIOV as usize {
+                  let remainder = bufs.split_off(libc::UIO_MAXIOV as usize);
+                  work
+                    .egress_blueprints
+                    .push_front(HandlerSqeBlueprint::RequestSendRawVectored {
+                      bufs: remainder,
+                      send_op_flags: *send_op_flags,
+                      batch_count: 0,
+                    });
+                }
+              }
+
+              let blueprint_to_submit = first_blueprint;
+
+              if let Err(returned_bp) =
+                cqe_processor::process_handler_blueprint(worker, fd, blueprint_to_submit)
+              {
+                work.egress_blueprints.push_front(returned_bp);
+                stop_processing_this_fd = true;
+                break;
+              }
+
+              batches_processed_this_iteration += 1;
+            }
+
+            if !work.ingress_blueprints.is_empty() || !work.egress_blueprints.is_empty() {
+              worker.work_map.insert(fd, work);
+            }
+
+            if stop_processing_this_fd {
               break;
             }
-
-            batches_processed_this_iteration += 1;
           }
-
-          if !work.ingress_blueprints.is_empty() || !work.egress_blueprints.is_empty() {
-            worker.work_map.insert(fd, work);
-          }
-
-          if stop_processing_this_fd {
-            break;
-          }
-        }
-        metric_time_phase!(worker.metrics, time_process_ns, t_phase);
+          metric_time_phase!(worker.metrics, time_process_ns, t_phase);
         } // end process_work_map
 
         // --- PHASE 3: ENSURE READS ---
         {
-        let _profg = profiler.profile(2, "ensure_reads");
-        worker
-          .handler_manager
-          .fill_active_fds(&mut worker.active_fds_scratch);
+          let _profg = profiler.profile(2, "ensure_reads");
+          worker
+            .handler_manager
+            .fill_active_fds(&mut worker.active_fds_scratch);
 
-        let mut sq = unsafe { worker.ring.submission_shared() };
-        for i in 0..worker.active_fds_scratch.len() {
-          let fd = worker.active_fds_scratch[i];
-          // Skip standard reads if this connection manages its own multishot read pathway or is throttled
-          if let Some(handler) = worker.handler_manager.get_mut(fd) {
-            if handler.should_throttle_reads() || handler.prefers_multishot_read() {
+          let mut sq = unsafe { worker.ring.submission_shared() };
+          for i in 0..worker.active_fds_scratch.len() {
+            let fd = worker.active_fds_scratch[i];
+            // Skip standard reads if this connection manages its own multishot read pathway or is throttled
+            if let Some(handler) = worker.handler_manager.get_mut(fd) {
+              if handler.should_throttle_reads() || handler.prefers_multishot_read() {
+                continue;
+              }
+            }
+            if worker.internal_op_tracker.has_pending_read_op(fd) {
               continue;
             }
-          }
-          if worker.internal_op_tracker.has_pending_read_op(fd) {
-            continue;
-          }
 
-          if sq.is_full() {
-            trace!("UringWorker: SQ full during read submission phase. Will retry next cycle.");
-            break;
-          }
+            if sq.is_full() {
+              trace!("UringWorker: SQ full during read submission phase. Will retry next cycle.");
+              break;
+            }
 
-          if let Some(bgid) = worker.default_buffer_ring_group_id_val {
-            let read_op_builder =
-              io_uring::opcode::Read::new(io_uring::types::Fd(fd), std::ptr::null_mut(), 0)
-                .offset(u64::MAX)
-                .buf_group(bgid);
-            let entry = read_op_builder
-              .build()
-              .flags(io_uring::squeue::Flags::BUFFER_SELECT);
-            let user_data = worker.internal_op_tracker.new_op_id(
-              fd,
-              super::InternalOpType::RingRead,
-              super::InternalOpPayload::None,
-            );
-            let final_entry = entry.user_data(user_data);
-            unsafe {
-              if sq.push(&final_entry).is_err() {
-                worker.internal_op_tracker.take_op_details(user_data);
-                warn!(
+            if let Some(bgid) = worker.default_buffer_ring_group_id_val {
+              let read_op_builder =
+                io_uring::opcode::Read::new(io_uring::types::Fd(fd), std::ptr::null_mut(), 0)
+                  .offset(u64::MAX)
+                  .buf_group(bgid);
+              let entry = read_op_builder
+                .build()
+                .flags(io_uring::squeue::Flags::BUFFER_SELECT);
+              let user_data = worker.internal_op_tracker.new_op_id(
+                fd,
+                super::InternalOpType::RingRead,
+                super::InternalOpPayload::None,
+              );
+              let final_entry = entry.user_data(user_data);
+              unsafe {
+                if sq.push(&final_entry).is_err() {
+                  worker.internal_op_tracker.take_op_details(user_data);
+                  warn!(
                   "UringWorker: SQ push failed for read op on FD {} (race). Will retry next cycle.",
                   fd
                 );
-                break;
-              } else {
-                counter!(worker.metrics, sqe_op_read, inc);
-                trace!(
-                  "UringWorker: Queued new standard read for FD {}. UD: {}",
-                  fd, user_data
-                );
+                  break;
+                } else {
+                  counter!(worker.metrics, sqe_op_read, inc);
+                  trace!(
+                    "UringWorker: Queued new standard read for FD {}. UD: {}",
+                    fd,
+                    user_data
+                  );
+                }
               }
-            }
-          } else {
-            error!(
+            } else {
+              error!(
               "UringWorker: Cannot submit read for FD {} because no default buffer ring is configured.",
               fd
             );
+            }
           }
-        }
-        drop(sq);
+          drop(sq);
 
-        metric_time_phase!(worker.metrics, time_reads_ns, t_phase);
+          metric_time_phase!(worker.metrics, time_reads_ns, t_phase);
         } // end ensure_reads
 
         // --- PHASE 4 & 5: SUBMIT AND IDLE ---
         {
-        let _profg = profiler.profile(3, "submit_and_idle");
+          let _profg = profiler.profile(3, "submit_and_idle");
 
-        {
-          let mut sq = unsafe { worker.ring.submission_shared() };
-          if worker.event_fd_poller.try_submit_initial_poll_sqe(&mut sq) {
-            counter!(worker.metrics, sqe_op_eventfd, inc);
-          }
-        }
-
-        let sq_len = unsafe { worker.ring.submission_shared().len() };
-        sqes_submitted_to_kernel_this_batch = 0;
-        let needs_wait = !work_was_available
-          && sq_len == 0
-          && unsafe { worker.ring.completion_shared().is_empty() };
-
-        if sq_len > 0 || needs_wait {
-          let submitted_count_res = if needs_wait {
-            // --- User-space spinning before kernel sleep ---
-            // worker_asleep stays false during all spin phases, so UringStream
-            // never fires an EventFD write while the worker is actively spinning.
-            let mut spin_found_work = false;
-
-            match worker.cfg_polling_strategy {
-              UringPollingStrategy::ImmediateSleep => {
-                // Skip all spinning; fall straight through to deep sleep.
-              }
-              UringPollingStrategy::Tiered {
-                aggressive_spin_limit,
-                cooperative_spin_limit,
-                os_yield_limit,
-                ..
-              } => {
-                // Phase 1 — Aggressive: tight loop, no yield hints.
-                for _ in 0..aggressive_spin_limit {
-                  if has_pending_work(worker) {
-                    spin_found_work = true;
-                    break;
-                  }
-                }
-                // Phase 2 — Cooperative: CPU pipeline pause hints.
-                if !spin_found_work {
-                  for _ in 0..cooperative_spin_limit {
-                    if has_pending_work(worker) {
-                      spin_found_work = true;
-                      break;
-                    }
-                    std::hint::spin_loop();
-                  }
-                }
-                // Phase 3 — OS yield: cooperate with the scheduler.
-                if !spin_found_work {
-                  for _ in 0..os_yield_limit {
-                    if has_pending_work(worker) {
-                      spin_found_work = true;
-                      break;
-                    }
-                    std::thread::yield_now();
-                  }
-                }
-              }
+          {
+            let mut sq = unsafe { worker.ring.submission_shared() };
+            if worker.event_fd_poller.try_submit_initial_poll_sqe(&mut sq) {
+              counter!(worker.metrics, sqe_op_eventfd, inc);
             }
+          }
 
-            if spin_found_work {
-              // Work detected during spinning — resume immediately without sleeping.
-              work_was_available = true;
-              Ok(0)
-            } else {
-              // All spin phases exhausted without finding work.
-              let should_sleep = match worker.cfg_polling_strategy {
-                UringPollingStrategy::ImmediateSleep => true,
+          let sq_len = unsafe { worker.ring.submission_shared().len() };
+          sqes_submitted_to_kernel_this_batch = 0;
+          let needs_wait = !work_was_available
+            && sq_len == 0
+            && unsafe { worker.ring.completion_shared().is_empty() };
+
+          if sq_len > 0 || needs_wait {
+            let submitted_count_res = if needs_wait {
+              // --- User-space spinning before kernel sleep ---
+              // worker_asleep stays false during all spin phases, so UringStream
+              // never fires an EventFD write while the worker is actively spinning.
+              let mut spin_found_work = false;
+
+              match worker.cfg_polling_strategy {
+                UringPollingStrategy::ImmediateSleep => {
+                  // Skip all spinning; fall straight through to deep sleep.
+                }
                 UringPollingStrategy::Tiered {
-                  deep_sleep_fallback,
+                  aggressive_spin_limit,
+                  cooperative_spin_limit,
+                  os_yield_limit,
                   ..
-                } => deep_sleep_fallback,
+                } => {
+                  // Phase 1 — Aggressive: tight loop, no yield hints.
+                  for _ in 0..aggressive_spin_limit {
+                    if has_pending_work(worker) {
+                      spin_found_work = true;
+                      break;
+                    }
+                  }
+                  // Phase 2 — Cooperative: CPU pipeline pause hints.
+                  if !spin_found_work {
+                    for _ in 0..cooperative_spin_limit {
+                      if has_pending_work(worker) {
+                        spin_found_work = true;
+                        break;
+                      }
+                      std::hint::spin_loop();
+                    }
+                  }
+                  // Phase 3 — OS yield: cooperate with the scheduler.
+                  if !spin_found_work {
+                    for _ in 0..os_yield_limit {
+                      if has_pending_work(worker) {
+                        spin_found_work = true;
+                        break;
+                      }
+                      std::thread::yield_now();
+                    }
+                  }
+                }
+              }
+
+              if spin_found_work {
+                // Work detected during spinning — resume immediately without sleeping.
+                work_was_available = true;
+                Ok(0)
+              } else {
+                // All spin phases exhausted without finding work.
+                let should_sleep = match worker.cfg_polling_strategy {
+                  UringPollingStrategy::ImmediateSleep => true,
+                  UringPollingStrategy::Tiered {
+                    deep_sleep_fallback,
+                    ..
+                  } => deep_sleep_fallback,
+                };
+
+                if should_sleep {
+                  // Cap sleep to 1ms when any handler has spillover data. Without this,
+                  // the worker can enter a deep sleep while holding undelivered data: the
+                  // Tokio task reads from the channel (freeing space), sees worker_asleep=false,
+                  // skips the eventfd write, then the worker sets worker_asleep=true and sleeps —
+                  // a TOCTOU deadlock where nobody wakes the worker up.
+                  let actual_timeout = if worker.handler_manager.any_handler_throttled() {
+                    Duration::from_millis(1)
+                  } else {
+                    kernel_poll_timeout_duration
+                  };
+                  let timespec_for_wait = types::Timespec::from(actual_timeout);
+                  let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
+                  // Double-check pattern: announce sleep, re-drain, then block.
+                  // Closes the race: if a sender pushed after the Phase 1 drain, it either
+                  // saw worker_asleep=true (wrote eventfd to wake us) or its message is
+                  // now visible via is_empty() below.
+                  worker
+                    .worker_asleep
+                    .store(WAKEUP_STATE_SLEEPING, Ordering::Release);
+                  let late_work = worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty())
+                    || worker
+                      .fd_to_zmtp_egress_rx
+                      .values()
+                      .any(|rx| !rx.is_empty())
+                    || worker.handler_manager.any_handler_has_inbound_data();
+                  if late_work {
+                    worker
+                      .worker_asleep
+                      .store(WAKEUP_STATE_ACTIVE, Ordering::Release);
+                    work_was_available = true;
+                    Ok(0)
+                  } else {
+                    let res = worker.ring.submitter().submit_with_args(1, &submit_args);
+                    worker
+                      .worker_asleep
+                      .store(WAKEUP_STATE_ACTIVE, Ordering::Release);
+                    res
+                  }
+                } else {
+                  // ultra_low_latency with deep_sleep_fallback=false: never sleep.
+                  // Re-enter the loop immediately.
+                  Ok(0)
+                }
+              }
+            } else {
+              // Non-waiting path: pending SQEs to submit.
+              // With SQPOLL enabled, skip the syscall when the kernel polling thread is awake.
+              // A SeqCst fence is required before reading IORING_SQ_NEED_WAKEUP to guarantee
+              // the kernel has observed our SQ tail update (io_uring spec §5.2).
+              let needs_syscall = if worker.cfg_sqpoll_active {
+                std::sync::atomic::fence(Ordering::SeqCst);
+                unsafe { worker.ring.submission_shared().need_wakeup() }
+              } else {
+                true
               };
 
-              if should_sleep {
-                // Cap sleep to 1ms when any handler has spillover data. Without this,
-                // the worker can enter a deep sleep while holding undelivered data: the
-                // Tokio task reads from the channel (freeing space), sees worker_asleep=false,
-                // skips the eventfd write, then the worker sets worker_asleep=true and sleeps —
-                // a TOCTOU deadlock where nobody wakes the worker up.
-                let actual_timeout = if worker.handler_manager.any_handler_throttled() {
-                  Duration::from_millis(1)
-                } else {
-                  kernel_poll_timeout_duration
-                };
-                let timespec_for_wait = types::Timespec::from(actual_timeout);
-                let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
-                // Double-check pattern: announce sleep, re-drain, then block.
-                // Closes the race: if a sender pushed after the Phase 1 drain, it either
-                // saw worker_asleep=true (wrote eventfd to wake us) or its message is
-                // now visible via is_empty() below.
-                worker
-                  .worker_asleep
-                  .store(WAKEUP_STATE_SLEEPING, Ordering::Release);
-                let late_work = worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty())
-                  || worker
-                    .fd_to_zmtp_egress_rx
-                    .values()
-                    .any(|rx| !rx.is_empty())
-                  || worker.handler_manager.any_handler_has_inbound_data();
-                if late_work {
-                  worker
-                    .worker_asleep
-                    .store(WAKEUP_STATE_ACTIVE, Ordering::Release);
-                  work_was_available = true;
-                  Ok(0)
-                } else {
-                  let res = worker.ring.submitter().submit_with_args(1, &submit_args);
-                  worker
-                    .worker_asleep
-                    .store(WAKEUP_STATE_ACTIVE, Ordering::Release);
-                  res
-                }
+              if needs_syscall {
+                worker.ring.submitter().submit()
               } else {
-                // ultra_low_latency with deep_sleep_fallback=false: never sleep.
-                // Re-enter the loop immediately.
-                Ok(0)
+                trace!("UringWorker: SQPOLL kernel thread active — bypassed submit() syscall.");
+                Ok(sq_len)
+              }
+            };
+            match submitted_count_res {
+              Ok(count) => {
+                sqes_submitted_to_kernel_this_batch = count;
+              }
+              Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                  || e.raw_os_error() == Some(libc::ETIME) => {}
+              Err(e)
+                if e.raw_os_error() == Some(libc::EBUSY)
+                  || e.raw_os_error() == Some(libc::EINTR) =>
+              {
+                warn!("UringWorker: submit() returned EBUSY/EINTR");
+              }
+              Err(e) => {
+                error!(
+                  "UringWorker: ring.submit() failed critically: {}. Shutting down.",
+                  e
+                );
+                return Err(ZmqError::from(e));
               }
             }
-          } else {
-            // Non-waiting path: pending SQEs to submit.
-            // With SQPOLL enabled, skip the syscall when the kernel polling thread is awake.
-            // A SeqCst fence is required before reading IORING_SQ_NEED_WAKEUP to guarantee
-            // the kernel has observed our SQ tail update (io_uring spec §5.2).
-            let needs_syscall = if worker.cfg_sqpoll_active {
-              std::sync::atomic::fence(Ordering::SeqCst);
-              unsafe { worker.ring.submission_shared().need_wakeup() }
-            } else {
-              true
+          }
+
+          metric_time_phase!(worker.metrics, time_submit_ns, t_phase);
+
+          let (cqe_count, newly_generated_work) =
+            match cqe_processor::process_all_cqes(worker, false) {
+              Ok(result) => result,
+              Err(e) => {
+                error!("UringWorker: cqe_processor returned a fatal error: {}", e);
+                return Err(e);
+              }
             };
+          cqe_processed_count = cqe_count;
 
-            if needs_syscall {
-              worker.ring.submitter().submit()
-            } else {
-              trace!("UringWorker: SQPOLL kernel thread active — bypassed submit() syscall.");
-              Ok(sq_len)
-            }
-          };
-          match submitted_count_res {
-            Ok(count) => {
-              sqes_submitted_to_kernel_this_batch = count;
-            }
-            Err(e)
-              if e.kind() == std::io::ErrorKind::TimedOut
-                || e.raw_os_error() == Some(libc::ETIME) => {}
-            Err(e)
-              if e.raw_os_error() == Some(libc::EBUSY) || e.raw_os_error() == Some(libc::EINTR) =>
-            {
-              warn!("UringWorker: submit() returned EBUSY/EINTR");
-            }
-            Err(e) => {
-              error!(
-                "UringWorker: ring.submit() failed critically: {}. Shutting down.",
-                e
-              );
-              return Err(ZmqError::from(e));
+          if !newly_generated_work.is_empty() {
+            work_was_available = true;
+            for (fd, blueprints) in newly_generated_work {
+              worker
+                .work_map
+                .entry(fd)
+                .or_default()
+                .route_blueprints(blueprints);
             }
           }
-        }
 
-        metric_time_phase!(worker.metrics, time_submit_ns, t_phase);
+          metric_time_phase!(worker.metrics, time_cqe_ns, t_phase);
+          counter!(worker.metrics, cqes_reaped, add, cqe_processed_count as u64);
+          counter!(
+            worker.metrics,
+            sqes_submitted,
+            add,
+            sqes_submitted_to_kernel_this_batch as u64
+          );
+          counter!(worker.metrics, loop_iterations, inc);
 
-        let (cqe_count, newly_generated_work) =
-          match cqe_processor::process_all_cqes(worker, false) {
-            Ok(result) => result,
-            Err(e) => {
-              error!("UringWorker: cqe_processor returned a fatal error: {}", e);
-              return Err(e);
-            }
-          };
-        cqe_processed_count = cqe_count;
-
-        if !newly_generated_work.is_empty() {
-          work_was_available = true;
-          for (fd, blueprints) in newly_generated_work {
-            worker
+          #[cfg(any(debug_assertions, feature = "diagnostics"))]
+          {
+            use std::sync::atomic::Ordering;
+            let writes_in_flight = worker
+              .internal_op_tracker
+              .op_to_details
+              .iter()
+              .any(|(_, d)| {
+                matches!(
+                  d.op_type,
+                  InternalOpType::Send
+                    | InternalOpType::SendZeroCopy
+                    | InternalOpType::SendRawVectored
+                    | InternalOpType::SendZeroCopyLeased
+                )
+              });
+            let total_egress_q: usize = worker
               .work_map
-              .entry(fd)
-              .or_default()
-              .route_blueprints(blueprints);
+              .values()
+              .map(|w| w.egress_blueprints.len())
+              .sum();
+            worker
+              .metrics
+              .write_in_flight_state
+              .store(writes_in_flight as u64, Ordering::Relaxed);
+            worker
+              .metrics
+              .egress_queue_len
+              .store(total_egress_q as u64, Ordering::Relaxed);
           }
-        }
-
-        metric_time_phase!(worker.metrics, time_cqe_ns, t_phase);
-        counter!(worker.metrics, cqes_reaped, add, cqe_processed_count as u64);
-        counter!(worker.metrics, sqes_submitted, add, sqes_submitted_to_kernel_this_batch as u64);
-        counter!(worker.metrics, loop_iterations, inc);
-
-        #[cfg(any(debug_assertions, feature = "diagnostics"))]
-        {
-          use std::sync::atomic::Ordering;
-          let writes_in_flight = worker
-            .internal_op_tracker
-            .op_to_details
-            .iter()
-            .any(|(_, d)| {
-              matches!(
-                d.op_type,
-                InternalOpType::Send
-                  | InternalOpType::SendZeroCopy
-                  | InternalOpType::SendRawVectored
-                  | InternalOpType::SendZeroCopyLeased
-              )
-            });
-          let total_egress_q: usize = worker
-            .work_map
-            .values()
-            .map(|w| w.egress_blueprints.len())
-            .sum();
-          worker
-            .metrics
-            .write_in_flight_state
-            .store(writes_in_flight as u64, Ordering::Relaxed);
-          worker
-            .metrics
-            .egress_queue_len
-            .store(total_egress_q as u64, Ordering::Relaxed);
-        }
         } // end submit_and_idle
 
         if sqes_submitted_to_kernel_this_batch == 0
