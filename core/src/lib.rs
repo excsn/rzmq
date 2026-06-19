@@ -28,6 +28,8 @@ pub(crate) mod throttle;
 
 pub(crate) mod profiler;
 
+pub(crate) mod observability;
+
 #[cfg(feature = "io-uring")]
 pub mod io_uring_backend;
 #[cfg(feature = "io-uring")]

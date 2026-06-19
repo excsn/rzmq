@@ -71,6 +71,10 @@ impl CorePipeManagerX {
   /// Appends up to `max` items to `out` in one channel pass and returns the count
   /// appended; `0` when the pipe is empty, closed, or not attached (closure is
   /// surfaced by the next blocking `recv_from_core`).
+  pub(crate) fn len(&self) -> usize {
+    self.state.rx_from_core.as_ref().map(|rx| rx.len()).unwrap_or(0)
+  }
+
   pub(crate) fn try_recv_batch_from_core(&self, out: &mut Vec<FrameBatch>, max: usize) -> usize {
     if let Some(ref rx) = self.state.rx_from_core {
       rx.try_recv_batch_mut(out, max).unwrap_or(0)

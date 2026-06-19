@@ -26,6 +26,7 @@ inproc = []
 plain = []
 
 bench_external_clients = []
+diagnostics = []
 
 [dependencies]
 

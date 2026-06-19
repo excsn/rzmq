@@ -14,7 +14,7 @@ use crate::socket::options::ZmtpEngineConfig;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::throttle::AdaptiveThrottle;
 use crate::transport::{ZmtpStdStream, ZmtpWriteHalf};
-use crate::{Blob, MailboxReceiver};
+use crate::{Blob, MailboxReceiver, counter, log_session_diagnostics};
 
 use super::message_processor::ZmqMessageProcessor;
 
@@ -34,8 +34,7 @@ use super::pipe_manager::CorePipeManagerX;
 use super::states::ActorConfigX;
 use super::types::ConnectionPhaseX;
 
-use std::sync::atomic::{AtomicU64, Ordering};
-pub(crate) static GLOBAL_DRAINED_MSGS: AtomicU64 = AtomicU64::new(0);
+use std::sync::atomic::Ordering;
 
 pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   handle: usize,
@@ -306,6 +305,9 @@ where
       let mut core_carryover: std::collections::VecDeque<FrameBatch> =
         std::collections::VecDeque::new();
 
+      #[cfg(any(debug_assertions, feature = "diagnostics"))]
+      let mut last_log_ms = 0u64;
+
       'operational: while self.current_phase == ConnectionPhaseX::Operational {
         if !core_carryover.is_empty()
           && self.current_phase == ConnectionPhaseX::Operational
@@ -386,7 +388,7 @@ where
           }
 
           if !outgoing_batch.is_empty() {
-            GLOBAL_DRAINED_MSGS.fetch_add(outgoing_batch.len() as u64, Ordering::Relaxed);
+            counter!(global, global_drained_msgs, add, outgoing_batch.len() as u64);
           }
 
           let throttle_guard = adaptive_throttle.begin_work_bulk(
@@ -653,7 +655,7 @@ where
                 }
 
                 if !outgoing_batch.is_empty() {
-                  GLOBAL_DRAINED_MSGS.fetch_add(outgoing_batch.len() as u64, Ordering::Relaxed);
+                  counter!(global, global_drained_msgs, add, outgoing_batch.len() as u64);
                 }
 
                 let throttle_guard = adaptive_throttle.begin_work_bulk(
@@ -704,7 +706,10 @@ where
               }
             }
           }
+
         }
+
+        log_session_diagnostics!(last_log_ms, self, ingress_buffer, egress_buffer, sndhwm, core_carryover);
       }
 
       self.read_half = Some(read_half);

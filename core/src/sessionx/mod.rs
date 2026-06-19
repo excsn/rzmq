@@ -1,6 +1,7 @@
 pub(crate) mod actor;
 pub(crate) mod egress_buffer;
 pub(crate) mod egress_future;
+pub(crate) mod egress_scheduler;
 pub(crate) mod message_processor;
 #[cfg(target_os = "linux")]
 pub(crate) mod cork;

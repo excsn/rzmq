@@ -1,19 +1,11 @@
 use super::egress_buffer::EgressBuffer;
 use crate::error::ZmqError;
 use crate::transport::ZmtpWriteHalf;
+use crate::{counter, log_egress_diagnostics};
 use std::future::Future;
 use std::io::IoSlice;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
-
-// Unified global counters accumulated across all 8 independent connection buffers
-pub(crate) static GLOBAL_MSGS_PULLED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static GLOBAL_BYTES_PULLED: AtomicU64 = AtomicU64::new(0);
-
-static LAST_BYTES_SENT: AtomicU64 = AtomicU64::new(0);
-static LAST_PRINT_TIME: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
 
 /// Cancel-safe egress write future.
 ///
@@ -83,38 +75,15 @@ impl<'a, W: ZmtpWriteHalf> Future for EgressDriver<'a, W> {
       let popped_msgs = this.egress_buffer.advance(n);
 
       // 2. Accumulate pulled counters
-      GLOBAL_MSGS_PULLED.fetch_add(popped_msgs as u64, Ordering::Relaxed);
-      let total_bytes_written =
-        GLOBAL_BYTES_PULLED.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+      counter!(global, global_msgs_pulled, add, popped_msgs as u64);
+      counter!(global, global_bytes_pulled, add, n as u64);
 
-      let now = Instant::now();
-      let print_time_mutex = LAST_PRINT_TIME.get_or_init(|| std::sync::Mutex::new(now));
-
-      if let Ok(mut last_print_time) = print_time_mutex.try_lock() {
-        let elapsed = now.duration_since(*last_print_time);
-        if elapsed >= Duration::from_secs(1) {
-          let last_bytes = LAST_BYTES_SENT.load(Ordering::Relaxed);
-          let delta_bytes = total_bytes_written.saturating_sub(last_bytes);
-
-          let mb_sec = (delta_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64();
-          let total_mb = total_bytes_written as f64 / 1_048_576.0;
-
-          println!(
-            "[EgressDriver ID: {}] Total: {:.2} MB | Speed: {:.2} MB/s | Buffer Msgs: {} | Peak Msgs: {} | Peak Bytes: {} | Global Drained Msgs: {} | Global Pulled Msgs: {}",
-            this.actor_handle, // Output the unique actor ID
-            total_mb,
-            mb_sec,
-            this.egress_buffer.pending_messages(),
-            this.egress_buffer.peak_messages(),
-            this.egress_buffer.peak_bytes(),
-            crate::sessionx::actor::GLOBAL_DRAINED_MSGS.load(Ordering::Relaxed),
-            GLOBAL_MSGS_PULLED.load(Ordering::Relaxed)
-          );
-
-          LAST_BYTES_SENT.store(total_bytes_written, Ordering::Relaxed);
-          *last_print_time = now;
-        }
-      }
+      log_egress_diagnostics!(
+        this.actor_handle,
+        this.egress_buffer.pending_messages(),
+        this.egress_buffer.peak_messages(),
+        this.egress_buffer.peak_bytes()
+      );
     }
   }
 }
