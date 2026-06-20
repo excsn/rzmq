@@ -4,7 +4,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -35,6 +35,10 @@ pub(crate) struct ZmtpSmartConnection {
   egress_tx: fibre::mpsc::BoundedAsyncSender<FrameBatch>,
   event_fd: eventfd::EventFD,
   worker_asleep: Arc<AtomicU8>,
+  /// Monotonic work-enqueued generation counter shared with the worker loop.
+  /// Bumped on every successful egress enqueue so a spinning worker detects the
+  /// batch via a single relaxed load instead of iterating every egress channel.
+  work_signal_gen: Arc<AtomicUsize>,
   sndtimeo: Option<Duration>,
 }
 
@@ -53,6 +57,7 @@ impl ZmtpSmartConnection {
     egress_tx: fibre::mpsc::BoundedAsyncSender<FrameBatch>,
     event_fd: eventfd::EventFD,
     worker_asleep: Arc<AtomicU8>,
+    work_signal_gen: Arc<AtomicUsize>,
     sndtimeo: Option<Duration>,
   ) -> Self {
     Self {
@@ -60,11 +65,17 @@ impl ZmtpSmartConnection {
       egress_tx,
       event_fd,
       worker_asleep,
+      work_signal_gen,
       sndtimeo,
     }
   }
 
   fn signal_worker(&self) {
+    // Monotonic work-signal bump (Release): pairs with the worker's Acquire load
+    // in the spin loop so the enqueued batch is visible without probing the channel.
+    // Must happen on every successful enqueue, including while the worker is spinning
+    // (worker_asleep == ACTIVE), where the eventfd write below is skipped.
+    self.work_signal_gen.fetch_add(1, Ordering::Release);
     if self.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
       if self
         .worker_asleep

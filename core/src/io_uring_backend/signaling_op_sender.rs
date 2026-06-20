@@ -4,7 +4,7 @@ use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use fibre::{mpmc::AsyncSender, SendError, TrySendError};
 use once_cell::sync::OnceCell;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{os::fd::AsRawFd, usize};
 
@@ -13,6 +13,10 @@ pub struct SignalingOpSender {
   op_tx: AsyncSender<UringOpRequest>,
   event_fd: eventfd::EventFD,
   worker_asleep: Arc<AtomicU8>,
+  /// Monotonic work-enqueued generation counter shared with the worker loop.
+  /// Bumped on every successful op enqueue so a spinning worker detects the new
+  /// op via a single relaxed load instead of locking the mpmc op channel.
+  work_signal_gen: Arc<AtomicUsize>,
   /// Shared slot populated by the worker thread once the `SendBufferPool` is initialized.
   /// `OnceCell` is lock-free for reads after the one-time write.
   pool_slot: Arc<OnceCell<Arc<SendBufferPool>>>,
@@ -23,9 +27,10 @@ impl SignalingOpSender {
     op_tx: AsyncSender<UringOpRequest>,
     event_fd: eventfd::EventFD,
     worker_asleep: Arc<AtomicU8>,
+    work_signal_gen: Arc<AtomicUsize>,
     pool_slot: Arc<OnceCell<Arc<SendBufferPool>>>,
   ) -> Self {
-    Self { op_tx, event_fd, worker_asleep, pool_slot }
+    Self { op_tx, event_fd, worker_asleep, work_signal_gen, pool_slot }
   }
 
   /// Clones the worker-asleep flag to share with data connections.
@@ -44,6 +49,9 @@ impl SignalingOpSender {
     let send_result = self.op_tx.send(req).await;
 
     if send_result.is_ok() {
+      // Monotonic work-signal bump (Release): pairs with the worker's Acquire load
+      // in the spin loop so the enqueued op is visible without locking op_tx.
+      self.work_signal_gen.fetch_add(1, Ordering::Release);
       // If send was successful, signal the eventfd.
       let val_to_write: u64 = 1;
       if let Err(e) = self.event_fd.write(val_to_write) {
@@ -73,6 +81,8 @@ impl SignalingOpSender {
     let send_result = self.op_tx.try_send(req);
 
     if send_result.is_ok() {
+      // Monotonic work-signal bump (Release): see `send` above.
+      self.work_signal_gen.fetch_add(1, Ordering::Release);
       let val_to_write: u64 = 1;
       if let Err(e) = self.event_fd.write(val_to_write) {
         tracing::error!(

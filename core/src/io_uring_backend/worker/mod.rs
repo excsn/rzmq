@@ -27,7 +27,7 @@ use std::fmt;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::sync::Arc;
 
 use fibre::mpmc::{unbounded, AsyncSender, Receiver as SyncReceiver, Sender as SyncSender};
@@ -117,6 +117,14 @@ pub struct UringWorker {
   // Shared flag: true while the worker is blocked in submit_with_args waiting for kernel events.
   // Connections check this before writing to eventfd to avoid redundant syscalls.
   pub(crate) worker_asleep: Arc<AtomicU8>,
+  /// Monotonic "work enqueued" generation counter. Every producer (op submission
+  /// via `SignalingOpSender`, egress batch via `ZmtpSmartConnection`) bumps this on
+  /// a successful enqueue; it is never decremented. The user-space spin loop snapshots
+  /// it once and detects new work with a single relaxed load instead of locking the
+  /// mpmc op channel or iterating every egress channel. A stale read only costs one
+  /// extra non-sleeping loop iteration; the authoritative pre-sleep double-check
+  /// (real channel `is_empty()` probes) remains the correctness guard.
+  pub(crate) work_signal_gen: Arc<AtomicUsize>,
 
   /// Scratchpad for active file descriptors to avoid hot-path heap allocations.
   pub(crate) active_fds_scratch: Vec<RawFd>,
@@ -177,6 +185,7 @@ impl UringWorker {
     })?;
 
     let worker_asleep = Arc::new(AtomicU8::new(WAKEUP_STATE_ACTIVE));
+    let work_signal_gen = Arc::new(AtomicUsize::new(0));
     let pool_slot: Arc<
       once_cell::sync::OnceCell<Arc<crate::io_uring_backend::send_buffer_pool::SendBufferPool>>,
     > = Arc::new(once_cell::sync::OnceCell::new());
@@ -184,6 +193,7 @@ impl UringWorker {
       op_tx_async_for_signaler,
       event_fd_master_instance.clone(),
       Arc::clone(&worker_asleep),
+      Arc::clone(&work_signal_gen),
       Arc::clone(&pool_slot),
     );
 
@@ -303,6 +313,7 @@ impl UringWorker {
               cfg_worker_batch_limit: (config.ring_entries as usize / 4).clamp(64, 512),
               cfg_egress_cap: (config.ring_entries as usize / 16).clamp(8, 128),
               worker_asleep,
+              work_signal_gen,
               active_fds_scratch: Vec::with_capacity(256),
               mpsc_fds_scratch: Vec::with_capacity(256),
               cqe_scratch: Vec::with_capacity(256),

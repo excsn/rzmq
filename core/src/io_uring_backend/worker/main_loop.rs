@@ -314,6 +314,7 @@ impl UringWorker {
           egress_tx_async,
           event_fd,
           std::sync::Arc::clone(&self.worker_asleep),
+          std::sync::Arc::clone(&self.work_signal_gen),
           engine_cfg.sndtimeo,
         ));
 
@@ -463,16 +464,17 @@ impl UringWorker {
   }
 }
 
-/// Non-consuming check: true if any inbound channel or the CQ ring has pending work.
-/// Called from spinning phases — must never block or allocate.
+/// Non-consuming check: true if new work arrived since `gen_snapshot`, or the CQ ring
+/// has pending completions. Called thousands of times per idle period from the spin
+/// phases — must never block, lock, or allocate.
+///
+/// Producers (op submission, egress batches) bump `work_signal_gen` on every enqueue,
+/// so a single relaxed load replaces the old mutex-locking mpmc probe plus the
+/// per-connection egress-channel iteration. A stale snapshot only costs one extra
+/// non-sleeping loop iteration; the pre-sleep double-check is the correctness guard.
 #[inline(always)]
-fn has_pending_work(worker: &UringWorker) -> bool {
-  !worker.op_rx.is_empty()
-    || worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty())
-    || worker
-      .fd_to_zmtp_egress_rx
-      .values()
-      .any(|rx| !rx.is_empty())
+fn has_pending_work(worker: &UringWorker, gen_snapshot: usize) -> bool {
+  worker.work_signal_gen.load(Ordering::Acquire) != gen_snapshot
     || unsafe { !worker.ring.completion_shared().is_empty() }
 }
 
@@ -805,6 +807,11 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               // never fires an EventFD write while the worker is actively spinning.
               let mut spin_found_work = false;
 
+              // Snapshot the work generation once. Phase 1 already drained every
+              // known channel, so any producer bump observed past this baseline
+              // means genuinely new work arrived during the spin.
+              let work_gen_snapshot = worker.work_signal_gen.load(Ordering::Acquire);
+
               match worker.cfg_polling_strategy {
                 UringPollingStrategy::ImmediateSleep => {
                   // Skip all spinning; fall straight through to deep sleep.
@@ -817,7 +824,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 } => {
                   // Phase 1 — Aggressive: tight loop, no yield hints.
                   for _ in 0..aggressive_spin_limit {
-                    if has_pending_work(worker) {
+                    if has_pending_work(worker, work_gen_snapshot) {
                       spin_found_work = true;
                       break;
                     }
@@ -825,7 +832,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                   // Phase 2 — Cooperative: CPU pipeline pause hints.
                   if !spin_found_work {
                     for _ in 0..cooperative_spin_limit {
-                      if has_pending_work(worker) {
+                      if has_pending_work(worker, work_gen_snapshot) {
                         spin_found_work = true;
                         break;
                       }
@@ -835,7 +842,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                   // Phase 3 — OS yield: cooperate with the scheduler.
                   if !spin_found_work {
                     for _ in 0..os_yield_limit {
-                      if has_pending_work(worker) {
+                      if has_pending_work(worker, work_gen_snapshot) {
                         spin_found_work = true;
                         break;
                       }
