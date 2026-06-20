@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 pub(crate) struct IngressDriver<'a> {
   sender_opt: Option<&'a PipeMessageSender>,
   ingress_buffer: &'a mut VecDeque<FrameBatch>,
-  // Lazily initialized on first poll() so new() never touches the buffer.
+  // Set only when try_send_batch hits backpressure; cleared after the async send resolves.
   fut: Option<Pin<Box<dyn Future<Output = Result<(), ZmqError>> + Send + 'a>>>,
 }
 
@@ -34,32 +34,61 @@ impl<'a> Future for IngressDriver<'a> {
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let this = self.get_mut();
+    let mut total_sent = 0;
 
-    // Lazy init: only runs on the first poll(), which only fires when the guard is true.
-    if this.fut.is_none() {
-      if this.ingress_buffer.is_empty() {
-        return Poll::Pending;
-      }
-      match this.sender_opt {
-        None => {
-          // No pipe sender (PUSH/PUB) — silently drain.
+    // Resolve any in-flight async send (from a prior backpressure stall) first.
+    if let Some(fut) = this.fut.as_mut() {
+      match fut.as_mut().poll(cx) {
+        Poll::Ready(Ok(())) => {
+          this.fut = None;
           let batch = this.ingress_buffer.pop_front().unwrap();
-          return Poll::Ready(Ok(batch.len()));
+          total_sent += batch.len();
+          // Fall through to bulk-drain whatever's left.
         }
-        Some(sender) => {
-          let batch = this.ingress_buffer.front().unwrap().clone();
-          this.fut = Some(Box::pin(sender.send(batch)));
+        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+        Poll::Pending => return Poll::Pending,
+      }
+    }
+
+    match this.sender_opt {
+      None => {
+        // No pipe sender (PUB/PUSH send-only) — silently discard.
+        for batch in this.ingress_buffer.drain(..) {
+          total_sent += batch.len();
+        }
+      }
+      Some(sender) => {
+        // Coalesced batch push: O(1) atomics and one wakeup for the whole buffer.
+        total_sent += sender.try_send_batch(this.ingress_buffer);
+
+        // If items remain, the front hit backpressure. Fall back to async to
+        // register the waker so this future is re-polled when the pipe drains.
+        if let Some(blocked) = this.ingress_buffer.front() {
+          let fut = sender.send(blocked.clone());
+          this.fut = Some(Box::pin(fut));
+          match this.fut.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Ready(Ok(())) => {
+              this.fut = None;
+              let sent = this.ingress_buffer.pop_front().unwrap();
+              total_sent += sent.len();
+            }
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => {
+              return if total_sent > 0 {
+                Poll::Ready(Ok(total_sent))
+              } else {
+                Poll::Pending
+              };
+            }
+          }
         }
       }
     }
 
-    match this.fut.as_mut().unwrap().as_mut().poll(cx) {
-      Poll::Ready(Ok(())) => {
-        let batch = this.ingress_buffer.pop_front().unwrap();
-        Poll::Ready(Ok(batch.len()))
-      }
-      Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-      Poll::Pending => Poll::Pending,
+    if total_sent > 0 {
+      Poll::Ready(Ok(total_sent))
+    } else {
+      Poll::Pending
     }
   }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "io-uring")]
 use std::sync::OnceLock;
 use std::sync::{
@@ -427,6 +427,80 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     Ok(())
   }
 
+  /// Synchronously pushes as many items as the channel will accept, performing
+  /// `queued_count` updates inline (prevents consumer underflow) and coalescing
+  /// the ready-queue wakeup to exactly one spin-retry at the end.
+  ///
+  /// Returns the total weight of items consumed from `items` (both sent and, in
+  /// the filtered case, discarded). Items that could not be sent due to backpressure
+  /// remain at the front of `items` in FIFO order.
+  pub fn try_send_batch(&self, items: &mut VecDeque<T>, get_weight: impl Fn(&T) -> usize) -> usize {
+    let slot = match self.slot.upgrade() {
+      Some(s) => s,
+      None => return 0,
+    };
+
+    let n = items.len();
+    if n == 0 {
+      return 0;
+    }
+
+    // Bulk reservation upfront — one atomic instead of N.
+    slot.reserved_count.fetch_add(n, Ordering::AcqRel);
+
+    let mut sent_batches = 0usize;
+    let mut total_weight = 0usize;
+    let mut had_zero_transition = false;
+
+    while let Some(item) = items.pop_front() {
+      let weight = get_weight(&item);
+      match slot.tx.try_send(item) {
+        Ok(()) => {
+          sent_batches += 1;
+          total_weight += weight;
+          // Inline increment — consumer may pop the item before the batch ends;
+          // updating immediately keeps queued_count >= physical channel occupancy.
+          let prev = slot.queued_count.fetch_add(1, Ordering::AcqRel);
+          if prev == 0 {
+            had_zero_transition = true;
+          }
+        }
+        Err(TrySendError::Full(returned)) => {
+          items.push_front(returned);
+          break;
+        }
+        Err(TrySendError::Closed(returned)) => {
+          items.push_front(returned);
+          break;
+        }
+        Err(TrySendError::Sent(_)) => unreachable!(),
+      }
+    }
+
+    // Roll back any reservations for items we couldn't push.
+    if sent_batches < n {
+      slot.reserved_count.fetch_sub(n - sent_batches, Ordering::AcqRel);
+    }
+
+    // Guaranteed wakeup on 0→1 transition. ready_capacity >= max registered
+    // pipes, so the spin almost never executes more than one iteration.
+    if had_zero_transition {
+      let mut spins = 0usize;
+      while let Err(e) = self.ready_tx.try_send(Arc::clone(&slot)) {
+        spins += 1;
+        if spins % 1_000_000 == 0 {
+          println!(
+            "[DEADLOCK pid={} spins={}] try_send_batch spinning on ready_tx — error: {:?}",
+            std::process::id(), spins, e
+          );
+        }
+        std::thread::yield_now();
+      }
+    }
+
+    total_weight
+  }
+
   pub fn queued_count(&self) -> usize {
     self
       .slot
@@ -520,6 +594,99 @@ impl PipeMessageSender {
         }
       }
       Self::DirectAddressed { sender } => sender.try_send(batch),
+    }
+  }
+
+  /// Synchronously drains as many `FrameBatch`es from `items` as possible,
+  /// applying subscription filtering for `FilteredAnonymous` senders.
+  ///
+  /// Returns the total frame count consumed (sent + discarded). Backpressured
+  /// items remain at the front of `items` in FIFO order.
+  pub fn try_send_batch(&self, items: &mut VecDeque<FrameBatch>) -> usize {
+    match self {
+      Self::DirectAnonymous(s) => s.try_send_batch(items, |b| b.len()),
+
+      Self::FilteredAnonymous { sender, trie } => {
+        let n = items.len();
+        if n == 0 {
+          return 0;
+        }
+
+        // Pre-scan to get exact match count for a precise coalesced reservation.
+        let match_count = items
+          .iter()
+          .filter(|b| trie.matches(b.first().and_then(|m| m.data()).unwrap_or(&[])))
+          .count();
+
+        // Fast path: nothing passes the filter — bulk discard.
+        if match_count == 0 {
+          let total = items.iter().map(|b| b.len()).sum::<usize>();
+          items.clear();
+          return total;
+        }
+
+        let slot = match sender.slot.upgrade() {
+          Some(s) => s,
+          None => return 0,
+        };
+
+        slot.reserved_count.fetch_add(match_count, Ordering::AcqRel);
+
+        let mut sent_batches = 0usize;
+        let mut total_frames = 0usize;
+        let mut had_zero_transition = false;
+
+        while let Some(item) = items.pop_front() {
+          let topic: &[u8] = item.first().and_then(|m| m.data()).unwrap_or(&[]);
+          if trie.matches(topic) {
+            let frame_count = item.len();
+            match slot.tx.try_send(item) {
+              Ok(()) => {
+                sent_batches += 1;
+                total_frames += frame_count;
+                let prev = slot.queued_count.fetch_add(1, Ordering::AcqRel);
+                if prev == 0 {
+                  had_zero_transition = true;
+                }
+              }
+              Err(TrySendError::Full(returned)) => {
+                items.push_front(returned);
+                break;
+              }
+              Err(TrySendError::Closed(returned)) => {
+                items.push_front(returned);
+                break;
+              }
+              _ => unreachable!(),
+            }
+          } else {
+            // Non-matching frames are discarded; count them as processed.
+            total_frames += item.len();
+          }
+        }
+
+        if sent_batches < match_count {
+          slot.reserved_count.fetch_sub(match_count - sent_batches, Ordering::AcqRel);
+        }
+
+        if had_zero_transition {
+          let mut spins = 0usize;
+          while let Err(e) = sender.ready_tx.try_send(Arc::clone(&slot)) {
+            spins += 1;
+            if spins % 1_000_000 == 0 {
+              println!(
+                "[DEADLOCK pid={} spins={}] try_send_batch filtered spinning — error: {:?}",
+                std::process::id(), spins, e
+              );
+            }
+            std::thread::yield_now();
+          }
+        }
+
+        total_frames
+      }
+
+      Self::DirectAddressed { sender } => sender.try_send_batch(items, |b| b.len()),
     }
   }
 
