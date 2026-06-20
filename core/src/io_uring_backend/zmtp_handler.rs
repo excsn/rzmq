@@ -150,6 +150,18 @@ impl ISocketConnection for ZmtpSmartConnection {
     }
   }
 
+  fn try_send_multipart_owned_sync(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
+    match self.egress_tx.try_send(msgs) {
+      Ok(()) => {
+        self.signal_worker();
+        Ok(())
+      }
+      Err(fibre::TrySendError::Full(returned)) => Err((returned, ZmqError::ResourceLimitReached)),
+      Err(fibre::TrySendError::Closed(returned)) => Err((returned, ZmqError::ConnectionClosed)),
+      _ => unreachable!(),
+    }
+  }
+
   async fn close_connection(&self) -> Result<(), ZmqError> {
     Ok(())
   }
