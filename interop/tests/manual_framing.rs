@@ -2,68 +2,31 @@ mod common;
 
 use anyhow::Result;
 use rzmq::{Msg, SocketType, context::context, socket::options};
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-
-struct ChildProcessGuard {
-  child: Child,
-}
-impl Drop for ChildProcessGuard {
-  fn drop(&mut self) {
-    let _ = self.child.kill();
-    let _ = self.child.wait();
-  }
-}
 
 /// Test A: rzmq ROUTER (Manual) <-> pyzmq DEALER (Raw)
 ///
 /// rzmq ROUTER (Manual) should:
 /// 1. Receive [Identity, Payload] from a raw DEALER (no empty delimiter inserted).
 /// 2. Send [Identity, Payload] to a raw DEALER (no empty delimiter inserted).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_router_manual_vs_pyzmq_dealer() -> Result<()> {
   common::setup_logging();
-  let endpoint = "tcp://127.0.0.1:5570";
+  let endpoint = common::alloc_endpoint();
 
   // 1. Setup rzmq ROUTER with MANUAL_FRAMING enabled
   let ctx = context()?;
   let router = ctx.socket(SocketType::Router)?;
 
   // Enable Manual Framing (disable Auto Delimiter)
-  // We pass 1 as a u64 to enable the option.
   router.set_option(options::AUTO_DELIMITER, false).await?;
 
-  router.bind(endpoint).await?;
+  router.bind(&endpoint).await?;
   tracing::info!("rzmq ROUTER (Manual): Bound to {}", endpoint);
 
-  // 2. Start Python DEALER
-  let mut cmd = Command::new("python3")
-    .arg("python_scripts/dealer_raw.py")
-    .arg(endpoint)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()?;
-
-  let stdout = cmd.stdout.take().expect("Failed to open stdout");
-  let _guard = ChildProcessGuard { child: cmd };
-  let mut reader = BufReader::new(stdout);
-  let mut line = String::new();
-
-  // Wait for Python to signal READY
-  let start = std::time::Instant::now();
-  let mut ready = false;
-  while start.elapsed() < Duration::from_secs(5) {
-    if reader.read_line(&mut line)? == 0 {
-      break;
-    }
-    if line.contains("READY") {
-      ready = true;
-      break;
-    }
-    line.clear();
-  }
-  anyhow::ensure!(ready, "Python DEALER did not signal READY");
+  // 2. Start Python DEALER and wait for it to be ready.
+  let (_guard, mut reader) =
+    common::spawn_and_wait_ready("dealer_raw.py", &[endpoint.as_str()], Duration::from_secs(5))?;
 
   // 3. Receive from Python
   // Python sends b"Hello".
@@ -92,22 +55,8 @@ async fn test_router_manual_vs_pyzmq_dealer() -> Result<()> {
     .await?;
 
   // 5. Verify Python Success
-  let success = tokio::task::spawn_blocking(move || -> Result<bool> {
-    let mut line = String::new();
-    while start.elapsed() < Duration::from_secs(5) {
-      line.clear();
-      if reader.read_line(&mut line)? == 0 {
-        break;
-      }
-      println!("[py] {}", line.trim());
-      if line.contains("SUCCESS") {
-        return Ok(true);
-      }
-    }
-    Ok(false)
-  })
-  .await??;
-  anyhow::ensure!(success, "Python DEALER did not report SUCCESS");
+  common::wait_for_line(&mut reader, "SUCCESS", Duration::from_secs(5))?;
+  tracing::info!("rzmq ROUTER: Python DEALER reported SUCCESS.");
 
   Ok(())
 }
@@ -117,45 +66,21 @@ async fn test_router_manual_vs_pyzmq_dealer() -> Result<()> {
 /// rzmq DEALER (Manual) should:
 /// 1. Send [Payload] (no empty delimiter prepended).
 /// 2. Receive [Payload] (no empty delimiter stripped/expected).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dealer_manual_vs_pyzmq_router() -> Result<()> {
   common::setup_logging();
-  let endpoint = "tcp://127.0.0.1:5571";
+  let endpoint = common::alloc_endpoint();
 
-  // 1. Start Python ROUTER (Server)
-  let mut cmd = Command::new("python3")
-    .arg("python_scripts/router_raw.py")
-    .arg(endpoint)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()?;
-
-  let stdout = cmd.stdout.take().expect("Failed to open stdout");
-  let _guard = ChildProcessGuard { child: cmd };
-  let mut reader = BufReader::new(stdout);
-  let mut line = String::new();
-
-  // Wait for READY
-  let start = std::time::Instant::now();
-  let mut ready = false;
-  while start.elapsed() < Duration::from_secs(5) {
-    if reader.read_line(&mut line)? == 0 {
-      break;
-    }
-    if line.contains("READY") {
-      ready = true;
-      break;
-    }
-    line.clear();
-  }
-  anyhow::ensure!(ready, "Python ROUTER did not signal READY");
+  // 1. Start Python ROUTER (Server) and wait for it to bind.
+  let (_guard, _reader) =
+    common::spawn_and_wait_ready("router_raw.py", &[endpoint.as_str()], Duration::from_secs(5))?;
 
   // 2. Setup rzmq DEALER with MANUAL_FRAMING
   let ctx = context()?;
   let dealer = ctx.socket(SocketType::Dealer)?;
   dealer.set_option(options::AUTO_DELIMITER, false).await?;
 
-  dealer.connect(endpoint).await?;
+  dealer.connect(&endpoint).await?;
   tokio::time::sleep(Duration::from_millis(200)).await;
 
   // 3. Send Message

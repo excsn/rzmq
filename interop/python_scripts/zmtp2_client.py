@@ -79,11 +79,6 @@ def main():
     print("READY")
     sys.stdout.flush()
 
-    # Let the peer fully settle the connection (e.g. a ROUTER applying our
-    # announced identity to its routing map) before sending traffic, as a real
-    # client would. This keeps identity-prefix assertions deterministic.
-    time.sleep(0.25)
-
     send_frame(sock, b"Hello")
     print("SENT")
     sys.stdout.flush()

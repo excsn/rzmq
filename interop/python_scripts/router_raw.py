@@ -1,5 +1,6 @@
 import zmq
 import sys
+import time
 
 def main():
     if len(sys.argv) < 2:
@@ -36,6 +37,12 @@ def main():
     router.send_multipart([identity, b"Reply"])
     print("SUCCESS")
     sys.stdout.flush()
+
+    # Hold the connection open until the Rust test harness kills us, so the rzmq
+    # DEALER reliably receives the reply before any TCP teardown (this peer has
+    # no LINGER set, so an immediate exit could otherwise drop the queued reply).
+    while True:
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()

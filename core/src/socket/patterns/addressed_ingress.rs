@@ -26,6 +26,16 @@ impl AddressedIngressEngine {
     self.queue.close();
   }
 
+  /// Blocking pop of the next ready `(pipe_id, batch)`, with no timeout.
+  ///
+  /// Cancel-safe: dropping the returned future before completion does not
+  /// consume a queued message (mirrors the `tokio::time::timeout` drop in
+  /// `recv_logical_message`). Used by the ROUTER to race a queue pop against
+  /// an identity-finalized signal.
+  pub async fn pop(&self) -> Result<(usize, FrameBatch), ZmqError> {
+    self.queue.pop().await
+  }
+
   pub async fn recv_logical_message(
     &self,
     rcvtimeo_opt: Option<std::time::Duration>,

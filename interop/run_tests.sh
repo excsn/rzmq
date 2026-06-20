@@ -25,19 +25,24 @@ which python3
 python3 -c "import zmq; print(f'Using pyzmq version: {zmq.pyzmq_version()}')"
 echo ""
 
-# Check if the first argument to this script is a literal "--".
-# This handles the common case of users typing `script.sh -- --arg`.
-if [ "$1" = "--" ]; then
-    # 'shift' discards the first argument ($1) and moves all subsequent
-    # arguments ($2, $3, etc.) down by one position.
-    shift
-fi
+# 4. Run the cargo tests.
+#
+# All arguments are forwarded verbatim to `cargo test`, so you can select what
+# runs without editing this script:
+#
+#   ./run_tests.sh                                  # full suite
+#   ./run_tests.sh --test pyzmq_req_router          # one test module
+#   ./run_tests.sh --test pyzmq_req_router test_req_to_pyzmq_router   # one test
+#   ./run_tests.sh some_test_name                   # name filter across all modules
+#   ./run_tests.sh --test pyzmq_req_router -- --nocapture   # forward test-binary args
+#
+# RUST_LOG defaults to `trace` but is overridable from the environment, e.g.
+#   RUST_LOG=warn ./run_tests.sh
+: "${RUST_LOG:=trace}"
+export RUST_LOG
 
-# 4. Run the cargo tests
-# The "$@" passes along any arguments you provide to this script (e.g., -- --nocapture)
-# to cargo test.
-echo "Executing cargo test for package 'rzmq_interop'..."
-RUST_LOG=trace cargo test -p rzmq_interop -- "$@"
+echo "Executing cargo test for package 'rzmq_interop' (RUST_LOG=$RUST_LOG)..."
+cargo test -p rzmq_interop "$@"
 
 echo ""
 echo "--- Interop tests completed. ---"

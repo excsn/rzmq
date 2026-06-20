@@ -10,74 +10,37 @@
 //!   * rzmq accepts an inbound v2 peer (rzmq binds, v2 client connects).
 //!   * rzmq initiates to a v2 peer and downgrades (rzmq connects, v2 server listens).
 //!   * v2 identity exchange propagates to a rzmq ROUTER.
+//!
+//! Multi-threaded runtime is required: these tests block the test thread on a
+//! synchronous `read_line` while waiting for the python peer, so rzmq's spawned
+//! actors (accept loop, session) must keep running on worker threads.
 
 mod common;
 
 use anyhow::Result;
-use rzmq::{context::context, Msg, SocketType};
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use rzmq::{Msg, SocketType, context::context};
+use std::time::Duration;
 
 // ZMTP/2.0 greeting socket-type bytes.
 const V2_PUSH: &str = "8";
 const V2_PULL: &str = "7";
 const V2_DEALER: &str = "5";
 
-struct ChildProcessGuard {
-  child: Child,
-}
-impl Drop for ChildProcessGuard {
-  fn drop(&mut self) {
-    let _ = self.child.kill();
-    let _ = self.child.wait();
-  }
-}
-
-/// Spawn a python script with piped stdout, returning a guard and a line reader.
-fn spawn_script(script: &str, args: &[&str]) -> Result<(ChildProcessGuard, BufReader<std::process::ChildStdout>)> {
-  let mut cmd = Command::new("python3")
-    .arg(format!("python_scripts/{script}"))
-    .args(args)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::inherit())
-    .spawn()?;
-  let stdout = cmd.stdout.take().expect("piped stdout");
-  Ok((ChildProcessGuard { child: cmd }, BufReader::new(stdout)))
-}
-
-/// Block until the reader yields a line containing `token` (or time out).
-fn wait_for_line(reader: &mut BufReader<std::process::ChildStdout>, token: &str, timeout: Duration) -> Result<()> {
-  let start = Instant::now();
-  let mut line = String::new();
-  while start.elapsed() < timeout {
-    line.clear();
-    if reader.read_line(&mut line)? == 0 {
-      anyhow::bail!("python peer closed stdout before emitting {token:?}");
-    }
-    if line.contains(token) {
-      return Ok(());
-    }
-  }
-  anyhow::bail!("timed out waiting for {token:?} from python peer")
-}
-
 /// rzmq PULL (bind) accepts an inbound raw ZMTP/2.0 PUSH client and receives data.
-///
-/// Multi-threaded runtime is required: these tests block the test thread on a
-/// synchronous `read_line` while waiting for the python peer, so rzmq's spawned
-/// actors (accept loop, session) must keep running on worker threads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rzmq_pull_accepts_v2_push() -> Result<()> {
   common::setup_logging();
-  let endpoint = "tcp://127.0.0.1:5591";
+  let endpoint = common::alloc_endpoint();
 
   let ctx = context()?;
   let pull = ctx.socket(SocketType::Pull)?;
-  pull.bind(endpoint).await?;
+  pull.bind(&endpoint).await?;
 
-  let (_guard, mut reader) = spawn_script("zmtp2_client.py", &[endpoint, V2_PUSH])?;
-  wait_for_line(&mut reader, "READY", Duration::from_secs(5))?;
+  let (_guard, _reader) = common::spawn_and_wait_ready(
+    "zmtp2_client.py",
+    &[endpoint.as_str(), V2_PUSH],
+    Duration::from_secs(5),
+  )?;
 
   let msg = tokio::time::timeout(Duration::from_secs(5), pull.recv()).await??;
   assert_eq!(msg.data().unwrap(), b"Hello", "payload from v2 PUSH peer mismatch");
@@ -90,21 +53,24 @@ async fn test_rzmq_pull_accepts_v2_push() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rzmq_push_connects_to_v2_pull() -> Result<()> {
   common::setup_logging();
-  let endpoint = "tcp://127.0.0.1:5592";
+  let endpoint = common::alloc_endpoint();
 
   // The v2 server must be listening before rzmq connects.
-  let (_guard, mut reader) = spawn_script("zmtp2_server.py", &[endpoint, V2_PULL])?;
-  wait_for_line(&mut reader, "READY", Duration::from_secs(5))?;
+  let (_guard, mut reader) = common::spawn_and_wait_ready(
+    "zmtp2_server.py",
+    &[endpoint.as_str(), V2_PULL],
+    Duration::from_secs(5),
+  )?;
 
   let ctx = context()?;
   let push = ctx.socket(SocketType::Push)?;
-  push.connect(endpoint).await?;
+  push.connect(&endpoint).await?;
   // Give the staged downgrade handshake time to complete before sending.
   tokio::time::sleep(Duration::from_millis(300)).await;
   push.send(Msg::from_static(b"Hello")).await?;
 
   // The v2 peer prints SUCCESS once it has read and validated our data frame.
-  wait_for_line(&mut reader, "SUCCESS", Duration::from_secs(5))?;
+  common::wait_for_line(&mut reader, "SUCCESS", Duration::from_secs(5))?;
 
   ctx.term().await?;
   Ok(())
@@ -115,15 +81,18 @@ async fn test_rzmq_push_connects_to_v2_pull() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rzmq_router_receives_v2_dealer_identity() -> Result<()> {
   common::setup_logging();
-  let endpoint = "tcp://127.0.0.1:5593";
+  let endpoint = common::alloc_endpoint();
   let peer_identity = "V2PEER";
 
   let ctx = context()?;
   let router = ctx.socket(SocketType::Router)?;
-  router.bind(endpoint).await?;
+  router.bind(&endpoint).await?;
 
-  let (_guard, mut reader) = spawn_script("zmtp2_client.py", &[endpoint, V2_DEALER, peer_identity])?;
-  wait_for_line(&mut reader, "READY", Duration::from_secs(5))?;
+  let (_guard, _reader) = common::spawn_and_wait_ready(
+    "zmtp2_client.py",
+    &[endpoint.as_str(), V2_DEALER, peer_identity],
+    Duration::from_secs(5),
+  )?;
 
   let frames = tokio::time::timeout(Duration::from_secs(5), router.recv_multipart()).await??;
   assert_eq!(frames.len(), 2, "ROUTER should receive [identity, payload]");

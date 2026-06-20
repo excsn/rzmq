@@ -1,0 +1,6 @@
+# Python virtual environment for the interop tests (recreate via ./setup_env.sh)
+venv/
+
+# Python bytecode caches
+__pycache__/
+*.pyc

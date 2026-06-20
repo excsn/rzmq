@@ -45,6 +45,14 @@ def main():
             frames_to_send = [identity] + payload_to_echo
             print(f"Echoing back frames: {frames_to_send}", flush=True)
             socket.send_multipart(frames_to_send)
+
+            # Hold the connection open until the Rust test harness kills us. The
+            # queued reply flushes in libzmq's background I/O thread while we
+            # sleep, so the rzmq REQ client's recv() can never race a premature
+            # TCP teardown (the original recv->echo->close->exit flake).
+            print("Reply sent. Holding connection until killed.", flush=True)
+            while True:
+                time.sleep(1)
         else:
             print("Received unexpected single-frame message, not replying.", file=sys.stderr, flush=True)
 
