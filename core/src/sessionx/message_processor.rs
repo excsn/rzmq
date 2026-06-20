@@ -41,7 +41,7 @@ impl ZmqMessageProcessor {
     }
 
     let rcvbuf = engine.config().rcvbuf.unwrap_or(INGRESS_GREEDY_CHUNK);
-    let mut buf = BytesMut::with_capacity(rcvbuf);
+    let mut buf = BytesMut::with_capacity(INGRESS_GREEDY_CHUNK);
 
     // 1. Initial async read (yields to Tokio if no data is available)
     let n = reader
@@ -61,7 +61,7 @@ impl ZmqMessageProcessor {
     // this task will hijack the OS thread, starve the Tokio executor, and
     // prevent the parsed messages from ever being delivered to the application.
     // We enforce a strict byte ceiling per async cycle to guarantee cooperative yielding.
-    let max_greedy_read = engine.config().rcvbatch_bytes.max(rcvbuf);
+    let max_greedy_read = engine.config().rcvbatch_bytes.max(INGRESS_GREEDY_CHUNK);
 
     // 2. Greedy synchronous drain up to the configured batch limit
     let mut greedy_buf = [0u8; INGRESS_GREEDY_CHUNK];
