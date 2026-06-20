@@ -370,6 +370,23 @@ reduce kernel context-switching overhead on high-throughput TCP and IPC connecti
 is applied when a connection is accepted or established; changing it after that has no effect on
 existing connections.
 
+Example: Setting `ALLOW_ZMTP2` (legacy ZMTP/2.0 wire-protocol compatibility)
+```rust
+use rzmq::socket::ALLOW_ZMTP2;
+async fn configure_zmtp2(socket: &rzmq::Socket) -> Result<(), rzmq::ZmqError> {
+    // Enabled by default: rzmq automatically downgrades the handshake to ZMTP/2.0
+    // when a legacy peer (older libzmq) announces it, in either direction.
+    // Disable it to enforce ZMTP/3.x only and reject v2 peers:
+    socket.set_option(ALLOW_ZMTP2, false).await?;
+    Ok(())
+}
+```
+ZMTP/2.0 is the wire protocol used by older `libzmq` (3.0–3.2). When enabled (the default),
+the handshake transparently negotiates the highest common version. A ZMTP/2.0 session uses
+**NULL security only** (CURVE/PLAIN/Noise are not available over v2), exchanges peer identities
+as bare frames instead of the `READY` command, and has **no PING/PONG heartbeats**. Set this
+before `bind`/`connect`.
+
 ### Outbound Write Batching (`SNDBATCH_COUNT` / `SNDBATCH_BYTES`)
 
 By default, each session actor issues one `write_all` syscall per logical ZMQ message. Under high message rates, telemetry pipelines, fan-out `PUB`/`SUB`, high-frequency `PUSH` senders - this means thousands of short syscalls per second and the corresponding context-switch overhead.

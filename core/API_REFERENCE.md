@@ -350,6 +350,7 @@ Constants for socket option integer IDs.
 *   `pub const HEARTBEAT_TTL: i32 = 40`
 *   `pub const HANDSHAKE_IVL: i32 = 41`
 *   `pub const ROUTER_MANDATORY: i32 = 33`
+*   `pub const ALLOW_ZMTP2: i32 = 1220` - Allow downgrading the handshake to the legacy ZMTP/2.0 wire protocol when a peer announces it; value is `i32` (`1` = enabled, default; `0` = reject v2 peers). ZMTP/2.0 sessions use NULL security only, exchange identities as bare frames (no `READY`), and have no heartbeats. Set before `bind`/`connect`.
 *   `pub const AUTO_DELIMITER: i32 = 42`
 *   `pub const ZAP_DOMAIN: i32 = 55`
 *   `pub const PLAIN_SERVER: i32 = 44` (Requires `plain` feature)
