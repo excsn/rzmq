@@ -5,9 +5,7 @@ use crate::protocol::zmtp::actions::EngineOutput;
 use crate::protocol::zmtp::engine::ZmtpEngine;
 use crate::transport::ZmtpReadHalf;
 
-/// Per-read iteration chunk size for the synchronous greedy drain stack buffer.
-/// Must be a compile-time constant because it sizes a stack array.
-const INGRESS_GREEDY_CHUNK: usize = 65536;
+use super::INGRESS_GREEDY_CHUNK;
 
 /// Per-connection ingress I/O helper.
 ///

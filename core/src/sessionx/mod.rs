@@ -13,3 +13,7 @@ pub(crate) mod states;
 pub(crate) mod types;
 
 pub(crate) use iface::ScaConnectionIface;
+
+/// Per-read iteration chunk size for the synchronous greedy drain stack buffer.
+/// Must be a compile-time constant because it sizes a stack array.
+pub(crate) const INGRESS_GREEDY_CHUNK: usize = 65536;
