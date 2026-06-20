@@ -104,7 +104,11 @@ impl Socket {
   /// For example, a PUSH socket will distribute the message, while a REQ socket
   /// will send it as a request.
   pub async fn send(&self, msg: Msg) -> Result<(), ZmqError> {
-    self.inner.send(msg).await
+    match self.inner.try_send_sync(msg) {
+      Ok(()) => Ok(()),
+      Err((returned, ZmqError::ResourceLimitReached)) => self.inner.send(returned).await,
+      Err((_, e)) => Err(e),
+    }
   }
 
   /// Receives a message asynchronously according to the socket's pattern.

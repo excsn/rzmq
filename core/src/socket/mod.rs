@@ -108,6 +108,14 @@ pub trait ISocket: Send + Sync + 'static {
   /// This method manages aspects like routing, sequencing, and high-water mark behavior.
   async fn send(&self, msg: Msg) -> Result<(), ZmqError>;
 
+  /// Synchronous zero-allocation fast-path for single-message sends.
+  /// Returns ownership of the message on failure so `Socket::send` can fall back to the
+  /// async path without a redundant clone. Default returns `Err` immediately so types that
+  /// don't implement it transparently fall through to the boxed async path.
+  fn try_send_sync(&self, msg: Msg) -> Result<(), (Msg, ZmqError)> {
+    Err((msg, ZmqError::ResourceLimitReached))
+  }
+
   /// Provides a message to the user, respecting the socket's messaging pattern.
   /// This typically involves reading from internal pipes or queues populated by `SocketCore`.
   async fn recv(&self) -> Result<Msg, ZmqError>;

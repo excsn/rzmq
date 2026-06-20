@@ -74,6 +74,18 @@ impl ISocket for PushSocket {
     self.send_with_timeout(fb, wait_for_peer, sndtimeo).await
   }
 
+  fn try_send_sync(&self, msg: Msg) -> Result<(), (Msg, ZmqError)> {
+    if !self.core.is_running() {
+      return Err((msg, ZmqError::InvalidState("Socket is closing".into())));
+    }
+    let mut fb = FrameBatch::new();
+    fb.push(msg);
+    match self.outgoing_orchestrator.try_route_sync(fb) {
+      Ok(()) => Ok(()),
+      Err((mut returned, e)) => Err((returned.pop().unwrap_or_default(), e)),
+    }
+  }
+
   async fn recv(&self) -> Result<Msg, ZmqError> {
     Err(ZmqError::UnsupportedFeature(
       "PUSH sockets cannot receive messages",

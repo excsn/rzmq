@@ -357,6 +357,33 @@ impl ISocket for DealerSocket {
     }
   }
 
+  fn try_send_sync(&self, msg: Msg) -> Result<(), (Msg, ZmqError)> {
+    // Only fast-path single-frame no-MORE messages; multipart transactions need async buffering.
+    if msg.is_more() {
+      return Err((msg, ZmqError::ResourceLimitReached));
+    }
+    if !self.core.is_running() {
+      return Err((msg, ZmqError::InvalidState("Socket is closing".into())));
+    }
+    // Bail immediately if the transaction slot is contended (mid-multipart send from elsewhere).
+    let guard = match self.current_send_transaction.try_lock() {
+      Ok(g) => g,
+      Err(_) => return Err((msg, ZmqError::ResourceLimitReached)),
+    };
+    if !matches!(*guard, DealerSendTransaction::Idle) {
+      return Err((msg, ZmqError::ResourceLimitReached));
+    }
+    drop(guard);
+    let mut fb = FrameBatch::new();
+    fb.push(msg);
+    let wire_frames = self.prepare_full_multipart_send_sequence(fb);
+    match self.outgoing_orchestrator.try_route_sync(wire_frames) {
+      Ok(()) => Ok(()),
+      // pop() recovers the payload (last frame); delimiter is discarded — DealerSocket::send re-frames on retry.
+      Err((mut returned, e)) => Err((returned.pop().unwrap_or_default(), e)),
+    }
+  }
+
   async fn send_multipart(&self, user_frames: FrameBatch) -> Result<(), ZmqError> {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));

@@ -35,6 +35,28 @@ impl OutgoingMessageOrchestrator {
     self.load_balancer.wait_for_connection().await
   }
 
+  /// Synchronous single-pass route attempt. Rotates the load balancer and tries each peer
+  /// once; returns ownership of the batch immediately if all peers are full or absent.
+  /// Never blocks, never allocates. Callers fall back to `route_message` on `Err`.
+  pub fn try_route_sync(&self, mut msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
+    let count = self.load_balancer.connection_count();
+    if count == 0 {
+      return Err((msgs, ZmqError::ResourceLimitReached));
+    }
+    for _ in 0..count {
+      let peer = match self.load_balancer.get_next_connection() {
+        Some(p) => p,
+        None => return Err((msgs, ZmqError::ResourceLimitReached)),
+      };
+      match peer.iface.try_send_multipart_owned_sync(msgs) {
+        Ok(()) => return Ok(()),
+        Err((returned, ZmqError::ResourceLimitReached)) => msgs = returned,
+        Err(e) => return Err(e),
+      }
+    }
+    Err((msgs, ZmqError::ResourceLimitReached))
+  }
+
   /// Route `msgs` to the next available peer, skipping full ones (write-ready skip).
   ///
   /// Returns ownership of the batch on failure so callers can re-queue without cloning.
