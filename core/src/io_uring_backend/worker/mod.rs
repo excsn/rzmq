@@ -13,7 +13,7 @@ mod sqe_builder;
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
-  HandlerSqeBlueprint, OutgoingMessage, ProtocolHandlerFactory,
+  HandlerSqeBlueprint, ProtocolHandlerFactory,
 };
 use crate::io_uring_backend::ops::{UringOpRequest, WAKEUP_STATE_ACTIVE};
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
@@ -91,7 +91,6 @@ pub struct UringWorker {
   fds_needing_close_initiated_pass: VecDeque<RawFd>,
   pub(crate) event_fd_poller: EventFdPoller,
   send_buffer_pool: Option<Arc<SendBufferPool>>, // For zero-copy sends
-  pub(crate) fd_to_mpsc_rx: HashMap<RawFd, Arc<mpsc::BoundedReceiver<OutgoingMessage>>>,
   /// Egress channels for `ZmtpUringHandler` connections (SocketCore → worker).
   /// Checked in the pre-sleep double-check to keep the worker awake when batches are pending.
   pub(crate) fd_to_zmtp_egress_rx:
@@ -128,8 +127,6 @@ pub struct UringWorker {
 
   /// Scratchpad for active file descriptors to avoid hot-path heap allocations.
   pub(crate) active_fds_scratch: Vec<RawFd>,
-  /// Scratchpad for MPSC channel FDs to avoid hot-path heap allocations.
-  pub(crate) mpsc_fds_scratch: Vec<RawFd>,
   /// Scratchpad for CQE entries to avoid hot-path heap allocations.
   pub(crate) cqe_scratch: Vec<io_uring::cqueue::Entry>,
   /// Lock-free counters for the debug observability dashboard. Zero-sized no-op in release.
@@ -156,7 +153,6 @@ impl fmt::Debug for UringWorker {
         &self.default_buffer_ring_group_id_val,
       )
       .field("event_fd_poller", &self.event_fd_poller)
-      .field("fd_to_mpsc_rx_len", &self.fd_to_mpsc_rx.len())
       .finish_non_exhaustive()
   }
 }
@@ -302,7 +298,6 @@ impl UringWorker {
               default_buffer_ring_group_id_val: default_worker_bgid_val,
               fds_needing_close_initiated_pass: VecDeque::new(),
               send_buffer_pool: worker_send_buffer_pool,
-              fd_to_mpsc_rx: HashMap::new(),
               fd_to_zmtp_egress_rx: HashMap::new(),
               cfg_send_zerocopy_enabled: effective_send_zerocopy_enabled_for_worker,
               cfg_send_buffer_count: config.default_send_buffer_count,
@@ -315,7 +310,6 @@ impl UringWorker {
               worker_asleep,
               work_signal_gen,
               active_fds_scratch: Vec::with_capacity(256),
-              mpsc_fds_scratch: Vec::with_capacity(256),
               cqe_scratch: Vec::with_capacity(256),
               metrics: Arc::new(UringMetrics::default()),
             };

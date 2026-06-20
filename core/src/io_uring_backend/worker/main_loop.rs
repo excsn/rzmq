@@ -516,56 +516,6 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             worker.process_external_op_request(request);
           }
 
-          // 1b. Drain application data — convert to blueprints immediately so egress ordering
-          //     is preserved when close_initiated appends RequestClose in Phase 1d.
-          worker.mpsc_fds_scratch.clear();
-          worker
-            .mpsc_fds_scratch
-            .extend(worker.fd_to_mpsc_rx.keys().copied());
-
-          for i in 0..worker.mpsc_fds_scratch.len() {
-            let fd = worker.mpsc_fds_scratch[i];
-            let pending_count = worker.work_map.get(&fd).map_or(0, |w| {
-              w.ingress_blueprints.len() + w.egress_blueprints.len()
-            });
-            if pending_count >= worker.cfg_worker_batch_limit {
-              continue; // Backpressure: leave messages in the bounded channel
-            }
-            if let Some(handler) = worker.handler_manager.get_mut(fd) {
-              let io_config = handler.io_config().clone();
-              if let Some(rx) = worker.fd_to_mpsc_rx.get(&fd) {
-                let mut converted = 0usize;
-                while let Ok(msg_parts) = rx.try_recv() {
-                  work_was_available = true;
-                  let pending_egress = worker
-                    .work_map
-                    .get(&fd)
-                    .map_or(0, |w| w.egress_blueprints.len());
-                  let interface = UringWorkerInterface::new(
-                    fd,
-                    &io_config,
-                    worker.buffer_manager.as_ref(),
-                    worker.default_buffer_ring_group_id_val,
-                    0,
-                    pending_egress,
-                    false,
-                    worker.cfg_egress_cap,
-                  );
-                  let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
-                  worker
-                    .work_map
-                    .entry(fd)
-                    .or_default()
-                    .route_blueprints(ops_output.sqe_blueprints);
-                  converted += 1;
-                  if converted >= worker.cfg_worker_batch_limit {
-                    break;
-                  }
-                }
-              }
-            }
-          }
-
           // 1c. Poll handlers for periodic work
           let handler_ops_list = worker.handler_manager.prepare_all_handler_io_ops(
             worker.buffer_manager.as_ref(),
@@ -890,11 +840,10 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                   worker
                     .worker_asleep
                     .store(WAKEUP_STATE_SLEEPING, Ordering::Release);
-                  let late_work = worker.fd_to_mpsc_rx.values().any(|rx| !rx.is_empty())
-                    || worker
-                      .fd_to_zmtp_egress_rx
-                      .values()
-                      .any(|rx| !rx.is_empty())
+                  let late_work = worker
+                    .fd_to_zmtp_egress_rx
+                    .values()
+                    .any(|rx| !rx.is_empty())
                     || worker.handler_manager.any_handler_has_inbound_data();
                   if late_work {
                     worker

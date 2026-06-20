@@ -872,9 +872,6 @@ pub(crate) fn process_all_cqes(
               "CQE Processor: Internal CloseFd op (ud:{}) for FD {} successful.",
               cqe_user_data, handler_fd
             );
-            if worker.fd_to_mpsc_rx.remove(&handler_fd).is_some() {
-              trace!("Removed MPSC receiver for closed FD {}", handler_fd);
-            }
             if worker.fd_to_zmtp_egress_rx.remove(&handler_fd).is_some() {
               trace!("Removed ZMTP egress receiver for closed FD {}", handler_fd);
             }
