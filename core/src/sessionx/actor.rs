@@ -29,7 +29,7 @@ use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
 use super::egress_buffer::EgressBuffer;
-use super::egress_future::EgressDriver;
+use super::egress_driver::EgressDriver;
 use super::pipe_manager::CorePipeManagerX;
 use super::states::ActorConfigX;
 use super::types::ConnectionPhaseX;
@@ -317,6 +317,7 @@ where
             egress_buffer.pending_messages() < sndhwm
           }
         {
+          //TODO needs to be put into observability or removed
           println!(
             "[Carryover Debug] ID: {} | Draining carryover queue. Starting size: {}",
             self.handle,
@@ -591,9 +592,10 @@ where
               } => {
             // Single-print alert if gating fails
             let pending_msgs = egress_buffer.pending_messages();
+            //TODO needs to be removed or put into observability some how
             if pending_msgs >= sndhwm {
               static PRINTED_ALERT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-              if !PRINTED_ALERT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+              if !PRINTED_ALERT.swap(true, Ordering::Relaxed) {
                 println!(
                   "[ACTOR LOOP ERROR] Gating failed! Draining pipe even though egress_buffer.pending_messages() = {} (sndhwm = {})",
                   pending_msgs,
