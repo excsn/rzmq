@@ -68,6 +68,12 @@ pub const TCP_CORK: i32 = 1172;
 
 pub const IO_URING_SESSION_ENABLED: i32 = 1175;
 
+/// Minimum payload size in bytes at which a send is issued as io_uring zero-copy (SEND_ZC)
+/// rather than a regular copy-based send. Tuning this trades kernel memory-lock overhead
+/// against the cost of a memcpy; the default 16384 bytes is a reasonable crossover point.
+#[cfg(feature = "io-uring")]
+pub const IO_URING_ZC_SEND_THRESHOLD: i32 = 1176;
+
 pub const ADAPTIVE_THROTTLE: i32 = 1210;
 
 pub const SNDBATCH_COUNT: i32 = 1215; // Max logical messages to coalesce per outbound write
@@ -75,11 +81,6 @@ pub const SNDBATCH_BYTES: i32 = 1216; // Max payload bytes to coalesce per outbo
 pub const RCVBATCH_COUNT: i32 = 1217; // Max logical messages to extract per inbound wakeup
 pub const RCVBATCH_BYTES: i32 = 1218; // Max payload bytes to extract per inbound wakeup
 
-/// Minimum payload size in bytes at which a send is issued as io_uring zero-copy (SEND_ZC)
-/// rather than a regular copy-based send. Tuning this trades kernel memory-lock overhead
-/// against the cost of a memcpy; the default 16384 bytes is a reasonable crossover point.
-#[cfg(feature = "io-uring")]
-pub const IO_URING_ZC_SEND_THRESHOLD: i32 = 1219;
 
 pub const DEFAULT_RECONNECT_IVL_MS: u64 = 1000;
 

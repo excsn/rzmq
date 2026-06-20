@@ -289,8 +289,11 @@ impl ISocket for RepSocket {
       tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "REP attaching pipe");
       self.pipe_read_id_to_endpoint_uri.write().insert(pipe_read_id, endpoint_uri);
 
-      let rcvhwm = self.core_state_read().options.rcvhwm.max(1);
-      let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm);
+      let (rcvhwm, rcvbatch_count) = {
+        let opts = self.core_state_read();
+        (opts.options.rcvhwm.max(1), opts.options.rcvbatch_count)
+      };
+      let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm, rcvbatch_count);
       self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
     } else {
       tracing::warn!(

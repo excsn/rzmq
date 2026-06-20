@@ -371,7 +371,7 @@ Constants for socket option integer IDs.
 *   `pub const SNDBATCH_BYTES: i32 = 1216` - Maximum total payload bytes to coalesce into a single outbound write; value is `i32` (minimum 1; default `524288` / 512 KB). Set before `bind`/`connect`.
 *   `pub const RCVBATCH_COUNT: i32 = 1217` - Maximum number of logical messages to extract per inbound wakeup; value is `i32` (minimum 1; default `256`). Set before `bind`/`connect`.
 *   `pub const RCVBATCH_BYTES: i32 = 1218` - Maximum total payload bytes to extract per inbound wakeup; value is `i32` (minimum 1; default `524288` / 512 KB). Set before `bind`/`connect`.
-*   `pub const IO_URING_ZC_SEND_THRESHOLD: i32 = 1219` (Requires `io-uring` feature) - Minimum payload size in bytes at which a send is issued as `SEND_ZC` (zero-copy) rather than a copy-based send; value is `i32` (minimum 1; default `16384`). Has no effect unless `IO_URING_SNDZEROCOPY` is also enabled. Set before `bind`/`connect`.
+*   `pub const IO_URING_ZC_SEND_THRESHOLD: i32 = 1176` (Requires `io-uring` feature) - Minimum payload size in bytes at which a send is issued as `SEND_ZC` (zero-copy) rather than a copy-based send; value is `i32` (minimum 1; default `16384`). Has no effect unless `IO_URING_SNDZEROCOPY` is also enabled. Set before `bind`/`connect`.
 
 ### In `rzmq::socket::events`:
 

@@ -33,6 +33,20 @@ pub(crate) struct UringWakeup {
 // Per-pipe slot
 // ---------------------------------------------------------------------------
 
+/// Compute the low-water mark for a pipe: the threshold below which the pipe
+/// is considered "drained" and the io_uring worker is woken to resume sending.
+///
+/// L = max(capacity / 2, capacity − drain_delta)
+///
+/// The `capacity / 2` floor prevents thrashing on small queues (e.g. capacity=2
+/// with drain_delta=64 would give L=0, causing immediate re-congestion).
+/// The `capacity − drain_delta` term scales L upward for large queues so that
+/// the worker is woken before the pipe empties completely, absorbing one full
+/// receive batch of back-pressure without an extra round-trip.
+pub(crate) fn pipe_lwm(capacity: usize, drain_delta: usize) -> usize {
+  (capacity / 2).max(capacity.saturating_sub(drain_delta))
+}
+
 pub(crate) struct PipeSlot<T: Send + 'static> {
   pub(crate) pipe_id: usize,
   pub(crate) tx: AsyncSender<T>,
@@ -46,6 +60,8 @@ pub(crate) struct PipeSlot<T: Send + 'static> {
   /// Incremented AFTER a successful channel write; decremented on consumer pop.
   /// Invariant: queued_count == reserved_count when no sends are in flight.
   pub(crate) queued_count: AtomicUsize,
+  /// Pre-computed low-water mark: wakeup fires when len() drops below this.
+  pub(crate) lwm: usize,
   #[cfg(feature = "io-uring")]
   pub(crate) uring_wakeup: Arc<OnceLock<UringWakeup>>,
 }
@@ -64,7 +80,7 @@ impl<T: Send + 'static> PipeSlot<T> {
   }
 
   pub fn is_drained(&self) -> bool {
-    self.len() < self.capacity() / 2
+    self.len() < self.lwm
   }
 }
 
@@ -159,7 +175,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
     }
   }
 
-  pub fn register_pipe(&self, pipe_id: usize, capacity: usize) -> ReadyPipeSender<T> {
+  pub fn register_pipe(&self, pipe_id: usize, capacity: usize, drain_delta: usize) -> ReadyPipeSender<T> {
     let mut pipes = self.pipes.write();
 
     if let Some(slot) = pipes.get(&pipe_id) {
@@ -179,6 +195,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
       rx,
       reserved_count: AtomicUsize::new(0),
       queued_count: AtomicUsize::new(0),
+      lwm: pipe_lwm(capacity, drain_delta),
       #[cfg(feature = "io-uring")]
       uring_wakeup,
     });
@@ -591,7 +608,7 @@ mod tests {
     let mut producer_handles = Vec::new();
 
     for pipe_id in 0..NUM_PRODUCERS {
-      let sender = Arc::new(queue.register_pipe(pipe_id, 1));
+      let sender = Arc::new(queue.register_pipe(pipe_id, 1, 0));
       senders.push(sender.clone());
 
       let sender_clone = sender.clone();
@@ -661,7 +678,7 @@ mod tests {
   #[test]
   fn test_ready_pipe_queue_pipe_deregistration_cleanup() {
     let queue = ReadyPipeQueue::<i32>::new(10);
-    let sender = queue.register_pipe(1, 10);
+    let sender = queue.register_pipe(1, 10, 0);
     assert_eq!(queue.pipes.read().len(), 1);
 
     queue.deregister_pipe(1);
@@ -685,7 +702,7 @@ mod livelock_repro_tests {
     let queue = Arc::new(ReadyPipeQueue::<i32>::new(10));
 
     // Pipe with capacity 1 so the second send blocks.
-    let sender = Arc::new(queue.register_pipe(1, 1));
+    let sender = Arc::new(queue.register_pipe(1, 1, 0));
 
     // Fill the channel.
     sender.try_send(100).unwrap();
@@ -730,7 +747,7 @@ mod cancellation_safety_tests {
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn test_cancellation_rollback() {
     let queue = Arc::new(ReadyPipeQueue::<i32>::new(10));
-    let sender = queue.register_pipe(1, 1);
+    let sender = queue.register_pipe(1, 1, 0);
 
     // Fill the pipe so the next send blocks.
     sender.send(100).await.unwrap();
@@ -763,7 +780,7 @@ mod cancellation_safety_tests {
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn test_massive_cancellation_storm() {
     let queue = Arc::new(ReadyPipeQueue::<i32>::new(10));
-    let sender = Arc::new(queue.register_pipe(1, 1));
+    let sender = Arc::new(queue.register_pipe(1, 1, 0));
 
     // Fill the pipe so every send blocks.
     sender.send(0).await.unwrap();
@@ -801,7 +818,7 @@ mod cancellation_safety_tests {
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn test_concurrent_send_cancel_race() {
     let queue = Arc::new(ReadyPipeQueue::<i32>::new(10));
-    let sender = Arc::new(queue.register_pipe(1, 4));
+    let sender = Arc::new(queue.register_pipe(1, 4, 0));
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut tasks = Vec::new();
@@ -870,7 +887,7 @@ mod cancellation_safety_tests {
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   async fn test_cancellation_safe_no_livelock() {
     let queue = Arc::new(ReadyPipeQueue::<i32>::new(10));
-    let sender = queue.register_pipe(1, 1);
+    let sender = queue.register_pipe(1, 1, 0);
 
     // Fill the channel. queued_count → 1, reserved_count → 1.
     sender.send(100).await.unwrap();

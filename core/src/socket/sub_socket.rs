@@ -249,8 +249,11 @@ impl ISocket for SubSocket {
         .insert(pipe_read_id, endpoint_uri.clone());
 
       // Register per-pipe ingress channel and create a filtered sender.
-      let rcvhwm = self.core_state_read().options.rcvhwm.max(1);
-      let sender = self.ingress_engine.register_pipe_filtered(pipe_read_id, rcvhwm, Arc::clone(&self.subscriptions));
+      let (rcvhwm, rcvbatch_count) = {
+        let opts = self.core_state_read();
+        (opts.options.rcvhwm.max(1), opts.options.rcvbatch_count)
+      };
+      let sender = self.ingress_engine.register_pipe_filtered(pipe_read_id, rcvhwm, Arc::clone(&self.subscriptions), rcvbatch_count);
       self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
 
       // Send any existing subscriptions to the new peer.

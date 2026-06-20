@@ -18,8 +18,8 @@ impl AnonymousIngressEngine {
     }
   }
 
-  pub fn register_pipe(&self, pipe_id: usize, capacity: usize) -> PipeMessageSender {
-    let sender = self.queue.register_pipe(pipe_id, capacity);
+  pub fn register_pipe(&self, pipe_id: usize, capacity: usize, drain_delta: usize) -> PipeMessageSender {
+    let sender = self.queue.register_pipe(pipe_id, capacity, drain_delta);
     PipeMessageSender::DirectAnonymous(sender)
   }
 
@@ -28,8 +28,9 @@ impl AnonymousIngressEngine {
     pipe_id: usize,
     capacity: usize,
     trie: Arc<crate::socket::patterns::SubscriptionTrie>,
+    drain_delta: usize,
   ) -> PipeMessageSender {
-    let sender = self.queue.register_pipe(pipe_id, capacity);
+    let sender = self.queue.register_pipe(pipe_id, capacity, drain_delta);
     PipeMessageSender::FilteredAnonymous { sender, trie }
   }
 

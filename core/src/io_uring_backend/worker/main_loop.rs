@@ -860,17 +860,21 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 };
 
                 if should_sleep {
-                  // Cap sleep to 1ms when any handler has spillover data. Without this,
-                  // the worker can enter a deep sleep while holding undelivered data: the
-                  // Tokio task reads from the channel (freeing space), sees worker_asleep=false,
-                  // skips the eventfd write, then the worker sets worker_asleep=true and sleeps —
-                  // a TOCTOU deadlock where nobody wakes the worker up.
-                  let actual_timeout = if worker.handler_manager.any_handler_throttled() {
-                    Duration::from_millis(1)
-                  } else {
-                    kernel_poll_timeout_duration
-                  };
-                  let timespec_for_wait = types::Timespec::from(actual_timeout);
+                  // The TOCTOU race (consumer drains queue before worker sets SLEEPING, then
+                  // nobody fires the eventfd) is closed by two cooperating mechanisms:
+                  //
+                  // 1. Double-check below (any_handler_has_inbound_data): after setting
+                  //    SLEEPING we re-check whether any spillover is now deliverable
+                  //    (!is_congested). If yes, we abort sleep and drain immediately.
+                  //
+                  // 2. Reactive LWM wakeup (ready_pipe_queue::pop/try_pop): when the
+                  //    consumer drains a slot below capacity/2, it fires the eventfd if
+                  //    worker_asleep == SLEEPING, waking the worker to resume reads.
+                  //
+                  // Together these eliminate the need to poll at 1ms during throttling;
+                  // the worker now sleeps through its normal exponential-backoff schedule
+                  // and wakes only when the application has genuinely made room.
+                  let timespec_for_wait = types::Timespec::from(kernel_poll_timeout_duration);
                   let submit_args = types::SubmitArgs::new().timespec(&timespec_for_wait);
                   // Double-check pattern: announce sleep, re-drain, then block.
                   // Closes the race: if a sender pushed after the Phase 1 drain, it either

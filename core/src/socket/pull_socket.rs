@@ -127,8 +127,11 @@ impl ISocket for PullSocket {
     _peer_identity: Option<&[u8]>,
   ) {
     tracing::debug!(handle = self.core.handle, pipe_read_id, "PULL attaching pipe");
-    let rcvhwm = self.core.core_state.read().options.rcvhwm.max(1);
-    let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm);
+    let (rcvhwm, rcvbatch_count) = {
+      let opts = self.core.core_state.read();
+      (opts.options.rcvhwm.max(1), opts.options.rcvbatch_count)
+    };
+    let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm, rcvbatch_count);
     self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
   }
 

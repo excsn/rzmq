@@ -13,8 +13,8 @@ impl AddressedIngressEngine {
     }
   }
 
-  pub fn register_pipe(&self, pipe_id: usize, capacity: usize) -> PipeMessageSender {
-    let sender = self.queue.register_pipe(pipe_id, capacity);
+  pub fn register_pipe(&self, pipe_id: usize, capacity: usize, drain_delta: usize) -> PipeMessageSender {
+    let sender = self.queue.register_pipe(pipe_id, capacity, drain_delta);
     PipeMessageSender::DirectAddressed { sender }
   }
 
