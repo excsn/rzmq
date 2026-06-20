@@ -79,8 +79,8 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
     Pattern::PushPull | Pattern::PubSub => {
       // Unidirectional Drain (Throughput)
       loop {
-        match socket.recv().await {
-          Ok(msg) => {
+        match tokio::time::timeout(Duration::from_secs(2), socket.recv()).await {
+          Ok(Ok(msg)) => {
             let size = msg.size();
             std::hint::black_box(msg);
             total_received += 1;
@@ -101,22 +101,23 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
               }
             }
           }
-          Err(ZmqError::ConnectionClosed) => {
+          Ok(Err(ZmqError::ConnectionClosed)) => {
             info!("Server: Connection closed by peer. Stopping receiver loop. Total received: {}", total_received);
             break;
           }
-          Err(e) => {
+          Ok(Err(e)) => {
             error!("Server receiver loop error: {}", e);
             return Err(e);
           }
+          Err(_) => {}
         }
       }
     }
     Pattern::ReqRep => {
       // Bidirectional Echo (Latency)
       loop {
-        match socket.recv().await {
-          Ok(msg) => {
+        match tokio::time::timeout(Duration::from_secs(2), socket.recv()).await {
+          Ok(Ok(msg)) => {
             let size = msg.size();
             socket.send(msg).await?;
             total_received += 1;
@@ -137,14 +138,15 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
               }
             }
           }
-          Err(ZmqError::ConnectionClosed) => {
+          Ok(Err(ZmqError::ConnectionClosed)) => {
             info!("Server: Connection closed by peer. Stopping ReqRep loop. Total handled: {}", total_received);
             break;
           }
-          Err(e) => {
+          Ok(Err(e)) => {
             error!("Server ReqRep loop error: {}", e);
             return Err(e);
           }
+          Err(_) => {}
         }
       }
     }
@@ -171,8 +173,8 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
       });
 
       loop {
-        match socket.recv_multipart().await {
-          Ok(frames) => {
+        match tokio::time::timeout(Duration::from_secs(2), socket.recv_multipart()).await {
+          Ok(Ok(frames)) => {
             let size: usize = frames.iter().map(|f| f.size()).sum();
             total_received += 1;
 
@@ -197,14 +199,15 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
               }
             }
           }
-          Err(ZmqError::ConnectionClosed) => {
+          Ok(Err(ZmqError::ConnectionClosed)) => {
             info!("Server: Connection closed by peer. Stopping DealerRouter loop. Total handled: {}", total_received);
             break;
           }
-          Err(e) => {
+          Ok(Err(e)) => {
             error!("Server DealerRouter loop error: {}", e);
             return Err(e);
           }
+          Err(_) => {}
         }
       }
     }

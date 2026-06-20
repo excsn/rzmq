@@ -342,6 +342,8 @@ impl Mechanism for PlainMechanism {
   fn into_framer(
     self: Box<Self>,
     max_msg_size: i64,
+    sndbatch_count: usize,
+    sndbatch_bytes_physical: usize,
   ) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     if self.status() != MechanismStatus::Ready {
       return Err(ZmqError::InvalidState(
@@ -349,7 +351,7 @@ impl Mechanism for PlainMechanism {
       ));
     }
     Ok((
-      Box::new(NullFramer::new(max_msg_size)),
+      Box::new(NullFramer::new(max_msg_size, sndbatch_count, sndbatch_bytes_physical)),
       self.username.clone(),
     ))
   }

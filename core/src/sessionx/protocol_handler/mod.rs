@@ -96,6 +96,8 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     });
     let max_msg_size = config.max_msg_size;
     let rcvbuf = config.rcvbuf.unwrap_or(65536);
+    let sndbatch_count = config.sndbatch_count;
+    let sndbatch_bytes_physical = config.sndbatch_bytes_physical;
 
     // Capture the raw fd for cork setup BEFORE consuming the stream via into_split.
     #[cfg(target_os = "linux")]
@@ -120,7 +122,7 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
       security_mechanism: Box::new(NullMechanism),
       pending_peer_greeting: None,
       zmtp_manual_parser: ZmtpManualParser::new(max_msg_size),
-      framer: Box::new(NullFramer::new(max_msg_size)),
+      framer: Box::new(NullFramer::new(max_msg_size, sndbatch_count, sndbatch_bytes_physical)),
       heartbeat_state: ZmtpHeartbeatStateX::new(
         heartbeat_ivl_from_config,
         effective_timeout_corrected,
@@ -258,6 +260,6 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
     if self.security_mechanism.name() != NullMechanism::NAME {
       self.security_mechanism = Box::new(NullMechanism);
     }
-    self.framer = Box::new(NullFramer::new(self.config.max_msg_size));
+    self.framer = Box::new(NullFramer::new(self.config.max_msg_size, self.config.sndbatch_count, self.config.sndbatch_bytes_physical));
   }
 }

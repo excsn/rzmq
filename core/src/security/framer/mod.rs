@@ -52,10 +52,12 @@ pub(crate) struct NullFramer {
 }
 
 impl NullFramer {
-  pub(crate) fn new(max_msg_size: i64) -> Self {
+  pub(crate) fn new(max_msg_size: i64, sndbatch_count: usize, sndbatch_bytes_physical: usize) -> Self {
     Self {
       parser: ZmtpManualParser::new(max_msg_size),
-      framer: ZmtpFrameEncoder::new(4096, 65536),
+      // header_slab: worst-case 9 bytes per frame (1-byte flags + 8-byte length)
+      // coalesce_buffer: sized to hold a full physical batch without reallocation
+      framer: ZmtpFrameEncoder::new(sndbatch_count * 9, sndbatch_bytes_physical),
     }
   }
 }
@@ -108,12 +110,14 @@ pub(crate) struct LengthPrefixedFramer {
 }
 
 impl LengthPrefixedFramer {
-  pub(crate) fn new(cipher: Box<dyn IDataCipher>, max_msg_size: i64) -> Self {
+  pub(crate) fn new(cipher: Box<dyn IDataCipher>, max_msg_size: i64, sndbatch_count: usize, sndbatch_bytes_physical: usize) -> Self {
     Self {
       cipher,
       parser: ZmtpManualParser::new(max_msg_size),
-      decrypted_buffer: BytesMut::with_capacity(65536 * 2),
-      framer: ZmtpFrameEncoder::new(4096, 65536),
+      // Sized to hold a full decrypted batch without reallocation
+      decrypted_buffer: BytesMut::with_capacity(sndbatch_bytes_physical),
+      // header_slab: worst-case 9 bytes per frame; coalesce_buffer: full physical batch
+      framer: ZmtpFrameEncoder::new(sndbatch_count * 9, sndbatch_bytes_physical),
     }
   }
 }

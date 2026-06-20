@@ -154,33 +154,6 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
     }
 
     Pattern::DealerRouter => {
-      let socket = context.socket(socket_type)?;
-      socket.set_option(SNDHWM, args.hwm as i32).await?;
-      socket.set_option(TCP_CORK, args.cork).await?;
-      socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
-      socket.set_option(SNDBUF, 65536i32).await?;
-      socket.set_option(RCVBUF, 65536i32).await?;
-      #[cfg(feature = "io-uring")]
-      if use_io_uring {
-        socket.set_option(IO_URING_SESSION_ENABLED, true).await?;
-        if uring_zerocopy { socket.set_option(IO_URING_SNDZEROCOPY, true).await?; }
-        if uring_multishot { socket.set_option(IO_URING_RCVMULTISHOT, true).await?; }
-      }
-      info!("Connecting DealerRouter socket to: {}...", args.endpoint);
-      socket.connect(&args.endpoint).await?;
-
-      {
-        let sd = Arc::clone(&shutdown);
-        let socket_for_close = socket.clone();
-        let total_duration = warmup_duration + duration_limit;
-        tokio::spawn(async move {
-          tokio::time::sleep(total_duration).await;
-          info!("Main duration timer expired. Triggering socket.close() to unblock DealerRouter workers.");
-          sd.store(true, Ordering::Release);
-          let _ = socket_for_close.close().await;
-        });
-      }
-
       let pipeline_depth = args.pipeline.max(1);
       let msg_counter = Arc::new(AtomicUsize::new(0));
       info!(
@@ -189,6 +162,21 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
       );
 
       for i in 0..args.concurrency {
+        let socket = context.socket(socket_type)?;
+        socket.set_option(SNDHWM, args.hwm as i32).await?;
+        socket.set_option(TCP_CORK, args.cork).await?;
+        socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
+        socket.set_option(SNDBUF, 65536i32).await?;
+        socket.set_option(RCVBUF, 65536i32).await?;
+        #[cfg(feature = "io-uring")]
+        if use_io_uring {
+          socket.set_option(IO_URING_SESSION_ENABLED, true).await?;
+          if uring_zerocopy { socket.set_option(IO_URING_SNDZEROCOPY, true).await?; }
+          if uring_multishot { socket.set_option(IO_URING_RCVMULTISHOT, true).await?; }
+        }
+        info!("Connecting DealerRouter worker {} socket to: {}...", i, args.endpoint);
+        socket.connect(&args.endpoint).await?;
+
         let worker_semaphore = Arc::new(Semaphore::new(pipeline_depth));
 
         join_set.spawn(run_dealer_sender(
@@ -205,7 +193,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
         ));
         join_set.spawn(run_dealer_receiver(
           i,
-          socket.clone(),
+          socket,
           Arc::clone(&collector),
           Arc::clone(&shutdown),
           worker_semaphore,
@@ -459,44 +447,48 @@ async fn run_reqrep_worker(
     }
 
     let start = Instant::now();
-    match socket.send(Msg::from_bytes(payload.clone())).await {
-      Ok(()) => {}
-      Err(ZmqError::ConnectionClosed) | Err(ZmqError::InvalidState(_)) => {
+    match tokio::time::timeout(Duration::from_secs(2), socket.send(Msg::from_bytes(payload.clone()))).await {
+      Ok(Ok(())) => {}
+      Ok(Err(ZmqError::ConnectionClosed)) | Ok(Err(ZmqError::InvalidState(_))) => {
         info!(
           "[ReqRep Worker {}] Socket was closed during send. Exiting loop cleanly.",
           id
         );
         break;
       }
-      Err(e) => {
+      Ok(Err(e)) => {
         error!("[ReqRep Worker {}] Send failed with error: {}", id, e);
         exit_result = Err(e);
         break;
       }
+      Err(_) => {}
     }
 
-    match socket.recv().await {
-      Ok(reply) => {
-        let elapsed = start.elapsed();
-        std::hint::black_box(reply);
-        messages_sent += 1;
+    loop {
+      match tokio::time::timeout(Duration::from_secs(2), socket.recv()).await {
+        Ok(Ok(reply)) => {
+          let elapsed = start.elapsed();
+          std::hint::black_box(reply);
+          messages_sent += 1;
 
-        if !warming_up.load(Ordering::Relaxed) {
-          local_hist.record(elapsed.as_nanos() as u64).ok();
-          collector.record_message(msg_size);
+          if !warming_up.load(Ordering::Relaxed) {
+            local_hist.record(elapsed.as_nanos() as u64).ok();
+            collector.record_message(msg_size);
+          }
+          break; // Succeeded, move to the next send
         }
-      }
-      Err(ZmqError::ConnectionClosed) | Err(ZmqError::InvalidState(_)) => {
-        info!(
-          "[ReqRep Worker {}] Socket was closed during recv. Exiting loop cleanly.",
-          id
-        );
-        break;
-      }
-      Err(e) => {
-        error!("[ReqRep Worker {}] Recv failed with error: {}", id, e);
-        exit_result = Err(e);
-        break;
+        Ok(Err(ZmqError::ConnectionClosed)) | Ok(Err(ZmqError::InvalidState(_))) => {
+          info!(
+            "[ReqRep Worker {}] Socket was closed during recv. Exiting loop cleanly.",
+            id
+          );
+          return Ok(());
+        }
+        Ok(Err(e)) => {
+          error!("[ReqRep Worker {}] Recv failed with error: {}", id, e);
+          return Err(e);
+        }
+        Err(_) => {}  // retry recv() without sending again to preserve FSM state
       }
     }
   }

@@ -485,6 +485,8 @@ impl Mechanism for NoiseXxMechanism {
   fn into_framer(
     mut self: Box<Self>,
     max_msg_size: i64,
+    sndbatch_count: usize,
+    sndbatch_bytes_physical: usize,
   ) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
     if self.current_status != MechanismStatus::Ready {
       return Err(ZmqError::InvalidState(
@@ -493,7 +495,7 @@ impl Mechanism for NoiseXxMechanism {
     }
 
     let (cipher, peer_id) = self.into_data_cipher()?;
-    let framer = Box::new(LengthPrefixedFramer::new(cipher, max_msg_size));
+    let framer = Box::new(LengthPrefixedFramer::new(cipher, max_msg_size, sndbatch_count, sndbatch_bytes_physical));
 
     Ok((framer, peer_id))
   }

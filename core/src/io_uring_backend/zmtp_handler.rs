@@ -195,6 +195,7 @@ impl ZmtpUringHandler {
     event_fd: eventfd::EventFD,
     worker_asleep: Arc<AtomicU8>,
   ) -> Self {
+    let sndbatch_count = engine.config().sndbatch_count;
     Self {
       fd,
       worker_io_config,
@@ -209,7 +210,7 @@ impl ZmtpUringHandler {
       use_send_zerocopy,
       use_recv_multishot,
       send_buffer_slot_size,
-      coalesce_scratch: Vec::with_capacity(32),
+      coalesce_scratch: Vec::with_capacity(sndbatch_count),
       write_in_flight: 0,
       event_fd,
       worker_asleep,

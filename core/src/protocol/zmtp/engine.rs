@@ -49,13 +49,15 @@ pub struct ZmtpEngine {
 impl ZmtpEngine {
   pub fn new(is_server: bool, config: Arc<ZmtpEngineConfig>) -> Self {
     let max_msg_size = config.max_msg_size;
+    let sndbatch_count = config.sndbatch_count;
+    let sndbatch_bytes_physical = config.sndbatch_bytes_physical;
     Self {
       config,
       is_server,
       phase: ZmtpPhase::Greeting,
       network_read_accumulator: BytesMut::with_capacity(8192),
       security_mechanism: Box::new(NullMechanism),
-      framer: Box::new(NullFramer::new(max_msg_size)),
+      framer: Box::new(NullFramer::new(max_msg_size, sndbatch_count, sndbatch_bytes_physical)),
       pending_framer: None,
       last_activity_time: Instant::now(),
       last_ping_sent_time: None,
@@ -521,7 +523,11 @@ impl ZmtpEngine {
 
   fn derive_pending_framer(&mut self) -> Result<Box<dyn ISecureFramer>, ZmqError> {
     let old = std::mem::replace(&mut self.security_mechanism, Box::new(NullMechanism));
-    let (new_framer, _peer_id_bytes) = old.into_framer(self.config.max_msg_size)?;
+    let (new_framer, _peer_id_bytes) = old.into_framer(
+      self.config.max_msg_size,
+      self.config.sndbatch_count,
+      self.config.sndbatch_bytes_physical,
+    )?;
     Ok(new_framer)
   }
 

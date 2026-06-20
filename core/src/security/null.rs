@@ -60,7 +60,9 @@ impl Mechanism for NullMechanism {
   fn into_framer(
     self: Box<Self>,
     max_msg_size: i64,
+    sndbatch_count: usize,
+    sndbatch_bytes_physical: usize,
   ) -> Result<(Box<dyn ISecureFramer>, Option<Vec<u8>>), ZmqError> {
-    Ok((Box::new(NullFramer::new(max_msg_size)), None))
+    Ok((Box::new(NullFramer::new(max_msg_size, sndbatch_count, sndbatch_bytes_physical)), None))
   }
 }

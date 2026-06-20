@@ -158,9 +158,13 @@ impl ProvidedBufferRing {
       )));
     }
 
-    // Pool headroom above entry_count covers buffers in flight to consumers while the
-    // ring is fully re-provided.
-    let pool = Arc::new(BufferPool::new(buffer_capacity, entry_count as usize * 2));
+    // T = N × (1 + J) where J = 3 is the scheduler jitter factor: the maximum number of
+    // full ring-completion cycles the worker can execute before Tokio schedules consumers
+    // to drop their Bytes handles and return buffers to the free pool.  J = 1 (T = 2N)
+    // fails under any 2-cycle jitter; J = 3 (T = 4N) absorbs three back-to-back
+    // saturation cycles, guaranteeing B_free > 0 on the hot path with no heap allocation.
+    const JITTER_CAPACITY_FACTOR: usize = 3;
+    let pool = Arc::new(BufferPool::new(buffer_capacity, entry_count as usize * (1 + JITTER_CAPACITY_FACTOR)));
 
     let this = Self {
       bgid,
@@ -479,7 +483,7 @@ mod tests {
 
     // After full cycles with prompt drops, the pool should be recycling rather
     // than growing: at most entry_count buffers were in flight at once.
-    assert!(pbr.pool.free.lock().len() <= ENTRIES as usize * 2);
+    assert!(pbr.pool.free.lock().len() <= ENTRIES as usize * 4);
 
     unsafe {
       libc::close(write_fd);
