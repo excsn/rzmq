@@ -95,11 +95,11 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
       })
     });
     let max_msg_size = config.max_msg_size;
+    let rcvbuf = config.rcvbuf.unwrap_or(65536);
 
     // Capture the raw fd for cork setup BEFORE consuming the stream via into_split.
     #[cfg(target_os = "linux")]
     let cork_info_val = {
-      use std::os::fd::AsRawFd;
       let stream_ref_for_cork: Option<&S> = if config.use_cork { Some(&stream) } else { None };
       try_create_cork_info(stream_ref_for_cork, config.use_cork)
     };
@@ -115,7 +115,7 @@ impl<S: ZmtpStdStream> ZmtpProtocolHandlerX<S> {
       is_server,
       read_half: Some(read_half),
       write_half: Some(write_half),
-      network_read_buffer: BytesMut::with_capacity(8192 * 2),
+      network_read_buffer: BytesMut::with_capacity(rcvbuf),
       handshake_state: ZmtpHandshakeStateX::new(),
       security_mechanism: Box::new(NullMechanism),
       pending_peer_greeting: None,

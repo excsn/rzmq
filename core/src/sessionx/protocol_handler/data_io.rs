@@ -30,9 +30,10 @@ pub(crate) async fn read_data_frame_impl<S: ZmtpStdStream>(
     match handler.framer.try_read_msg(&mut handler.network_read_buffer) {
       Ok(Some(msg)) => {
         handler.heartbeat_state.record_activity();
-        if handler.network_read_buffer.is_empty() && handler.network_read_buffer.capacity() > 65536
+        let rcvbuf = handler.config.rcvbuf.unwrap_or(65536);
+        if handler.network_read_buffer.is_empty() && handler.network_read_buffer.capacity() > rcvbuf
         {
-          handler.network_read_buffer = BytesMut::with_capacity(16384);
+          handler.network_read_buffer = BytesMut::with_capacity(rcvbuf);
         }
         return Ok(Some(msg));
       }
@@ -201,7 +202,7 @@ pub(crate) async fn read_data_frames_batch_impl<S: ZmtpStdStream>(
   if handler.network_read_buffer.len() > 16 * 1024 * 1024 {
     return Err(ZmqError::ResourceLimitReached);
   }
-  handler.network_read_buffer.reserve(65536);
+  handler.network_read_buffer.reserve(handler.config.rcvbuf.unwrap_or(65536));
   let bytes_read = reader
     .read_buf(&mut handler.network_read_buffer)
     .await

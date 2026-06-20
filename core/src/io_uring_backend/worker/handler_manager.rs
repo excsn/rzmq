@@ -109,6 +109,7 @@ impl HandlerManager {
       originating_op_ud_for_connection,
       0,
       false,
+      0, // egress_cap unused at connection_ready time (no egress yet)
     );
 
     let initial_ops = handler_box.connection_ready(&interface_for_ready);
@@ -117,7 +118,7 @@ impl HandlerManager {
   }
 
   /// Adds a pre-built handler (bypasses the factory), calls `connection_ready`, and stores it.
-  /// Used by `RegisterExternalByteFd` to inject a `UringByteHandler` directly.
+  /// Used to inject a pre-built `UringByteHandler` directly, bypassing the factory.
   pub(crate) fn add_handler_directly(
     &mut self,
     fd: RawFd,
@@ -141,6 +142,7 @@ impl HandlerManager {
       originating_op_ud,
       0,
       false,
+      0, // egress_cap unused at connection_ready time (no egress yet)
     );
     let initial_ops = handler.connection_ready(&interface);
     self.handlers.insert(fd, handler);
@@ -187,6 +189,7 @@ impl HandlerManager {
     &mut self,
     buffer_manager_for_interface: Option<&'a BufferRingManager>,
     default_bgid_val_from_worker: Option<u16>,
+    egress_cap: usize,
     get_pending_egress: impl Fn(RawFd) -> usize,
   ) -> Vec<(RawFd, HandlerIoOps)> {
     let mut all_ops = Vec::new();
@@ -203,6 +206,7 @@ impl HandlerManager {
         PREPARE_SQES_SENTINEL_UD,
         pending_egress,
         false,
+        egress_cap,
       );
       trace!("HandlerManager: Calling prepare_sqes for FD {}", fd);
       let handler_output = handler.prepare_sqes(&interface);

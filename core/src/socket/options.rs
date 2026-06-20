@@ -75,6 +75,12 @@ pub const SNDBATCH_BYTES: i32 = 1216; // Max payload bytes to coalesce per outbo
 pub const RCVBATCH_COUNT: i32 = 1217; // Max logical messages to extract per inbound wakeup
 pub const RCVBATCH_BYTES: i32 = 1218; // Max payload bytes to extract per inbound wakeup
 
+/// Minimum payload size in bytes at which a send is issued as io_uring zero-copy (SEND_ZC)
+/// rather than a regular copy-based send. Tuning this trades kernel memory-lock overhead
+/// against the cost of a memcpy; the default 16384 bytes is a reasonable crossover point.
+#[cfg(feature = "io-uring")]
+pub const IO_URING_ZC_SEND_THRESHOLD: i32 = 1219;
+
 pub const DEFAULT_RECONNECT_IVL_MS: u64 = 1000;
 
 /// Holds parsed and validated socket options.
@@ -193,6 +199,9 @@ pub struct IOURingSocketOptions {
   pub send_zerocopy: bool,
   pub recv_multishot: bool,
   pub session_enabled: bool,
+  /// Minimum payload bytes to use zero-copy send (SEND_ZC) instead of a copy-based send.
+  /// Default 16384 bytes — below this the memcpy is cheaper than the kernel memory-lock cost.
+  pub zc_send_threshold: usize,
 }
 
 impl Default for IOURingSocketOptions {
@@ -201,6 +210,7 @@ impl Default for IOURingSocketOptions {
       session_enabled: false,
       send_zerocopy: false,
       recv_multishot: false,
+      zc_send_threshold: 16384,
     }
   }
 }
@@ -289,6 +299,13 @@ pub(crate) struct ZmtpEngineConfig {
   pub sndbatch_bytes_physical: usize,
   pub rcvbatch_count: usize,
   pub rcvbatch_bytes: usize,
+  /// Receive buffer size hint in bytes, derived from the RCVBUF socket option.
+  /// Used to size read buffers and greedy-read limits. `None` means use the compile-time default.
+  pub rcvbuf: Option<usize>,
+  /// Minimum payload bytes before a send uses SEND_ZC instead of a copy-based send.
+  /// Derived from IO_URING_ZC_SEND_THRESHOLD socket option; default 16384 bytes.
+  #[cfg(feature = "io-uring")]
+  pub zc_send_threshold: usize,
 }
 
 impl Default for ZmtpEngineConfig {
@@ -332,6 +349,9 @@ impl Default for ZmtpEngineConfig {
       sndbatch_bytes_physical: DEFAULT_SNDBATCH_BYTES + (DEFAULT_SNDBATCH_COUNT * 9),
       rcvbatch_count: DEFAULT_RCVBATCH_COUNT,
       rcvbatch_bytes: DEFAULT_RCVBATCH_BYTES,
+      rcvbuf: None,
+      #[cfg(feature = "io-uring")]
+      zc_send_threshold: 16384,
     }
   }
 }
@@ -434,6 +454,9 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       sndbatch_bytes_physical,
       rcvbatch_count: options.rcvbatch_count,
       rcvbatch_bytes: options.rcvbatch_bytes,
+      rcvbuf: options.rcvbuf,
+      #[cfg(feature = "io-uring")]
+      zc_send_threshold: options.io_uring.zc_send_threshold,
     }
   }
 }
@@ -717,6 +740,9 @@ pub(crate) fn apply_core_option_value(
         #[cfg(feature = "io-uring")]
         IO_URING_RCVMULTISHOT => options.io_uring.recv_multishot = parse_bool_option(value)?,
 
+        #[cfg(feature = "io-uring")]
+        IO_URING_ZC_SEND_THRESHOLD => options.io_uring.zc_send_threshold = parse_i32_option(value)?.max(1) as usize,
+
         ADAPTIVE_THROTTLE => options.throttle_config.enabled = parse_bool_option(value)?,
         SNDBATCH_COUNT => options.sndbatch_count = parse_i32_option(value)?.max(1) as usize,
         SNDBATCH_BYTES => options.sndbatch_bytes = parse_i32_option(value)?.max(1) as usize,
@@ -785,6 +811,9 @@ pub(crate) fn retrieve_core_option_value(
         #[cfg(feature = "io-uring")]
         IO_URING_RCVMULTISHOT => Ok((options.io_uring.recv_multishot as i32).to_ne_bytes().to_vec()),
 
+        #[cfg(feature = "io-uring")]
+        IO_URING_ZC_SEND_THRESHOLD => Ok((options.io_uring.zc_send_threshold as i32).to_ne_bytes().to_vec()),
+
         ADAPTIVE_THROTTLE => Ok((options.throttle_config.enabled as i32).to_ne_bytes().to_vec()),
         SNDBATCH_COUNT => Ok((options.sndbatch_count as i32).to_ne_bytes().to_vec()),
         SNDBATCH_BYTES => Ok((options.sndbatch_bytes as i32).to_ne_bytes().to_vec()),
@@ -812,6 +841,6 @@ pub fn calculate_required_slot_size(target_payload_bytes: usize, max_batch_count
   let long_frame_overhead = max_long_frames * 9;
   let short_frame_overhead = max_batch_count.saturating_sub(max_long_frames) * 2;
   let raw_physical_size = target_payload_bytes + long_frame_overhead + short_frame_overhead;
-  const PAGE_SIZE: usize = 4096;
-  ((raw_physical_size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE
+  let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+  ((raw_physical_size + page_size - 1) / page_size) * page_size
 }

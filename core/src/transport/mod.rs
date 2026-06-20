@@ -6,8 +6,6 @@ pub mod inproc_stream;
 #[cfg(feature = "ipc")]
 pub mod ipc;
 pub mod tcp;
-#[cfg(feature = "io-uring")]
-pub mod uring_stream;
 
 use std::os::fd::AsRawFd;
 
@@ -152,5 +150,4 @@ impl ZmtpStdStream for tokio::net::UnixStream {
   }
 }
 
-// UringStream impl is in uring_stream.rs
 // InprocStream impl is in inproc_stream.rs

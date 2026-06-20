@@ -707,6 +707,7 @@ pub(crate) fn process_all_cqes(
             cqe_user_data,
             pending_egress,
             false,
+            worker.cfg_egress_cap,
           );
           if let Some(delegation_result) = handler.delegate_cqe_to_multishot_reader(
             &cqe,
@@ -1238,6 +1239,7 @@ pub(crate) fn process_all_cqes(
               cqe_user_data,
               pending_egress,
               true,
+              worker.cfg_egress_cap,
             );
             let handler_output = handler.handle_internal_sqe_completion(
               cqe_user_data,
@@ -1284,6 +1286,7 @@ pub(crate) fn process_all_cqes(
               cqe_user_data,
               pending_egress,
               false,
+              worker.cfg_egress_cap,
             );
             let handler_output: HandlerIoOps = if op_type == InternalOpType::RingRead
               && cqueue::buffer_select(cqe_flags).is_some()

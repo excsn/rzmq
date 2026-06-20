@@ -12,7 +12,6 @@ use bytes::Bytes;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::ZmqError;
-use crate::io_uring_backend::ZC_SEND_THRESHOLD;
 use crate::io_uring_backend::{
   buffer_manager::BufferRingManager,
   connection_handler::{
@@ -30,9 +29,6 @@ use crate::runtime::Command;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 
-// Low values - The worker becomes less willing to wait. The moment it accumulates 4 or 8 messages, it stops spinning, exits the loop, and commits the write.
-// High values - The worker becomes highly aggressive about building large batches. It will continue to execute micro-spins until it reaches the larger target size.
-const MICRO_COALESCE_THRESHOLD: usize = 16;
 
 pub(crate) struct ZmtpSmartConnection {
   fd: RawFd,
@@ -230,7 +226,7 @@ impl ZmtpUringHandler {
     for net in output.net_actions {
       match net {
         NetAction::Send { data, zc_eligible } => {
-          if zc_eligible && self.use_send_zerocopy && data.len() >= ZC_SEND_THRESHOLD {
+          if zc_eligible && self.use_send_zerocopy && data.len() >= self.engine.config().zc_send_threshold {
             ops
               .sqe_blueprints
               .push(HandlerSqeBlueprint::RequestSendZeroCopy {
@@ -505,13 +501,15 @@ impl UringConnectionHandler for ZmtpUringHandler {
 
     // (b) Coalesce/Batch egress messages into a single, high-throughput write SQE.
     // Lock the queue draining if we currently have an unacknowledged write in-flight.
+    let sndbatch_count = self.engine.config().sndbatch_count;
+    let micro_coalesce_threshold = (sndbatch_count / 4).clamp(4, 32);
     if !self.is_closing
       && self.engine.phase == crate::protocol::zmtp::engine::ZmtpPhase::Data
       && self.write_in_flight < 1
-      && interface.pending_egress_count < MICRO_COALESCE_THRESHOLD
+      && interface.pending_egress_count < micro_coalesce_threshold
     {
       self.coalesce_scratch.clear();
-      let limit = self.engine.config().sndbatch_count.max(1);
+      let limit = sndbatch_count.max(1);
 
       // BULK DRAIN: Acquire channel synchronization lock exactly once.
       // First fast non-blocking bulk drain

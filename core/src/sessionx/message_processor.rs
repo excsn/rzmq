@@ -5,10 +5,9 @@ use crate::protocol::zmtp::actions::EngineOutput;
 use crate::protocol::zmtp::engine::ZmtpEngine;
 use crate::transport::ZmtpReadHalf;
 
-/// Size of each async read request and the greedy-drain stack buffer.
-/// Matches the typical OS socket receive-buffer size; one chunk drains
-/// a full TCP window without requiring a second async yield.
-const INGRESS_READ_CHUNK: usize = 65536;
+/// Per-read iteration chunk size for the synchronous greedy drain stack buffer.
+/// Must be a compile-time constant because it sizes a stack array.
+const INGRESS_GREEDY_CHUNK: usize = 65536;
 
 /// Per-connection ingress I/O helper.
 ///
@@ -41,7 +40,8 @@ impl ZmqMessageProcessor {
       return Err(ZmqError::ResourceLimitReached);
     }
 
-    let mut buf = BytesMut::with_capacity(INGRESS_READ_CHUNK);
+    let rcvbuf = engine.config().rcvbuf.unwrap_or(INGRESS_GREEDY_CHUNK);
+    let mut buf = BytesMut::with_capacity(rcvbuf);
 
     // 1. Initial async read (yields to Tokio if no data is available)
     let n = reader
@@ -61,10 +61,10 @@ impl ZmqMessageProcessor {
     // this task will hijack the OS thread, starve the Tokio executor, and
     // prevent the parsed messages from ever being delivered to the application.
     // We enforce a strict byte ceiling per async cycle to guarantee cooperative yielding.
-    let max_greedy_read = engine.config().rcvbatch_bytes.max(INGRESS_READ_CHUNK);
+    let max_greedy_read = engine.config().rcvbatch_bytes.max(rcvbuf);
 
     // 2. Greedy synchronous drain up to the configured batch limit
-    let mut greedy_buf = [0u8; INGRESS_READ_CHUNK];
+    let mut greedy_buf = [0u8; INGRESS_GREEDY_CHUNK];
     while total_read < max_greedy_read {
       match reader.try_read_chunk(&mut greedy_buf) {
         Ok(0) => return Err(ZmqError::ConnectionClosed),

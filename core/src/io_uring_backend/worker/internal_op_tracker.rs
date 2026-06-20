@@ -9,7 +9,6 @@ use std::os::unix::io::RawFd;
 /// Simple, protocol-agnostic scatter-gather batch for raw vectored writes.
 ///
 /// Unlike `PinnedBatchWrite`, this has no ZMTP-specific fields (`header_slab`, `app_op_name`).
-/// Used exclusively by `UringByteHandler` for `EgressChunk::Vectored` writes.
 ///
 /// Memory safety: `iovecs` is a heap-allocated Box whose address is stable through any
 /// HashMap resize. `iov_base` pointers inside each iovec reference `payloads` entries,
@@ -46,7 +45,7 @@ pub(crate) enum InternalOpType {
   EventFdPoll,
   RingReadMultishot,
   AsyncCancel,
-  /// Protocol-agnostic writev for `UringByteHandler` vectored egress.
+  /// Protocol-agnostic writev for raw vectored egress.
   SendRawVectored,
   /// `SEND_ZC` from a pre-registered, pre-written buffer slot (Phase 3 zero-copy lease path).
   SendZeroCopyLeased,
@@ -72,7 +71,7 @@ pub(crate) enum InternalOpPayload {
     app_op_ud: UserData,
     app_op_name: String,
   },
-  /// Protocol-agnostic scatter-gather batch for `UringByteHandler` vectored egress.
+  /// Protocol-agnostic scatter-gather batch for raw vectored egress.
   RawVectored(PinnedEgressBatch),
   /// Leased pre-registered buffer slot — only the buffer ID is needed for release on completion.
   SendZeroCopyLeased {

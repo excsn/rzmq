@@ -69,22 +69,6 @@ pub enum UringOpRequest {
     fd: RawFd,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
-  /// Registers a pre-connected FD with the worker using `UringByteHandler` — a raw byte
-  /// forwarder that bypasses ZMTP framing. Used when `io_uring.session_enabled = true` so
-  /// that ZMTP processing happens inside a Tokio-side `SessionConnectionActorX<UringStream>`.
-  RegisterExternalByteFd {
-    user_data: UserData,
-    fd: RawFd,
-    socket_mailbox: MailboxSyncSender,
-    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
-    /// Inbound: worker → Tokio (sync sender so the OS thread can push without blocking).
-    raw_inbound_tx: fibre::mpsc::BoundedSender<bytes::Bytes>,
-    /// Egress: Tokio → worker (sync receiver so the OS thread can drain without blocking).
-    raw_egress_rx: fibre::mpsc::BoundedReceiver<crate::io_uring_backend::byte_handler::EgressChunk>,
-    /// Whether to use kernel multishot recv (`IORING_OP_RECV_MULTISHOT`). When false the
-    /// handler uses single-shot reads, respecting the socket's `io_uring.recv_multishot` option.
-    use_recv_multishot: bool,
-  },
   /// Registers a pre-connected FD with full ZMTP protocol handling on the worker thread.
   /// The worker's `ZmtpUringHandler` owns the `ZmtpEngine` and drives all handshake and
   /// data framing itself — no `UringStream` or `SessionConnectionActorX` is involved.
@@ -128,7 +112,6 @@ impl UringOpRequest {
       | Self::RegisterRawBuffers { user_data, .. }
       | Self::Listen { user_data, .. }
       | Self::Connect { user_data, .. }
-      | Self::RegisterExternalByteFd { user_data, .. }
       | Self::RegisterExternalZmtpFd { user_data, .. }
       | Self::AttachIngressSender { user_data, .. }
       | Self::ResumeConnection { user_data, .. }
@@ -144,7 +127,6 @@ impl UringOpRequest {
       Self::RegisterRawBuffers { .. } => "RegisterRawBuffers".to_string(),
       Self::Listen { .. } => "Listen".to_string(),
       Self::Connect { .. } => "Connect".to_string(),
-      Self::RegisterExternalByteFd { .. } => "RegisterExternalByteFd".to_string(),
       Self::RegisterExternalZmtpFd { .. } => "RegisterExternalZmtpFd".to_string(),
       Self::AttachIngressSender { .. } => "AttachIngressSender".to_string(),
       Self::ResumeConnection { .. } => "ResumeConnection".to_string(),
@@ -161,7 +143,6 @@ impl UringOpRequest {
       | Self::InitializeBufferRing { reply_tx, .. }
       | Self::RegisterRawBuffers { reply_tx, .. }
       | Self::Listen { reply_tx, .. }
-      | Self::RegisterExternalByteFd { reply_tx, .. }
       | Self::RegisterExternalZmtpFd { reply_tx, .. }
       | Self::AttachIngressSender { reply_tx, .. }
       | Self::ResumeConnection { reply_tx, .. }
@@ -231,11 +212,6 @@ impl fmt::Debug for UringOpRequest {
         .field("user_data", user_data)
         .field("fd", fd)
         .finish_non_exhaustive(),
-      UringOpRequest::RegisterExternalByteFd { user_data, fd, .. } => f
-        .debug_struct("RegisterExternalByteFd")
-        .field("user_data", user_data)
-        .field("fd", fd)
-        .finish_non_exhaustive(),
       UringOpRequest::RegisterExternalZmtpFd {
         user_data,
         fd,
@@ -284,10 +260,6 @@ pub enum UringOpCompletion {
     connected_fd: RawFd,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
-  },
-  RegisterExternalByteFdSuccess {
-    user_data: UserData,
-    fd: RawFd,
   },
   RegisterExternalZmtpFdSuccess {
     user_data: UserData,
@@ -357,11 +329,6 @@ impl fmt::Debug for UringOpCompletion {
         .field("connected_fd", connected_fd)
         .field("peer_addr", peer_addr)
         .field("local_addr", local_addr)
-        .finish(),
-      UringOpCompletion::RegisterExternalByteFdSuccess { user_data, fd } => f
-        .debug_struct("RegisterExternalByteFdSuccess")
-        .field("user_data", user_data)
-        .field("fd", fd)
         .finish(),
       UringOpCompletion::RegisterExternalZmtpFdSuccess { user_data, fd } => f
         .debug_struct("RegisterExternalZmtpFdSuccess")

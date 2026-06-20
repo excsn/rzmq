@@ -105,6 +105,15 @@ pub struct UringWorker {
   pub(crate) cfg_sqpoll_active: bool,
   /// User-space spinning strategy applied when `needs_wait` is true.
   pub(crate) cfg_polling_strategy: UringPollingStrategy,
+  /// Total SQE budget per event-loop iteration across all connections: 75% of ring capacity.
+  /// B_max = (3/4) * N — leaves 25% headroom for control ops (eventfd polls, cancels, accepts).
+  pub(crate) cfg_max_batches_per_iteration: usize,
+  /// Max messages pulled from a single connection's MPSC channel per iteration.
+  /// B_batch = clamp(N/4, 64, 512) — prevents one hot connection from starving others.
+  pub(crate) cfg_worker_batch_limit: usize,
+  /// Max in-flight egress blueprints per connection before draining pauses.
+  /// L_egress = clamp(N/16, 8, 128) — scales pipeline depth with ring capacity.
+  pub(crate) cfg_egress_cap: usize,
   // Shared flag: true while the worker is blocked in submit_with_args waiting for kernel events.
   // Connections check this before writing to eventfd to avoid redundant syscalls.
   pub(crate) worker_asleep: Arc<AtomicU8>,
@@ -290,6 +299,9 @@ impl UringWorker {
               cfg_send_buffer_size: config.default_send_buffer_size,
               cfg_sqpoll_active: actual_sqpoll_enabled,
               cfg_polling_strategy: config.polling_strategy,
+              cfg_max_batches_per_iteration: (config.ring_entries as usize * 3) / 4,
+              cfg_worker_batch_limit: (config.ring_entries as usize / 4).clamp(64, 512),
+              cfg_egress_cap: (config.ring_entries as usize / 16).clamp(8, 128),
               worker_asleep,
               active_fds_scratch: Vec::with_capacity(256),
               mpsc_fds_scratch: Vec::with_capacity(256),

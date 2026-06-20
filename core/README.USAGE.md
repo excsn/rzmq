@@ -531,6 +531,7 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
     *   `rzmq::socket::TCP_CORK`: (Boolean `1i32` or `0i32`) Enable/disable TCP corking for better batching.
     *   `rzmq::socket::IO_URING_SNDZEROCOPY`: (Boolean) Request zero-copy sends. Fulfillment depends on global `UringConfig.default_send_zerocopy` and pool setup.
     *   `rzmq::socket::IO_URING_RCVMULTISHOT`: (Boolean) Request multishot receives. Fulfillment depends on global `UringConfig.default_recv_multishot` and default ring setup.
+    *   `rzmq::socket::IO_URING_ZC_SEND_THRESHOLD`: (`i32`) Minimum payload bytes before switching from copy-based to `SEND_ZC`. Default `16384`; only relevant when `IO_URING_SNDZEROCOPY` is also enabled.
 
     Global parameters for zero-copy send pools and the default multishot receive ring are set via `UringConfig` during `initialize_uring_backend()`.
 

@@ -37,7 +37,6 @@ pub enum HandlerSqeBlueprint {
     batch_count: u32,
   },
   /// Protocol-agnostic scatter-gather write — issued as a single `writev` SQE.
-  /// Emitted by `UringByteHandler` when the Tokio side sends a vectored `EgressChunk`.
   RequestSendRawVectored {
     bufs: Vec<Bytes>,
     send_op_flags: i32,
@@ -142,6 +141,9 @@ pub struct UringWorkerInterface<'cfg_life> {
   pub current_external_op_ud: UserData,
   pub pending_egress_count: usize,
   pub is_write_completion: bool,
+  /// Maximum in-flight egress blueprints allowed per connection before draining is paused.
+  /// Derived from ring size N: clamp(N/16, 8, 128).
+  pub egress_cap: usize,
 }
 
 impl<'cfg_life> UringWorkerInterface<'cfg_life> {
@@ -153,6 +155,7 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
     current_external_op_ud: UserData,
     pending_egress_count: usize,
     is_write_completion: bool,
+    egress_cap: usize,
   ) -> Self {
     Self {
       fd,
@@ -162,6 +165,7 @@ impl<'cfg_life> UringWorkerInterface<'cfg_life> {
       current_external_op_ud,
       pending_egress_count,
       is_write_completion,
+      egress_cap,
     }
   }
   // Methods for handlers to get info, but not to directly queue ops.

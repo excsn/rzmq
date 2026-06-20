@@ -32,12 +32,6 @@ use tracing::{debug, error, info, trace, warn};
 // Constants for the kernel polling strategy
 const KERNEL_POLL_INITIAL: Duration = Duration::from_millis(1);
 const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(128);
-const MAX_BATCHES_PER_ITERATION: usize = 512;
-
-//TODO Consider replacing this with user controlled socket option
-/// Maximum number of egress blueprints or channel messages processed in a single pass
-/// Larger numbers allow for deeper pipelining and better coalescing
-const DEFAULT_WORKER_BATCH_LIMIT: usize = 256;
 
 // Helper from the original `sqe_builder` module, now integrated here.
 fn socket_addr_to_sockaddr_storage(
@@ -297,81 +291,6 @@ impl UringWorker {
           }
         }
       }
-      UringOpRequest::RegisterExternalByteFd {
-        user_data,
-        fd,
-        socket_mailbox,
-        reply_tx,
-        raw_inbound_tx,
-        raw_egress_rx,
-        use_recv_multishot,
-      } => {
-        self.external_op_tracker.add_op(
-          user_data,
-          ExternalOpContext {
-            reply_tx,
-            op_name: op_name_str.clone(),
-            protocol_handler_factory_id: None,
-            protocol_config: None,
-            socket_mailbox: None,
-            fd_created_for_connect_op: None,
-            listener_fd: None,
-            target_fd_for_shutdown: Some(fd),
-            multipart_state: None,
-          },
-        );
-
-        let use_zc = self.cfg_send_zerocopy_enabled && self.send_buffer_pool.is_some();
-        let handler = crate::io_uring_backend::byte_handler::UringByteHandler::new(
-          fd,
-          socket_mailbox,
-          format!("fd:{}", fd),
-          String::new(),
-          raw_inbound_tx,
-          raw_egress_rx,
-          use_zc,
-          use_recv_multishot,
-          if use_zc { self.cfg_send_buffer_size } else { 0 },
-        );
-
-        match self.handler_manager.add_handler_directly(
-          fd,
-          Box::new(handler),
-          self.buffer_manager.as_ref(),
-          self.default_buffer_ring_group_id_val,
-          user_data,
-        ) {
-          Ok(initial_ops) => {
-            if !initial_ops.sqe_blueprints.is_empty() {
-              self
-                .work_map
-                .entry(fd)
-                .or_default()
-                .route_blueprints(initial_ops.sqe_blueprints);
-            }
-            if initial_ops.initiate_close_due_to_error {
-              self.fds_needing_close_initiated_pass.push_back(fd);
-            }
-            if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
-              let _ = ctx
-                .reply_tx
-                .send(Ok(UringOpCompletion::RegisterExternalByteFdSuccess {
-                  user_data,
-                  fd,
-                }));
-            }
-          }
-          Err(err_msg) => {
-            if let Some(ctx) = self.external_op_tracker.take_op(user_data) {
-              let _ = ctx.reply_tx.send(Ok(UringOpCompletion::OpError {
-                user_data,
-                op_name: op_name_str,
-                error: ZmqError::Internal(err_msg),
-              }));
-            }
-          }
-        }
-      }
       UringOpRequest::RegisterExternalZmtpFd {
         user_data,
         fd,
@@ -607,7 +526,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
             let pending_count = worker.work_map.get(&fd).map_or(0, |w| {
               w.ingress_blueprints.len() + w.egress_blueprints.len()
             });
-            if pending_count >= DEFAULT_WORKER_BATCH_LIMIT {
+            if pending_count >= worker.cfg_worker_batch_limit {
               continue; // Backpressure: leave messages in the bounded channel
             }
             if let Some(handler) = worker.handler_manager.get_mut(fd) {
@@ -628,6 +547,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                     0,
                     pending_egress,
                     false,
+                    worker.cfg_egress_cap,
                   );
                   let ops_output = handler.handle_outgoing_app_data(msg_parts, &interface);
                   worker
@@ -636,7 +556,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                     .or_default()
                     .route_blueprints(ops_output.sqe_blueprints);
                   converted += 1;
-                  if converted >= DEFAULT_WORKER_BATCH_LIMIT {
+                  if converted >= worker.cfg_worker_batch_limit {
                     break;
                   }
                 }
@@ -648,6 +568,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           let handler_ops_list = worker.handler_manager.prepare_all_handler_io_ops(
             worker.buffer_manager.as_ref(),
             worker.default_buffer_ring_group_id_val,
+            worker.cfg_egress_cap,
             |fd| {
               worker
                 .work_map
@@ -690,6 +611,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
                 0,
                 pending_egress,
                 false,
+                worker.cfg_egress_cap,
               );
               let close_io_ops = handler.close_initiated(&interface);
               if !close_io_ops.sqe_blueprints.is_empty() {
@@ -716,7 +638,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
           for i in 0..worker.active_fds_scratch.len() {
             let fd = worker.active_fds_scratch[i];
-            if batches_processed_this_iteration >= MAX_BATCHES_PER_ITERATION {
+            if batches_processed_this_iteration >= worker.cfg_max_batches_per_iteration {
               break;
             }
             if unsafe { worker.ring.submission_shared().is_full() } {

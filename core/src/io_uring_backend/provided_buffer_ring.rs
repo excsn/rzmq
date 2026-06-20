@@ -131,8 +131,9 @@ impl ProvidedBufferRing {
         ))
       })?;
 
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
     let ring_layout =
-      Layout::from_size_align(entry_count as usize * size_of::<BufRingEntry>(), 4096)
+      Layout::from_size_align(entry_count as usize * size_of::<BufRingEntry>(), page_size)
         .map_err(|e| ZmqError::Internal(format!("ProvidedBufferRing: ring layout: {}", e)))?;
     // Zeroed allocation also initializes the ring tail (entry 0's resv field) to 0,
     // as the kernel expects at registration time.
