@@ -76,6 +76,10 @@ pub const IO_URING_ZC_SEND_THRESHOLD: i32 = 1176;
 
 pub const ADAPTIVE_THROTTLE: i32 = 1210;
 
+/// Allow downgrading to the ZMTP/2.0 wire protocol when a peer announces it.
+/// Boolean (0 or 1). Enabled by default (matching libzmq, which accepts v2 peers).
+pub const ALLOW_ZMTP2: i32 = 1220;
+
 pub const SNDBATCH_COUNT: i32 = 1215; // Max logical messages to coalesce per outbound write
 pub const SNDBATCH_BYTES: i32 = 1216; // Max payload bytes to coalesce per outbound write
 pub const RCVBATCH_COUNT: i32 = 1217; // Max logical messages to extract per inbound wakeup
@@ -122,6 +126,9 @@ pub(crate) struct SocketOptions {
   /// ROUTER behavior when routing ID is unknown.
   /// Default false (drop message). True = return EHOSTUNREACH.
   pub router_mandatory: bool,
+  /// Allow downgrading the handshake to ZMTP/2.0 when the peer announces it.
+  /// Default true (libzmq accepts v2 peers).
+  pub allow_zmtp2: bool,
   // Add other commonly used options as needed
   // pub heartbeat_ttl: Option<Duration>, // TTL often derived from timeout
   pub tcp_cork: bool,
@@ -167,6 +174,7 @@ impl Default for SocketOptions {
       heartbeat_timeout: None,
       handshake_ivl: None,
       router_mandatory: false, // Default ZMQ behavior is to drop silently
+      allow_zmtp2: true,       // Accept ZMTP/2.0 peers by default (matches libzmq)
       tcp_cork: false,
       sndbuf: None,
       rcvbuf: None,
@@ -262,6 +270,8 @@ pub(crate) struct ZmtpEngineConfig {
   /// Socket type name to include in READY command
   pub socket_type_name: String,
   pub security_enabled: bool,
+  /// Allow downgrading the handshake to ZMTP/2.0 when the peer announces it.
+  pub allow_zmtp2: bool,
   pub heartbeat_ivl: Option<Duration>,
   pub heartbeat_timeout: Option<Duration>,
   pub handshake_timeout: Option<Duration>,
@@ -315,6 +325,7 @@ impl Default for ZmtpEngineConfig {
       routing_id: None,
       socket_type_name: String::new(),
       security_enabled: false,
+      allow_zmtp2: true,
       heartbeat_ivl: None,
       heartbeat_timeout: None,
       handshake_timeout: None,
@@ -420,6 +431,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       routing_id: options.routing_id.clone(),
       socket_type_name: options.socket_type_name.clone(),
       security_enabled,
+      allow_zmtp2: options.allow_zmtp2,
       heartbeat_ivl: options.heartbeat_ivl,
       heartbeat_timeout: options.heartbeat_timeout,
       handshake_timeout: options.handshake_ivl,
@@ -692,6 +704,7 @@ pub(crate) fn apply_core_option_value(
         MAXMSGSIZE => options.maxmsgsize = parse_maxmsgsize_option(value)?,
         MAX_CONNECTIONS => options.max_connections = parse_max_connections_option(value, option_id)?,
         TCP_CORK => options.tcp_cork = parse_bool_option(value)?,
+        ALLOW_ZMTP2 => options.allow_zmtp2 = parse_bool_option(value)?,
         ZAP_DOMAIN => options.zap_domain = Some(parse_string_option(value, option_id)?),
         #[cfg(feature = "plain")]
         PLAIN_SERVER => {
@@ -787,6 +800,7 @@ pub(crate) fn retrieve_core_option_value(
         MAXMSGSIZE => Ok(options.maxmsgsize.to_ne_bytes().to_vec()),
         MAX_CONNECTIONS => Ok(options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
         TCP_CORK => Ok((options.tcp_cork as i32).to_ne_bytes().to_vec()),
+        ALLOW_ZMTP2 => Ok((options.allow_zmtp2 as i32).to_ne_bytes().to_vec()),
         ZAP_DOMAIN => options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option ZAP_DOMAIN not set".into())),
         #[cfg(feature = "plain")]
         PLAIN_SERVER => options.plain_options.server_role.map(|b| (b as i32).to_ne_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_SERVER not set".into())),
@@ -844,4 +858,29 @@ pub fn calculate_required_slot_size(target_payload_bytes: usize, max_batch_count
   let raw_physical_size = target_payload_bytes + long_frame_overhead + short_frame_overhead;
   let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
   ((raw_physical_size + page_size - 1) / page_size) * page_size
+}
+
+#[cfg(test)]
+mod allow_zmtp2_tests {
+  use super::*;
+
+  #[test]
+  fn test_allow_zmtp2_default_true() {
+    assert!(SocketOptions::default().allow_zmtp2);
+    assert!(ZmtpEngineConfig::default().allow_zmtp2);
+  }
+
+  #[test]
+  fn test_allow_zmtp2_apply_and_map_through() {
+    let mut opts = SocketOptions::default();
+    apply_core_option_value(&mut opts, ALLOW_ZMTP2, &0i32.to_ne_bytes()).unwrap();
+    assert!(!opts.allow_zmtp2);
+
+    let cfg = ZmtpEngineConfig::from(&opts);
+    assert!(!cfg.allow_zmtp2, "From<&SocketOptions> must carry allow_zmtp2 through");
+
+    apply_core_option_value(&mut opts, ALLOW_ZMTP2, &1i32.to_ne_bytes()).unwrap();
+    assert!(opts.allow_zmtp2);
+    assert!(ZmtpEngineConfig::from(&opts).allow_zmtp2);
+  }
 }
