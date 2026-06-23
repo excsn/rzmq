@@ -3,7 +3,7 @@ pub(crate) mod macros;
 #[cfg(feature = "io-uring")]
 pub mod uring;
 
-#[cfg(any(debug_assertions, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 pub(crate) mod active {
   use std::sync::atomic::AtomicU64;
 

@@ -1,6 +1,6 @@
 #![cfg(feature = "io-uring")]
 
-#[cfg(any(debug_assertions, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 pub mod active {
   use std::sync::atomic::{AtomicU64, Ordering};
   use std::sync::Arc;
@@ -203,12 +203,12 @@ pub mod active {
   }
 }
 
-#[cfg(any(debug_assertions, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 pub use active::UringMetrics;
 
-#[cfg(any(debug_assertions, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 pub use active::spawn_observability_thread;
 
-#[cfg(not(any(debug_assertions, feature = "diagnostics")))]
+#[cfg(not(feature = "diagnostics"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UringMetrics;

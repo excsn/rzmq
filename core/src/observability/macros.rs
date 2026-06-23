@@ -12,7 +12,7 @@
 #[macro_export]
 macro_rules! counter {
   ($source:expr, $field:ident, inc) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       $source
         .$field
@@ -20,7 +20,7 @@ macro_rules! counter {
     }
   };
   (global, $field:ident, add, $val:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       $crate::observability::active::METRICS
         .$field
@@ -28,7 +28,7 @@ macro_rules! counter {
     }
   };
   ($source:expr, $field:ident, add, $val:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       $source
         .$field
@@ -36,13 +36,13 @@ macro_rules! counter {
     }
   };
   (global, $field:ident, load) => {{
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       $crate::observability::active::METRICS
         .$field
         .load(::std::sync::atomic::Ordering::Relaxed)
     }
-    #[cfg(not(any(debug_assertions, feature = "diagnostics")))]
+    #[cfg(not(feature = "diagnostics"))]
     {
       0u64
     }
@@ -54,7 +54,7 @@ macro_rules! counter {
 #[macro_export]
 macro_rules! metric_record_write_batch {
   ($source:expr, $count:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       let count = $count;
       if count > 0 {
@@ -91,7 +91,7 @@ macro_rules! metric_record_write_batch {
 #[macro_export]
 macro_rules! metric_cqe_errno {
   ($source:expr, $errno:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       let errno = $errno;
       match errno {
@@ -130,7 +130,7 @@ macro_rules! metric_cqe_errno {
 #[macro_export]
 macro_rules! declare_timer {
   ($timer_name:ident) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     let mut $timer_name = ::std::time::Instant::now();
   };
 }
@@ -140,7 +140,7 @@ macro_rules! declare_timer {
 #[macro_export]
 macro_rules! metric_time_phase {
   ($source:expr, $field:ident, $timer_name:ident) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       let elapsed = $timer_name.elapsed();
       $source.$field.fetch_add(
@@ -153,12 +153,12 @@ macro_rules! metric_time_phase {
 }
 
 /// Spawn the background io_uring observability thread.
-/// Compiles to nothing when neither `debug_assertions` nor `diagnostics` is active,
+/// Compiles to nothing when `diagnostics` is not active,
 /// or when the `io-uring` feature is not enabled.
 #[macro_export]
 macro_rules! spawn_uring_observability {
   ($metrics:expr) => {
-    #[cfg(all(feature = "io-uring", any(debug_assertions, feature = "diagnostics")))]
+    #[cfg(all(feature = "io-uring", feature = "diagnostics"))]
     {
       $crate::observability::uring::spawn_observability_thread(::std::sync::Arc::clone(&$metrics));
     }
@@ -181,7 +181,7 @@ macro_rules! spawn_uring_observability {
 #[macro_export]
 macro_rules! log_session_diagnostics {
   ($last_log_ms:ident, $actor:expr, $ingress_buf:expr, $egress_buf:expr, $sndhwm:expr, $core_carryover:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       let now_ms = ::std::time::SystemTime::now()
         .duration_since(::std::time::UNIX_EPOCH)
@@ -240,7 +240,7 @@ macro_rules! log_session_diagnostics {
 #[macro_export]
 macro_rules! cancel_guard {
   ($name:ident, $label:literal) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     let mut $name = $crate::observability::active::CancelGuard::new($label);
   };
 }
@@ -250,7 +250,7 @@ macro_rules! cancel_guard {
 #[macro_export]
 macro_rules! cancel_guard_complete {
   ($name:ident) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     $name.complete();
   };
 }
@@ -263,7 +263,7 @@ macro_rules! cancel_guard_complete {
 #[macro_export]
 macro_rules! log_rpq_spin_deadlock {
   ($spins:expr, $label:literal, $err:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     if $spins % 1_000_000 == 0 {
       println!(
         "[DEADLOCK pid={} spins={}] {} — error: {:?}",
@@ -282,7 +282,7 @@ macro_rules! log_rpq_spin_deadlock {
 #[macro_export]
 macro_rules! log_gating_failure {
   ($pending_msgs:expr, $sndhwm:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       let pending_msgs = $pending_msgs;
       if pending_msgs >= $sndhwm {
@@ -306,7 +306,7 @@ macro_rules! log_gating_failure {
 #[macro_export]
 macro_rules! log_carryover_drain {
   ($handle:expr, $len:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     println!(
       "[Carryover Debug] ID: {} | Draining carryover queue. Starting size: {}",
       $handle,
@@ -323,7 +323,7 @@ macro_rules! log_carryover_drain {
 #[macro_export]
 macro_rules! log_delivery_gap {
   ($handle:expr, $uri:expr, $error:expr, $egress_buf:expr, $core_carryover:expr, $pending_vectored:expr, $ingress_buf:expr, $outgoing_batch:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       let egress_msgs = $egress_buf.pending_messages();
       let carryover_msgs = $core_carryover.len();
@@ -359,7 +359,7 @@ macro_rules! log_delivery_gap {
 #[macro_export]
 macro_rules! log_egress_diagnostics {
   ($handle:expr, $pending_msgs:expr, $peak_msgs:expr, $peak_bytes:expr) => {
-    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     {
       use ::std::sync::atomic::Ordering;
       use ::std::time::{Duration, Instant};

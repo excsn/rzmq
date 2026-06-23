@@ -939,7 +939,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
           );
           counter!(worker.metrics, loop_iterations, inc);
 
-          #[cfg(any(debug_assertions, feature = "diagnostics"))]
+          #[cfg(feature = "diagnostics")]
           {
             use std::sync::atomic::Ordering;
             let writes_in_flight = worker

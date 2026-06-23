@@ -62,7 +62,7 @@ pub(crate) fn pipe_lwm(capacity: usize, drain_delta: usize) -> usize {
 /// so it adds no log throughput until something is actually wrong.
 #[inline]
 fn audit_slot<T: Send + 'static>(slot: &PipeSlot<T>, site: &str) {
-  #[cfg(any(debug_assertions, feature = "diagnostics"))]
+  #[cfg(feature = "diagnostics")]
   {
     let rxlen = slot.rx.len();
     let reserved = slot.reserved_count.load(Ordering::Acquire);
@@ -80,10 +80,8 @@ fn audit_slot<T: Send + 'static>(slot: &PipeSlot<T>, site: &str) {
       );
     }
   }
-  #[cfg(not(any(debug_assertions, feature = "diagnostics")))]
-  {
-    let _ = (slot, site);
-  }
+  #[cfg(not(feature = "diagnostics"))]
+  let _ = (slot, site);
 }
 
 pub(crate) struct PipeSlot<T: Send + 'static> {

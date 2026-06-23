@@ -1,4 +1,4 @@
-#[cfg(debug_assertions)]
+#[cfg(feature = "diagnostics")]
 mod active {
   use std::time::{Duration, Instant};
 
@@ -84,7 +84,7 @@ mod active {
   }
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(feature = "diagnostics"))]
 mod stub {
   use std::time::Duration;
 
@@ -113,8 +113,8 @@ mod stub {
   }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "diagnostics")]
 pub(crate) use active::{LoopProfiler, ProfileGuard};
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(feature = "diagnostics"))]
 pub(crate) use stub::{LoopProfiler, ProfileGuard};

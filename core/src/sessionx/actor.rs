@@ -305,7 +305,7 @@ where
       let mut core_carryover: std::collections::VecDeque<FrameBatch> =
         std::collections::VecDeque::new();
 
-      #[cfg(any(debug_assertions, feature = "diagnostics"))]
+      #[cfg(feature = "diagnostics")]
       let mut last_log_ms = 0u64;
 
       'operational: while self.current_phase == ConnectionPhaseX::Operational {
