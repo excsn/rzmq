@@ -6,29 +6,30 @@
 
 ### `PUSH_PULL_Scalability_Throughput/NumPushers-1_MsgSize-64_MsgsPerPusher-5000`
 
-* **Time:** 9.7828 ms - 9.8683 ms - 10.002 ms
+* **Time:** 951.34 µs - 959.59 µs - 972.14 µs
+* **Throughput:** 313.92 MiB/s - 318.03 MiB/s - 320.78 MiB/s
 
 ### `PUSH_PULL_Scalability_Throughput/NumPushers-1_MsgSize-1024_MsgsPerPusher-5000`
 
-* **Time:** 10.523 ms - 10.730 ms - 11.054 ms
-* **Throughput:** 27.607 MiB/s - 28.442 MiB/s - 29.000 MiB/s
+* **Time:** 1.6348 ms - 1.6479 ms - 1.6648 ms
+* **Throughput:** 2.8643 GiB/s - 2.8936 GiB/s - 2.9167 GiB/s
 
 ### `PUSH_PULL_Scalability_Throughput/NumPushers-4_MsgSize-64_MsgsPerPusher-5000`
 
-* **Time:** 71.431 ms - 71.752 ms - 72.106 ms
-* **Throughput:** 67.717 MiB/s - 68.052 MiB/s - 68.357 MiB/s
+* **Time:** 2.4884 ms - 2.5098 ms - 2.5406 ms
+* **Throughput:** 480.48 MiB/s - 486.37 MiB/s - 490.55 MiB/s
 
 ### `PUSH_PULL_Scalability_Throughput/NumPushers-4_MsgSize-1024_MsgsPerPusher-5000`
 
-* **Time:** 71.320 ms - 72.342 ms - 73.103 ms
-* **Throughput:** 16.698 MiB/s - 16.874 MiB/s - 17.116 MiB/s
+* **Time:** 3.8081 ms - 3.8599 ms - 3.9103 ms
+* **Throughput:** 4.8777 GiB/s - 4.9414 GiB/s - 5.0086 GiB/s
 
 ### `PUSH_PULL_Scalability_Throughput/NumPushers-8_MsgSize-64_MsgsPerPusher-5000`
 
-* **Time:** 148.02 ms - 148.88 ms - 149.86 ms
-* **Throughput:** 130.33 MiB/s - 131.18 MiB/s - 131.95 MiB/s
+* **Time:** 4.5688 ms - 4.5945 ms - 4.6231 ms
+* **Throughput:** 528.09 MiB/s - 531.37 MiB/s - 534.36 MiB/s
 
 ### `PUSH_PULL_Scalability_Throughput/NumPushers-8_MsgSize-1024_MsgsPerPusher-5000`
 
-* **Time:** 148.11 ms - 148.67 ms - 149.27 ms
-* **Throughput:** 16.356 MiB/s - 16.422 MiB/s - 16.484 MiB/s
+* **Time:** 7.6807 ms - 7.7428 ms - 7.8758 ms
+* **Throughput:** 4.8436 GiB/s - 4.9268 GiB/s - 4.9666 GiB/s

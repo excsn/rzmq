@@ -6,29 +6,30 @@
 
 ### `REQ_REP_Scalability_RoundTrip/NumRequesters-1_MsgSize-64_ReqsPerRequester-1000`
 
-* **Time:** 22.014 ms - 22.125 ms - 22.298 ms
+* **Time:** 22.007 ms - 22.170 ms - 22.245 ms
+* **Throughput:** 5.4875 MiB/s - 5.5060 MiB/s - 5.5469 MiB/s
 
 ### `REQ_REP_Scalability_RoundTrip/NumRequesters-1_MsgSize-1024_ReqsPerRequester-1000`
 
-* **Time:** 21.922 ms - 22.130 ms - 22.525 ms
-* **Throughput:** 5.4192 MiB/s - 5.5160 MiB/s - 5.5684 MiB/s
+* **Time:** 21.777 ms - 21.938 ms - 22.129 ms
+* **Throughput:** 88.261 MiB/s - 89.028 MiB/s - 89.687 MiB/s
 
 ### `REQ_REP_Scalability_RoundTrip/NumRequesters-4_MsgSize-64_ReqsPerRequester-1000`
 
-* **Time:** 38.194 ms - 38.400 ms - 38.623 ms
-* **Throughput:** 50.569 MiB/s - 50.863 MiB/s - 51.137 MiB/s
+* **Time:** 37.762 ms - 37.948 ms - 38.232 ms
+* **Throughput:** 12.772 MiB/s - 12.867 MiB/s - 12.931 MiB/s
 
 ### `REQ_REP_Scalability_RoundTrip/NumRequesters-4_MsgSize-1024_ReqsPerRequester-1000`
 
-* **Time:** 39.455 ms - 40.012 ms - 41.104 ms
-* **Throughput:** 11.879 MiB/s - 12.203 MiB/s - 12.376 MiB/s
+* **Time:** 38.452 ms - 38.588 ms - 38.783 ms
+* **Throughput:** 201.44 MiB/s - 202.46 MiB/s - 203.17 MiB/s
 
 ### `REQ_REP_Scalability_RoundTrip/NumRequesters-8_MsgSize-64_ReqsPerRequester-1000`
 
-* **Time:** 119.85 ms - 120.11 ms - 120.44 ms
-* **Throughput:** 64.868 MiB/s - 65.045 MiB/s - 65.187 MiB/s
+* **Time:** 78.958 ms - 79.202 ms - 79.392 ms
+* **Throughput:** 12.301 MiB/s - 12.330 MiB/s - 12.368 MiB/s
 
 ### `REQ_REP_Scalability_RoundTrip/NumRequesters-8_MsgSize-1024_ReqsPerRequester-1000`
 
-* **Time:** 120.67 ms - 121.08 ms - 121.91 ms
-* **Throughput:** 8.0102 MiB/s - 8.0657 MiB/s - 8.0931 MiB/s
+* **Time:** 79.459 ms - 80.240 ms - 81.378 ms
+* **Throughput:** 192.01 MiB/s - 194.73 MiB/s - 196.64 MiB/s

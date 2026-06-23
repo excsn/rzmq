@@ -6,39 +6,40 @@
 
 ### `DEALER_ROUTER_Scalability_Throughput/NumDealers-1_MsgSize-64_TotalRequests-10000`
 
-* **Time:** 225.07 ms - 227.09 ms - 229.20 ms
+* **Time:** 223.50 ms - 225.87 ms - 227.85 ms
+* **Throughput:** 2.6788 MiB/s - 2.7022 MiB/s - 2.7309 MiB/s
 
 ### `DEALER_ROUTER_Scalability_Throughput/NumDealers-1_MsgSize-1024_TotalRequests-10000`
 
-* **Time:** 234.84 ms - 236.36 ms - 238.15 ms
-* **Throughput:** 2.5629 MiB/s - 2.5823 MiB/s - 2.5990 MiB/s
+* **Time:** 215.14 ms - 216.15 ms - 217.16 ms
+* **Throughput:** 44.970 MiB/s - 45.180 MiB/s - 45.392 MiB/s
 
 ### `DEALER_ROUTER_Scalability_Throughput/NumDealers-4_MsgSize-64_TotalRequests-10000`
 
-* **Time:** 132.70 ms - 133.51 ms - 135.16 ms
-* **Throughput:** 72.250 MiB/s - 73.145 MiB/s - 73.590 MiB/s
+* **Time:** 96.858 ms - 97.406 ms - 98.121 ms
+* **Throughput:** 6.2204 MiB/s - 6.2661 MiB/s - 6.3015 MiB/s
 
 ### `DEALER_ROUTER_Scalability_Throughput/NumDealers-4_MsgSize-1024_TotalRequests-10000`
 
-* **Time:** 133.13 ms - 133.77 ms - 134.86 ms
-* **Throughput:** 4.5257 MiB/s - 4.5627 MiB/s - 4.5847 MiB/s
+* **Time:** 98.177 ms - 98.754 ms - 99.343 ms
+* **Throughput:** 98.302 MiB/s - 98.889 MiB/s - 99.470 MiB/s
 
 ### `DEALER_ROUTER_Scalability_Throughput/NumDealers-8_MsgSize-64_TotalRequests-10000`
 
-* **Time:** 221.25 ms - 223.45 ms - 225.62 ms
-* **Throughput:** 43.284 MiB/s - 43.703 MiB/s - 44.139 MiB/s
+* **Time:** 100.31 ms - 100.55 ms - 100.98 ms
+* **Throughput:** 6.0446 MiB/s - 6.0701 MiB/s - 6.0847 MiB/s
 
 ### `DEALER_ROUTER_Scalability_Throughput/NumDealers-8_MsgSize-1024_TotalRequests-10000`
 
-* **Time:** 220.26 ms - 221.88 ms - 223.40 ms
-* **Throughput:** 2.7322 MiB/s - 2.7509 MiB/s - 2.7711 MiB/s
+* **Time:** 100.05 ms - 100.39 ms - 100.88 ms
+* **Throughput:** 96.801 MiB/s - 97.274 MiB/s - 97.609 MiB/s
 
 ### `DEALER_ROUTER_Scalability_Throughput/NumDealers-16_MsgSize-64_TotalRequests-10000`
 
-* **Time:** 238.11 ms - 239.04 ms - 239.89 ms
-* **Throughput:** 40.709 MiB/s - 40.854 MiB/s - 41.012 MiB/s
+* **Time:** 99.182 ms - 100.63 ms - 102.18 ms
+* **Throughput:** 5.9732 MiB/s - 6.0653 MiB/s - 6.1539 MiB/s
 
 ### `DEALER_ROUTER_Scalability_Throughput/NumDealers-16_MsgSize-1024_TotalRequests-10000`
 
-* **Time:** 239.62 ms - 240.98 ms - 242.42 ms
-* **Throughput:** 2.5178 MiB/s - 2.5328 MiB/s - 2.5471 MiB/s
+* **Time:** 100.37 ms - 100.64 ms - 100.95 ms
+* **Throughput:** 96.739 MiB/s - 97.034 MiB/s - 97.301 MiB/s
