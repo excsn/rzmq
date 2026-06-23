@@ -3,19 +3,19 @@
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 [![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
 
-`rzmq` is an asynchronous, cpu/memory efficient, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, built on top of the [Tokio](https://tokio.rs/) runtime. It provides a familiar ZeroMQ-style API within the Rust async ecosystem, **strives for wire-level interoperability with `libzmq` and other ZeroMQ implementations for core patterns and ZMTP 3.1 using NULL, PLAIN, and CURVE security.**
+`rzmq` is an asynchronous, cpu/memory efficient, pure-Rust implementation of ZeroMQ (ØMQ) messaging patterns, built on top of the [Tokio](https://tokio.rs/) runtime. It provides a familiar ZeroMQ-style API within the Rust async ecosystem, **strives for wire-level interoperability with `libzmq` and other ZeroMQ implementations for core patterns and ZMTP 3.1 using NULL, PLAIN and CURVE security and transparently negotiates down to ZMTP 2.0 for legacy peers (older `libzmq` 3.0–3.2).**
 
 **A key design goal and unique demonstrated capability of `rzmq` is achieving efficient, exceptional performance on Linux with simultaneous use of `io_uring` alongside Tokio.** 
 
 ## Performance Highlights
 
-TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
+TCP Loopback (`tcp://127.0.0.1`), 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
 
-- **5.0 M msg/s** - PushPull · 64 B · Linux · 4 workers
-- **9.7 GB/s** - PushPull · 32 KB · Linux · 4 workers
+- **5.0 M msg/s** - PushPull · 64 B · 4 workers
+- **9.7 GB/s** - PushPull · 32 KB · 4 workers
 
-- **3.2 M msg/s** - PushPull · 64 B · Linux · io\_uring + cork · 4 workers
-- **7.3 GB/s** - PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
+- **3.2 M msg/s** - PushPull · 64 B · io\_uring + cork · 4 workers
+- **7.3 GB/s** - PushPull · 32 KB · io\_uring + cork + multishot + zerocopy · 8 workers
 
 **`rzmq` has shown stunningly superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a compelling choice for performance-critical distributed applications on Linux.
 
@@ -24,17 +24,17 @@ TCP Loopback (`tcp://127.0.0.1`), 10-second window, release build on an AMD Ryze
 **Please Note:** `rzmq` is currently in **Beta**. While core functionality and significant performance advantages (on Linux with `io_uring`) are in place, users should be aware of the following:
 
 *   **API Stability:** The public API is stabilizing but may still see minor refinements before a 1.0 release.
-*   **Feature Scope:** While major ZeroMQ patterns and options are supported, **full feature parity with all of `libzmq`'s extensive options and advanced behaviors (such as ZAP) is a non-goal.** The focus is on core ZMTP 3.1 compliance, popular patterns, and supported security mechanisms (NULL, PLAIN, CURVE, and its own Noise_XX offering).
-*   **Interoperability:** `rzmq` aims for wire-level interoperability with `libzmq` and other standard ZMTP 3.1 implementations for supported socket patterns using the **NULL, PLAIN, and CURVE** security mechanisms. The **Noise_XX** mechanism is specific to `rzmq` and will not interoperate with other `libzmq` security layers.
+*   **Feature Scope:** While major ZeroMQ patterns and options are supported, **full feature parity with all of `libzmq`'s extensive options and advanced behaviors (such as ZAP) is a non-goal.** The focus is on core ZMTP 3.1 compliance, popular patterns and supported security mechanisms (NULL, PLAIN, CURVE and its own Noise_XX offering).
+*   **Interoperability:** `rzmq` aims for wire-level interoperability with `libzmq` and other standard ZMTP 3.1 implementations for supported socket patterns using the **NULL, PLAIN and CURVE** security mechanisms. The **Noise_XX** mechanism is specific to `rzmq` and will not interoperate with other `libzmq` security layers.
 *   **Testing Environment:**
     *   Core functionality has primarily been tested on **macOS (ARM & x86)** and **Linux (Kernel version 6.x)**.
     *   The high-performance `io_uring` backend is Linux-specific and has been developed and tested primarily against **Linux Kernel 6.x**. Functionality on older kernels supporting `io_uring` (e.g., 5.6+) may vary, especially for advanced features.
     *   Windows and other operating systems are **not currently supported or tested**.
 *   **Performance Generalization:** While leading performance is demonstrated in specific benchmarks, comprehensive benchmarking across all diverse workloads and hardware configurations is ongoing.
 *   **Robustness & Edge Cases:** The library has been tested for common use cases on the aforementioned platforms, but some edge cases or extreme conditions might not be as hardened as the mature `libzmq`.
-*   **Security Mechanisms:** NULL, PLAIN, and CURVE security mechanisms are functional and designed for interoperability with `libzmq`. **Noise_XX is also provided as a modern, robust alternative for `rzmq`-to-`rzmq` communication.** The ZAP (ZeroMQ Authentication Protocol) is not supported.
+*   **Security Mechanisms:** NULL, PLAIN and CURVE security mechanisms are functional and designed for interoperability with `libzmq`. **Noise_XX is also provided as a modern, robust alternative for `rzmq`-to-`rzmq` communication.** The ZAP (ZeroMQ Authentication Protocol) is not supported.
 
-We encourage testing, feedback, and contributions to help mature the library towards a stable 1.0 release.
+We encourage testing, feedback and contributions to help mature the library towards a stable 1.0 release.
 
 ## Notable Users
 
@@ -42,7 +42,7 @@ We encourage testing, feedback, and contributions to help mature the library tow
 
 ## Key Features
 ### Leading Performance on Linux (with `io_uring`)
-*   **`io_uring` Backend**: On supported Linux systems, `rzmq`'s `io_uring` backend has demonstrated superior throughput and lower latency compared to other ZeroMQ implementations, including `libzmq`, in high-throughput benchmark scenarios. This is achieved by optimized syscall patterns, reduced data copying (especially with zerocopy send enabled), and efficient kernel-level I/O batching.
+*   **`io_uring` Backend**: On supported Linux systems, `rzmq`'s `io_uring` backend has demonstrated superior throughput and lower latency compared to other ZeroMQ implementations, including `libzmq`, in high-throughput benchmark scenarios. This is achieved by optimized syscall patterns, reduced data copying (especially with zerocopy send enabled) and efficient kernel-level I/O batching.
     *   Activated per-socket session using the `IO_URING_SESSION_ENABLED` socket option.
     *   Global `io_uring` parameters (ring size, default buffer pool parameters) are configured via `UringConfig` when calling `rzmq::uring::initialize_uring_backend()`.
 *   **TCP Corking (Linux-only)**: Enabled via the `TCP_CORK` socket option, contributing to performance gains by batching smaller ZMTP frames for a single network write.
@@ -78,8 +78,8 @@ Provides a `Context` for managing sockets and a `Socket` handle with async metho
     *   The `UringWorker` uses a global default receive buffer ring (for group ID 0) if buffer parameters (`default_recv_buffer_count`, `default_recv_buffer_size`) were valid during backend initialization. If this default ring isn't available, multishot requests might not be fulfilled as intended.
     *   Leverages `io_uring`'s multishot receive operations to submit multiple receive buffers to the kernel at once, potentially reducing syscall overhead.
 
-### ZMTP 3.1 Protocol Basics
-Implements core aspects of the ZeroMQ Message Transport Protocol version 3.1, including Greeting, Framing, READY command, and PING/PONG keepalives.
+### ZMTP Protocol Support
+Implements core aspects of the ZeroMQ Message Transport Protocol version 3.1, including Greeting, Framing, READY command and PING/PONG keepalives. Also supports transparent **ZMTP 2.0** backward compatibility: when a legacy peer announces v2, the handshake auto-downgrades (NULL security only, no heartbeats). Controlled via `ALLOW_ZMTP2` (enabled by default). See the [Usage Guide](./README.USAGE.md#socket-options) for details.
 
 ### Common Socket Options
 Supports a range of common socket options for fine-tuning behavior, including:
@@ -91,6 +91,7 @@ Supports a range of common socket options for fine-tuning behavior, including:
 *   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE` (for SUB), `ROUTING_ID` (for DEALER/ROUTER identity), `ROUTER_MANDATORY`
 *   Keepalives: ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
 *   Adaptive throttle: `ADAPTIVE_THROTTLE` (enable/disable the I/O fairness engine; see `Socket::with_throttle_config` for full configuration)
+*   Legacy interop: `ALLOW_ZMTP2` (enable/disable transparent ZMTP/2.0 downgrade for legacy peers; default `true`)
 *   Security:
     *   `PLAIN_SERVER`, `PLAIN_USERNAME`, `PLAIN_PASSWORD` (requires `plain` feature)
     *   `CURVE_SERVER`, `CURVE_SECRET_KEY`, `CURVE_SERVER_KEY` (requires `curve` feature)
@@ -153,7 +154,7 @@ tokio = { version = "1", features = ["full"] } # "full" feature recommended for 
 
 ## Getting Started / Documentation
 
-For a detailed guide on using `rzmq`, including core concepts, examples, API overviews, and how to use features like `io_uring`, please see the **[Usage Guide (README.USAGE.md)](./README.USAGE.md)**.
+For a detailed guide on using `rzmq`, including core concepts, examples, API overviews and how to use features like `io_uring`, please see the **[Usage Guide (README.USAGE.md)](./README.USAGE.md)**.
 
 The library includes an `examples/` directory in its repository showcasing various usage patterns.
 
@@ -221,7 +222,7 @@ socket.set_option(AUTO_DELIMITER, false).await?;
 *   **Performance:**
     *   While `io_uring` support shows leading performance in specific benchmarks, `rzmq` has not undergone exhaustive performance optimization or direct benchmarking against `libzmq` across *all* scenarios and socket types.
 *   **Error Handling Parity:** The mapping of internal errors to specific `ZmqError` variants corresponding to all `zmq_errno()` values may not be exhaustive.
-*   **Robustness:** Edge cases, high-concurrency stress, diverse network failure modes, and very long-running stability require more extensive testing.
+*   **Robustness:** Edge cases, high-concurrency stress, diverse network failure modes and very long-running stability require more extensive testing.
 
 ## Running Examples
 
