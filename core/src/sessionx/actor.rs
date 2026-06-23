@@ -14,7 +14,7 @@ use crate::socket::options::ZmtpEngineConfig;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::throttle::AdaptiveThrottle;
 use crate::transport::{ZmtpStdStream, ZmtpWriteHalf};
-use crate::{Blob, MailboxReceiver, counter, log_session_diagnostics};
+use crate::{Blob, MailboxReceiver, counter, log_carryover_drain, log_delivery_gap, log_gating_failure, log_session_diagnostics};
 
 use super::message_processor::ZmqMessageProcessor;
 
@@ -317,12 +317,7 @@ where
             egress_buffer.pending_messages() < sndhwm
           }
         {
-          //TODO needs to be put into observability or removed
-          println!(
-            "[Carryover Debug] ID: {} | Draining carryover queue. Starting size: {}",
-            self.handle,
-            core_carryover.len()
-          );
+          log_carryover_drain!(self.handle, core_carryover.len());
           outgoing_batch.clear();
           let wire_size = |msgs: &FrameBatch| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
           let hwm_budget = sndhwm
@@ -590,19 +585,7 @@ where
               } else {
                 egress_buffer.pending_messages() < sndhwm
               } => {
-            // Single-print alert if gating fails
-            let pending_msgs = egress_buffer.pending_messages();
-            //TODO needs to be removed or put into observability some how
-            if pending_msgs >= sndhwm {
-              static PRINTED_ALERT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-              if !PRINTED_ALERT.swap(true, Ordering::Relaxed) {
-                println!(
-                  "[ACTOR LOOP ERROR] Gating failed! Draining pipe even though egress_buffer.pending_messages() = {} (sndhwm = {})",
-                  pending_msgs,
-                  sndhwm
-                );
-              }
-            }
+            log_gating_failure!(egress_buffer.pending_messages(), sndhwm);
             match maybe_msgs_from_core {
               Ok(first_msgs) => {
                 outgoing_batch.clear();
@@ -716,6 +699,19 @@ where
 
       self.read_half = Some(read_half);
       self.write_half = Some(write_half);
+
+      if self.current_phase == ConnectionPhaseX::Terminating {
+        log_delivery_gap!(
+          self.handle,
+          self.actor_config.connected_endpoint_uri,
+          self.error_for_drop_guard,
+          egress_buffer,
+          core_carryover,
+          pending_vectored,
+          ingress_buffer,
+          outgoing_batch
+        );
+      }
     }
 
     if self.current_phase == ConnectionPhaseX::ShuttingDownStream {

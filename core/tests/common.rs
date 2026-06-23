@@ -22,7 +22,7 @@ fn setup_tracing() {
   TRACING_INIT.call_once(|| {
     // Default level filter (e.g., info for rzmq, warn for others)
     // Can be overridden by RUST_LOG env variable
-    let default_filter = "rzmq=trace,debug,info,warn";
+    let default_filter = "rzmq=debug,info,warn";
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
     let subscriber = FmtSubscriber::builder()

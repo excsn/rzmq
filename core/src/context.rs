@@ -346,9 +346,7 @@ impl Context {
 
     // --- Attempt to publish the event (best effort) ---
     if let Err(e) = self.inner.event_bus().publish(event) {
-      // Log failure, especially if during active shutdown phase.
-      // Use eprintln for higher chance of visibility during shutdown/panic.
-      // Check if already panicking to avoid making things worse.
+      // Check if already panicking to avoid making things worse, especially if during active shutdown phase.
       if !std::thread::panicking() {
         warn!(
           "WARN: Failed to publish ActorStopping event for handle {}: {} (receivers={})",
@@ -366,8 +364,7 @@ impl Context {
     // --- Unconditionally decrement the WaitGroup ---
     // This is the crucial part to ensure termination completes even if the
     // event listener is gone or event publishing fails.
-    let wg = &self.inner.actor_wait_group; // Borrow the WaitGroup
-                                           // Ensure count doesn't go below zero before decrementing.
+    let wg = &self.inner.actor_wait_group;
     if wg.get_count() > 0 {
       tracing::trace!(
         actor_handle = handle_id,

@@ -20,4 +20,35 @@ pub(crate) mod active {
     global_bytes_pulled: AtomicU64::new(0),
     last_bytes_sent: AtomicU64::new(0),
   };
+
+  /// RAII guard that prints a cancellation warning if dropped before `complete()` is called.
+  ///
+  /// Use via the `cancel_guard!` / `cancel_guard_complete!` macros so call sites
+  /// compile to nothing in release builds without the `diagnostics` feature.
+  pub(crate) struct CancelGuard {
+    pub(crate) label: &'static str,
+    pub(crate) completed: bool,
+  }
+
+  impl CancelGuard {
+    pub(crate) fn new(label: &'static str) -> Self {
+      Self { label, completed: false }
+    }
+
+    pub(crate) fn complete(&mut self) {
+      self.completed = true;
+    }
+  }
+
+  impl Drop for CancelGuard {
+    fn drop(&mut self) {
+      if !self.completed {
+        println!(
+          "[CANCEL-DETECTED pid={}] future dropped mid-flight at: {}",
+          std::process::id(),
+          self.label,
+        );
+      }
+    }
+  }
 }

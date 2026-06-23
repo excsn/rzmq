@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::sync::{
   Arc, Weak,
-  atomic::{AtomicUsize, Ordering},
+  atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use parking_lot::RwLock;
@@ -14,6 +14,7 @@ use fibre::{RecvError, TryRecvError, TrySendError};
 use crate::error::ZmqError;
 use crate::message::FrameBatch;
 use crate::socket::patterns::trie::SubscriptionTrie;
+use crate::{cancel_guard, cancel_guard_complete, log_rpq_spin_deadlock};
 
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::{WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING};
@@ -47,6 +48,44 @@ pub(crate) fn pipe_lwm(capacity: usize, drain_delta: usize) -> usize {
   (capacity / 2).max(capacity.saturating_sub(drain_delta))
 }
 
+/// Diagnostic invariant audit (debug / `diagnostics` builds only).
+///
+/// Invariant: every item physically present in `rx` must have a live reservation,
+/// i.e. `reserved_count >= rx.len()` at all times — a reservation is taken *before*
+/// an item is enqueued and only released *after* it is dequeued. `rx.len()` is read
+/// *before* `reserved_count` so a concurrent producer (reserve-then-enqueue) or
+/// consumer (dequeue-then-release) cannot fabricate a false positive.
+///
+/// Fires at most once per slot, on the first violation, naming the `site` — this
+/// pinpoints the exact operation that breaks the accounting behind the PULL-ingress
+/// deadlock (`rx` full while `queued`/`reserved` read 0). Silent in the happy path,
+/// so it adds no log throughput until something is actually wrong.
+#[inline]
+fn audit_slot<T: Send + 'static>(slot: &PipeSlot<T>, site: &str) {
+  #[cfg(any(debug_assertions, feature = "diagnostics"))]
+  {
+    let rxlen = slot.rx.len();
+    let reserved = slot.reserved_count.load(Ordering::Acquire);
+    if reserved < rxlen && !slot.audit_reported.swap(true, Ordering::AcqRel) {
+      let queued = slot.queued_count.load(Ordering::Acquire);
+      println!(
+        "[RPQ-DESYNC pid={} pipe={} site={}] reserved({}) < rx.len({}) \
+         — item(s) in channel with no backing reservation; queued={}",
+        std::process::id(),
+        slot.pipe_id,
+        site,
+        reserved,
+        rxlen,
+        queued,
+      );
+    }
+  }
+  #[cfg(not(any(debug_assertions, feature = "diagnostics")))]
+  {
+    let _ = (slot, site);
+  }
+}
+
 pub(crate) struct PipeSlot<T: Send + 'static> {
   pub(crate) pipe_id: usize,
   pub(crate) tx: AsyncSender<T>,
@@ -62,6 +101,9 @@ pub(crate) struct PipeSlot<T: Send + 'static> {
   pub(crate) queued_count: AtomicUsize,
   /// Pre-computed low-water mark: wakeup fires when len() drops below this.
   pub(crate) lwm: usize,
+  /// Diagnostic latch ensuring the desync audit prints at most once per slot.
+  #[allow(dead_code)]
+  pub(crate) audit_reported: AtomicBool,
   #[cfg(feature = "io-uring")]
   pub(crate) uring_wakeup: Arc<OnceLock<UringWakeup>>,
 }
@@ -92,32 +134,6 @@ impl<T: Send + 'static> PipeSlot<T> {
 // drop fires and prints a loud warning with the exact location.
 // ---------------------------------------------------------------------------
 
-struct CancelDetector {
-  location: &'static str,
-  completed: bool,
-}
-
-impl CancelDetector {
-  fn new(location: &'static str) -> Self {
-    Self { location, completed: false }
-  }
-
-  fn complete(&mut self) {
-    self.completed = true;
-  }
-}
-
-impl Drop for CancelDetector {
-  fn drop(&mut self) {
-    if !self.completed {
-      println!(
-        "[CANCEL-DETECTED pid={}] future dropped mid-flight at: {}",
-        std::process::id(),
-        self.location
-      );
-    }
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Private RAII send reservation
@@ -196,6 +212,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
       reserved_count: AtomicUsize::new(0),
       queued_count: AtomicUsize::new(0),
       lwm: pipe_lwm(capacity, drain_delta),
+      audit_reported: AtomicBool::new(false),
       #[cfg(feature = "io-uring")]
       uring_wakeup,
     });
@@ -226,28 +243,15 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
           let prev = slot.queued_count.fetch_sub(1, Ordering::AcqRel);
           slot.reserved_count.fetch_sub(1, Ordering::AcqRel);
           debug_assert!(prev > 0);
+          audit_slot(&slot, "pop");
 
           if prev > 1 {
-            struct CancelGuard {
-              completed: bool,
-              pid: u32,
-            }
-            impl Drop for CancelGuard {
-              fn drop(&mut self) {
-                if !self.completed {
-                  println!(
-                    "[CANCELLATION LEAK DETECTED pid={}] pop() dropped mid-flight while awaiting ready_tx.send!",
-                    self.pid
-                  );
-                }
-              }
-            }
-            let mut guard = CancelGuard { completed: false, pid: std::process::id() };
+            cancel_guard!(guard, "ReadyPipeQueue::pop → ready_tx.send");
 
             // More committed messages remain — keep this pipe on the ready list.
             let _ = self.ready_tx.send(Arc::clone(&slot)).await;
 
-            guard.completed = true;
+            cancel_guard_complete!(guard);
           }
 
           #[cfg(feature = "io-uring")]
@@ -294,6 +298,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
           let prev = slot.queued_count.fetch_sub(1, Ordering::AcqRel);
           slot.reserved_count.fetch_sub(1, Ordering::AcqRel);
           debug_assert!(prev > 0);
+          audit_slot(&slot, "try_pop");
 
           if prev > 1 {
             let _ = self.ready_tx.try_send(Arc::clone(&slot));
@@ -382,15 +387,16 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     reservation.commit();
 
     if prev == 0 {
-      let mut cd = CancelDetector::new("ReadyPipeSender::send → ready_tx.send");
+      cancel_guard!(cd, "ReadyPipeSender::send → ready_tx.send");
       self
         .ready_tx
         .send(Arc::clone(&slot))
         .await
         .map_err(|_| ZmqError::ConnectionClosed)?;
-      cd.complete();
+      cancel_guard_complete!(cd);
     }
 
+    audit_slot(&slot, "send");
     Ok(())
   }
 
@@ -414,16 +420,12 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
       let mut spins = 0usize;
       while let Err(e) = self.ready_tx.try_send(Arc::clone(&slot)) {
         spins += 1;
-        if spins % 1_000_000 == 0 {
-          println!(
-            "[DEADLOCK pid={} spins={}] try_send spinning — error: {:?}",
-            std::process::id(), spins, e
-          );
-        }
+        log_rpq_spin_deadlock!(spins, "try_send spinning", e);
         std::thread::yield_now();
       }
     }
 
+    audit_slot(&slot, "try_send");
     Ok(())
   }
 
@@ -488,16 +490,12 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
       let mut spins = 0usize;
       while let Err(e) = self.ready_tx.try_send(Arc::clone(&slot)) {
         spins += 1;
-        if spins % 1_000_000 == 0 {
-          println!(
-            "[DEADLOCK pid={} spins={}] try_send_batch spinning on ready_tx — error: {:?}",
-            std::process::id(), spins, e
-          );
-        }
+        log_rpq_spin_deadlock!(spins, "try_send_batch spinning on ready_tx", e);
         std::thread::yield_now();
       }
     }
 
+    audit_slot(&slot, "try_send_batch");
     total_weight
   }
 
@@ -673,12 +671,7 @@ impl PipeMessageSender {
           let mut spins = 0usize;
           while let Err(e) = sender.ready_tx.try_send(Arc::clone(&slot)) {
             spins += 1;
-            if spins % 1_000_000 == 0 {
-              println!(
-                "[DEADLOCK pid={} spins={}] try_send_batch filtered spinning — error: {:?}",
-                std::process::id(), spins, e
-              );
-            }
+            log_rpq_spin_deadlock!(spins, "try_send_batch filtered spinning", e);
             std::thread::yield_now();
           }
         }
@@ -899,6 +892,109 @@ mod livelock_repro_tests {
     assert!(
       result.is_ok(),
       "pop() spun indefinitely instead of waiting for the blocked sender"
+    );
+  }
+}
+
+#[cfg(test)]
+mod pop_counter_desync_regression {
+  use super::*;
+  use std::collections::VecDeque;
+  use std::sync::Arc;
+  use std::sync::atomic::Ordering;
+  use std::time::Duration;
+  use tokio::time::timeout;
+
+  /// Push `buf` into `sender` exactly the way the session ingress path
+  /// (`IngressDriver`) does: a bulk synchronous `try_send_batch`, then an async
+  /// `send` of the still-blocked front frame when the channel is full. Returns
+  /// when the whole buffer has been delivered.
+  async fn ingress_style_push(sender: &ReadyPipeSender<usize>, buf: &mut VecDeque<usize>) {
+    loop {
+      sender.try_send_batch(buf, |_| 1);
+      match buf.front().copied() {
+        None => return,
+        Some(front) => {
+          sender.send(front).await.expect("blocked send must succeed");
+          buf.pop_front();
+        }
+      }
+    }
+  }
+
+  /// Regression for the PULL-ingress deadlock.
+  ///
+  /// Under sustained backpressure (channel pinned at `RCVHWM`), a race between a
+  /// producer enqueue and a consumer `pop()` let `queued_count`/`reserved_count`
+  /// fall one behind the physical `rx` occupancy (`[RPQ-DESYNC site=pop]
+  /// reserved(99) < rx.len(100)`). The skew ratcheted down until `queued_count`
+  /// reached 0 with items still in `rx`; `pop()`'s `prev > 1` re-enqueue then
+  /// stopped firing, the pipe was never re-armed on `ready_tx`, and the consumer
+  /// deadlocked — losing messages mid-stream (observed as a PULL receiver timing
+  /// out short of the sent count in `test_push_pull_concurrent_shutdown_race`).
+  ///
+  /// This drives the identical workload — one producer using the ingress push
+  /// pattern, one `pop()` consumer, capacity == RCVHWM — and asserts every
+  /// message is delivered and the counters are clean at the end. On the buggy
+  /// code the consumer stalls and this fails via the per-pop timeout.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn test_pop_counter_desync_deadlock_regression() {
+    const CAP: usize = 100; // mirrors RCVHWM in the failing integration test
+    const BATCH: usize = 128; // mirrors rcvbatch_count
+    const TOTAL: usize = 300_000; // enough volume to hit the enqueue/pop race
+
+    let queue = Arc::new(ReadyPipeQueue::<usize>::new(8));
+    let sender = Arc::new(queue.register_pipe(0, CAP, 0));
+
+    let producer = {
+      let sender = sender.clone();
+      tokio::spawn(async move {
+        let mut next = 0usize;
+        let mut buf: VecDeque<usize> = VecDeque::with_capacity(BATCH);
+        while next < TOTAL {
+          let end = (next + BATCH).min(TOTAL);
+          buf.extend(next..end);
+          next = end;
+          ingress_style_push(&sender, &mut buf).await;
+        }
+      })
+    };
+
+    let consumer = {
+      let queue = queue.clone();
+      tokio::spawn(async move {
+        let mut got = 0usize;
+        while got < TOTAL {
+          match timeout(Duration::from_secs(5), queue.pop()).await {
+            Ok(Ok(_)) => got += 1,
+            Ok(Err(e)) => panic!("pop() errored after {got}/{TOTAL}: {e:?}"),
+            Err(_) => panic!(
+              "DEADLOCK: pop() stalled after {got}/{TOTAL} messages — \
+               queued_count/reserved_count desynced from rx (the [RPQ-DESYNC] bug)"
+            ),
+          }
+        }
+        got
+      })
+    };
+
+    producer.await.expect("producer task");
+    let got = consumer.await.expect("consumer task");
+    assert_eq!(got, TOTAL, "messages were lost in the ready pipe queue");
+
+    // Drained and balanced: no leaked reservations / counts, channel empty.
+    let pipes = queue.pipes.read();
+    let slot = pipes.get(&0).expect("pipe slot present");
+    assert_eq!(slot.rx.len(), 0, "rx not fully drained");
+    assert_eq!(
+      slot.queued_count.load(Ordering::Acquire),
+      0,
+      "queued_count leaked"
+    );
+    assert_eq!(
+      slot.reserved_count.load(Ordering::Acquire),
+      0,
+      "reserved_count leaked"
     );
   }
 }

@@ -227,6 +227,130 @@ macro_rules! log_session_diagnostics {
   };
 }
 
+/// Declare a `CancelGuard` that prints if the surrounding future is dropped before completion.
+///
+/// Usage:
+/// ```ignore
+/// cancel_guard!(cd, "MyStruct::method → some_channel.send");
+/// some_channel.send(val).await?;
+/// cancel_guard_complete!(cd);
+/// ```
+///
+/// Compiles to nothing when diagnostics are disabled.
+#[macro_export]
+macro_rules! cancel_guard {
+  ($name:ident, $label:literal) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    let mut $name = $crate::observability::active::CancelGuard::new($label);
+  };
+}
+
+/// Mark a `cancel_guard!`-declared guard as successfully completed.
+/// Compiles to nothing when diagnostics are disabled.
+#[macro_export]
+macro_rules! cancel_guard_complete {
+  ($name:ident) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    $name.complete();
+  };
+}
+
+/// Periodic alert when the `ready_tx` try-send spin loop stalls.
+///
+/// Fires at most once per million spins — the spin itself is real code;
+/// only the `println!` is diagnostic. Compiles to nothing when diagnostics
+/// are disabled.
+#[macro_export]
+macro_rules! log_rpq_spin_deadlock {
+  ($spins:expr, $label:literal, $err:expr) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    if $spins % 1_000_000 == 0 {
+      println!(
+        "[DEADLOCK pid={} spins={}] {} — error: {:?}",
+        ::std::process::id(),
+        $spins,
+        $label,
+        $err,
+      );
+    }
+  };
+}
+
+/// One-shot alert if the HWM gate is breached (fires at most once per actor lifetime).
+/// The `static AtomicBool` lives inside the macro expansion so each call site gets
+/// its own latch. Compiles to nothing when diagnostics are disabled.
+#[macro_export]
+macro_rules! log_gating_failure {
+  ($pending_msgs:expr, $sndhwm:expr) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    {
+      let pending_msgs = $pending_msgs;
+      if pending_msgs >= $sndhwm {
+        static PRINTED_ALERT: ::std::sync::atomic::AtomicBool =
+          ::std::sync::atomic::AtomicBool::new(false);
+        if !PRINTED_ALERT.swap(true, ::std::sync::atomic::Ordering::Relaxed) {
+          println!(
+            "[ACTOR LOOP ERROR] Gating failed! Draining pipe even though \
+             egress_buffer.pending_messages() = {} (sndhwm = {})",
+            pending_msgs,
+            $sndhwm,
+          );
+        }
+      }
+    }
+  };
+}
+
+/// One-shot log when the carryover queue drain begins.
+/// Compiles to nothing when diagnostics are disabled.
+#[macro_export]
+macro_rules! log_carryover_drain {
+  ($handle:expr, $len:expr) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    println!(
+      "[Carryover Debug] ID: {} | Draining carryover queue. Starting size: {}",
+      $handle,
+      $len,
+    );
+  };
+}
+
+/// Delivery-gap report emitted once on abnormal session teardown.
+///
+/// Prints only when at least one message is being dropped (lost due to
+/// `Terminating` rather than graceful `ShuttingDownStream`). Compiles to
+/// nothing when diagnostics are disabled.
+#[macro_export]
+macro_rules! log_delivery_gap {
+  ($handle:expr, $uri:expr, $error:expr, $egress_buf:expr, $core_carryover:expr, $pending_vectored:expr, $ingress_buf:expr, $outgoing_batch:expr) => {
+    #[cfg(any(debug_assertions, feature = "diagnostics"))]
+    {
+      let egress_msgs = $egress_buf.pending_messages();
+      let carryover_msgs = $core_carryover.len();
+      let vectored_msgs = $pending_vectored.len();
+      let ingress_msgs = $ingress_buf.len();
+      let batch_msgs = $outgoing_batch.len();
+      let dropped = egress_msgs + carryover_msgs + vectored_msgs + ingress_msgs + batch_msgs;
+      if dropped > 0 {
+        println!(
+          "[DELIVERY-GAP pid={} sca={}] terminating with {} undelivered msg(s) \
+           (egress={} carryover={} vectored={} ingress={} batch={}) uri={} error={:?}",
+          ::std::process::id(),
+          $handle,
+          dropped,
+          egress_msgs,
+          carryover_msgs,
+          vectored_msgs,
+          ingress_msgs,
+          batch_msgs,
+          $uri,
+          $error,
+        );
+      }
+    }
+  };
+}
+
 /// Periodic egress-driver diagnostic dump.
 ///
 /// Uses a global `OnceLock<Mutex<Instant>>` — multiple connections share one

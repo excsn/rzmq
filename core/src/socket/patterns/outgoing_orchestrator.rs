@@ -94,8 +94,21 @@ impl OutgoingMessageOrchestrator {
           msgs = returned;
           attempts += 1;
           if attempts >= max_attempts {
-            // SLOW PATH: All peers are full. Fall back to the async path to properly block.
-            match peer.iface.send_multipart_owned(msgs).await {
+            // SLOW PATH: every peer was full on this sweep, so we must block.
+            //
+            // Pick a *fresh* peer from the round-robin rotation to block on rather
+            // than reusing the sweep-terminal `peer`. A full sweep calls
+            // `get_next_connection` exactly `count` times, which wraps `next_idx`
+            // back to where the sweep started — so without this extra advance every
+            // saturated message would deterministically block on the same terminal
+            // peer, funneling a disproportionate share to it. The extra rotation
+            // makes the blocking target drift across all peers (net advance of 1 per
+            // saturated message), restoring fair distribution under backpressure.
+            let block_peer = match self.load_balancer.get_next_connection() {
+              Some(p) => p,
+              None => return Err((msgs, ZmqError::ResourceLimitReached)),
+            };
+            match block_peer.iface.send_multipart_owned(msgs).await {
               Ok(()) => return Ok(()),
               Err((returned, ZmqError::ResourceLimitReached)) => {
                 return Err((returned, ZmqError::ResourceLimitReached));

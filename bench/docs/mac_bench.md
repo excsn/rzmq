@@ -25,7 +25,7 @@
 | **PubSub** | Concurrency 4 | 37,547,928 | 3,754,404.22 | 229.15 | — | — |
 | **PubSub** | Concurrency 1, Msg Size 16KB | 6,532,096 | 653,200.69 | 10,206.26 | — | — |
 | **PubSub** | Concurrency 4, Msg Size 16KB | 9,406,909 | 940,692.03 | 14,698.31 | — | — |
-| **PubSub** | Concurrency 1, Msg Size 32KB | 2,985,526 | 298,547.29 | 9,329.60 | — | — |
+| **PubSub** | Concurrency 1, Msg Size 32KB | 3,433,100 | 343,316.29 | 10,728.63 | — | — |
 | **PubSub** | Concurrency 4, Msg Size 32KB | 4,578,940 | 457,861.91 | 14,308.18 | — | — |
 
 ---
@@ -319,11 +319,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PubSub
-* **Elapsed Time:** 10.0002 seconds
-* **Total Messages:** 2,985,526
-* **Total Data:** 93,297.69 MB
-* **Throughput:** 298,547.29 msg/s
-* **Throughput Rate:** 9,329.60 MB/s
+* **Elapsed Time:** 9.9998 seconds
+* **Total Messages:** 3,433,100
+* **Total Data:** 107,284.38 MB
+* **Throughput:** 343,316.29 msg/s
+* **Throughput Rate:** 10,728.63 MB/s
 
 #### Concurrency 4, Msg size 32KB
 
