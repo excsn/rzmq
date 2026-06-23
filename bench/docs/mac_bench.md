@@ -2,7 +2,7 @@
 
 * **System:** Macbook Pro M4
 * **Message Size:** 64 bytes (unless otherwise specified)
-* **Role:** Client
+* **Role:** Client/Server
 * **Target Endpoint:** `tcp://127.0.0.1:19876` (unless otherwise specified)
 
 ---

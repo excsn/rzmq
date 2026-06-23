@@ -11,11 +11,11 @@
 
 TCP Loopback (`tcp://127.0.0.1`), 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
 
-- **5.0 M msg/s** - PushPull · 64 B · 4 workers
-- **9.7 GB/s** - PushPull · 32 KB · 4 workers
+- **3.5 M msg/s** - PushPull · 64 B · Linux · 4 workers
+- **16.2 GB/s** - PushPull · 32 KB · Linux · 4 workers
 
-- **3.2 M msg/s** - PushPull · 64 B · io\_uring + cork · 4 workers
-- **7.3 GB/s** - PushPull · 32 KB · io\_uring + cork + multishot + zerocopy · 8 workers
+- **5.3 M msg/s** - PushPull · 64 B · Linux · io\_uring + cork · 4 workers
+- **7.8 GB/s** - PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 8 workers
 
 **`rzmq` has shown stunningly superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a compelling choice for performance-critical distributed applications on Linux.
 
