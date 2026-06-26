@@ -1,25 +1,25 @@
-# rzmq: An Asynchronous Pure Rust ZeroMQ Implementation
+# rzmq: Asynchronous Pure Rust ZeroMQ with io-uring and TCP Cork Acceleration
 
 [![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 
-**rzmq** is a high-performance, asynchronous pure Rust implementation of ZeroMQ (ØMQ) built on [Tokio](https://tokio.rs/). It implements the ZMTP 3.1 wire protocol with familiar ZeroMQ socket patterns and an optional `io_uring` backend for leading throughput on Linux.
+**rzmq** is a high-performance, asynchronous pure Rust implementation of ZeroMQ (ØMQ) built on [Tokio](https://tokio.rs/). It implements the ZMTP 3.1 wire protocol with familiar ZeroMQ socket patterns and an opt-in `io_uring` worker for ultra low latency, high throughput on Linux.
 
 ## Performance Highlights
 
 TCP Loopback (`tcp://127.0.0.1`), 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
 
-- **3.5 M msg/s** - PushPull · 64 B · Linux · 4 workers
-- **16.2 GB/s** - PushPull · 32 KB · Linux · 4 workers
+- **3.5 M msg/s** - PushPull · 64 B · 4 workers
+- **16.2 GB/s** - PushPull · 32 KB · 4 workers
 
-- **5.3 M msg/s** - PushPull · 64 B · Linux · io\_uring + cork · 4 workers
-- **7.8 GB/s** - PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 4 workers
+- **5.3 M msg/s** - PushPull · 64 B · io\_uring + cork · 4 workers
+- **7.8 GB/s** - PushPull · 32 KB · io\_uring + cork + multishot + zerocopy · 4 workers
 
-`rzmq` has demonstrated stunningly superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput [benchmarks](#benchmarks) included in this repository.
+`rzmq` delivers stunningly superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput [benchmarks](#benchmarks) included.
 
 ## Project Status: Beta ⚠️
 
-`rzmq` is currently in Beta — core functionality and performance advantages are in place, but the API may still see minor refinements before 1.0. See [`core/README.md`](core/README.md#project-status-beta-️) for full details.
+`rzmq` is currently in Beta. See [`core/README.md`](core/README.md#project-status-beta-️) for full details.
 
 ## Notable Users
 
