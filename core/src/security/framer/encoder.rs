@@ -101,14 +101,13 @@ impl ZmtpFrameEncoder {
 mod tests {
   use super::*;
   use crate::message::Msg;
-  use smallvec::smallvec;
 
   #[test]
   fn test_contiguous_framer_correctness() {
     let mut enc = ZmtpFrameEncoder::new(1024, 1024);
     let batch: Vec<FrameBatch> = vec![
-      smallvec![Msg::from_static(b"hello")],
-      smallvec![Msg::from_static(b"world")],
+      FrameBatch::from(vec![Msg::from_static(b"hello")]),
+      FrameBatch::from(vec![Msg::from_static(b"world")]),
     ];
 
     let result = enc.frame_contiguous(&batch).unwrap();
@@ -123,7 +122,7 @@ mod tests {
   #[test]
   fn test_zero_reallocation_under_steady_state() {
     let mut enc = ZmtpFrameEncoder::new(4096, 4096);
-    let batch: Vec<FrameBatch> = vec![smallvec![Msg::from_static(b"static-size")]];
+    let batch: Vec<FrameBatch> = vec![FrameBatch::from(vec![Msg::from_static(b"static-size")])];
 
     let _ = enc.frame_contiguous(&batch).unwrap();
     let initial_cap = enc.coalesce_buffer.capacity();
@@ -142,7 +141,7 @@ mod tests {
   #[test]
   fn test_vectored_header_carving() {
     let mut enc = ZmtpFrameEncoder::new(1024, 1024);
-    let batch: Vec<FrameBatch> = vec![smallvec![Msg::from_static(b"payload")]];
+    let batch: Vec<FrameBatch> = vec![FrameBatch::from(vec![Msg::from_static(b"payload")])];
 
     let slices = enc.frame_vectored(&batch).unwrap();
     assert_eq!(slices.len(), 2);

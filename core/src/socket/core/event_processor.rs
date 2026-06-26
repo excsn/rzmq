@@ -1,12 +1,8 @@
 use crate::error::ZmqError;
-use crate::runtime::{Command, SystemEvent};
+use crate::runtime::SystemEvent;
 use crate::socket::ISocket;
-#[cfg(feature = "io-uring")]
-use crate::socket::connection_iface::UringFdConnection;
 use crate::socket::core::state::ShutdownPhase;
 use crate::socket::core::{SocketCore, command_processor, pipe_manager, shutdown};
-#[cfg(feature = "io-uring")]
-use crate::uring;
 
 use std::sync::Arc;
 
@@ -112,25 +108,6 @@ pub(crate) async fn process_system_event(
             }
           }
 
-          let core_write_id_opt = {
-            let core_s = core_arc.core_state.read();
-            core_s
-              .pipe_read_id_to_endpoint_uri
-              .get(&connection_identifier)
-              .and_then(|uri| core_s.endpoints.get(uri))
-              .and_then(|ep_info| ep_info.pipe_ids.map(|pids| pids.0))
-          };
-
-          if let Some(core_write_id) = core_write_id_opt {
-            socket_logic_strong
-              .pipe_attached(
-                connection_identifier,
-                core_write_id,
-                peer_identity.as_ref().map(|b| b.as_ref()),
-              )
-              .await;
-          }
-
           socket_logic_strong
             .update_peer_identity(connection_identifier, peer_identity)
             .await;
@@ -206,6 +183,3 @@ pub(crate) async fn process_system_event(
   }
   Ok(())
 }
-
-// handle_new_connection_established has been moved to command_processor.rs.
-// Connection registration now flows through Command::NewConnectionEstablished (direct mailbox).

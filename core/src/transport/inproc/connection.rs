@@ -42,7 +42,6 @@ impl ISocketConnection for DirectInprocConnection {
 mod tests {
   use super::*;
   use crate::message::Msg;
-  use smallvec::smallvec;
 
   #[tokio::test]
   async fn test_successful_direct_send() {
@@ -53,7 +52,7 @@ mod tests {
       peer_queue_sender: tx,
     };
 
-    let batch: FrameBatch = smallvec![Msg::from_static(b"hello-inproc")];
+    let batch = FrameBatch::from(vec![Msg::from_static(b"hello-inproc")]);
     assert!(connection.send_multipart(batch).await.is_ok());
 
     let received = rx.recv().await.unwrap();
@@ -70,8 +69,8 @@ mod tests {
       peer_queue_sender: tx,
     };
 
-    let batch1: FrameBatch = smallvec![Msg::from_static(b"frame-1")];
-    let batch2: FrameBatch = smallvec![Msg::from_static(b"frame-2")];
+    let batch1 = FrameBatch::from(vec![Msg::from_static(b"frame-1")]);
+    let batch2 = FrameBatch::from(vec![Msg::from_static(b"frame-2")]);
 
     let res1 = connection.try_send_multipart_owned_sync(batch1);
     assert!(res1.is_ok());
@@ -94,7 +93,7 @@ mod tests {
 
     drop(rx);
 
-    let batch: FrameBatch = smallvec![Msg::from_static(b"lost-frame")];
+    let batch = FrameBatch::from(vec![Msg::from_static(b"lost-frame")]);
     let res = connection.send_multipart(batch).await;
     assert!(matches!(res, Err(ZmqError::ConnectionClosed)));
   }

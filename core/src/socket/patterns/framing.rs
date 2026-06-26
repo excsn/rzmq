@@ -111,13 +111,11 @@ pub(crate) fn dealer_auto_decode(frames: &mut FrameBatch) {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use smallvec::smallvec;
 
   #[test]
   fn test_router_auto_encode() {
     // Case 1: Identity + Payload
-    let mut frames: FrameBatch =
-      smallvec![Msg::from_static(b"Identity"), Msg::from_static(b"Payload")];
+    let mut frames = FrameBatch::from(vec![Msg::from_static(b"Identity"), Msg::from_static(b"Payload")]);
     router_auto_encode(&mut frames);
 
     assert_eq!(frames.len(), 3);
@@ -131,7 +129,7 @@ mod tests {
     assert!(!frames[2].is_more()); // Payload didn't have MORE
 
     // Case 2: Identity only (no payload)
-    let mut frames: FrameBatch = smallvec![Msg::from_static(b"Identity")];
+    let mut frames = FrameBatch::from(vec![Msg::from_static(b"Identity")]);
     router_auto_encode(&mut frames);
 
     assert_eq!(frames.len(), 2);
@@ -145,7 +143,7 @@ mod tests {
   #[test]
   fn test_dealer_auto_encode() {
     // Case 1: Payload
-    let mut frames: FrameBatch = smallvec![Msg::from_static(b"Payload")];
+    let mut frames = FrameBatch::from(vec![Msg::from_static(b"Payload")]);
     dealer_auto_encode(&mut frames);
 
     assert_eq!(frames.len(), 2);

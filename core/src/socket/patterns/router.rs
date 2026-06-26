@@ -218,7 +218,7 @@ mod additional_router_map_tests {
     let req_strat = ReqPeerStrategy;
 
     let id_msg = Msg::from_static(b"destination-identity");
-    let payload: FrameBatch = smallvec::smallvec![Msg::from_static(b"hello")];
+    let payload = FrameBatch::from(vec![Msg::from_static(b"hello")]);
 
     let result = req_strat.prepare_wire_frames(id_msg, payload, &framing);
 

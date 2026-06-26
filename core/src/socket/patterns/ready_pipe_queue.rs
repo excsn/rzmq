@@ -132,7 +132,6 @@ impl<T: Send + 'static> PipeSlot<T> {
 // drop fires and prints a loud warning with the exact location.
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // Private RAII send reservation
 //
@@ -149,7 +148,10 @@ struct SendReservation<T: Send + 'static> {
 impl<T: Send + 'static> SendReservation<T> {
   fn new(slot: Arc<PipeSlot<T>>) -> Self {
     slot.reserved_count.fetch_add(1, Ordering::AcqRel);
-    Self { slot, committed: false }
+    Self {
+      slot,
+      committed: false,
+    }
   }
 
   fn commit(&mut self) {
@@ -189,7 +191,12 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
     }
   }
 
-  pub fn register_pipe(&self, pipe_id: usize, capacity: usize, drain_delta: usize) -> ReadyPipeSender<T> {
+  pub fn register_pipe(
+    &self,
+    pipe_id: usize,
+    capacity: usize,
+    drain_delta: usize,
+  ) -> ReadyPipeSender<T> {
     let mut pipes = self.pipes.write();
 
     if let Some(slot) = pipes.get(&pipe_id) {
@@ -479,7 +486,9 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
 
     // Roll back any reservations for items we couldn't push.
     if sent_batches < n {
-      slot.reserved_count.fetch_sub(n - sent_batches, Ordering::AcqRel);
+      slot
+        .reserved_count
+        .fetch_sub(n - sent_batches, Ordering::AcqRel);
     }
 
     // Guaranteed wakeup on 0→1 transition. ready_capacity >= max registered
@@ -662,7 +671,9 @@ impl PipeMessageSender {
         }
 
         if sent_batches < match_count {
-          slot.reserved_count.fetch_sub(match_count - sent_batches, Ordering::AcqRel);
+          slot
+            .reserved_count
+            .fetch_sub(match_count - sent_batches, Ordering::AcqRel);
         }
 
         if had_zero_transition {
@@ -999,7 +1010,9 @@ mod pop_counter_desync_regression {
 
 #[cfg(test)]
 mod cancellation_safety_tests {
-  use super::*;
+  use crate::Msg;
+
+use super::*;
   use std::sync::Arc;
   use std::time::Duration;
   use tokio::time::timeout;
@@ -1171,5 +1184,72 @@ mod cancellation_safety_tests {
       result.is_err(),
       "pop() returned unexpectedly — phantom reservation or ghost message present"
     );
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn test_exact_rzmq_ready_pipe_queue_uaf_crash() {
+    println!("\n--- STARTING DETERMINISTIC READY_PIPE_QUEUE CRASH TEST ---");
+
+    let queue = Arc::new(ReadyPipeQueue::<FrameBatch>::new(10));
+
+    let mut senders = Vec::new();
+    for i in 0..4 {
+      senders.push(Arc::new(queue.register_pipe(i, 1, 0)));
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+
+    for t_id in 0..20 {
+      let senders_clone = senders.clone();
+      let stop_clone = stop.clone();
+
+      handles.push(tokio::spawn(async move {
+        let mut seq = t_id * 10000;
+        let mut rng = u64::wrapping_mul(seq as u64, 0x9E37_79B9_7F4A_7C15);
+
+        while !stop_clone.load(Ordering::Relaxed) {
+          rng = rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
+          let target_pipe = (rng % 4) as usize;
+          let sender = &senders_clone[target_pipe];
+
+          let mut batch = FrameBatch::new();
+          batch.push(Msg::from_static(b"chaos-data"));
+
+          let timeout_us = 10 + (rng % 150);
+          let _ = timeout(Duration::from_micros(timeout_us), sender.send(batch)).await;
+
+          seq += 1;
+          tokio::task::yield_now().await;
+        }
+      }));
+    }
+
+    for t_id in 0..20 {
+      let queue_clone = queue.clone();
+      let stop_clone = stop.clone();
+
+      handles.push(tokio::spawn(async move {
+        let mut rng = u64::wrapping_mul((t_id + 100) as u64, 0x9E37_79B9_7F4A_7C15);
+
+        while !stop_clone.load(Ordering::Relaxed) {
+          rng = rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
+          let timeout_us = 10 + (rng % 150);
+
+          let _ = timeout(Duration::from_micros(timeout_us), queue_clone.pop()).await;
+          tokio::task::yield_now().await;
+        }
+      }));
+    }
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    println!("[SYS] Stopping tasks...");
+    stop.store(true, Ordering::SeqCst);
+
+    for h in handles {
+      let _ = h.await;
+    }
+
+    println!("--- REPRO COMPLETED SUCCESSFULLY (No Segfault occurred) ---");
   }
 }

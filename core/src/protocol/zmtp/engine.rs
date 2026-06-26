@@ -13,7 +13,6 @@ use crate::security::null::NullMechanism;
 use crate::socket::options::ZmtpEngineConfig;
 
 use bytes::{Buf, Bytes, BytesMut};
-use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -736,7 +735,7 @@ impl ZmtpEngine {
       let is_more = msg.is_more();
       self.partial_batch.push(msg);
       if !is_more {
-        let batch = std::mem::replace(&mut self.partial_batch, SmallVec::new());
+        let batch = std::mem::replace(&mut self.partial_batch, FrameBatch::new());
         out.app_actions.push(AppAction::DeliverMessage(batch));
       }
     }
