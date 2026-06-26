@@ -11,15 +11,15 @@ It provides a familiar ZeroMQ-style API within the Rust async ecosystem, **striv
 
 ## Performance Highlights
 
-TCP Loopback (`tcp://127.0.0.1`), 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
+TCP Loopback (`tcp://127.0.0.1`), PUSH/PULL Sockets, 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
 
-- **3.5 M msg/s** - PushPull · 64 B · Linux · 4 workers
-- **16.2 GB/s** - PushPull · 32 KB · Linux · 4 workers
+- **3.5 M msg/s** - 64 B · 4 workers
+- **16.2 GB/s** - 32 KB · 4 workers
 
-- **5.3 M msg/s** - PushPull · 64 B · Linux · io\_uring + cork · 4 workers
-- **7.8 GB/s** - PushPull · 32 KB · Linux · io\_uring + cork + multishot + zerocopy · 4 workers
+- **5.3 M msg/s** - 64 B · io\_uring + cork · 4 workers
+- **7.8 GB/s** - 32 KB · io\_uring + cork + multishot + zerocopy · 4 workers
 
-**`rzmq` has shown stunningly superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a compelling choice for performance-critical distributed applications on Linux.
+**`rzmq` delivers stunningly superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a compelling choice for performance-critical distributed applications on Linux.
 
 ## Project Status: Beta ⚠️
 
