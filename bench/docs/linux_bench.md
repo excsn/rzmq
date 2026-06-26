@@ -23,18 +23,18 @@
 | **PubSub** | `--cork` | 1 | 35,354,522 | 3,535,691.42 | 215.80 | — | — |
 | **PushPull** | `--cork` | 1 | 31,791,104 | 3,026,835.40 | 184.74 | — | — |
 | **PushPull** | `--cork` | 4 | 32,103,173 | 3,210,380.06 | 195.95 | — | — |
-| **PushPull** | `--cork` (32 KB msg) | 4 | 5,211,300 | 521,127.65 | 16,285.24 | — | — |
-| **PushPull** | `io-uring` | 1 | 39,315,594 | 3,927,298.09 | 239.70 | — | — |
-| **PushPull** | `io-uring` | 4 | 45,571,307 | 4,535,801.23 | 276.84 | — | — |
+| **PushPull** | `--cork` (32 KB msg) | 4 | 5,422,517 | 542,206.15 | 16,943.94 | — | — |
+| **PushPull** | `io-uring` | 1 | 40,466,303 | 4,046,773.88 | 247.00 | — | — |
+| **PushPull** | `io-uring` | 4 | 49,317,766 | 4,923,121.95 | 300.48 | — | — |
 | **PushPull** | `io-uring` + `--cork` | 1 | 41,914,266 | 4,191,825.75 | 255.85 | — | — |
 | **PushPull** | `io-uring` + `--cork` | 4 | 53,224,944 | 5,319,865.40 | 324.70 | — | — |
 | **PushPull** | `io-uring` + `--uring-multishot` | 1 | 35,943,858 | 3,592,001.06 | 219.24 | — | — |
 | **PushPull** | `io-uring` + `--uring-multishot` | 4 | 40,904,075 | 4,090,856.30 | 249.69 | — | — |
 | **PushPull** | `io-uring` (32 KB msg) | 1 | 2,291,371 | 229,142.24 | 7,160.70 | — | — |
 | **PushPull** | `io-uring` + `--uring-multishot` (32 KB msg) | 1 | 2,489,001 | 248,909.66 | 7,778.43 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` (32 KB msg) | 4 | 2,439,876 | 243,992.26 | 7,624.76 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 1 | 2,479,425 | 247,950.31 | 7,748.45 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 4 | 2,495,371 | 249,534.19 | 7,797.94 | — | — |
+| **PushPull** | `io-uring` + `--uring-multishot` (32 KB msg) | 4 | 2,549,252 | 254,907.35 | 7,965.85 | — | — |
+| **PushPull** | `io-uring` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 1 | 2,557,517 | 255,773.78 | 7,992.93 | — | — |
+| **PushPull** | `io-uring` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 4 | 150,823,172 | 251,372.05 | 7,855.38 | — | — |
 
 ---
 
@@ -265,11 +265,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 10.0000 seconds
-* **Total Messages:** 5,211,300
-* **Total Data:** 162,853.12 MB
-* **Throughput:** 521,127.65 msg/s
-* **Throughput Rate:** 16,285.24 MB/s
+* **Elapsed Time:** 10.0008 seconds
+* **Total Messages:** 5,422,517
+* **Total Data:** 169,453.66 MB
+* **Throughput:** 542,206.15 msg/s
+* **Throughput Rate:** 16,943.94 MB/s
 
 ---
 
@@ -282,11 +282,11 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 10.0109 seconds
-* **Total Messages:** 39,315,594
-* **Total Data:** 2,399.63 MB
-* **Throughput:** 3,927,298.09 msg/s
-* **Throughput Rate:** 239.70 MB/s
+* **Elapsed Time:** 9.9996 seconds
+* **Total Messages:** 40,466,303
+* **Total Data:** 2,469.87 MB
+* **Throughput:** 4,046,773.88 msg/s
+* **Throughput Rate:** 247.00 MB/s
 
 #### Concurrency 4
 
@@ -297,11 +297,11 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 10.0470 seconds
-* **Total Messages:** 45,571,307
-* **Total Data:** 2,781.45 MB
-* **Throughput:** 4,535,801.23 msg/s
-* **Throughput Rate:** 276.84 MB/s
+* **Elapsed Time:** 10.0176 seconds
+* **Total Messages:** 49,317,766
+* **Total Data:** 3,010.12 MB
+* **Throughput:** 4,923,121.95 msg/s
+* **Throughput Rate:** 300.48 MB/s
 
 ---
 
@@ -409,11 +409,11 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9998 seconds
-* **Total Messages:** 2,439,876
-* **Total Data:** 76,246.12 MB
-* **Throughput:** 243,992.26 msg/s
-* **Throughput Rate:** 7,624.76 MB/s
+* **Elapsed Time:** 10.0007 seconds
+* **Total Messages:** 2,549,252
+* **Total Data:** 79,664.12 MB
+* **Throughput:** 254,907.35 msg/s
+* **Throughput Rate:** 7,965.85 MB/s
 
 #### with Multishot and ZeroCopy, Concurrency 1
 **Command:**
@@ -423,22 +423,22 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9997 seconds
-* **Total Messages:** 2,479,425
-* **Total Data:** 77,482.03 MB
-* **Throughput:** 247,950.31 msg/s
-* **Throughput Rate:** 7,748.45 MB/s
+* **Elapsed Time:** 9.9991 seconds
+* **Total Messages:** 2,557,517
+* **Total Data:** 79,922.41 MB
+* **Throughput:** 255,773.78 msg/s
+* **Throughput Rate:** 7,992.93 MB/s
 
 #### with Multishot and ZeroCopy, Concurrency 4
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-multishot --uring-zerocopy --concurrency 4
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-multishot --uring-zerocopy --concurrency 4 --duration 600
 ```
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 10.0001 seconds
-* **Total Messages:** 2,495,371
-* **Total Data:** 77,980.34 MB
-* **Throughput:** 249,534.19 msg/s
-* **Throughput Rate:** 7,797.94 MB/s
+* **Elapsed Time:** 599.9998 seconds
+* **Total Messages:** 150,823,172
+* **Total Data:** 4,713,224.12 MB
+* **Throughput:** 251,372.05 msg/s
+* **Throughput Rate:** 7,855.38 MB/s
