@@ -112,8 +112,6 @@ impl TcpCorkInfoX {
   }
 }
 
-// Helper function that might be used by ZmtpProtocolHandlerX to initialize its cork_info field.
-// This is defined outside the struct so it can be called conditionally.
 pub(crate) fn try_create_cork_info<S: AsRawFd>(
   stream_option: Option<&S>,
   use_cork_config: bool,
