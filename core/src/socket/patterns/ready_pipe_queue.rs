@@ -9,6 +9,7 @@ use std::sync::{
 use parking_lot::RwLock;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender, bounded_async};
+use fibre::spsc;
 use fibre::{RecvError, TryRecvError, TrySendError};
 
 use crate::error::ZmqError;
@@ -86,8 +87,8 @@ fn audit_slot<T: Send + 'static>(slot: &PipeSlot<T>, site: &str) {
 
 pub(crate) struct PipeSlot<T: Send + 'static> {
   pub(crate) pipe_id: usize,
-  pub(crate) tx: AsyncSender<T>,
-  pub(crate) rx: AsyncReceiver<T>,
+  pub(crate) tx: spsc::BoundedAsyncSender<T>,
+  pub(crate) rx: spsc::BoundedAsyncReceiver<T>,
   /// Active send reservations: in-flight (not yet committed) + committed messages.
   /// Incremented at the START of every send attempt (before the channel write).
   /// Decremented on cancellation (RAII) or on consumer pop.
@@ -112,7 +113,7 @@ impl<T: Send + 'static> PipeSlot<T> {
   }
 
   pub fn capacity(&self) -> usize {
-    self.rx.capacity().unwrap_or(usize::MAX)
+    self.rx.capacity()
   }
 
   pub fn is_congested(&self) -> bool {
@@ -206,7 +207,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
       };
     }
 
-    let (tx, rx) = bounded_async(capacity.max(1));
+    let (tx, rx) = spsc::bounded_async(capacity.max(1));
     #[cfg(feature = "io-uring")]
     let uring_wakeup = Arc::new(OnceLock::new());
 

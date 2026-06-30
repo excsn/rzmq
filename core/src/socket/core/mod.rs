@@ -1,6 +1,8 @@
 pub(crate) mod command_loop;
 pub(crate) mod command_processor;
 pub(crate) mod event_processor;
+#[cfg(feature = "inproc")]
+pub(crate) mod inproc_reader;
 pub(crate) mod pipe_manager;
 pub(crate) mod shutdown;
 pub(crate) mod state;

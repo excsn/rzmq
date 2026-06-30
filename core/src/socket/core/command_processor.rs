@@ -8,7 +8,8 @@ use crate::sessionx::ScaConnectionIface;
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 
-#[cfg(feature = "io-uring")]
+#[cfg(feature = "inproc")]
+use crate::socket::core::inproc_reader;
 use crate::socket::core::pipe_manager;
 
 use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
@@ -1088,7 +1089,7 @@ async fn handle_new_connection_established(
 
       // Dummy closed mailbox — no SCAX actor to command for direct inproc.
       let (dummy_mailbox_tx, _dropped_rx) =
-        fibre::mpmc::bounded_async::<Command>(1);
+        fibre::mpsc::bounded_async::<Command>(1);
 
       let endpoint_info = EndpointInfo {
         mailbox: dummy_mailbox_tx,
@@ -1127,35 +1128,16 @@ async fn handle_new_connection_established(
 
       let event_bus = core_arc.context.event_bus().clone();
       let endpoint_uri_clone = endpoint_uri_from_event.clone();
-      let task_handle = tokio::spawn(async move {
-        let mut accumulator = FrameBatch::new();
-        loop {
-          match rx.recv().await {
-            Ok(batch) => {
-              accumulator.extend(batch);
-              if let Some(last_msg) = accumulator.last_mut() {
-                if !last_msg.is_more() {
-                  let complete_batch = std::mem::replace(&mut accumulator, FrameBatch::new());
-                  if let Some(ref sender) = pipe_sender_opt {
-                    if sender.send(complete_batch).await.is_err() {
-                      break;
-                    }
-                  }
-                }
-              }
-            }
-            Err(_) => break,
-          }
-        }
-        tracing::debug!(reader_task_id, uri = %endpoint_uri_clone, "DirectInproc reader task exiting.");
-        let _ = event_bus.publish(SystemEvent::ActorStopping {
-          handle_id: reader_task_id,
-          actor_type: ActorType::PipeReader,
-          endpoint_uri: Some(endpoint_uri_clone),
-          parent_id: Some(core_handle),
-          error: None,
-        });
-      });
+      let rcvbatch_count = core_arc.core_state.read().options.rcvbatch_count;
+      let task_handle = inproc_reader::spawn(
+        rx,
+        pipe_sender_opt,
+        event_bus,
+        endpoint_uri_clone,
+        reader_task_id,
+        core_handle,
+        rcvbatch_count,
+      );
 
       core_arc
         .core_state
