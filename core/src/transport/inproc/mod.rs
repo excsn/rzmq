@@ -129,10 +129,17 @@ pub(crate) async fn connect_inproc(
       }
 
       let peer_identity = response.binder_identity.clone();
+      let (monitor_tx, sndtimeo) = {
+        let s = core_arc.core_state.read();
+        (s.get_monitor_sender_clone(), s.options.sndtimeo)
+      };
       let direct_conn = DirectInprocConnection {
         connection_id: connection_handle_id,
         target_endpoint_uri: connection_specific_uri.clone(),
         peer_queue_sender: response.binder_rx_sender,
+        monitor_tx,
+        is_congested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sndtimeo,
       };
 
       let cmd = Command::NewConnectionEstablished {

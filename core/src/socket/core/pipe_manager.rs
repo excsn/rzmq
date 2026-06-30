@@ -363,10 +363,17 @@ pub(crate) async fn process_inproc_binding_request_event(
   // Unblock the connector — it now has the sender to reach us.
   let _ = request.reply_tx.send(Ok(response));
 
+  let (monitor_tx, sndtimeo) = {
+    let s = core_arc.core_state.read();
+    (s.get_monitor_sender_clone(), s.options.sndtimeo)
+  };
   let direct_conn = DirectInprocConnection {
     connection_id: binder_core_handle,
     target_endpoint_uri: connector_uri.clone(),
     peer_queue_sender: request.connector_rx_sender,
+    monitor_tx,
+    is_congested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    sndtimeo,
   };
 
   let cmd = Command::NewConnectionEstablished {

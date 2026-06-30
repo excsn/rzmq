@@ -761,6 +761,7 @@ impl ISocket for RouterSocket {
       };
 
       tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, ?identity_to_use, conn_id = connection_id, "ROUTER attaching connection");
+      let is_inproc = endpoint_uri.starts_with("inproc://");
       self
         .router_map_for_send
         .add_peer(identity_to_use.clone(), pipe_read_id, endpoint_uri)
@@ -782,7 +783,8 @@ impl ISocket for RouterSocket {
       // post-handshake attach), the pipe is finalized immediately. A
       // placeholder/`None` attach (standard pre-handshake path) leaves the pipe
       // pending until `update_peer_identity` finalizes it.
-      if matches!(peer_identity_opt, Some(id) if !id.is_empty()) {
+      // Direct inproc connections have no handshake, so they are finalized immediately.
+      if matches!(peer_identity_opt, Some(id) if !id.is_empty()) || is_inproc {
         self.finalize_pipe(pipe_read_id);
       }
     } else {

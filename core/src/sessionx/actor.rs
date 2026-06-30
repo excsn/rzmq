@@ -9,7 +9,7 @@ use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};
 use crate::sessionx::ingress_future::IngressDriver;
 use crate::sessionx::regulator::SessionRegulator;
 use crate::socket::ISocket;
-use crate::socket::events::SocketEvent;
+use crate::socket::events::{SocketEvent, clean_endpoint_uri};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::throttle::AdaptiveThrottle;
@@ -404,7 +404,7 @@ where
                 if !self.is_currently_congested && egress_buffer.pending_messages() >= sndhwm {
                   self.is_currently_congested = true;
                   if let Some(ref tx) = self.actor_config.monitor_tx {
-                    let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri);
+                    let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri).to_owned();
                     let _ = tx.try_send(SocketEvent::ConnectionCongested { endpoint: ep });
                   }
                 }
@@ -558,7 +558,7 @@ where
                   if let Some(ref tx) = self.actor_config.monitor_tx {
                     let ep = clean_endpoint_uri(
                       &self.actor_config.logical_target_endpoint_uri,
-                    );
+                    ).to_owned();
                     let _ = tx.try_send(SocketEvent::ConnectionUncongested {
                       endpoint: ep,
                     });
@@ -668,7 +668,7 @@ where
                             &self
                               .actor_config
                               .logical_target_endpoint_uri,
-                          );
+                          ).to_owned();
                           let _ = tx.try_send(
                             SocketEvent::ConnectionCongested {
                               endpoint: ep,
@@ -1099,9 +1099,3 @@ where
   }
 }
 
-fn clean_endpoint_uri(uri: &str) -> String {
-  match uri.find('#') {
-    Some(pos) => uri[..pos].to_string(),
-    None => uri.to_string(),
-  }
-}

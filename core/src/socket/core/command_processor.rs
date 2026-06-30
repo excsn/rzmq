@@ -1128,15 +1128,21 @@ async fn handle_new_connection_established(
       let event_bus = core_arc.context.event_bus().clone();
       let endpoint_uri_clone = endpoint_uri_from_event.clone();
       let task_handle = tokio::spawn(async move {
+        let mut accumulator = FrameBatch::new();
         loop {
           match rx.recv().await {
             Ok(batch) => {
-              if let Some(ref sender) = pipe_sender_opt {
-                if sender.send(batch).await.is_err() {
-                  break;
+              accumulator.extend(batch);
+              if let Some(last_msg) = accumulator.last_mut() {
+                if !last_msg.is_more() {
+                  let complete_batch = std::mem::replace(&mut accumulator, FrameBatch::new());
+                  if let Some(ref sender) = pipe_sender_opt {
+                    if sender.send(complete_batch).await.is_err() {
+                      break;
+                    }
+                  }
                 }
               }
-              // else: send-only socket type — discard frame
             }
             Err(_) => break,
           }

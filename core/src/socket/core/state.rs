@@ -1,7 +1,7 @@
 use crate::message::FrameBatch;
 use crate::runtime::MailboxSender;
 use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::events::MonitorSender;
+use crate::socket::events::{MonitorSender, clean_endpoint_uri};
 use crate::socket::options::SocketOptions;
 use crate::socket::types::SocketType;
 use crate::socket::SocketEvent;
@@ -206,15 +206,7 @@ impl CoreState {
 
   pub(crate) fn send_monitor_event(&self, event: SocketEvent) {
     if let Some(ref tx) = self.monitor_tx {
-      // Strip internal `#<id>` uniqueness suffixes from URIs before exposing them.
-      // Inproc connections use `inproc://name#<handle>` as map keys internally;
-      // external observers always see the clean logical URI.
-      let clean = |s: String| -> String {
-        match s.find('#') {
-          Some(pos) => s[..pos].to_string(),
-          None => s,
-        }
-      };
+      let clean = |s: String| -> String { clean_endpoint_uri(&s).to_owned() };
       let event = match event {
         SocketEvent::Listening { endpoint } => SocketEvent::Listening {
           endpoint: clean(endpoint),

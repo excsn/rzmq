@@ -52,6 +52,17 @@ pub enum SocketEvent {
   ConnectionUncongested { endpoint: String },
 }
 
+/// Strip the internal `#<handle>` uniqueness suffix from a connection URI before
+/// exposing it through the monitor channel. Inproc connections use
+/// `inproc://name#<handle>` as internal map keys; external observers always see
+/// the clean logical URI.
+pub(crate) fn clean_endpoint_uri(uri: &str) -> &str {
+  match uri.find('#') {
+    Some(pos) => &uri[..pos],
+    None => uri,
+  }
+}
+
 // Type alias for the channel sender used for monitor events
 pub type MonitorSender = fibre::mpmc::AsyncSender<SocketEvent>;
 // Type alias for the channel receiver used for monitor events
