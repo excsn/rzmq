@@ -6,11 +6,9 @@ use crate::io_uring_backend::ops::UringOpRequest;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::{WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING};
 use crate::message::{FrameBatch, Msg};
-use crate::socket::events::MonitorSender;
-use crate::socket::options::SocketOptions;
-use crate::socket::SocketEvent;
 #[cfg(feature = "io-uring")]
 use crate::uring;
+#[cfg(feature = "io-uring")]
 use crate::Context;
 
 use std::any::Any;
@@ -19,18 +17,16 @@ use std::fmt;
 use std::os::{fd::AsRawFd, unix::io::RawFd};
 #[cfg(feature = "io-uring")]
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(feature = "io-uring")]
 use std::sync::Arc;
 #[cfg(feature = "io-uring")]
 use std::time::Duration;
 
 use async_trait::async_trait;
-use fibre::mpmc::AsyncSender;
 #[cfg(feature = "io-uring")]
 use fibre::mpsc;
 #[cfg(feature = "io-uring")]
 use fibre::oneshot::oneshot;
-use fibre::{SendError, TrySendError};
-use tokio::time::timeout as tokio_timeout;
 
 #[async_trait]
 pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
@@ -201,143 +197,3 @@ impl ISocketConnection for UringFdConnection {
   }
 }
 
-#[derive(Clone)]
-pub(crate) struct InprocConnection {
-  connection_id: usize,
-  local_pipe_write_id_to_peer: usize,
-  local_pipe_read_id_from_peer: usize,
-  peer_inproc_name_or_uri: String,
-  context: Context,
-  data_tx_to_peer: AsyncSender<FrameBatch>,
-  monitor_tx: Option<MonitorSender>,
-  socket_options: Arc<SocketOptions>,
-}
-
-impl fmt::Debug for InprocConnection {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("InprocConnection")
-      .field("connection_id", &self.connection_id)
-      .field(
-        "local_pipe_write_id_to_peer",
-        &self.local_pipe_write_id_to_peer,
-      )
-      .field(
-        "local_pipe_read_id_from_peer",
-        &self.local_pipe_read_id_from_peer,
-      )
-      .field("peer_inproc_name_or_uri", &self.peer_inproc_name_or_uri)
-      .field("context_present", &true) // Context doesn't have a simple Debug
-      .field("data_tx_to_peer_closed", &self.data_tx_to_peer.is_closed())
-      .field("monitor_tx_is_some", &self.monitor_tx.is_some())
-      .field("socket_options", &self.socket_options)
-      .finish()
-  }
-}
-
-impl InprocConnection {
-  pub(crate) fn new(
-    connection_id: usize,
-    local_pipe_write_id_to_peer: usize,
-    local_pipe_read_id_from_peer: usize,
-    peer_inproc_name_or_uri: String,
-    context: Context,
-    data_tx_to_peer: AsyncSender<FrameBatch>,
-    monitor_tx: Option<MonitorSender>,
-    socket_options: Arc<SocketOptions>,
-  ) -> Self {
-    Self {
-      connection_id,
-      local_pipe_write_id_to_peer,
-      local_pipe_read_id_from_peer,
-      peer_inproc_name_or_uri,
-      context,
-      data_tx_to_peer,
-      monitor_tx,
-      socket_options,
-    }
-  }
-}
-
-#[async_trait]
-impl ISocketConnection for InprocConnection {
-  async fn send_multipart(&self, msgs: FrameBatch) -> Result<(), ZmqError> {
-    let timeout_opt = self.socket_options.sndtimeo;
-
-    match timeout_opt {
-      None => {
-        self.data_tx_to_peer.send(msgs).await.map_err(|_| {
-          tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection send failed (ConnectionClosed)");
-          ZmqError::ConnectionClosed
-        })
-      }
-      Some(d) if d.is_zero() => {
-        match self.data_tx_to_peer.try_send(msgs) {
-          Ok(()) => Ok(()),
-          Err(TrySendError::Full(_)) => Err(ZmqError::ResourceLimitReached),
-          Err(TrySendError::Closed(_)) => {
-            tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection non-blocking send failed (ConnectionClosed)");
-            Err(ZmqError::ConnectionClosed)
-          }
-          _ => unreachable!(),
-        }
-      }
-      Some(duration) => {
-        match self.data_tx_to_peer.try_send(msgs) {
-          Ok(()) => Ok(()),
-          Err(TrySendError::Closed(_)) => {
-            tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection send failed (ConnectionClosed)");
-            Err(ZmqError::ConnectionClosed)
-          }
-          Err(TrySendError::Full(returned_msgs)) => {
-            match tokio_timeout(duration, self.data_tx_to_peer.send(returned_msgs)).await {
-              Ok(Ok(())) => Ok(()),
-              Ok(Err(SendError::Closed)) => {
-                tracing::warn!(conn_id = self.connection_id, peer = %self.peer_inproc_name_or_uri, "InprocConnection timed send failed (ConnectionClosed)");
-                Err(ZmqError::ConnectionClosed)
-              }
-              Err(_) => Err(ZmqError::Timeout),
-              _ => unreachable!(),
-            }
-          }
-          _ => unreachable!(),
-        }
-      }
-    }
-  }
-
-  async fn close_connection(&self) -> Result<(), ZmqError> {
-    tracing::debug!(
-      conn_id = self.connection_id,
-      peer = %self.peer_inproc_name_or_uri,
-      local_read_pipe_id_being_closed = self.local_pipe_read_id_from_peer,
-      "InprocConnection::close_connection called."
-    );
-
-    if let Some(ref monitor) = self.monitor_tx {
-      let event = SocketEvent::Disconnected {
-        endpoint: self.peer_inproc_name_or_uri.clone(),
-      };
-      if monitor.try_send(event).is_err() {
-        tracing::warn!(
-          conn_id = self.connection_id,
-          peer = %self.peer_inproc_name_or_uri,
-          "Failed to send Disconnected monitor event for inproc connection (channel full/closed)."
-        );
-      } else {
-        tracing::debug!(
-          conn_id = self.connection_id,
-          peer = %self.peer_inproc_name_or_uri,
-          "Sent Disconnected monitor event for inproc connection."
-        );
-      }
-    }
-
-    // SCAX-backed inproc connections handle teardown via EOF on the DuplexStream.
-    // No explicit peer-closed event needed.
-    Ok(())
-  }
-  
-  fn as_any(&self) -> &dyn Any {
-    self
-  }
-}
