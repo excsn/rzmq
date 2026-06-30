@@ -1,24 +1,24 @@
 use bench_matrix::{
-  criterion_runner::{
-    async_suite::{AsyncBenchmarkLogicFn, AsyncBenchmarkSuite, AsyncSetupFn, AsyncTeardownFn},
-    ExtractorFn, GlobalSetupFn, GlobalTeardownFn,
-  },
   AbstractCombination, MatrixCellValue,
-};
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use rzmq::{
-  socket::{
-    options::{RCVHWM, SNDHWM, SUBSCRIBE},
-    MonitorReceiver, SocketEvent,
+  criterion_runner::{
+    ExtractorFn, GlobalSetupFn, GlobalTeardownFn,
+    async_suite::{AsyncBenchmarkLogicFn, AsyncBenchmarkSuite, AsyncSetupFn, AsyncTeardownFn},
   },
+};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use rzmq::{
   Context, Msg, SocketType, ZmqError,
+  socket::{
+    MonitorReceiver, SocketEvent,
+    options::{RCVHWM, SNDHWM, SUBSCRIBE},
+  },
 };
 use std::{
   future::Future,
   pin::Pin,
   sync::{
-    atomic::{AtomicU16, Ordering as AtomicOrdering},
     Arc,
+    atomic::{AtomicU16, Ordering as AtomicOrdering},
   },
   time::{Duration, Instant},
 };
@@ -90,8 +90,12 @@ fn extract_config(combo: &AbstractCombination) -> Result<ConfigPubSub, String> {
 }
 
 // --- Global Setup/Teardown (Optional) ---
-fn bench_global_setup(_cfg: &ConfigPubSub) -> Result<(), String> { Ok(()) }
-fn bench_global_teardown(_cfg: &ConfigPubSub) -> Result<(), String> { Ok(()) }
+fn bench_global_setup(_cfg: &ConfigPubSub) -> Result<(), String> {
+  Ok(())
+}
+fn bench_global_teardown(_cfg: &ConfigPubSub) -> Result<(), String> {
+  Ok(())
+}
 
 // --- Async Setup Function ---
 fn setup_pub_sub_bench(
@@ -101,42 +105,52 @@ fn setup_pub_sub_bench(
   let cfg_clone = cfg.clone();
   Box::pin(async move {
     if PRINT_BENCH_INFO {
-        println!("[Setup] Starting for config: {:?}", cfg_clone);
+      println!("[Setup] Starting for config: {:?}", cfg_clone);
     }
     let ctx = Context::new().map_err(|e| format!("Zmq Context creation failed: {}", e))?;
     let ctx_arc = Arc::new(ctx);
 
     // --- Setup PUB Socket ---
-    let pub_socket = ctx_arc
-      .socket(SocketType::Pub)
-      .map_err(|e| e.to_string())?;
+    let pub_socket = ctx_arc.socket(SocketType::Pub).map_err(|e| e.to_string())?;
     pub_socket
       .set_option(SNDHWM, BENCH_HWM)
       .await
       .map_err(|e| e.to_string())?;
-    let pub_monitor = pub_socket.monitor_default().await.map_err(|e| e.to_string())?;
+    let pub_monitor = pub_socket
+      .monitor_default()
+      .await
+      .map_err(|e| e.to_string())?;
     let port = NEXT_BENCH_PORT.fetch_add(1, AtomicOrdering::Relaxed);
     let bind_addr = format!("{}:{}", BIND_ADDR_BASE, port);
-    pub_socket.bind(&bind_addr).await.map_err(|e| e.to_string())?;
-    wait_for_event(&pub_monitor, |e| {
-      matches!(e, SocketEvent::Listening { endpoint: ep } if ep == &bind_addr)
-    }).await?;
+    pub_socket
+      .bind(&bind_addr)
+      .await
+      .map_err(|e| e.to_string())?;
+    wait_for_event(
+      &pub_monitor,
+      |e| matches!(e, SocketEvent::Listening { endpoint: ep } if ep == &bind_addr),
+    )
+    .await?;
 
     // --- Setup SUB Sockets ---
     let mut sub_sockets = Vec::with_capacity(cfg_clone.num_subscribers);
     for _ in 0..cfg_clone.num_subscribers {
-      let sub_socket = ctx_arc
-        .socket(SocketType::Sub)
-        .map_err(|e| e.to_string())?;
+      let sub_socket = ctx_arc.socket(SocketType::Sub).map_err(|e| e.to_string())?;
       sub_socket
         .set_option(RCVHWM, BENCH_HWM)
         .await
         .map_err(|e| e.to_string())?;
-      sub_socket.set_option(SUBSCRIBE, b"").await.map_err(|e| e.to_string())?;
-      sub_socket.connect(&bind_addr).await.map_err(|e| e.to_string())?;
+      sub_socket
+        .set_option(SUBSCRIBE, b"")
+        .await
+        .map_err(|e| e.to_string())?;
+      sub_socket
+        .connect(&bind_addr)
+        .await
+        .map_err(|e| e.to_string())?;
       sub_sockets.push(sub_socket);
     }
-    
+
     // --- Verify All Connections ---
     for i in 0..cfg_clone.num_subscribers {
       wait_for_event(&pub_monitor, |e| {
@@ -146,10 +160,10 @@ fn setup_pub_sub_bench(
       .map_err(|e| format!("PUB HandshakeSucceeded event {} error: {}", i, e))?;
     }
     if PRINT_BENCH_INFO {
-        println!(
-          "[Setup] {} subscribers on {} connected. All handshakes seen by PUB.",
-          cfg_clone.num_subscribers, bind_addr
-        );
+      println!(
+        "[Setup] {} subscribers on {} connected. All handshakes seen by PUB.",
+        cfg_clone.num_subscribers, bind_addr
+      );
     }
 
     // Crucial sleep to allow subscriptions to be processed by the PUB socket's distributor
@@ -195,14 +209,14 @@ fn benchmark_logic(
     // --- Subscriber Tasks ---
     let mut subscriber_tasks = Vec::new();
     for sub_socket in state.sub_sockets.iter().cloned() {
-        let sub_task: JoinHandle<Result<(), ZmqError>> = tokio::spawn(async move {
-            for _ in 0..num_messages {
-                let msg = sub_socket.recv().await?;
-                black_box(msg.data());
-            }
-            Ok(())
-        });
-        subscriber_tasks.push(sub_task);
+      let sub_task: JoinHandle<Result<(), ZmqError>> = tokio::spawn(async move {
+        for _ in 0..num_messages {
+          let msg = sub_socket.recv().await?;
+          black_box(msg.data());
+        }
+        Ok(())
+      });
+      subscriber_tasks.push(sub_task);
     }
 
     // --- Wait for all tasks to complete ---
@@ -213,13 +227,13 @@ fn benchmark_logic(
     // --- Handle Task Results ---
     pub_result.expect("Publisher task failed with ZmqError");
     for (i, result) in sub_results.into_iter().enumerate() {
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => panic!("Benchmark SUB task {} failed: {}", i, e),
-            Err(e) => panic!("Benchmark SUB task {} panicked: {}", i, e),
-        }
+      match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => panic!("Benchmark SUB task {} failed: {}", i, e),
+        Err(e) => panic!("Benchmark SUB task {} panicked: {}", i, e),
+      }
     }
-    
+
     (ctx, state, elapsed)
   })
 }
@@ -233,7 +247,7 @@ fn teardown_pub_sub_bench(
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
   Box::pin(async move {
     if PRINT_BENCH_INFO {
-        println!("[Teardown] Closing sockets...");
+      println!("[Teardown] Closing sockets...");
     }
     if let Err(e) = state.pub_socket.close().await {
       eprintln!("[Teardown Warning] Error closing PUB socket: {}", e);
@@ -245,7 +259,7 @@ fn teardown_pub_sub_bench(
     }
     sleep(Duration::from_millis(100)).await;
     if PRINT_BENCH_INFO {
-        println!("[Teardown] Finished.");
+      println!("[Teardown] Finished.");
     }
   })
 }
@@ -260,10 +274,19 @@ fn pub_sub_matrix_benchmark(c: &mut Criterion) {
       MatrixCellValue::Unsigned(4),
       MatrixCellValue::Unsigned(8),
     ],
-    vec![MatrixCellValue::Unsigned(64), MatrixCellValue::Unsigned(1024)],
+    vec![
+      MatrixCellValue::Unsigned(64),
+      MatrixCellValue::Unsigned(1024),
+      MatrixCellValue::Unsigned(4096),
+      MatrixCellValue::Unsigned(32768),
+    ],
     vec![MatrixCellValue::Unsigned(5000)],
   ];
-  let parameter_names = vec!["NumSubscribers".to_string(), "MsgSize".to_string(), "NumMessages".to_string()];
+  let parameter_names = vec![
+    "NumSubscribers".to_string(),
+    "MsgSize".to_string(),
+    "NumMessages".to_string(),
+  ];
 
   let suite = AsyncBenchmarkSuite::new(
     c,

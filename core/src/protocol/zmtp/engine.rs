@@ -20,6 +20,10 @@ use tokio_util::codec::Encoder;
 
 /// Greeting byte index of the protocol revision (immediately after the signature).
 const REVISION_OFFSET: usize = SIGNATURE_LENGTH; // 10
+/// Payload bytes below which an outgoing batch is serialized flat (single contiguous Bytes)
+/// rather than as a scatter-gather vector. Above this threshold the vectored path avoids
+/// copying large payloads for io-uring zero-copy writes.
+const FLAT_THRESHOLD: usize = 64 * 1024; // 64 KiB
 /// Greeting byte index of the ZMTP/2.0 socket-type code.
 const V2_SOCKET_TYPE_OFFSET: usize = SIGNATURE_LENGTH + 1; // 11
 /// Total length of a ZMTP/2.0 greeting header: signature + revision + socket-type.
@@ -137,9 +141,14 @@ impl ZmtpEngine {
   }
 
   /// Encode a batch for io-uring vectored write, returning multiple `Bytes` slices.
+  ///
+  /// Batches whose total payload is below `FLAT_THRESHOLD` are serialized into a single
+  /// contiguous `Bytes` (one element vec) — this is faster for small-message streams
+  /// because it avoids the overhead of managing many I/O descriptors. Larger batches
+  /// take the zero-copy vectored path (header slab slice + payload reference per frame).
   pub fn frame_batch_vectored(&mut self, batch: &[FrameBatch]) -> Result<Vec<Bytes>, ZmqError> {
     let total: usize = batch.iter().flat_map(|g| g.iter().map(|m| m.size())).sum();
-    if total < self.config.sndbatch_bytes {
+    if total < FLAT_THRESHOLD {
       Ok(vec![self.framer.write_msg_batch(batch)?])
     } else {
       self.framer.frame_vectored(batch)

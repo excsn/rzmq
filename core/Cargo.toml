@@ -84,7 +84,7 @@ rstest = "0.26.1"
 tracing-subscriber = { workspace = true }
 
 [[bench]]
-name = "pull_throughput"
+name = "push_pull_throughput"
 harness = false
 
 [[bench]]

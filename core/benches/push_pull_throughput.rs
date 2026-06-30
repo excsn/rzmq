@@ -1,24 +1,24 @@
 use bench_matrix::{
-  criterion_runner::{
-    async_suite::{AsyncBenchmarkLogicFn, AsyncBenchmarkSuite, AsyncSetupFn, AsyncTeardownFn},
-    ExtractorFn, GlobalSetupFn, GlobalTeardownFn,
-  },
   AbstractCombination, MatrixCellValue,
-};
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use rzmq::{
-  socket::{
-    options::{RCVHWM, SNDHWM},
-    MonitorReceiver, SocketEvent,
+  criterion_runner::{
+    ExtractorFn, GlobalSetupFn, GlobalTeardownFn,
+    async_suite::{AsyncBenchmarkLogicFn, AsyncBenchmarkSuite, AsyncSetupFn, AsyncTeardownFn},
   },
+};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use rzmq::{
   Context, Msg, SocketType, ZmqError,
+  socket::{
+    MonitorReceiver, SocketEvent,
+    options::{RCVHWM, SNDHWM},
+  },
 };
 use std::{
   future::Future,
   pin::Pin,
   sync::{
-    atomic::{AtomicU16, Ordering as AtomicOrdering},
     Arc,
+    atomic::{AtomicU16, Ordering as AtomicOrdering},
   },
   time::{Duration, Instant},
 };
@@ -287,6 +287,8 @@ fn push_pull_matrix_benchmark(c: &mut Criterion) {
     vec![
       MatrixCellValue::Unsigned(64),
       MatrixCellValue::Unsigned(1024),
+      MatrixCellValue::Unsigned(4096),
+      MatrixCellValue::Unsigned(32768),
     ],
     vec![MatrixCellValue::Unsigned(5000)],
   ];
