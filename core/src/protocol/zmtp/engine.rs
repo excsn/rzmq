@@ -23,7 +23,7 @@ const REVISION_OFFSET: usize = SIGNATURE_LENGTH; // 10
 /// Payload bytes below which an outgoing batch is serialized flat (single contiguous Bytes)
 /// rather than as a scatter-gather vector. Above this threshold the vectored path avoids
 /// copying large payloads for io-uring zero-copy writes.
-const FLAT_THRESHOLD: usize = 64 * 1024; // 64 KiB
+const FLAT_THRESHOLD: usize = 16 * 1024; // 16 KiB
 /// Greeting byte index of the ZMTP/2.0 socket-type code.
 const V2_SOCKET_TYPE_OFFSET: usize = SIGNATURE_LENGTH + 1; // 11
 /// Total length of a ZMTP/2.0 greeting header: signature + revision + socket-type.
