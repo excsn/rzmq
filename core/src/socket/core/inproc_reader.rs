@@ -2,13 +2,13 @@ use crate::message::FrameBatch;
 use crate::runtime::{ActorType, EventBus, SystemEvent};
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 
-use fibre::mpmc::AsyncReceiver;
+use fibre::mpsc::BoundedAsyncReceiver;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 pub(crate) fn spawn(
-  rx: AsyncReceiver<FrameBatch>,
+  rx: BoundedAsyncReceiver<FrameBatch>,
   pipe_sender_opt: Option<PipeMessageSender>,
   event_bus: Arc<EventBus>,
   endpoint_uri: String,

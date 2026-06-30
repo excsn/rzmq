@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fibre::TrySendError;
-use fibre::mpmc::AsyncSender;
+use fibre::mpsc::BoundedAsyncSender;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScaConnectionIface {
   sca_stop_mailbox: MailboxSender,
   sca_handle_id: usize,
-  pipe_sender: AsyncSender<FrameBatch>,
+  pipe_sender: BoundedAsyncSender<FrameBatch>,
   pipe_write_id_to_sca: usize,
   sndtimeo: Option<Duration>,
 }
@@ -25,7 +25,7 @@ impl ScaConnectionIface {
   pub(crate) fn new(
     sca_stop_mailbox: MailboxSender,
     sca_handle_id: usize,
-    pipe_sender: AsyncSender<FrameBatch>,
+    pipe_sender: BoundedAsyncSender<FrameBatch>,
     pipe_write_id_to_sca: usize,
     sndtimeo: Option<Duration>,
   ) -> Self {

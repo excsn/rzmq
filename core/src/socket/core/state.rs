@@ -6,7 +6,7 @@ use crate::socket::options::SocketOptions;
 use crate::socket::types::SocketType;
 use crate::socket::SocketEvent;
 
-use fibre::mpmc::AsyncSender;
+use fibre::mpsc::BoundedAsyncSender;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -110,7 +110,7 @@ pub(crate) struct CoreState {
   pub options: Arc<SocketOptions>,
   pub socket_type: SocketType,
   // For Session-based path: Map Core's pipe_write_id -> Sender to Session's data pipe
-  pub pipes_tx: HashMap<usize, AsyncSender<FrameBatch>>,
+  pub pipes_tx: HashMap<usize, BoundedAsyncSender<FrameBatch>>,
   // For Session-based path: Map Core's pipe_read_id -> JoinHandle of PipeReaderTask
   pub pipe_reader_task_handles: HashMap<usize, JoinHandle<()>>,
   // Main map of active endpoints, keyed by resolved endpoint_uri
@@ -149,7 +149,7 @@ impl CoreState {
     }
   }
 
-  pub(crate) fn get_pipe_sender(&self, pipe_write_id: usize) -> Option<AsyncSender<FrameBatch>> {
+  pub(crate) fn get_pipe_sender(&self, pipe_write_id: usize) -> Option<BoundedAsyncSender<FrameBatch>> {
     self.pipes_tx.get(&pipe_write_id).cloned()
   }
 

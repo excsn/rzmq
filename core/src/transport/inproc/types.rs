@@ -1,14 +1,14 @@
 use crate::error::ZmqError;
 use crate::message::{Blob, FrameBatch};
 use crate::socket::types::SocketType;
-use fibre::mpmc::AsyncSender;
+use fibre::mpsc::BoundedAsyncSender;
 use fibre::oneshot;
 
 pub(crate) struct InprocHandshakeRequest {
   pub connector_id: usize,
   pub connector_socket_type: SocketType,
   pub connector_identity: Option<Blob>,
-  pub connector_rx_sender: AsyncSender<FrameBatch>,
+  pub connector_rx_sender: BoundedAsyncSender<FrameBatch>,
   pub reply_tx: oneshot::Sender<Result<InprocHandshakeResponse, ZmqError>>,
 }
 
@@ -17,7 +17,7 @@ pub(crate) struct InprocHandshakeResponse {
   pub binder_id: usize,
   pub binder_socket_type: SocketType,
   pub binder_identity: Option<Blob>,
-  pub binder_rx_sender: AsyncSender<FrameBatch>,
+  pub binder_rx_sender: BoundedAsyncSender<FrameBatch>,
 }
 
 impl InprocHandshakeRequest {
@@ -41,7 +41,7 @@ mod tests {
     InprocHandshakeRequest,
     oneshot::Receiver<Result<InprocHandshakeResponse, ZmqError>>,
   ) {
-    let (tx_to_connector, _) = fibre::mpmc::bounded_async::<FrameBatch>(1);
+    let (tx_to_connector, _) = fibre::mpsc::bounded_async::<FrameBatch>(1);
     let (reply_tx, reply_rx) = oneshot::oneshot();
 
     let request = InprocHandshakeRequest {
@@ -57,7 +57,7 @@ mod tests {
   #[test]
   fn test_handshake_contract_matching_types() {
     let (request, _rx) = dummy_handshake_request(SocketType::Push);
-    let (tx_to_binder, _) = fibre::mpmc::bounded_async::<FrameBatch>(1);
+    let (tx_to_binder, _) = fibre::mpsc::bounded_async::<FrameBatch>(1);
 
     let valid_response = InprocHandshakeResponse {
       binder_id: 2,
@@ -72,7 +72,7 @@ mod tests {
   #[test]
   fn test_handshake_contract_mismatched_types() {
     let (request, _rx) = dummy_handshake_request(SocketType::Push);
-    let (tx_to_binder, _) = fibre::mpmc::bounded_async::<FrameBatch>(1);
+    let (tx_to_binder, _) = fibre::mpsc::bounded_async::<FrameBatch>(1);
 
     let invalid_response = InprocHandshakeResponse {
       binder_id: 2,

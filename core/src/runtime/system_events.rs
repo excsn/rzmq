@@ -17,7 +17,7 @@ use crate::message::FrameBatch;
 #[cfg(feature = "inproc")]
 use crate::transport::inproc::types::InprocHandshakeRequest;
 #[cfg(feature = "inproc")]
-use fibre::mpmc::AsyncReceiver;
+use fibre::mpsc::BoundedAsyncReceiver;
 
 /// Type identifier for different actors in the system.
 /// Used in ActorStarted and ActorStopping events to categorize actors.
@@ -222,7 +222,7 @@ pub enum ConnectionInteractionModel {
   ViaDirectInproc {
     /// The local receive channel end — taken exactly once in `handle_new_connection_established`
     /// to spin up the pipe-reader task.
-    local_rx: Arc<std::sync::Mutex<Option<AsyncReceiver<FrameBatch>>>>,
+    local_rx: Arc<std::sync::Mutex<Option<BoundedAsyncReceiver<FrameBatch>>>>,
     /// Peer identity known at handshake time, passed directly to `pipe_attached`.
     peer_identity: Option<Blob>,
   },

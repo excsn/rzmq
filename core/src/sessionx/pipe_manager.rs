@@ -2,7 +2,7 @@
 
 use crate::message::FrameBatch;
 use fibre::{RecvError, TryRecvError};
-use fibre::mpmc::AsyncReceiver;
+use fibre::mpsc::BoundedAsyncReceiver;
 
 // Import the state struct we defined earlier
 use super::states::CorePipeManagerXState;
@@ -20,7 +20,7 @@ impl CorePipeManagerX {
   }
 
   /// Attaches the pipes and routing information received from SocketCore.
-  pub(crate) fn attach(&mut self, rx_from_core: AsyncReceiver<FrameBatch>, core_pipe_read_id_for_incoming_routing: usize) {
+  pub(crate) fn attach(&mut self, rx_from_core: BoundedAsyncReceiver<FrameBatch>, core_pipe_read_id_for_incoming_routing: usize) {
     if self.state.is_attached {
       return;
     }
@@ -98,7 +98,7 @@ mod additional_pipe_manager_tests {
     let mut manager = CorePipeManagerX::new();
     assert!(!manager.is_attached());
 
-    let (tx, rx) = fibre::mpmc::bounded_async::<FrameBatch>(1);
+    let (tx, rx) = fibre::mpsc::bounded_async::<FrameBatch>(1);
     let _ = tx; // keep sender alive
     manager.attach(rx, 42);
 

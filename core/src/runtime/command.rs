@@ -11,6 +11,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
+use fibre::mpsc::BoundedAsyncReceiver;
 use fibre::oneshot;
 use tokio::task::Id as TaskId;
 
@@ -97,7 +98,7 @@ pub enum Command {
 
   ScaInitializePipes {
     sca_handle_id: usize,
-    rx_from_core: AsyncReceiver<FrameBatch>,
+    rx_from_core: BoundedAsyncReceiver<FrameBatch>,
     core_pipe_read_id_for_incoming_routing: usize,
     incoming_pipe_sender: Option<PipeMessageSender>,
   },

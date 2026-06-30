@@ -4,7 +4,7 @@ use crate::context::Context;
 use crate::message::FrameBatch;
 use crate::socket::events::MonitorSender;
 
-use fibre::mpmc::AsyncReceiver;
+use fibre::mpsc::BoundedAsyncReceiver;
 
 /// General configuration and context for the SessionConnectionActorX.
 #[derive(Debug, Clone)] // Clone if it needs to be passed around easily
@@ -20,7 +20,7 @@ pub(crate) struct ActorConfigX {
 // Located here as it's primarily a state holder for pipe-related fields.
 #[derive(Debug)]
 pub(crate) struct CorePipeManagerXState {
-  pub rx_from_core: Option<AsyncReceiver<FrameBatch>>,
+  pub rx_from_core: Option<BoundedAsyncReceiver<FrameBatch>>,
   pub core_pipe_read_id_for_incoming_routing: Option<usize>,
   pub is_attached: bool,
 }

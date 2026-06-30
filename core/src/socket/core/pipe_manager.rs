@@ -13,7 +13,7 @@ use crate::transport::inproc::{
   handshake::validate_socket_compatibility,
 };
 #[cfg(feature = "inproc")]
-use fibre::mpmc::bounded_async;
+use fibre::mpsc::bounded_async;
 
 use std::sync::Arc;
 use tokio::task::JoinHandle;

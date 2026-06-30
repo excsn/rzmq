@@ -12,7 +12,7 @@ use crate::runtime::{Command, SystemEvent, system_events::ConnectionInteractionM
 use crate::socket::core::SocketCore;
 use crate::socket::events::SocketEvent;
 
-use fibre::mpmc::bounded_async;
+use fibre::mpsc::bounded_async;
 use fibre::oneshot;
 use std::sync::{Arc, Mutex};
 
