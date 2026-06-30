@@ -12,6 +12,13 @@ use std::sync::Arc;
 use fibre::oneshot;
 use tokio::task::Id as TaskId;
 
+#[cfg(feature = "inproc")]
+use crate::message::FrameBatch;
+#[cfg(feature = "inproc")]
+use crate::transport::inproc::types::InprocHandshakeRequest;
+#[cfg(feature = "inproc")]
+use fibre::mpmc::AsyncReceiver;
+
 /// Type identifier for different actors in the system.
 /// Used in ActorStarted and ActorStopping events to categorize actors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -105,26 +112,21 @@ pub enum SystemEvent {
     error: ZmqError,
   },
 
-  /// Published by an `inproc` connector's `SocketCore` to request a connection
-  /// from an `inproc` binder `SocketCore`. The binder listens for events
-  /// matching its `target_inproc_name`.
-  ///
-  /// Both sides create a `SessionConnectionActorX<InprocStream>` and run the full
-  /// ZMTP state machine over a `tokio::io::duplex` in-memory byte pipe.
+  /// Published by an `inproc` connector's `SocketCore` to request a direct
+  /// in-memory channel connection from an `inproc` binder `SocketCore`.
+  /// Both sides exchange `FrameBatch` channels directly — no SCAX or ZMTP engine involved.
   #[cfg(feature = "inproc")]
   InprocBindingRequest {
     /// The logical name of the inproc endpoint to connect to (e.g., "my-service").
     target_inproc_name: String,
     /// The URI of the connector socket, for logging or identification purposes.
     connector_uri: String,
-    /// The binder's half of the in-memory duplex pipe.
+    /// The connector's handshake request — contains its socket type, identity, the sender
+    /// half of its receive channel, and the reply oneshot.
     ///
     /// Wrapped in `Arc<Mutex<Option<…>>>` because `SystemEvent` derives `Clone`
-    /// but `DuplexStream` is not `Clone`. The binder takes the stream exactly once
-    /// via `.lock().unwrap().take()`.
-    binder_stream_end: Arc<std::sync::Mutex<Option<tokio::io::DuplexStream>>>,
-    /// Reply channel: binder sends `Ok(())` on acceptance, `Err(…)` on rejection.
-    reply_tx: oneshot::Sender<Result<(), ZmqError>>,
+    /// but `InprocHandshakeRequest` is not `Clone`. Binder takes it exactly once.
+    handshake_request: Arc<std::sync::Mutex<Option<InprocHandshakeRequest>>>,
   },
 }
 
@@ -192,6 +194,7 @@ impl fmt::Debug for SystemEvent {
         .field("target_inproc_name", target_inproc_name)
         .field("connector_uri", connector_uri)
         .finish_non_exhaustive(),
+
     }
   }
 }
@@ -212,6 +215,17 @@ pub enum ConnectionInteractionModel {
   },
   #[cfg(not(feature = "io-uring"))]
   ViaUringFd { _fd_placeholder: () }, // Ensure struct is valid if feature disabled
+
+  /// Connection is managed via direct in-memory FrameBatch channels — no SCAX, no ZMTP engine.
+  /// Used for inproc:// connections on the direct path.
+  #[cfg(feature = "inproc")]
+  ViaDirectInproc {
+    /// The local receive channel end — taken exactly once in `handle_new_connection_established`
+    /// to spin up the pipe-reader task.
+    local_rx: Arc<std::sync::Mutex<Option<AsyncReceiver<FrameBatch>>>>,
+    /// Peer identity known at handshake time, passed directly to `pipe_attached`.
+    peer_identity: Option<Blob>,
+  },
 }
 
 impl fmt::Debug for ConnectionInteractionModel {
@@ -234,6 +248,10 @@ impl fmt::Debug for ConnectionInteractionModel {
         .debug_struct("ViaUringFd")
         .field("_fd_placeholder", &())
         .finish(),
+      #[cfg(feature = "inproc")]
+      ConnectionInteractionModel::ViaDirectInproc { .. } => {
+        f.debug_struct("ViaDirectInproc").finish_non_exhaustive()
+      }
     }
   }
 }

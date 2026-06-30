@@ -1,21 +1,20 @@
 use crate::Command;
 use crate::error::ZmqError;
-use crate::error::ZmqResult;
-use crate::runtime::{ActorType, mailbox, system_events::ConnectionInteractionModel};
+use crate::runtime::{ActorType, system_events::ConnectionInteractionModel};
 use crate::socket::core::state::{EndpointInfo, EndpointType};
 use crate::socket::core::SocketCore;
 use crate::socket::{ISocket, SocketEvent};
-use crate::socket::options::ZmtpEngineConfig;
 
 #[cfg(feature = "inproc")]
-use crate::sessionx::actor::SessionConnectionActorX;
+use crate::message::FrameBatch;
 #[cfg(feature = "inproc")]
-use crate::sessionx::states::ActorConfigX;
+use crate::transport::inproc::{
+  DirectInprocConnection, InprocHandshakeRequest, InprocHandshakeResponse,
+  handshake::validate_socket_compatibility,
+};
 #[cfg(feature = "inproc")]
-use crate::transport::inproc_stream::InprocStream;
+use fibre::mpmc::bounded_async;
 
-#[cfg(feature = "inproc")]
-use fibre::oneshot;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
@@ -321,64 +320,68 @@ pub(crate) async fn process_inproc_binding_request_event(
   core_arc: Arc<SocketCore>,
   socket_logic_strong: &Arc<dyn ISocket>,
   connector_uri: String,
-  binder_stream_end: Arc<std::sync::Mutex<Option<tokio::io::DuplexStream>>>,
-  reply_tx_to_connector: oneshot::Sender<ZmqResult<()>>,
+  handshake_request: Arc<std::sync::Mutex<Option<InprocHandshakeRequest>>>,
 ) -> Result<(), ZmqError> {
   let binder_core_handle = core_arc.handle;
   tracing::debug!(
     binder_handle = binder_core_handle,
     %connector_uri,
-    "SocketCore (binder) processing InprocBindingRequest — spawning SCAX."
+    "SocketCore (binder) processing InprocBindingRequest — direct channel path."
   );
 
-  // Take the binder's stream half out of the shared wrapper.
-  let stream = match binder_stream_end.lock().unwrap().take() {
-    Some(s) => s,
+  let request = match handshake_request.lock().unwrap().take() {
+    Some(r) => r,
     None => {
-      tracing::error!(binder_handle = binder_core_handle, "InprocBindingRequest: binder_stream_end already taken.");
-      let _ = reply_tx_to_connector.send(Err(ZmqError::Internal("binder_stream_end already taken".into())));
-      return Err(ZmqError::Internal("binder_stream_end already taken".into()));
+      tracing::error!(binder_handle = binder_core_handle, "InprocBindingRequest: handshake_request already taken.");
+      return Err(ZmqError::Internal("handshake_request already taken".into()));
     }
   };
 
-  let sca_handle_id = core_arc.context.inner().next_handle();
-  let engine_conf = Arc::new(ZmtpEngineConfig::from(&*core_arc.core_state.read().options));
-  let actor_conf = ActorConfigX {
-    context: core_arc.context.clone(),
-    monitor_tx: core_arc.core_state.read().get_monitor_sender_clone(),
-    logical_target_endpoint_uri: connector_uri.clone(),
-    connected_endpoint_uri: connector_uri.clone(),
-    is_server_role: true,
+  let (binder_socket_type, binder_identity, rcvhwm) = {
+    let s = core_arc.core_state.read();
+    (s.socket_type, s.options.routing_id.clone(), s.options.rcvhwm.max(1))
   };
-  let capacity = core_arc.context.inner().get_actor_mailbox_capacity();
-  let (command_sender_for_sca, command_receiver_for_sca) = mailbox(capacity);
-  let sca_task_handle = SessionConnectionActorX::create_and_spawn(
-    sca_handle_id,
-    binder_core_handle,
-    InprocStream::new(stream),
-    actor_conf,
-    engine_conf,
-    command_receiver_for_sca,
-    socket_logic_strong.clone(),
-    None,
-  );
 
-  // Tell the binder's SocketCore about the new connection so it sets up pipes.
+  // Validate compatibility before creating any channels.
+  if let Err(e) = validate_socket_compatibility(request.connector_socket_type, binder_socket_type) {
+    tracing::warn!(binder_handle = binder_core_handle, %connector_uri, "Inproc socket type mismatch: {}", e);
+    let _ = request.reply_tx.send(Err(e.clone()));
+    return Err(e);
+  }
+
+  // Channel on which the binder receives frames from the connector.
+  let (tx_to_binder, rx_for_binder) = bounded_async::<FrameBatch>(rcvhwm);
+
+  let peer_identity = request.connector_identity.clone();
+  let response = InprocHandshakeResponse {
+    binder_id: binder_core_handle,
+    binder_socket_type,
+    binder_identity,
+    binder_rx_sender: tx_to_binder,
+  };
+
+  // Unblock the connector — it now has the sender to reach us.
+  let _ = request.reply_tx.send(Ok(response));
+
+  let direct_conn = DirectInprocConnection {
+    connection_id: binder_core_handle,
+    target_endpoint_uri: connector_uri.clone(),
+    peer_queue_sender: request.connector_rx_sender,
+  };
+
   let cmd = Command::NewConnectionEstablished {
     endpoint_uri: connector_uri.clone(),
     target_endpoint_uri: connector_uri.clone(),
-    connection_iface: None,
-    interaction_model: ConnectionInteractionModel::ViaSca {
-      sca_mailbox: command_sender_for_sca,
-      sca_handle_id,
+    connection_iface: Some(Arc::new(direct_conn)),
+    interaction_model: ConnectionInteractionModel::ViaDirectInproc {
+      local_rx: Arc::new(std::sync::Mutex::new(Some(rx_for_binder))),
+      peer_identity,
     },
-    managing_actor_task_id: Some(sca_task_handle.id()),
+    managing_actor_task_id: None,
   };
   if socket_logic_strong.mailbox().send(cmd).await.is_err() {
     tracing::error!(binder_handle = binder_core_handle, "Failed to send NewConnectionEstablished to binder socket core.");
-    let err = ZmqError::Internal("binder socket core closed".into());
-    let _ = reply_tx_to_connector.send(Err(err.clone()));
-    return Err(err);
+    return Err(ZmqError::Internal("binder socket core closed".into()));
   }
 
   if let Some(monitor_tx) = core_arc.core_state.read().get_monitor_sender_clone() {
@@ -388,7 +391,6 @@ pub(crate) async fn process_inproc_binding_request_event(
     });
   }
 
-  tracing::info!(binder_handle = binder_core_handle, %connector_uri, "Inproc binder SCAX spawned; sending Ok to connector.");
-  let _ = reply_tx_to_connector.send(Ok(()));
+  tracing::info!(binder_handle = binder_core_handle, %connector_uri, "Direct inproc connection established.");
   Ok(())
 }

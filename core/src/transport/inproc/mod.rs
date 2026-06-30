@@ -7,14 +7,12 @@ pub(crate) use types::{InprocHandshakeRequest, InprocHandshakeResponse};
 
 use crate::context::Context;
 use crate::error::ZmqError;
-use crate::runtime::{Command, SystemEvent, mailbox, system_events::ConnectionInteractionModel};
-use crate::sessionx::actor::SessionConnectionActorX;
-use crate::sessionx::states::ActorConfigX;
+use crate::message::FrameBatch;
+use crate::runtime::{Command, SystemEvent, system_events::ConnectionInteractionModel};
 use crate::socket::core::SocketCore;
 use crate::socket::events::SocketEvent;
-use crate::socket::options::ZmtpEngineConfig;
-use crate::transport::inproc_stream::InprocStream;
 
+use fibre::mpmc::bounded_async;
 use fibre::oneshot;
 use std::sync::{Arc, Mutex};
 
@@ -38,7 +36,7 @@ pub(crate) async fn connect_inproc(
 ) {
   let connector_core_handle = core_arc.handle;
   let connector_uri_str = format!("inproc://{}", name);
-  tracing::debug!(connector_core_handle, inproc_name = %name, "Attempting inproc connect via SCAX");
+  tracing::debug!(connector_core_handle, inproc_name = %name, "Attempting direct inproc connect");
 
   let _binder_info = match core_arc.context.inner().lookup_inproc(&name) {
     Some(info) => info,
@@ -78,48 +76,30 @@ pub(crate) async fn connect_inproc(
     }
   };
 
-  let pipe_hwm = {
+  let connection_handle_id = core_arc.context.inner().next_handle();
+  let connection_specific_uri = format!("inproc://{}#{}", name, connection_handle_id);
+
+  let (connector_socket_type, connector_identity, rcvhwm) = {
     let s = core_arc.core_state.read();
-    match s.socket_type {
-      crate::socket::SocketType::Push | crate::socket::SocketType::Pub => s.options.sndhwm,
-      crate::socket::SocketType::Pull | crate::socket::SocketType::Sub => s.options.rcvhwm,
-      _ => s.options.rcvhwm.max(s.options.sndhwm),
-    }
-    .max(1)
+    (s.socket_type, s.options.routing_id.clone(), s.options.rcvhwm.max(1))
   };
 
-  let buf_size = inproc_buffer_size(pipe_hwm);
-  let (connector_stream_end, binder_stream_end) = tokio::io::duplex(buf_size);
-
-  let sca_handle_id = core_arc.context.inner().next_handle();
-  let connection_specific_uri = format!("inproc://{}#{}", name, sca_handle_id);
-  let engine_conf = Arc::new(ZmtpEngineConfig::from(&*core_arc.core_state.read().options));
-  let actor_conf = ActorConfigX {
-    context: core_arc.context.clone(),
-    monitor_tx: core_arc.core_state.read().get_monitor_sender_clone(),
-    logical_target_endpoint_uri: connector_uri_str.clone(),
-    connected_endpoint_uri: connection_specific_uri.clone(),
-    is_server_role: false,
-  };
-  let capacity = core_arc.context.inner().get_actor_mailbox_capacity();
-  let (command_sender_for_sca, command_receiver_for_sca) = mailbox(capacity);
-  let sca_task_handle = SessionConnectionActorX::create_and_spawn(
-    sca_handle_id,
-    connector_core_handle,
-    InprocStream::new(connector_stream_end),
-    actor_conf,
-    engine_conf,
-    command_receiver_for_sca,
-    socket_logic.clone(),
-    None,
-  );
+  // Channel on which the connector receives frames from the binder.
+  let (tx_to_connector, rx_for_connector) = bounded_async::<FrameBatch>(rcvhwm);
 
   let (reply_tx, reply_rx) = oneshot::oneshot();
+  let request = InprocHandshakeRequest {
+    connector_id: connector_core_handle,
+    connector_socket_type,
+    connector_identity,
+    connector_rx_sender: tx_to_connector,
+    reply_tx,
+  };
+
   let request_event = SystemEvent::InprocBindingRequest {
     target_inproc_name: name.clone(),
     connector_uri: connection_specific_uri.clone(),
-    binder_stream_end: Arc::new(Mutex::new(Some(binder_stream_end))),
-    reply_tx,
+    handshake_request: Arc::new(Mutex::new(Some(request))),
   };
 
   if core_arc.context.event_bus().publish(request_event).is_err() {
@@ -131,18 +111,39 @@ pub(crate) async fn connect_inproc(
   }
 
   match reply_rx.recv().await {
-    Ok(Ok(())) => {
-      tracing::info!(connector_core_handle, inproc_name = %name, "Inproc connection accepted by binder; notifying connector socket core.");
+    Ok(Ok(response)) => {
+      tracing::info!(connector_core_handle, inproc_name = %name, "Inproc connection accepted by binder.");
+
+      // Validate the binder's socket type is compatible with ours.
+      if let Err(e) = handshake::validate_socket_compatibility(connector_socket_type, response.binder_socket_type) {
+        tracing::warn!(connector_core_handle, inproc_name = %name, "Inproc socket type mismatch: {}", e);
+        let monitor_tx = core_arc.core_state.read().get_monitor_sender_clone();
+        if let Some(monitor) = monitor_tx {
+          let _ = monitor.send(SocketEvent::ConnectFailed {
+            endpoint: connector_uri_str,
+            error_msg: e.to_string(),
+          }).await;
+        }
+        let _ = reply_tx_user.send(Err(e));
+        return;
+      }
+
+      let peer_identity = response.binder_identity.clone();
+      let direct_conn = DirectInprocConnection {
+        connection_id: connection_handle_id,
+        target_endpoint_uri: connection_specific_uri.clone(),
+        peer_queue_sender: response.binder_rx_sender,
+      };
 
       let cmd = Command::NewConnectionEstablished {
         endpoint_uri: connection_specific_uri.clone(),
         target_endpoint_uri: connector_uri_str.clone(),
-        connection_iface: None,
-        interaction_model: ConnectionInteractionModel::ViaSca {
-          sca_mailbox: command_sender_for_sca,
-          sca_handle_id,
+        connection_iface: Some(Arc::new(direct_conn)),
+        interaction_model: ConnectionInteractionModel::ViaDirectInproc {
+          local_rx: Arc::new(Mutex::new(Some(rx_for_connector))),
+          peer_identity,
         },
-        managing_actor_task_id: Some(sca_task_handle.id()),
+        managing_actor_task_id: None,
       };
       if socket_logic.mailbox().send(cmd).await.is_err() {
         tracing::error!(connector_core_handle, inproc_name = %name, "Failed to send NewConnectionEstablished to connector socket core.");
@@ -211,39 +212,3 @@ pub(crate) async fn disconnect_inproc(
   Ok(())
 }
 
-fn inproc_buffer_size(pipe_hwm: usize) -> usize {
-  const BASE: usize = 8192;
-  const MAX: usize = 1024 * 1024;
-  let hwm = pipe_hwm.max(1);
-  let exponent = hwm.ilog2() / 2;
-  let multiplier = 1_usize << exponent;
-  BASE.saturating_mul(multiplier).clamp(BASE, MAX)
-}
-
-#[cfg(test)]
-mod tests {
-  use super::inproc_buffer_size;
-
-  #[test]
-  fn low_hwm_bounds() {
-    assert_eq!(inproc_buffer_size(0), 8192);
-    assert_eq!(inproc_buffer_size(1), 8192);
-    assert_eq!(inproc_buffer_size(3), 8192);
-  }
-
-  #[test]
-  fn sub_linear_scaling() {
-    assert_eq!(inproc_buffer_size(4), 16384);
-    assert_eq!(inproc_buffer_size(16), 32768);
-    assert_eq!(inproc_buffer_size(64), 65536);
-    assert_eq!(inproc_buffer_size(256), 131072);
-    assert_eq!(inproc_buffer_size(1024), 262144);
-  }
-
-  #[test]
-  fn ceiling_clamp() {
-    assert_eq!(inproc_buffer_size(16384), 1048576);
-    assert_eq!(inproc_buffer_size(100000), 1048576);
-    assert_eq!(inproc_buffer_size(usize::MAX), 1048576);
-  }
-}

@@ -1,6 +1,6 @@
 use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg};
-#[cfg(feature = "io-uring")]
+#[cfg(any(feature = "io-uring", feature = "inproc"))]
 use crate::runtime::ActorType;
 use crate::runtime::system_events::ConnectionInteractionModel;
 use crate::runtime::{Command, MailboxSender, SystemEvent};
@@ -18,6 +18,8 @@ use crate::socket::options::{self, *};
 use crate::transport::endpoint::{Endpoint, parse_endpoint};
 #[cfg(feature = "inproc")]
 use crate::transport::inproc;
+#[cfg(feature = "inproc")]
+use crate::transport::inproc::DirectInprocConnection;
 #[cfg(feature = "ipc")]
 use crate::transport::ipc::{IpcConnecter, IpcListener};
 use crate::transport::tcp::{TcpConnecter, TcpListener};
@@ -1044,6 +1046,124 @@ async fn handle_new_connection_established(
         core_w_id = core_write_id,
         core_r_id = core_read_id,
         "Sent ScaInitializePipes to SessionConnectionActorX."
+      );
+    }
+
+    #[cfg(feature = "inproc")]
+    ConnectionInteractionModel::ViaDirectInproc { local_rx, peer_identity } => {
+      tracing::debug!(
+        handle = core_handle,
+        conn_uri = %endpoint_uri_from_event,
+        "NewConnectionEstablished: ViaDirectInproc path."
+      );
+
+      let rx = match local_rx.lock().unwrap().take() {
+        Some(r) => r,
+        None => {
+          return Err(ZmqError::Internal("ViaDirectInproc: local_rx already consumed".into()));
+        }
+      };
+
+      let connection_iface = match connection_iface_from_event_opt {
+        Some(iface) => iface,
+        None => {
+          return Err(ZmqError::Internal("ViaDirectInproc requires connection_iface".into()));
+        }
+      };
+
+      // Extract the peer-facing sender from the DirectInprocConnection so we can also
+      // put it in pipes_tx — the socket pattern's outbound routing goes through pipes_tx.
+      let tx_to_peer = match connection_iface.as_any().downcast_ref::<DirectInprocConnection>() {
+        Some(c) => c.peer_queue_sender.clone(),
+        None => {
+          return Err(ZmqError::Internal(
+            "ViaDirectInproc: connection_iface is not a DirectInprocConnection".into(),
+          ));
+        }
+      };
+
+      let core_write_id = core_arc.context.inner().next_handle();
+      let core_read_id = core_arc.context.inner().next_handle();
+      let reader_task_id = core_arc.context.inner().next_handle();
+
+      // Dummy closed mailbox — no SCAX actor to command for direct inproc.
+      let (dummy_mailbox_tx, _dropped_rx) =
+        fibre::mpmc::bounded_async::<Command>(1);
+
+      let endpoint_info = EndpointInfo {
+        mailbox: dummy_mailbox_tx,
+        task_handle: None,
+        endpoint_type: EndpointType::Session,
+        endpoint_uri: endpoint_uri_from_event.clone(),
+        pipe_ids: Some((core_write_id, core_read_id)),
+        handle_id: reader_task_id,
+        target_endpoint_uri: Some(target_endpoint_uri_from_event),
+        is_outbound_connection: is_outbound_this_core_initiated,
+        peer_socket_type: None,
+        connection_iface,
+      };
+
+      {
+        let mut cs = core_arc.core_state.write();
+        cs.pipes_tx.insert(core_write_id, tx_to_peer);
+        if let Some(old_info) = cs.endpoints.insert(endpoint_uri_from_event.clone(), endpoint_info) {
+          tracing::warn!(handle=core_handle, uri=%endpoint_uri_from_event, "Overwrote existing EndpointInfo for NewConnection (DirectInproc).");
+          tokio::spawn(async move {
+            let _ = old_info.connection_iface.close_connection().await;
+          });
+        }
+        cs.pipe_read_id_to_endpoint_uri
+          .insert(core_read_id, endpoint_uri_from_event.clone());
+      }
+
+      tracing::debug!(handle=core_handle, conn_uri=%endpoint_uri_from_event, "Notifying ISocket of pipe attachment for direct inproc connection.");
+      socket_logic_strong
+        .pipe_attached(core_read_id, core_write_id, peer_identity.as_deref())
+        .await;
+
+      // None is valid for send-only socket types (e.g. Push). The reader task still runs
+      // to drain the channel and handle the connection lifecycle — it just discards frames.
+      let pipe_sender_opt = socket_logic_strong.get_incoming_pipe_sender(core_read_id);
+
+      let event_bus = core_arc.context.event_bus().clone();
+      let endpoint_uri_clone = endpoint_uri_from_event.clone();
+      let task_handle = tokio::spawn(async move {
+        loop {
+          match rx.recv().await {
+            Ok(batch) => {
+              if let Some(ref sender) = pipe_sender_opt {
+                if sender.send(batch).await.is_err() {
+                  break;
+                }
+              }
+              // else: send-only socket type — discard frame
+            }
+            Err(_) => break,
+          }
+        }
+        tracing::debug!(reader_task_id, uri = %endpoint_uri_clone, "DirectInproc reader task exiting.");
+        let _ = event_bus.publish(SystemEvent::ActorStopping {
+          handle_id: reader_task_id,
+          actor_type: ActorType::PipeReader,
+          endpoint_uri: Some(endpoint_uri_clone),
+          parent_id: Some(core_handle),
+          error: None,
+        });
+      });
+
+      core_arc
+        .core_state
+        .write()
+        .pipe_reader_task_handles
+        .insert(core_read_id, task_handle);
+
+      tracing::debug!(
+        handle = core_handle,
+        conn_uri = %endpoint_uri_from_event,
+        core_w_id = core_write_id,
+        core_r_id = core_read_id,
+        reader_id = reader_task_id,
+        "ViaDirectInproc pipes wired."
       );
     }
 

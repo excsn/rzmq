@@ -141,8 +141,7 @@ pub(crate) async fn process_system_event(
     SystemEvent::InprocBindingRequest {
       target_inproc_name,
       connector_uri,
-      binder_stream_end,
-      reply_tx,
+      handshake_request,
     } => {
       let is_my_binding_name = core_arc
         .core_state
@@ -155,15 +154,17 @@ pub(crate) async fn process_system_event(
             core_arc,
             socket_logic_strong,
             connector_uri,
-            binder_stream_end,
-            reply_tx,
+            handshake_request,
           )
           .await?;
         } else {
           tracing::debug!(handle = core_handle, target_inproc_name = %target_inproc_name, "SocketCore (binder) ignoring InprocBindingRequest during shutdown.");
-          let _ = reply_tx.send(Err(ZmqError::InvalidState(
-            "Binder socket is shutting down".into(),
-          )));
+          // Reject by sending an error through the request's reply channel.
+          if let Some(req) = handshake_request.lock().unwrap().take() {
+            let _ = req.reply_tx.send(Err(ZmqError::InvalidState(
+              "Binder socket is shutting down".into(),
+            )));
+          }
         }
       }
     }
