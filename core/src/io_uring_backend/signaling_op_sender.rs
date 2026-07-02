@@ -77,7 +77,7 @@ impl SignalingOpSender {
   }
 
   /// Attempts to send an operation request without blocking and signals eventfd on success.
-  pub fn try_send(&self, req: UringOpRequest) -> Result<(), TrySendError<UringOpRequest>> {
+  pub fn try_send(&mut self, req: UringOpRequest) -> Result<(), TrySendError<UringOpRequest>> {
     let send_result = self.op_tx.try_send(req);
 
     if send_result.is_ok() {
@@ -112,7 +112,7 @@ impl SignalingOpSender {
   }
 
   pub fn capacity(&self) -> usize {
-    self.op_tx.capacity().unwrap_or(usize::MAX)
+    self.op_tx.capacity()
   }
 
   pub fn len(&self) -> usize {
