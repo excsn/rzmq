@@ -195,11 +195,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 10.0010 seconds
-* **Total Messages:** 39,917,123
-* **Total Data:** 2,436.35 MB
-* **Throughput:** 3,991,308.88 msg/s
-* **Throughput Rate:** 243.61 MB/s
+* **Elapsed Time:** 10.0006 seconds
+* **Total Messages:** 64,505,959
+* **Total Data:** 3,937.13 MB
+* **Throughput:** 6,450,220.87 msg/s
+* **Throughput Rate:** 393.69 MB/s
 
 #### Concurrency 2
 
@@ -210,11 +210,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PushPull
-* **Elapsed Time:** 9.9995 seconds
-* **Total Messages:** 35,209,030
-* **Total Data:** 2,148.99 MB
-* **Throughput:** 3,521,088.08 msg/s
-* **Throughput Rate:** 214.91 MB/s
+* **Elapsed Time:** 9.9989 seconds
+* **Total Messages:** 73,162,112
+* **Total Data:** 4,465.46 MB
+* **Throughput:** 7,317,045.01 msg/s
+* **Throughput Rate:** 446.60 MB/s
 
 #### Concurrency 4, Msg Size 32KB
 
@@ -245,10 +245,10 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 **Metrics:**
 * **Pattern:** PubSub
 * **Elapsed Time:** 9.9996 seconds
-* **Total Messages:** 33,527,057
-* **Total Data:** 2,046.33 MB
-* **Throughput:** 3,352,853.88 msg/s
-* **Throughput Rate:** 204.64 MB/s
+* **Total Messages:** 62,226,356
+* **Total Data:** 3,798.00 MB
+* **Throughput:** 6,222,750.33 msg/s
+* **Throughput Rate:** 379.81 MB/s
 
 #### Concurrency 2
 
@@ -260,10 +260,10 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 **Metrics:**
 * **Pattern:** PubSub
 * **Elapsed Time:** 9.9998 seconds
-* **Total Messages:** 23,849,970
-* **Total Data:** 1,455.69 MB
-* **Throughput:** 2,385,035.28 msg/s
-* **Throughput Rate:** 145.57 MB/s
+* **Total Messages:** 53,544,093
+* **Total Data:** 3,268.07 MB
+* **Throughput:** 5,354,645.33 msg/s
+* **Throughput Rate:** 326.82 MB/s
 
 #### Concurrency 4
 
@@ -274,11 +274,11 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Metrics:**
 * **Pattern:** PubSub
-* **Elapsed Time:** 10.0010 seconds
-* **Total Messages:** 37,547,928
-* **Total Data:** 12,291.74 MB
-* **Throughput:** 3,754,404.22 msg/s
-* **Throughput Rate:** 229.15 MB/s
+* **Elapsed Time:** 10.0000 seconds
+* **Total Messages:** 55,771,862
+* **Total Data:** 3,404.04 MB
+* **Throughput:** 5,577,204.91 msg/s
+* **Throughput Rate:** 340.41 MB/s
 
 #### Concurrency 1, Msg size 16KB
 

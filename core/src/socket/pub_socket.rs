@@ -66,23 +66,13 @@ impl ISocket for PubSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let payload_preview_str = msg
-      .data()
-      .map(|d| String::from_utf8_lossy(&d.iter().take(20).copied().collect::<Vec<_>>()).into_owned())
-      .unwrap_or_else(|| "<empty_payload>".to_string());
-
-    tracing::debug!(
-        handle = self.core.handle,
-        msg_size = msg.size(),
-        msg_payload_preview = %payload_preview_str,
-        "PubSocket::send preparing to distribute message"
+    tracing::trace!(
+      handle = self.core.handle,
+      msg_size = msg.size(),
+      "PubSocket::send distributing message"
     );
 
-    match self
-      .distributor
-      .send_to_all(&msg, self.core.handle, &self.core.core_state)
-      .await
-    {
+    match self.distributor.send_to_all(&msg, self.core.handle).await {
       Ok(()) => Ok(()),
       Err(failed_uris_with_errors) => {
         for (uri, error_detail) in failed_uris_with_errors {
@@ -129,7 +119,7 @@ impl ISocket for PubSocket {
 
     match self
       .distributor
-      .send_to_all_multipart(frames, self.core.handle, &self.core.core_state)
+      .send_to_all_multipart(frames, self.core.handle)
       .await
     {
       Ok(()) => Ok(()),
@@ -173,26 +163,33 @@ impl ISocket for PubSocket {
     _pipe_write_id: usize, // No longer directly used by PubSocket for Distributor
     _peer_identity: Option<&[u8]>,
   ) {
-    let endpoint_uri_option = self
-      .core
-      .core_state
-      .read() // Guard dropped
-      .pipe_read_id_to_endpoint_uri
-      .get(&pipe_read_id)
-      .cloned();
+    let (endpoint_uri_opt, connection_iface_opt) = {
+      let core_s = self.core.core_state.read();
+      let uri = core_s
+        .pipe_read_id_to_endpoint_uri
+        .get(&pipe_read_id)
+        .cloned();
+      let iface = uri.as_ref().and_then(|u| {
+        core_s
+          .endpoints
+          .get(u)
+          .map(|ep| ep.connection_iface.clone())
+      });
+      (uri, iface)
+    };
 
-    if let Some(endpoint_uri) = endpoint_uri_option {
+    if let (Some(endpoint_uri), Some(iface)) = (endpoint_uri_opt, connection_iface_opt) {
       tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "PUB attaching connection");
       self
         .pipe_read_to_endpoint_uri
         .write()
         .insert(pipe_read_id, endpoint_uri.clone()); // Guard dropped
-      self.distributor.add_peer_uri(endpoint_uri); // This uses its own internal lock
+      self.distributor.add_peer(endpoint_uri, iface);
     } else {
       tracing::warn!(
         handle = self.core.handle,
         pipe_read_id,
-        "PUB pipe_attached: Could not find endpoint_uri for pipe_read_id. Distributor not updated."
+        "PUB pipe_attached: Could not find endpoint_uri or connection_iface for pipe_read_id. Distributor not updated."
       );
     }
   }
