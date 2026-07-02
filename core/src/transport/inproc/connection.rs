@@ -20,6 +20,37 @@ pub(crate) struct DirectInprocConnection {
   pub sndtimeo: Option<Duration>,
 }
 
+impl DirectInprocConnection {
+  /// Congested-edge bookkeeping. The relaxed load keeps the per-send happy
+  /// path free of RMWs and allocations: the swap and the cleaned-URI string
+  /// are only produced on an actual state transition.
+  fn note_congested(&self) {
+    if self.is_congested.load(Ordering::Relaxed) {
+      return;
+    }
+    if !self.is_congested.swap(true, Ordering::AcqRel) {
+      if let Some(ref tx) = self.monitor_tx {
+        let _ = tx.try_send(SocketEvent::ConnectionCongested {
+          endpoint: clean_endpoint_uri(&self.target_endpoint_uri).to_owned(),
+        });
+      }
+    }
+  }
+
+  fn note_uncongested(&self) {
+    if !self.is_congested.load(Ordering::Relaxed) {
+      return;
+    }
+    if self.is_congested.swap(false, Ordering::AcqRel) {
+      if let Some(ref tx) = self.monitor_tx {
+        let _ = tx.try_send(SocketEvent::ConnectionUncongested {
+          endpoint: clean_endpoint_uri(&self.target_endpoint_uri).to_owned(),
+        });
+      }
+    }
+  }
+}
+
 #[async_trait]
 impl ISocketConnection for DirectInprocConnection {
   async fn send_multipart(&self, msgs: FrameBatch) -> Result<(), ZmqError> {
@@ -30,53 +61,25 @@ impl ISocketConnection for DirectInprocConnection {
   }
 
   async fn send_multipart_owned(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
-    let clean_endpoint = clean_endpoint_uri(&self.target_endpoint_uri).to_owned();
-
     match self.peer_queue_sender.try_send(msgs) {
       Ok(()) => {
         if self.peer_queue_sender.is_full() {
-          if !self.is_congested.swap(true, Ordering::AcqRel) {
-            if let Some(ref tx) = self.monitor_tx {
-              let _ = tx.try_send(SocketEvent::ConnectionCongested {
-                endpoint: clean_endpoint,
-              });
-            }
-          }
+          self.note_congested();
         }
         Ok(())
       }
       Err(TrySendError::Closed(returned)) => Err((returned, ZmqError::ConnectionClosed)),
       Err(TrySendError::Full(returned)) => {
+        self.note_congested();
         if self.sndtimeo == Some(Duration::ZERO) {
-          if !self.is_congested.swap(true, Ordering::AcqRel) {
-            if let Some(ref tx) = self.monitor_tx {
-              let _ = tx.try_send(SocketEvent::ConnectionCongested {
-                endpoint: clean_endpoint,
-              });
-            }
-          }
           return Err((returned, ZmqError::ResourceLimitReached));
-        }
-
-        if !self.is_congested.swap(true, Ordering::AcqRel) {
-          if let Some(ref tx) = self.monitor_tx {
-            let _ = tx.try_send(SocketEvent::ConnectionCongested {
-              endpoint: clean_endpoint.clone(),
-            });
-          }
         }
 
         let timeout_dur = self.sndtimeo.unwrap_or(Duration::from_secs(300));
         match tokio::time::timeout(timeout_dur, self.peer_queue_sender.send(returned)).await {
           Ok(Ok(())) => {
             if !self.peer_queue_sender.is_full() {
-              if self.is_congested.swap(false, Ordering::AcqRel) {
-                if let Some(ref tx) = self.monitor_tx {
-                  let _ = tx.try_send(SocketEvent::ConnectionUncongested {
-                    endpoint: clean_endpoint,
-                  });
-                }
-              }
+              self.note_uncongested();
             }
             Ok(())
           }
@@ -89,36 +92,17 @@ impl ISocketConnection for DirectInprocConnection {
   }
 
   fn try_send_multipart_owned_sync(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
-    let clean_endpoint = clean_endpoint_uri(&self.target_endpoint_uri).to_owned();
     match self.peer_queue_sender.try_send(msgs) {
       Ok(()) => {
         if self.peer_queue_sender.is_full() {
-          if !self.is_congested.swap(true, Ordering::AcqRel) {
-            if let Some(ref tx) = self.monitor_tx {
-              let _ = tx.try_send(SocketEvent::ConnectionCongested {
-                endpoint: clean_endpoint,
-              });
-            }
-          }
+          self.note_congested();
         } else {
-          if self.is_congested.swap(false, Ordering::AcqRel) {
-            if let Some(ref tx) = self.monitor_tx {
-              let _ = tx.try_send(SocketEvent::ConnectionUncongested {
-                endpoint: clean_endpoint,
-              });
-            }
-          }
+          self.note_uncongested();
         }
         Ok(())
       }
       Err(TrySendError::Full(returned)) => {
-        if !self.is_congested.swap(true, Ordering::AcqRel) {
-          if let Some(ref tx) = self.monitor_tx {
-            let _ = tx.try_send(SocketEvent::ConnectionCongested {
-              endpoint: clean_endpoint,
-            });
-          }
-        }
+        self.note_congested();
         Err((returned, ZmqError::ResourceLimitReached))
       }
       Err(TrySendError::Closed(returned)) => Err((returned, ZmqError::ConnectionClosed)),

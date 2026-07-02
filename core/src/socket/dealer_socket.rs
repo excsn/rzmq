@@ -143,11 +143,14 @@ impl DealerSocket {
     };
 
     let processor_jh = tokio::spawn(processor.run());
-    let max_conn = core.core_state.read().options.max_connections.unwrap_or(1024);
+    let (max_conn, rcvbatch_count) = {
+      let opts = &core.core_state.read().options;
+      (opts.max_connections.unwrap_or(1024), opts.rcvbatch_count)
+    };
     Self {
       core,
       outgoing_orchestrator: orchestrator_arc,
-      ingress_engine: AddressedIngressEngine::new(max_conn),
+      ingress_engine: AddressedIngressEngine::new(max_conn, rcvbatch_count),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       frame_recv_buffer: ParkingMutex::new(None),
       pipe_read_to_endpoint_uri: ParkingLotRwLock::new(HashMap::new()),

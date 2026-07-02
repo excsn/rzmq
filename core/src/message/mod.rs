@@ -160,6 +160,11 @@ impl FrameBatch {
     if self.is_empty() { None } else { Some(&self[0]) }
   }
 
+  pub fn last(&self) -> Option<&Msg> {
+    let len = self.len();
+    if len == 0 { None } else { Some(&self[len - 1]) }
+  }
+
   pub fn last_mut(&mut self) -> Option<&mut Msg> {
     let len = self.len();
     if len == 0 { None } else { Some(&mut self[len - 1]) }

@@ -858,6 +858,26 @@ pub(crate) enum PipeMessageSender {
   },
 }
 
+/// Debug-only invariant: one send call = one complete logical message.
+///
+/// The ingress caches (the anonymous engine's frame cache and the addressed
+/// engine's entry cache) reassemble messages by MORE flags, and any future
+/// direct-to-pipe transport delivers each send as a standalone message — both
+/// depend on a batch never ending mid-message. A batch whose last frame still
+/// has MORE set means some egress path split a logical message across sends
+/// (the failure mode behind the DEALER "expected empty delimiter" symptom).
+/// Empty batches are tolerated (legacy empty-message edge).
+#[inline(always)]
+fn debug_assert_complete_message(batch: &FrameBatch, site: &str) {
+  debug_assert!(
+    batch.last().map_or(true, |m| !m.is_more()),
+    "PipeMessageSender::{site}: FrameBatch ends with MORE set — logical message split across sends ({} frames)",
+    batch.len(),
+  );
+  #[cfg(not(debug_assertions))]
+  let _ = (batch, site);
+}
+
 impl PipeMessageSender {
   #[cfg(feature = "io-uring")]
   pub fn bind_uring_wakeup(&self, wakeup: UringWakeup) {
@@ -869,6 +889,7 @@ impl PipeMessageSender {
   }
 
   pub async fn send(&self, batch: FrameBatch) -> Result<(), ZmqError> {
+    debug_assert_complete_message(&batch, "send");
     match self {
       Self::DirectAnonymous(s) => s.send(batch).await,
       Self::FilteredAnonymous { sender, trie } => {
@@ -884,6 +905,10 @@ impl PipeMessageSender {
   }
 
   pub async fn send_batch_mut(&self, items: &mut Vec<FrameBatch>) -> Result<usize, ZmqError> {
+    #[cfg(debug_assertions)]
+    for batch in items.iter() {
+      debug_assert_complete_message(batch, "send_batch_mut");
+    }
     match self {
       Self::DirectAnonymous(s) => s.send_batch_mut(items).await,
       Self::DirectAddressed { sender } => sender.send_batch_mut(items).await,
@@ -903,6 +928,7 @@ impl PipeMessageSender {
   }
 
   pub fn try_send_sync(&self, batch: FrameBatch) -> Result<(), TrySendError<FrameBatch>> {
+    debug_assert_complete_message(&batch, "try_send_sync");
     match self {
       Self::DirectAnonymous(s) => s.try_send(batch),
       Self::FilteredAnonymous { sender, trie } => {
@@ -923,6 +949,10 @@ impl PipeMessageSender {
   /// Returns the total frame count consumed (sent + discarded). Backpressured
   /// items remain at the front of `items` in FIFO order.
   pub fn try_send_batch(&self, items: &mut VecDeque<FrameBatch>) -> usize {
+    #[cfg(debug_assertions)]
+    for batch in items.iter() {
+      debug_assert_complete_message(batch, "try_send_batch");
+    }
     match self {
       Self::DirectAnonymous(s) => s.try_send_batch(items, |b| b.len()),
 
