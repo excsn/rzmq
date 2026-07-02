@@ -30,7 +30,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::sync::Arc;
 
-use fibre::mpmc::{unbounded, AsyncSender, Receiver as SyncReceiver, Sender as SyncSender};
+use fibre::mpmc::{unbounded, UnboundedAsyncSender as AsyncSender, UnboundedSyncReceiver as SyncReceiver, Sender as SyncSender};
 use fibre::mpsc;
 use io_uring::opcode;
 use io_uring::IoUring;
@@ -94,7 +94,7 @@ pub struct UringWorker {
   /// Egress channels for `ZmtpUringHandler` connections (SocketCore → worker).
   /// Checked in the pre-sleep double-check to keep the worker awake when batches are pending.
   pub(crate) fd_to_zmtp_egress_rx:
-    HashMap<RawFd, Arc<mpsc::BoundedReceiver<crate::message::FrameBatch>>>,
+    HashMap<RawFd, Arc<mpsc::BoundedSyncReceiver<crate::message::FrameBatch>>>,
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
   cfg_send_buffer_count: usize, //TODO revisit

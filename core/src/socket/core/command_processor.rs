@@ -273,7 +273,7 @@ pub(crate) async fn process_socket_command(
       // ReadyPipeQueue — no intermediate UringPipeReader task needed.
       if let Some(ingress_sender) = socket_logic_strong.get_incoming_pipe_sender(synthetic_read_id) {
         match crate::uring::global_state::get_global_uring_worker_op_tx() {
-          Ok(worker_tx) => {
+          Ok(mut worker_tx) => {
             let ud = core_arc.context.inner().next_handle() as u64;
             let (reply_tx, reply_rx) = oneshot::oneshot::<Result<crate::io_uring_backend::ops::UringOpCompletion, crate::ZmqError>>();
             let req = crate::io_uring_backend::ops::UringOpRequest::AttachIngressSender {

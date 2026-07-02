@@ -319,7 +319,7 @@ impl IpcListener {
                     let raw_fd = std_stream.into_raw_fd();
 
                     match uring::global_state::get_global_uring_worker_op_tx() {
-                      Ok(worker_op_tx) => {
+                      Ok(mut worker_op_tx) => {
                         let user_data = context_clone.inner().next_handle() as u64;
                         let (reply_tx, reply_rx) = fibre_oneshot();
                         let engine_cfg =
@@ -616,7 +616,7 @@ impl IpcConnecter {
                   let raw_fd = std_stream.into_raw_fd();
 
                   match uring::global_state::get_global_uring_worker_op_tx() {
-                    Ok(worker_op_tx) => {
+                    Ok(mut worker_op_tx) => {
                       let user_data = self.context.inner().next_handle() as u64;
                       let (reply_tx, reply_rx) = fibre_oneshot();
                       let engine_cfg =

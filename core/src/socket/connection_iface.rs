@@ -179,7 +179,7 @@ impl ISocketConnection for UringFdConnection {
       reply_tx,
     };
     
-    let worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
+    let mut worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
     worker_op_tx.send(req).await.map_err(|e| {
       ZmqError::Internal(format!("UringWorker op channel error for close: {}", e))
     })?;

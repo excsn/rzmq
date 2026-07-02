@@ -2,7 +2,7 @@
 
 use crate::io_uring_backend::ops::UringOpRequest;
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
-use fibre::{mpmc::AsyncSender, SendError, TrySendError};
+use fibre::{mpmc::UnboundedAsyncSender as AsyncSender, SendError, TrySendError};
 use once_cell::sync::OnceCell;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -44,7 +44,7 @@ impl SignalingOpSender {
   }
 
   /// Asynchronously sends an operation request and signals the eventfd on success.
-  pub async fn send(&self, req: UringOpRequest) -> Result<(), SendError> {
+  pub async fn send(&mut self, req: UringOpRequest) -> Result<(), SendError> {
     // Send to the underlying channel first.
     let send_result = self.op_tx.send(req).await;
 

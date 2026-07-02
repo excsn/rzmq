@@ -181,7 +181,7 @@ pub(crate) struct ZmtpUringHandler {
   worker_io_config: Arc<WorkerIoConfig>,
   engine: ZmtpEngine,
   /// Egress channel receiver: SocketCore → handler (via ZmtpSmartConnection → egress_tx).
-  egress_rx: Arc<fibre::mpsc::BoundedReceiver<FrameBatch>>,
+  egress_rx: Arc<fibre::mpsc::BoundedSyncReceiver<FrameBatch>>,
   /// Direct ingress sender: delivers decoded messages straight to the socket's ReadyPipeQueue.
   /// Set by `attach_ingress` after SocketCore completes pipe registration.
   ingress_sender: Option<PipeMessageSender>,
@@ -206,12 +206,15 @@ pub(crate) struct ZmtpUringHandler {
   worker_asleep: Arc<AtomicU8>,
 }
 
+unsafe impl Sync for ZmtpUringHandler {}
+unsafe impl Send for ZmtpUringHandler {}
+
 impl ZmtpUringHandler {
   pub(crate) fn new(
     fd: RawFd,
     worker_io_config: Arc<WorkerIoConfig>,
     engine: ZmtpEngine,
-    egress_rx: Arc<fibre::mpsc::BoundedReceiver<FrameBatch>>,
+    egress_rx: Arc<fibre::mpsc::BoundedSyncReceiver<FrameBatch>>,
     use_send_zerocopy: bool,
     use_recv_multishot: bool,
     send_buffer_slot_size: usize,

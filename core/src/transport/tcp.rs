@@ -384,7 +384,7 @@ impl TcpListener {
                       } else {
                         let raw_fd = std_stream.into_raw_fd();
 
-                        let worker_op_tx =
+                        let mut worker_op_tx =
                           uring::global_state::get_global_uring_worker_op_tx().unwrap();
                         let user_data_for_op = context_clone.inner().next_handle() as u64;
                         let (reply_tx_for_op, reply_rx_for_op) = oneshot();
@@ -984,7 +984,7 @@ impl TcpConnecter {
             }
             apply_tcp_socket_options_to_std(&std_stream, &self.config)?;
             let raw_fd = std_stream.into_raw_fd();
-            let worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
+            let mut worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
 
             let user_data_for_op = self.context.inner().next_handle() as u64;
             let (reply_tx_for_op, reply_rx_for_op) = oneshot();
