@@ -156,7 +156,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
       // A single dedicated sender task drains a lock-free MPSC queue in FIFO
       // order, guaranteeing sequential consistency for echoed replies. The main
       // read loop never blocks on network backpressure.
-      let (send_tx, send_rx) = mpsc::unbounded_async::<Vec<rzmq::Msg>>();
+      let (mut send_tx, mut send_rx) = mpsc::unbounded_async::<Vec<rzmq::Msg>>();
 
       let socket_clone = socket.clone();
       tokio::spawn(async move {

@@ -4,11 +4,9 @@ use rzmq::{
   Socket, SocketType, ZmqError,
   socket::{LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME, SocketEvent},
 };
-use serial_test::serial; // Add necessary rzmq imports
+use serial_test::serial;
 use std::time::Duration;
 use tokio::{task::JoinHandle, time::timeout};
-
-const TEST_TIMEOUT: Duration = Duration::from_secs(5); // Timeout for async test operations
 
 async fn setup_server(
   ctx: &rzmq::Context,
@@ -40,7 +38,7 @@ async fn setup_client(
   username: Option<&str>,
   password: Option<&str>,
   // Add other mechanism configs
-) -> Result<(Socket, fibre::mpmc::AsyncReceiver<SocketEvent>), ZmqError> {
+) -> Result<(Socket, rzmq::socket::MonitorReceiver), ZmqError> {
   let client = ctx.socket(SocketType::Req)?;
   if enable_plain {
     let user_to_set = username.unwrap_or("");

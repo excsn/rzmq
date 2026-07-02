@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "io-uring")]
 use std::sync::OnceLock;
@@ -15,7 +16,7 @@ use fibre::{RecvError, TryRecvError, TrySendError};
 use crate::error::ZmqError;
 use crate::message::FrameBatch;
 use crate::socket::patterns::trie::SubscriptionTrie;
-use crate::{cancel_guard, cancel_guard_complete, log_rpq_spin_deadlock};
+use crate::log_rpq_spin_deadlock;
 
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::{WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING};
@@ -29,6 +30,39 @@ use crate::io_uring_backend::ops::{WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING}
 pub(crate) struct UringWakeup {
   pub event_fd: eventfd::EventFD,
   pub worker_asleep: Arc<std::sync::atomic::AtomicU8>,
+}
+
+// ---------------------------------------------------------------------------
+// ExclusiveCell — mutex-shaped cell without the lock
+// ---------------------------------------------------------------------------
+
+/// Interior-mutability cell for the fibre spsc handles inside `PipeSlot`.
+///
+/// fibre takes `&mut self` on every ring-touching spsc op to enforce exclusive
+/// producer/consumer access at the type level. `PipeSlot` provides that
+/// exclusivity dynamically instead:
+/// - `rx`: a slot occupies the ready list at most once (0→1 `queued_count`
+///   transition on send / `prev > 1` re-enqueue on pop), so only the holder of
+///   the ready token touches `rx`, and the mpmc ready channel's send/recv
+///   provides the happens-before edge between successive holders.
+/// - `tx`: exactly one producer task per pipe holds the `ReadyPipeSender`.
+struct ExclusiveCell<T>(UnsafeCell<T>);
+
+unsafe impl<T: Send> Send for ExclusiveCell<T> {}
+unsafe impl<T: Send> Sync for ExclusiveCell<T> {}
+
+impl<T> ExclusiveCell<T> {
+  fn new(v: T) -> Self {
+    Self(UnsafeCell::new(v))
+  }
+
+  /// SAFETY: caller must be the exclusive owner at this instant — the ready
+  /// token holder for `rx`, or the single registered producer for `tx` (see
+  /// the type-level docs).
+  #[allow(clippy::mut_from_ref)]
+  unsafe fn get_mut(&self) -> &mut T {
+    unsafe { &mut *self.0.get() }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -51,44 +85,51 @@ pub(crate) fn pipe_lwm(capacity: usize, drain_delta: usize) -> usize {
 
 /// Diagnostic invariant audit (debug / `diagnostics` builds only).
 ///
-/// Invariant: every item physically present in `rx` must have a live reservation,
-/// i.e. `reserved_count >= rx.len()` at all times — a reservation is taken *before*
-/// an item is enqueued and only released *after* it is dequeued. `rx.len()` is read
-/// *before* `reserved_count` so a concurrent producer (reserve-then-enqueue) or
-/// consumer (dequeue-then-release) cannot fabricate a false positive.
+/// Invariant: every committed item must have a live reservation, i.e.
+/// `reserved_count >= occupancy` at all times — a reservation is taken *before*
+/// an item is enqueued and only released *after* it is dequeued. `occupancy` is
+/// read *before* `reserved_count` so a concurrent producer (reserve-then-enqueue)
+/// or consumer (dequeue-then-release) cannot fabricate a false positive.
+///
+/// `occupancy` is a closure because the measure differs per side: the pop site
+/// holds the ready token and may read the physical `rx.len()`; producer sites
+/// must not touch `rx` (the token holder may hold `&mut rx`) and pass
+/// `queued_count` instead.
 ///
 /// Fires at most once per slot, on the first violation, naming the `site` — this
 /// pinpoints the exact operation that breaks the accounting behind the PULL-ingress
 /// deadlock (`rx` full while `queued`/`reserved` read 0). Silent in the happy path,
 /// so it adds no log throughput until something is actually wrong.
 #[inline]
-fn audit_slot<T: Send + 'static>(slot: &PipeSlot<T>, site: &str) {
+fn audit_slot<T: Send + 'static>(slot: &PipeSlot<T>, site: &str, occupancy: impl FnOnce() -> usize) {
   #[cfg(feature = "diagnostics")]
   {
-    let rxlen = slot.rx.len();
+    let occ = occupancy();
     let reserved = slot.reserved_count.load(Ordering::Acquire);
-    if reserved < rxlen && !slot.audit_reported.swap(true, Ordering::AcqRel) {
+    if reserved < occ && !slot.audit_reported.swap(true, Ordering::AcqRel) {
       let queued = slot.queued_count.load(Ordering::Acquire);
       println!(
-        "[RPQ-DESYNC pid={} pipe={} site={}] reserved({}) < rx.len({}) \
+        "[RPQ-DESYNC pid={} pipe={} site={}] reserved({}) < occupancy({}) \
          — item(s) in channel with no backing reservation; queued={}",
         std::process::id(),
         slot.pipe_id,
         site,
         reserved,
-        rxlen,
+        occ,
         queued,
       );
     }
   }
   #[cfg(not(feature = "diagnostics"))]
-  let _ = (slot, site);
+  let _ = (slot, site, occupancy);
 }
 
 pub(crate) struct PipeSlot<T: Send + 'static> {
   pub(crate) pipe_id: usize,
-  pub(crate) tx: spsc::BoundedAsyncSender<T>,
-  pub(crate) rx: spsc::BoundedAsyncReceiver<T>,
+  tx: ExclusiveCell<spsc::BoundedAsyncSender<T>>,
+  rx: ExclusiveCell<spsc::BoundedAsyncReceiver<T>>,
+  /// Channel capacity, mirrored here so observers never touch `rx`/`tx`.
+  capacity: usize,
   /// Active send reservations: in-flight (not yet committed) + committed messages.
   /// Incremented at the START of every send attempt (before the channel write).
   /// Decremented on cancellation (RAII) or on consumer pop.
@@ -108,12 +149,18 @@ pub(crate) struct PipeSlot<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> PipeSlot<T> {
+  /// Committed occupancy. Uses `queued_count` rather than the physical
+  /// `rx.len()`: observers on both sides call this concurrently, and touching
+  /// `rx` here would alias the ready-token holder's `&mut rx`. `queued_count`
+  /// tracks exactly the committed messages present in `rx` (transiently
+  /// lagging by the commit window), which is sufficient for the
+  /// congestion/drain heuristics built on it.
   pub fn len(&self) -> usize {
-    self.rx.len()
+    self.queued_count.load(Ordering::Acquire)
   }
 
   pub fn capacity(&self) -> usize {
-    self.rx.capacity()
+    self.capacity
   }
 
   pub fn is_congested(&self) -> bool {
@@ -213,8 +260,9 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
 
     let slot = Arc::new(PipeSlot {
       pipe_id,
-      tx,
-      rx,
+      tx: ExclusiveCell::new(tx),
+      rx: ExclusiveCell::new(rx),
+      capacity: capacity.max(1),
       reserved_count: AtomicUsize::new(0),
       queued_count: AtomicUsize::new(0),
       lwm: pipe_lwm(capacity, drain_delta),
@@ -244,20 +292,30 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
         }
       };
 
-      match slot.rx.try_recv() {
+      // SAFETY: we hold this slot's ready token (received it off `ready_rx`
+      // just above), so we are the exclusive consumer right now.
+      match unsafe { slot.rx.get_mut() }.try_recv() {
         Ok(item) => {
           let prev = slot.queued_count.fetch_sub(1, Ordering::AcqRel);
           slot.reserved_count.fetch_sub(1, Ordering::AcqRel);
           debug_assert!(prev > 0);
-          audit_slot(&slot, "pop");
+          audit_slot(&slot, "pop", || unsafe { slot.rx.get_mut() }.len());
 
           if prev > 1 {
-            cancel_guard!(guard, "ReadyPipeQueue::pop → ready_tx.send");
-
             // More committed messages remain — keep this pipe on the ready list.
-            let _ = self.ready_tx.send(Arc::clone(&slot)).await;
-
-            cancel_guard_complete!(guard);
+            let mut spins = 0usize;
+            loop {
+              match self.ready_tx.try_send(Arc::clone(&slot)) {
+                Ok(()) => break,
+                Err(TrySendError::Full(_)) => {
+                  spins += 1;
+                  log_rpq_spin_deadlock!(spins, "pop spinning on ready_tx", "Full");
+                  std::thread::yield_now();
+                }
+                Err(TrySendError::Closed(_)) => break,
+                Err(TrySendError::Sent(_)) => unreachable!(),
+              }
+            }
           }
 
           #[cfg(feature = "io-uring")]
@@ -299,15 +357,29 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
         Err(_) => return None,
       };
 
-      match slot.rx.try_recv() {
+      // SAFETY: we hold this slot's ready token (received it off `ready_rx`
+      // just above), so we are the exclusive consumer right now.
+      match unsafe { slot.rx.get_mut() }.try_recv() {
         Ok(item) => {
           let prev = slot.queued_count.fetch_sub(1, Ordering::AcqRel);
           slot.reserved_count.fetch_sub(1, Ordering::AcqRel);
           debug_assert!(prev > 0);
-          audit_slot(&slot, "try_pop");
+          audit_slot(&slot, "try_pop", || unsafe { slot.rx.get_mut() }.len());
 
           if prev > 1 {
-            let _ = self.ready_tx.try_send(Arc::clone(&slot));
+            let mut spins = 0usize;
+            loop {
+              match self.ready_tx.try_send(Arc::clone(&slot)) {
+                Ok(()) => break,
+                Err(TrySendError::Full(_)) => {
+                  spins += 1;
+                  log_rpq_spin_deadlock!(spins, "try_pop spinning on ready_tx", "Full");
+                  std::thread::yield_now();
+                }
+                Err(TrySendError::Closed(_)) => break,
+                Err(TrySendError::Sent(_)) => unreachable!(),
+              }
+            }
           }
 
           #[cfg(feature = "io-uring")]
@@ -339,6 +411,105 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
         Err(TryRecvError::Disconnected) => continue,
       }
     }
+  }
+
+  /// Pops up to `max` messages from the next ready pipe while holding its
+  /// ready token, appending them to `out`. One token round-trip (and at most
+  /// one re-enqueue) is paid for the whole batch instead of per message.
+  /// Returns the pipe id and the number of messages appended (>= 1).
+  pub async fn pop_batch(&self, out: &mut Vec<T>, max: usize) -> Result<(usize, usize), ZmqError> {
+    loop {
+      let slot = match self.ready_rx.recv().await {
+        Ok(s) => s,
+        Err(RecvError::Disconnected) => {
+          return Err(ZmqError::InvalidState("ready queue closed"));
+        }
+      };
+
+      if let Some(res) = self.drain_slot(&slot, out, max) {
+        return Ok(res);
+      }
+      // Stale ready signal — discard and wait for the next token.
+    }
+  }
+
+  /// Non-blocking `pop_batch`. Returns `None` when no pipe is ready.
+  pub fn try_pop_batch(&self, out: &mut Vec<T>, max: usize) -> Option<(usize, usize)> {
+    loop {
+      let slot = match self.ready_rx.try_recv() {
+        Ok(s) => s,
+        Err(_) => return None,
+      };
+
+      if let Some(res) = self.drain_slot(&slot, out, max) {
+        return Some(res);
+      }
+    }
+  }
+
+  /// Drains up to `max` committed messages from `slot` into `out` while the
+  /// caller holds the slot's ready token. Returns `None` for a stale token.
+  fn drain_slot(&self, slot: &Arc<PipeSlot<T>>, out: &mut Vec<T>, max: usize) -> Option<(usize, usize)> {
+    // Only committed messages may be popped: capping at queued_count keeps the
+    // counter decrement below from racing a producer's post-write increment.
+    // Committed items are always physically present in rx (the increment
+    // happens after the channel write), so the batch read cannot come short.
+    let committed = slot.queued_count.load(Ordering::Acquire);
+    let cap = committed.min(max.max(1));
+    if cap == 0 {
+      return None;
+    }
+
+    // SAFETY: we hold this slot's ready token, so we are the exclusive
+    // consumer right now.
+    let got = match unsafe { slot.rx.get_mut() }.try_recv_batch_mut(out, cap) {
+      Ok(n) => n,
+      Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return None,
+    };
+    debug_assert!(got > 0 && got <= committed);
+
+    let prev = slot.queued_count.fetch_sub(got, Ordering::AcqRel);
+    slot.reserved_count.fetch_sub(got, Ordering::AcqRel);
+    audit_slot(slot, "pop_batch", || unsafe { slot.rx.get_mut() }.len());
+
+    if prev > got {
+      // More committed messages remain — keep this pipe on the ready list.
+      let mut spins = 0usize;
+      loop {
+        match self.ready_tx.try_send(Arc::clone(slot)) {
+          Ok(()) => break,
+          Err(TrySendError::Full(_)) => {
+            spins += 1;
+            log_rpq_spin_deadlock!(spins, "pop_batch spinning on ready_tx", "Full");
+            std::thread::yield_now();
+          }
+          Err(TrySendError::Closed(_)) => break,
+          Err(TrySendError::Sent(_)) => unreachable!(),
+        }
+      }
+    }
+
+    #[cfg(feature = "io-uring")]
+    if slot.is_drained() {
+      if let Some(wakeup) = slot.uring_wakeup.get() {
+        if wakeup.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING {
+          if wakeup
+            .worker_asleep
+            .compare_exchange(
+              WAKEUP_STATE_SLEEPING,
+              WAKEUP_STATE_SIGNALED,
+              Ordering::AcqRel,
+              Ordering::Acquire,
+            )
+            .is_ok()
+          {
+            let _ = wakeup.event_fd.write(1);
+          }
+        }
+      }
+    }
+
+    Some((slot.pipe_id, got))
   }
 
   pub fn close(&self) {
@@ -373,16 +544,14 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     // the guard's Drop rolls back reserved_count — no leak.
     let mut reservation = SendReservation::new(Arc::clone(&slot));
 
-    match slot.tx.try_send(item) {
+    // SAFETY: this ReadyPipeSender is the pipe's single producer.
+    let tx = unsafe { slot.tx.get_mut() };
+    match tx.try_send(item) {
       Ok(()) => {}
       Err(TrySendError::Closed(_)) => return Err(ZmqError::ConnectionClosed),
       Err(TrySendError::Full(returned)) => {
         // Block here. If cancelled mid-await, Drop runs on the reservation.
-        slot
-          .tx
-          .send(returned)
-          .await
-          .map_err(|_| ZmqError::ConnectionClosed)?;
+        tx.send(returned).await.map_err(|_| ZmqError::ConnectionClosed)?;
       }
       Err(TrySendError::Sent(_)) => unreachable!(),
     }
@@ -393,16 +562,22 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     reservation.commit();
 
     if prev == 0 {
-      cancel_guard!(cd, "ReadyPipeSender::send → ready_tx.send");
-      self
-        .ready_tx
-        .send(Arc::clone(&slot))
-        .await
-        .map_err(|_| ZmqError::ConnectionClosed)?;
-      cancel_guard_complete!(cd);
+      let mut spins = 0usize;
+      loop {
+        match self.ready_tx.try_send(Arc::clone(&slot)) {
+          Ok(()) => break,
+          Err(TrySendError::Full(_)) => {
+            spins += 1;
+            log_rpq_spin_deadlock!(spins, "send spinning on ready_tx", "Full");
+            std::thread::yield_now();
+          }
+          Err(TrySendError::Closed(_)) => return Err(ZmqError::ConnectionClosed),
+          Err(TrySendError::Sent(_)) => unreachable!(),
+        }
+      }
     }
 
-    audit_slot(&slot, "send");
+    audit_slot(&slot, "send", || slot.queued_count.load(Ordering::Acquire));
     Ok(())
   }
 
@@ -415,7 +590,8 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     let mut reservation = SendReservation::new(Arc::clone(&slot));
 
     // If this returns an error, the reservation is dropped (rolled back).
-    slot.tx.try_send(item)?;
+    // SAFETY: this ReadyPipeSender is the pipe's single producer.
+    unsafe { slot.tx.get_mut() }.try_send(item)?;
 
     let prev = slot.queued_count.fetch_add(1, Ordering::AcqRel);
     reservation.commit();
@@ -424,14 +600,21 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
       // 0→1 transition: ready queue capacity must be >= max registered
       // pipes so this should never spin more than one iteration.
       let mut spins = 0usize;
-      while let Err(e) = self.ready_tx.try_send(Arc::clone(&slot)) {
-        spins += 1;
-        log_rpq_spin_deadlock!(spins, "try_send spinning", e);
-        std::thread::yield_now();
+      loop {
+        match self.ready_tx.try_send(Arc::clone(&slot)) {
+          Ok(()) => break,
+          Err(TrySendError::Full(_)) => {
+            spins += 1;
+            log_rpq_spin_deadlock!(spins, "try_send spinning on ready_tx", "Full");
+            std::thread::yield_now();
+          }
+          Err(TrySendError::Closed(_)) => break,
+          Err(TrySendError::Sent(_)) => unreachable!(),
+        }
       }
     }
 
-    audit_slot(&slot, "try_send");
+    audit_slot(&slot, "try_send", || slot.queued_count.load(Ordering::Acquire));
     Ok(())
   }
 
@@ -460,9 +643,11 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     let mut total_weight = 0usize;
     let mut had_zero_transition = false;
 
+    // SAFETY: this ReadyPipeSender is the pipe's single producer.
+    let tx = unsafe { slot.tx.get_mut() };
     while let Some(item) = items.pop_front() {
       let weight = get_weight(&item);
-      match slot.tx.try_send(item) {
+      match tx.try_send(item) {
         Ok(()) => {
           sent_batches += 1;
           total_weight += weight;
@@ -496,15 +681,125 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     // pipes, so the spin almost never executes more than one iteration.
     if had_zero_transition {
       let mut spins = 0usize;
-      while let Err(e) = self.ready_tx.try_send(Arc::clone(&slot)) {
-        spins += 1;
-        log_rpq_spin_deadlock!(spins, "try_send_batch spinning on ready_tx", e);
-        std::thread::yield_now();
+      loop {
+        match self.ready_tx.try_send(Arc::clone(&slot)) {
+          Ok(()) => break,
+          Err(TrySendError::Full(_)) => {
+            spins += 1;
+            log_rpq_spin_deadlock!(spins, "try_send_batch spinning on ready_tx", "Full");
+            std::thread::yield_now();
+          }
+          Err(TrySendError::Closed(_)) => break,
+          Err(TrySendError::Sent(_)) => unreachable!(),
+        }
       }
     }
 
-    audit_slot(&slot, "try_send_batch");
+    audit_slot(&slot, "try_send_batch", || {
+      slot.queued_count.load(Ordering::Acquire)
+    });
     total_weight
+  }
+
+  pub async fn send_batch_mut(&self, items: &mut Vec<T>) -> Result<usize, ZmqError> {
+    let slot = self.slot.upgrade().ok_or(ZmqError::ConnectionClosed)?;
+    let mut total_sent = 0;
+
+    // SAFETY: this ReadyPipeSender is the pipe's single producer.
+    let tx = unsafe { slot.tx.get_mut() };
+    while !items.is_empty() {
+      // 1. Drain synchronously into the channel until full.
+      let sent_this_pass = match tx.try_send_batch_mut(items) {
+        Ok(n) => n,
+        Err(fibre::SendError::Closed) => return Err(ZmqError::ConnectionClosed),
+        Err(fibre::SendError::Sent) => unreachable!(),
+      };
+
+      if sent_this_pass > 0 {
+        total_sent += sent_this_pass;
+        slot.reserved_count.fetch_add(sent_this_pass, Ordering::AcqRel);
+        let prev = slot.queued_count.fetch_add(sent_this_pass, Ordering::AcqRel);
+
+        if prev == 0 {
+          let mut spins = 0usize;
+          loop {
+            match self.ready_tx.try_send(Arc::clone(&slot)) {
+              Ok(()) => break,
+              Err(TrySendError::Full(_)) => {
+                spins += 1;
+                log_rpq_spin_deadlock!(spins, "send_batch_mut spinning on ready_tx", "Full");
+                std::thread::yield_now();
+              }
+              Err(TrySendError::Closed(_)) => return Err(ZmqError::ConnectionClosed),
+              Err(TrySendError::Sent(_)) => unreachable!(),
+            }
+          }
+        }
+        audit_slot(&slot, "send_batch_mut_sync_pass", || {
+          slot.queued_count.load(Ordering::Acquire)
+        });
+      }
+
+      if items.is_empty() {
+        break;
+      }
+
+      // 2. The channel is full. We must yield/wait.
+      // Take exactly one item out of the vector to await on.
+      let mut temp = vec![items.remove(0)];
+
+      // Micro-guard: if the future is dropped while awaiting, or fails,
+      // put the item back into `items` so nothing is lost.
+      struct WaitGuard<'a, T> {
+        items: &'a mut Vec<T>,
+        temp: &'a mut Vec<T>,
+      }
+      impl<'a, T> Drop for WaitGuard<'a, T> {
+        fn drop(&mut self) {
+          if !self.temp.is_empty() {
+            self.items.insert(0, self.temp.remove(0));
+          }
+        }
+      }
+
+      let guard = WaitGuard {
+        items: &mut *items,
+        temp: &mut temp,
+      };
+
+      // Await space for this single item.
+      if tx.send_batch_mut(guard.temp).await.is_err() {
+        return Err(ZmqError::ConnectionClosed);
+      }
+
+      // Successfully sent. The guard drops here with `temp` empty.
+      drop(guard);
+
+      total_sent += 1;
+      slot.reserved_count.fetch_add(1, Ordering::AcqRel);
+      let prev = slot.queued_count.fetch_add(1, Ordering::AcqRel);
+
+      if prev == 0 {
+        let mut spins = 0usize;
+        loop {
+          match self.ready_tx.try_send(Arc::clone(&slot)) {
+            Ok(()) => break,
+            Err(TrySendError::Full(_)) => {
+              spins += 1;
+              log_rpq_spin_deadlock!(spins, "send_batch_mut spinning on ready_tx", "Full");
+              std::thread::yield_now();
+            }
+            Err(TrySendError::Closed(_)) => return Err(ZmqError::ConnectionClosed),
+            Err(TrySendError::Sent(_)) => unreachable!(),
+          }
+        }
+      }
+      audit_slot(&slot, "send_batch_mut_async_pass", || {
+        slot.queued_count.load(Ordering::Acquire)
+      });
+    }
+
+    Ok(total_sent)
   }
 
   pub fn queued_count(&self) -> usize {
@@ -565,7 +860,7 @@ pub(crate) enum PipeMessageSender {
 
 impl PipeMessageSender {
   #[cfg(feature = "io-uring")]
-  pub fn bind_uring_wakeup(&mut self, wakeup: UringWakeup) {
+  pub fn bind_uring_wakeup(&self, wakeup: UringWakeup) {
     match self {
       Self::DirectAnonymous(s) => s.bind_uring_wakeup(wakeup),
       Self::FilteredAnonymous { sender, .. } => sender.bind_uring_wakeup(wakeup),
@@ -585,6 +880,25 @@ impl PipeMessageSender {
         }
       }
       Self::DirectAddressed { sender } => sender.send(batch).await,
+    }
+  }
+
+  pub async fn send_batch_mut(&self, items: &mut Vec<FrameBatch>) -> Result<usize, ZmqError> {
+    match self {
+      Self::DirectAnonymous(s) => s.send_batch_mut(items).await,
+      Self::DirectAddressed { sender } => sender.send_batch_mut(items).await,
+      Self::FilteredAnonymous { sender, trie } => {
+        // In-place, zero-allocation filter of the vector before transmitting.
+        items.retain(|batch| {
+          let topic = batch.first().and_then(|m| m.data()).unwrap_or(&[]);
+          trie.matches(topic)
+        });
+
+        if items.is_empty() {
+          return Ok(0);
+        }
+        sender.send_batch_mut(items).await
+      }
     }
   }
 
@@ -642,11 +956,13 @@ impl PipeMessageSender {
         let mut total_frames = 0usize;
         let mut had_zero_transition = false;
 
+        // SAFETY: this sender is the pipe's single producer.
+        let tx = unsafe { slot.tx.get_mut() };
         while let Some(item) = items.pop_front() {
           let topic: &[u8] = item.first().and_then(|m| m.data()).unwrap_or(&[]);
           if trie.matches(topic) {
             let frame_count = item.len();
-            match slot.tx.try_send(item) {
+            match tx.try_send(item) {
               Ok(()) => {
                 sent_batches += 1;
                 total_frames += frame_count;
@@ -679,10 +995,17 @@ impl PipeMessageSender {
 
         if had_zero_transition {
           let mut spins = 0usize;
-          while let Err(e) = sender.ready_tx.try_send(Arc::clone(&slot)) {
-            spins += 1;
-            log_rpq_spin_deadlock!(spins, "try_send_batch filtered spinning", e);
-            std::thread::yield_now();
+          loop {
+            match sender.ready_tx.try_send(Arc::clone(&slot)) {
+              Ok(()) => break,
+              Err(TrySendError::Full(_)) => {
+                spins += 1;
+                log_rpq_spin_deadlock!(spins, "try_send_batch filtered spinning on ready_tx", "Full");
+                std::thread::yield_now();
+              }
+              Err(TrySendError::Closed(_)) => break,
+              Err(TrySendError::Sent(_)) => unreachable!(),
+            }
           }
         }
 
@@ -806,7 +1129,10 @@ mod tests {
         let pipes = queue.pipes.read();
         for pipe_id in 0..NUM_PRODUCERS {
           if let Some(slot) = pipes.get(&pipe_id) {
-            let has_items = !slot.rx.is_empty();
+            // SAFETY: this thread is the test's sole consumer, so it is the
+            // exclusive rx accessor.
+            let rx_len = unsafe { slot.rx.get_mut() }.len();
+            let has_items = rx_len > 0;
             // reserved_count covers both in-flight and committed messages so
             // a non-zero value means a wakeup signal is guaranteed to arrive.
             let reserved = slot.reserved_count.load(Ordering::Acquire);
@@ -816,7 +1142,7 @@ mod tests {
               println!(
                 "\n[LOST WAKEUP] pipe={} rx_len={} reserved={} queued={} ready_rx_len={}",
                 pipe_id,
-                slot.rx.len(),
+                rx_len,
                 reserved,
                 slot.queued_count.load(Ordering::Acquire),
                 queue.ready_rx.len()
@@ -995,7 +1321,9 @@ mod pop_counter_desync_regression {
     // Drained and balanced: no leaked reservations / counts, channel empty.
     let pipes = queue.pipes.read();
     let slot = pipes.get(&0).expect("pipe slot present");
-    assert_eq!(slot.rx.len(), 0, "rx not fully drained");
+    // SAFETY: producer and consumer tasks have both been joined; this thread
+    // is the only remaining accessor.
+    assert_eq!(unsafe { slot.rx.get_mut() }.len(), 0, "rx not fully drained");
     assert_eq!(
       slot.queued_count.load(Ordering::Acquire),
       0,
@@ -1055,10 +1383,11 @@ use super::*;
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn test_massive_cancellation_storm() {
     let queue = Arc::new(ReadyPipeQueue::<i32>::new(10));
-    let sender = Arc::new(queue.register_pipe(1, 1, 0));
+    // SPSC contract: one producer at a time — tasks serialize through the Mutex.
+    let sender = Arc::new(tokio::sync::Mutex::new(queue.register_pipe(1, 1, 0)));
 
     // Fill the pipe so every send blocks.
-    sender.send(0).await.unwrap();
+    sender.lock().await.send(0).await.unwrap();
 
     let pipes = queue.pipes.read();
     let slot = pipes.get(&1).unwrap().clone();
@@ -1069,7 +1398,10 @@ use super::*;
     for i in 1..=1000 {
       let s = sender.clone();
       tasks.push(tokio::spawn(async move {
-        let _ = timeout(Duration::from_millis(1), s.send(i)).await;
+        let _ = timeout(Duration::from_millis(1), async {
+          let _ = s.lock().await.send(i).await;
+        })
+        .await;
       }));
     }
     for t in tasks {
@@ -1093,7 +1425,8 @@ use super::*;
   #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
   async fn test_concurrent_send_cancel_race() {
     let queue = Arc::new(ReadyPipeQueue::<i32>::new(10));
-    let sender = Arc::new(queue.register_pipe(1, 4, 0));
+    // SPSC contract: one producer at a time — tasks serialize through the Mutex.
+    let sender = Arc::new(tokio::sync::Mutex::new(queue.register_pipe(1, 4, 0)));
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut tasks = Vec::new();
@@ -1107,9 +1440,12 @@ use super::*;
         while !stop2.load(Ordering::Relaxed) {
           // Alternate cancellable and normal sends.
           if seq % 2 == 0 {
-            let _ = timeout(Duration::from_micros(10), s.send(seq)).await;
+            let _ = timeout(Duration::from_micros(10), async {
+              let _ = s.lock().await.send(seq).await;
+            })
+            .await;
           } else {
-            let _ = s.send(seq).await;
+            let _ = s.lock().await.send(seq).await;
           }
           seq += 8;
           tokio::task::yield_now().await;
@@ -1193,9 +1529,11 @@ use super::*;
 
     let queue = Arc::new(ReadyPipeQueue::<FrameBatch>::new(10));
 
+    // SPSC contract: one producer at a time per pipe — the chaos tasks
+    // serialize access to each pipe's sender through its Mutex.
     let mut senders = Vec::new();
     for i in 0..4 {
-      senders.push(Arc::new(queue.register_pipe(i, 1, 0)));
+      senders.push(Arc::new(tokio::sync::Mutex::new(queue.register_pipe(i, 1, 0))));
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1218,7 +1556,10 @@ use super::*;
           batch.push(Msg::from_static(b"chaos-data"));
 
           let timeout_us = 10 + (rng % 150);
-          let _ = timeout(Duration::from_micros(timeout_us), sender.send(batch)).await;
+          let _ = timeout(Duration::from_micros(timeout_us), async {
+            let _ = sender.lock().await.send(batch).await;
+          })
+          .await;
 
           seq += 1;
           tokio::task::yield_now().await;

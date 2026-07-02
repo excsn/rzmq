@@ -5,8 +5,7 @@ use crate::message::FrameBatch;
 use crate::protocol::zmtp::actions::{AppAction, EngineOutput, NetAction};
 use crate::protocol::zmtp::engine::{ZmtpEngine, ZmtpPhase};
 use crate::protocol::zmtp::greeting::GREETING_LENGTH;
-use crate::runtime::{ActorDropGuard, ActorType, Command, SystemEvent};
-use crate::sessionx::ingress_future::IngressDriver;
+use crate::runtime::{ActorDropGuard, ActorType, Command, ReusableBoxFuture, SystemEvent};
 use crate::sessionx::regulator::SessionRegulator;
 use crate::socket::ISocket;
 use crate::socket::events::{SocketEvent, clean_endpoint_uri};
@@ -63,7 +62,10 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   socket_logic: Arc<dyn ISocket>,
   session_regulator: SessionRegulator,
   _connection_permit: Option<OwnedSemaphorePermit>,
-  incoming_pipe_sender: Option<PipeMessageSender>,
+  /// Arc so the persistent ingress send future (`ingress_send_fut`) can own a
+  /// clone; the actor never sends on the pipe while that future is active, so
+  /// the pipe's single-producer contract is preserved.
+  incoming_pipe_sender: Option<Arc<PipeMessageSender>>,
   is_currently_congested: bool,
 
   #[cfg(target_os = "linux")]
@@ -189,8 +191,8 @@ where
     let mut egress_buffer = EgressBuffer::new();
 
     // Local FIFO queue decouples network read from application pipe send to prevent deadlock.
-    let mut ingress_buffer: std::collections::VecDeque<FrameBatch> =
-      std::collections::VecDeque::new();
+    let mut ingress_buffer: Vec<FrameBatch> =
+      Vec::with_capacity(self.zmtp_engine.config().rcvbatch_count);
 
     // Send the initial greeting (client only; server returns empty output).
     let initial_out = self.zmtp_engine.start();
@@ -308,7 +310,39 @@ where
       #[cfg(feature = "diagnostics")]
       let mut last_log_ms = 0u64;
 
+      // Persistent ingress→pipe send. Owns the drained ingress buffer plus an
+      // Arc'd sender and returns the buffer on completion so its allocation is
+      // reused. Unlike an inline select! arm it is NOT dropped when another arm
+      // wins — under backpressure the blocked send resumes where it left off
+      // instead of re-running the try_send fast path (and its reserved_count
+      // add/rollback churn) every loop iteration. The box itself is allocated
+      // once and reused via ReusableBoxFuture::set().
+      let mut ingress_send_fut: ReusableBoxFuture<
+        'static,
+        (Vec<FrameBatch>, Result<usize, ZmqError>),
+      > = ReusableBoxFuture::new(async { (Vec::new(), Ok(0)) });
+      let mut ingress_send_fut_active = false;
+
       'operational: while self.current_phase == ConnectionPhaseX::Operational {
+        // Arm the persistent ingress send with whatever the read arm buffered.
+        if !ingress_send_fut_active && !ingress_buffer.is_empty() {
+          match self.incoming_pipe_sender.as_ref() {
+            Some(sender) => {
+              let sender = Arc::clone(sender);
+              let mut buf = std::mem::take(&mut ingress_buffer);
+              ingress_send_fut.set(async move {
+                let res = sender.send_batch_mut(&mut buf).await;
+                (buf, res)
+              });
+              ingress_send_fut_active = true;
+            }
+            None => {
+              // No pipe sender (PUB/PUSH send-only) — silently discard.
+              ingress_buffer.clear();
+            }
+          }
+        }
+
         if !core_carryover.is_empty()
           && self.current_phase == ConnectionPhaseX::Operational
           && if use_owned_write {
@@ -471,29 +505,36 @@ where
           }
 
           // Drain ingress buffer: decouples network read from application pipe send.
-          drain_res = IngressDriver::new(self.incoming_pipe_sender.as_ref(), &mut ingress_buffer),
-            if !ingress_buffer.is_empty() => {
-            match drain_res {
-              Ok(batch_len) => {
-                if self.incoming_pipe_sender.is_some() {
-                  let weight = batch_len as u32;
-                  let throttle_guard = adaptive_throttle
-                    .begin_work_bulk(crate::throttle::Direction::Ingress, weight);
+          // Persistent across iterations (armed at the top of the loop); losing
+          // the select! race does not restart the blocked send.
+          (returned_buf, write_res) = &mut ingress_send_fut, if ingress_send_fut_active => {
+            ingress_send_fut_active = false;
+            // Reclaim the (drained) buffer allocation for the read arm.
+            ingress_buffer = returned_buf;
+            match write_res {
+              Ok(sent) => {
+                if sent > 0 {
+                  let throttle_guard = adaptive_throttle.begin_work_bulk(
+                    crate::throttle::Direction::Ingress,
+                    sent as u32,
+                  );
                   if throttle_guard.should_throttle() {
                     yield_now().await;
                   }
                 }
               }
               Err(e) => {
-                tracing::debug!(sca_handle = self.handle, error = %e, "Ingress pipe closed; shutting down.");
+                tracing::debug!(sca_handle = self.handle, error = %e, "Ingress pipe closed during batch send.");
                 self.transition_to_shutdown_stream(Some(e)).await;
               }
             }
           }
 
-          // Ingress network read: gated on empty buffer to propagate TCP backpressure.
+          // Ingress network read: gated on the buffer AND the in-flight pipe
+          // send (the buffer is empty-by-move while the send future is active)
+          // to propagate TCP backpressure.
           ingress_res = message_processor.read_and_process(&mut read_half, &mut self.zmtp_engine),
-            if ingress_buffer.is_empty() => {
+            if ingress_buffer.is_empty() && !ingress_send_fut_active => {
             match ingress_res {
               Ok(engine_out) => {
                 // Net actions: PONG frames and any other protocol-level sends.
@@ -517,7 +558,7 @@ where
                 for action in engine_out.app_actions {
                   match action {
                     AppAction::DeliverMessage(batch) => {
-                      ingress_buffer.push_back(batch);
+                      ingress_buffer.push(batch);
                     }
                     AppAction::PeerError(e) => {
                       self.set_fatal_error(e).await;
@@ -799,7 +840,7 @@ where
           return;
         }
 
-        self.incoming_pipe_sender = incoming_pipe_sender;
+        self.incoming_pipe_sender = incoming_pipe_sender.map(Arc::new);
         self
           .core_pipe_manager
           .attach(rx_from_core, core_pipe_read_id_for_incoming_routing);

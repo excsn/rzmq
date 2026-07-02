@@ -4,7 +4,7 @@ use crate::runtime::Command;
 use crate::runtime::MailboxSender;
 use crate::socket::ISocket;
 use crate::socket::events::{DEFAULT_MONITOR_CAPACITY, MonitorReceiver};
-use fibre::mpmc::bounded_async;
+use fibre::mpsc::bounded_async;
 use fibre::oneshot;
 use std::fmt;
 use std::sync::Arc;

@@ -6,7 +6,7 @@ use fibre::mpsc;
 /// Default capacity for bounded mailboxes created by the `mailbox()` helper function.
 /// This capacity applies to the single mailbox used by `SocketCore` and other simpler actors.
 /// It can be tuned based on expected load and performance characteristics.
-pub const DEFAULT_MAILBOX_CAPACITY: usize = 512;
+pub const DEFAULT_MAILBOX_CAPACITY: usize = 128;
 
 /// The async sending end of an actor's mailbox.
 /// Used by Tokio tasks to send commands to `SocketCore`.
@@ -14,7 +14,7 @@ pub type MailboxSender = mpsc::BoundedAsyncSender<Command>;
 
 /// The sync sending end of an actor's mailbox.
 /// Used by OS threads (e.g. the io_uring worker) to send commands to `SocketCore` across the sync/async boundary.
-pub type MailboxSyncSender = mpsc::BoundedSender<Command>;
+pub type MailboxSyncSender = mpsc::BoundedSyncSender<Command>;
 
 /// The receiving end of an actor's mailbox.
 /// Only one task should typically own and receive from a `MailboxReceiver` to process commands sequentially.

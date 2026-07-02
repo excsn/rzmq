@@ -5,6 +5,8 @@ pub mod command;
 pub mod event_bus;
 pub mod latch;
 pub mod mailbox;
+pub(crate) mod reusable_box;
+pub(crate) use reusable_box::ReusableBoxFuture;
 pub mod system_events;
 pub mod waitgroup;
 

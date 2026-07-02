@@ -64,9 +64,9 @@ pub(crate) fn clean_endpoint_uri(uri: &str) -> &str {
 }
 
 // Type alias for the channel sender used for monitor events
-pub type MonitorSender = fibre::mpmc::AsyncSender<SocketEvent>;
+pub type MonitorSender = fibre::mpsc::BoundedAsyncSender<SocketEvent>;
 // Type alias for the channel receiver used for monitor events
-pub type MonitorReceiver = fibre::mpmc::AsyncReceiver<SocketEvent>;
+pub type MonitorReceiver = fibre::mpsc::BoundedAsyncReceiver<SocketEvent>;
 
 // Default capacity for monitor channel
 pub const DEFAULT_MONITOR_CAPACITY: usize = 100;

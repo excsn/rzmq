@@ -166,8 +166,7 @@ impl UringWorker {
           }));
           return;
         }
-        // ... setsockopt, bind, listen logic from original file ...
-        // This logic is complex and assumed to be correct. If it fails at any step,
+        // If it fails at any step,
         // it replies with an error and returns.
         // On final success, it queues the first Accept SQE.
       }

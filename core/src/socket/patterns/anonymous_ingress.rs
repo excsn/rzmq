@@ -5,16 +5,30 @@ use crate::message::{Msg, FrameBatch};
 use crate::ZmqError;
 use crate::socket::patterns::ready_pipe_queue::{PipeMessageSender, ReadyPipeQueue};
 
+/// Consumer-local buffers. `frames` holds flattened frames from already-popped
+/// batches (message boundaries preserved by the MORE flag); `scratch` is the
+/// reusable batch-drain buffer handed to `ReadyPipeQueue::pop_batch`.
+struct IngressCache {
+  frames: VecDeque<Msg>,
+  scratch: Vec<FrameBatch>,
+}
+
 pub(crate) struct AnonymousIngressEngine {
   queue: ReadyPipeQueue<FrameBatch>,
-  local_cache: Mutex<Option<VecDeque<Msg>>>,
+  /// Max messages drained per ready-token acquisition (rcvbatch_count).
+  batch_max: usize,
+  cache: Mutex<IngressCache>,
 }
 
 impl AnonymousIngressEngine {
-  pub fn new(activation_capacity: usize) -> Self {
+  pub fn new(activation_capacity: usize, batch_max: usize) -> Self {
     Self {
       queue: ReadyPipeQueue::new(activation_capacity),
-      local_cache: Mutex::new(None),
+      batch_max: batch_max.max(1),
+      cache: Mutex::new(IngressCache {
+        frames: VecDeque::new(),
+        scratch: Vec::new(),
+      }),
     }
   }
 
@@ -36,76 +50,90 @@ impl AnonymousIngressEngine {
 
   pub fn deregister_pipe(&self, pipe_id: usize) {
     self.queue.deregister_pipe(pipe_id);
-    *self.local_cache.lock() = None;
+    self.cache.lock().frames.clear();
   }
 
   pub fn close(&self) {
     self.queue.close();
-    *self.local_cache.lock() = None;
+    self.cache.lock().frames.clear();
+  }
+
+  /// Drains up to `batch_max` messages from the ready queue into `scratch`.
+  async fn pop_batch(
+    &self,
+    scratch: &mut Vec<FrameBatch>,
+    rcvtimeo_opt: Option<std::time::Duration>,
+  ) -> Result<(), ZmqError> {
+    match rcvtimeo_opt {
+      Some(d) if d.is_zero() => self
+        .queue
+        .try_pop_batch(scratch, self.batch_max)
+        .map(|_| ())
+        .ok_or(ZmqError::ResourceLimitReached),
+      Some(d) => tokio::time::timeout(d, self.queue.pop_batch(scratch, self.batch_max))
+        .await
+        .map_err(|_| ZmqError::Timeout)?
+        .map(|_| ()),
+      None => self.queue.pop_batch(scratch, self.batch_max).await.map(|_| ()),
+    }
   }
 
   pub async fn recv(&self, rcvtimeo_opt: Option<std::time::Duration>) -> Result<Msg, ZmqError> {
-    {
-      let mut cache = self.local_cache.lock();
-      if let Some(ref mut deque) = *cache {
-        if let Some(msg) = deque.pop_front() {
-          if deque.is_empty() { *cache = None; }
-          return Ok(msg);
-        }
-        *cache = None;
+    let mut scratch = {
+      let mut cache = self.cache.lock();
+      if let Some(msg) = cache.frames.pop_front() {
+        return Ok(msg);
       }
-    }
-
-    let (_, mut batch) = match rcvtimeo_opt {
-      Some(d) if d.is_zero() => self.queue.try_pop().ok_or(ZmqError::ResourceLimitReached)?,
-      Some(d) => tokio::time::timeout(d, self.queue.pop())
-        .await
-        .map_err(|_| ZmqError::Timeout)??,
-      None => self.queue.pop().await?,
+      std::mem::take(&mut cache.scratch)
     };
 
-    if batch.is_empty() {
-      return Ok(Msg::new());
-    }
-    if batch.len() == 1 {
-      return Ok(batch.remove(0));
-    }
-    let mut deque: VecDeque<Msg> = batch.into_iter().collect();
-    let first = deque.pop_front().unwrap();
-    *self.local_cache.lock() = Some(deque);
-    Ok(first)
+    let pop_res = self.pop_batch(&mut scratch, rcvtimeo_opt).await;
+
+    let mut cache = self.cache.lock();
+    cache.frames.extend(scratch.drain(..).flatten());
+    cache.scratch = scratch;
+    pop_res?;
+
+    // A popped batch with zero frames degrades to an empty Msg (legacy edge).
+    Ok(cache.frames.pop_front().unwrap_or_else(Msg::new))
   }
 
   pub async fn recv_multipart(&self, rcvtimeo_opt: Option<std::time::Duration>) -> Result<FrameBatch, ZmqError> {
-    {
-      let mut cache = self.local_cache.lock();
-      if let Some(ref mut deque) = *cache {
-        let mut batch = FrameBatch::new();
-        let mut completed = false;
-        while let Some(msg) = deque.pop_front() {
-          let is_more = msg.is_more();
-          batch.push(msg);
-          if !is_more {
-            completed = true;
-            break;
-          }
-        }
-        if deque.is_empty() { *cache = None; }
-        if completed {
+    let mut scratch = {
+      let mut cache = self.cache.lock();
+      if !cache.frames.is_empty() {
+        if let Some(batch) = Self::assemble_message(&mut cache.frames) {
           return Ok(batch);
         }
+        // Partial message without a boundary (mixed recv/recv_multipart use):
+        // discarded, matching the previous cache behavior.
       }
-    }
-
-    let (_, batch) = match rcvtimeo_opt {
-      Some(d) if d.is_zero() => self.queue.try_pop().ok_or(ZmqError::ResourceLimitReached)?,
-      Some(d) => tokio::time::timeout(d, self.queue.pop())
-        .await
-        .map_err(|_| ZmqError::Timeout)??,
-      None => self.queue.pop().await?,
+      std::mem::take(&mut cache.scratch)
     };
 
-    Ok(batch)
+    let pop_res = self.pop_batch(&mut scratch, rcvtimeo_opt).await;
+
+    let mut cache = self.cache.lock();
+    cache.frames.extend(scratch.drain(..).flatten());
+    cache.scratch = scratch;
+    pop_res?;
+
+    Ok(Self::assemble_message(&mut cache.frames).unwrap_or_else(FrameBatch::new))
+  }
+
+  /// Pops one logical message (frames up to and including the first frame
+  /// without MORE) off the front of `frames`. Returns `None` — leaving
+  /// `frames` drained — if no complete boundary is present.
+  fn assemble_message(frames: &mut VecDeque<Msg>) -> Option<FrameBatch> {
+    let mut batch = FrameBatch::new();
+    while let Some(msg) = frames.pop_front() {
+      let is_more = msg.is_more();
+      batch.push(msg);
+      if !is_more {
+        return Some(batch);
+      }
+    }
+    None
   }
 }
 

@@ -648,9 +648,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "fibre"
-version = "0.5.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff70c35f2e75bec591091f6e7a57a04095eb599539f29541c4a16945703a2551"
+version = "0.6.0"
 dependencies = [
  "futures-core",
  "futures-intrusive",

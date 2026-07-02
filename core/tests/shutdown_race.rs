@@ -30,7 +30,6 @@ async fn wait_for_event(
   monitor_rx: &MonitorReceiver,
   check_event: impl Fn(&SocketEvent) -> bool,
 ) -> Result<SocketEvent, String> {
-  // ... (implementation from previous step) ...
   let start_time = std::time::Instant::now();
   loop {
     if start_time.elapsed() > EVENT_RECV_TIMEOUT {
