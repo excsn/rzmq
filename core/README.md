@@ -9,23 +9,29 @@
 
 It provides a familiar ZeroMQ-style API within the Rust async ecosystem, **strives for wire-level interoperability with `libzmq` and other ZeroMQ implementations for core patterns and ZMTP 3.1 using NULL, PLAIN and CURVE security and transparently negotiates down to ZMTP 2.0 for legacy peers (older `libzmq` 3.0–3.2).**
 
+**`rzmq` delivers stunningly superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a very compelling choice for performance-critical distributed applications on Linux.
+
 ## Performance Highlights
 
-TCP Loopback (`tcp://127.0.0.1`), PUSH/PULL Sockets, 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
+Throughput - TCP Loopback (`tcp://127.0.0.1`), PUSH/PULL Sockets, 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
 
-- **3.5 M msg/s** - 64 B · 4 workers
-- **16.2 GB/s** - 32 KB · 4 workers
+Standard · 4 workers
 
-- **5.3 M msg/s** - 64 B · io\_uring + cork · 4 workers
-- **7.8 GB/s** - 32 KB · io\_uring + cork + multishot + zerocopy · 4 workers
+- **3.5 M msg/s** - 64 B
+- **~17 GB/s** - 32 KB · cork
 
-**`rzmq` delivers stunningly superior throughput and lower latency compared to other ZeroMQ implementations, including the C-based `libzmq`, in high-throughput benchmark scenarios.** This makes `rzmq` a compelling choice for performance-critical distributed applications on Linux.
+io_uring + cork · 4 workers
+
+- **6.5 M msg/s** - 64 B
+- **7.9 GB/s** - 32 KB · multishot + zerocopy (600 second sustained)
+
+**WARNING**: Always do your own testing for production use. Benchmarks tell a narrative against one environment and library configuration at a snapshot of time. Never trust any benchmarks especially library comparison benchmarks done over a short duration. Benchmarks are *always* out of date and these numbers are provided as tongue in cheek numbers: No universal guarantees ;).
 
 ## Project Status: Beta ⚠️
 
 **Please Note:** `rzmq` is currently in **Beta**. While core functionality and significant performance advantages (on Linux with `io_uring`) are in place, users should be aware of the following:
 
-*   **API Stability:** The public API is stabilizing but may still see minor refinements before a 1.0 release.
+*   **API Stability:** The public API is stabilizing but may still see minor refinements before a stable release.
 *   **Feature Scope:** While major ZeroMQ patterns and options are supported, **full feature parity with all of `libzmq`'s extensive options and advanced behaviors (such as ZAP) is a non-goal.** The focus is on core ZMTP 3.1 compliance, popular patterns and supported security mechanisms (NULL, PLAIN, CURVE and its own Noise_XX offering).
 *   **Interoperability:** `rzmq` aims for wire-level interoperability with `libzmq` and other standard ZMTP 3.1 implementations for supported socket patterns using the **NULL, PLAIN and CURVE** security mechanisms. The **Noise_XX** mechanism is specific to `rzmq` and will not interoperate with other `libzmq` security layers.
 *   **Testing Environment:**
@@ -36,7 +42,7 @@ TCP Loopback (`tcp://127.0.0.1`), PUSH/PULL Sockets, 10-second window, Linux rel
 *   **Robustness & Edge Cases:** The library has been tested for common use cases on the aforementioned platforms, but some edge cases or extreme conditions might not be as hardened as the mature `libzmq`.
 *   **Security Mechanisms:** NULL, PLAIN and CURVE security mechanisms are functional and designed for interoperability with `libzmq`. **Noise_XX is also provided as a modern, robust alternative for `rzmq`-to-`rzmq` communication.** The ZAP (ZeroMQ Authentication Protocol) is not supported.
 
-We encourage testing, feedback and contributions to help mature the library towards a stable 1.0 release.
+We encourage testing, feedback and contributions to help mature the library towards a stable release.
 
 ## Notable Users
 
@@ -74,13 +80,10 @@ For applications requiring the broadest `libzmq` feature set (e.g., ZAP), or sup
 
 ## Key Features
 ### Leading Performance on Linux (with `io_uring`)
-*   **`io_uring` Backend**: On supported Linux systems, `rzmq`'s `io_uring` backend has demonstrated superior throughput and lower latency compared to other ZeroMQ implementations, including `libzmq`, in high-throughput benchmark scenarios. This is achieved by optimized syscall patterns, reduced data copying (especially with zerocopy send enabled) and efficient kernel-level I/O batching.
+*   **`io_uring` Backend**: On supported Linux systems, `rzmq`'s `io_uring` backend has demonstrated superior throughput and lower latency compared to other ZeroMQ implementations in high-throughput benchmark scenarios. This is achieved by optimized syscall patterns, reduced data copying (especially with zerocopy send enabled) and efficient kernel-level I/O batching.
     *   Activated per-socket session using the `IO_URING_SESSION_ENABLED` socket option.
     *   Global `io_uring` parameters (ring size, default buffer pool parameters) are configured via `UringConfig` when calling `rzmq::uring::initialize_uring_backend()`.
 *   **TCP Corking (Linux-only)**: Enabled via the `TCP_CORK` socket option, contributing to performance gains by batching smaller ZMTP frames for a single network write.
-
-### Asynchronous & Pure Rust
-Built entirely on Tokio for non-blocking I/O, with no dependency on the C `libzmq` library.
 
 ### Adaptive I/O Throttling
 
@@ -100,7 +103,7 @@ Provides a `Context` for managing sockets and a `Socket` handle with async metho
 *   **`ipc`**: Inter-Process Communication via Unix Domain Sockets (requires `ipc` feature, Unix-like systems only).
 *   **`inproc`**: In-process communication between threads within the same application (requires `inproc` feature).
 
-### Advanced `io_uring` Optimizations (Experimental, Linux-only)
+### Advanced `io_uring` Optimizations
 *   **Zerocopy Send**: (Requires `io-uring` feature)
     *   Individual socket sessions can request zero-copy sends by enabling the `IO_URING_SNDZEROCOPY` socket option.
     *   The `UringWorker` will only attempt to perform actual zero-copy operations if `UringConfig.default_send_zerocopy` was set to `true` *and* a send buffer pool was successfully configured (via `UringConfig.default_send_buffer_count` and `UringConfig.default_send_buffer_size`) during backend initialization. Otherwise, it falls back to standard sends.
@@ -151,11 +154,10 @@ Add `rzmq` to your `Cargo.toml` dependencies. You will also need `tokio`.
 
 ```toml
 [dependencies]
-# Replace "..." with the desired version or Git source
-rzmq = { git = "https://github.com/zeromq/rzmq.git", branch = "main" }
+rzmq = { version = "0" }
 
 # Enable desired features:
-# rzmq = { git = "...", features = ["ipc", "inproc", "noise_xx", "io-uring"] }
+# rzmq = { version = "0", features = ["ipc", "inproc", "noise_xx", "io-uring"] }
 
 tokio = { version = "1", features = ["full"] } # "full" feature recommended for general use
 ```

@@ -3,23 +3,37 @@
 [![crates.io](https://img.shields.io/crates/v/rzmq.svg)](https://crates.io/crates/rzmq)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 
-**rzmq** is a high-performance, asynchronous pure Rust implementation of ZeroMQ (ØMQ) built on [Tokio](https://tokio.rs/). It implements the ZMTP 3.1 wire protocol with familiar ZeroMQ socket patterns and an opt-in `io_uring` worker for ultra low latency, high throughput on Linux.
+**rzmq** is a high-performance, asynchronous pure Rust implementation of ZeroMQ (ØMQ) built on [Tokio](https://tokio.rs/).
+
+Implements the ZMTP 2/3.1 wire protocol with familiar ZeroMQ socket patterns.
+
+Supports an optional per-socket **dedicated** `io_uring` worker on Linux, allowing individual sockets to trade CPU for lower latency and higher throughput.
+
+Delivers stunningly superior throughput and lower latency compared to every other ZeroMQ implementation as shown in high-throughput [benchmarks](#benchmarks) included.
+
+***Fast, boring and correct.***
 
 ## Performance Highlights
 
 TCP Loopback (`tcp://127.0.0.1`), PUSH/PULL Sockets, 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
 
-- **3.5 M msg/s** - 64 B · 4 workers
-- **16.2 GB/s** - 32 KB · 4 workers
+Standard · 4 workers
 
-- **5.3 M msg/s** - 64 B · io\_uring + cork · 4 workers
-- **7.8 GB/s** - 32 KB · io\_uring + cork + multishot + zerocopy · 4 workers
+- **3.5 M msg/s** - 64 B
+- **~17 GB/s** - 32 KB · cork
 
-`rzmq` delivers stunningly superior throughput and lower latency compared to every other ZeroMQ implementation, including the C-based `libzmq`, in high-throughput [benchmarks](#benchmarks) included.
+io_uring + cork · 4 workers
+
+- **6.5 M msg/s** - 64 B
+- **7.9 GB/s** - 32 KB · multishot + zerocopy (600 second sustained)
+
+**WARNING**: Always do your own testing for production use. Benchmarks tell a narrative against one environment and library configuration at a snapshot of time. Never trust any benchmarks especially library comparison benchmarks done over a short duration. Benchmarks are *always* out of date and these numbers are provided as tongue in cheek numbers: No universal guarantees ;).
 
 ## Project Status: Beta ⚠️
 
-`rzmq` is currently in Beta. See [`core/README.md`](core/README.md#project-status-beta-️) for full details.
+`rzmq` is currently in Beta, used in **long term Production** software.
+
+See [`core/README.md`](core/README.md#project-status-beta-️) for full details.
 
 ## Notable Users
 
