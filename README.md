@@ -7,7 +7,7 @@
 
 Implements the ZMTP 2/3.1 wire protocol with familiar ZeroMQ socket patterns.
 
-Supports an optional per-socket **dedicated** `io_uring` worker on Linux, allowing individual sockets to trade CPU for lower latency and higher throughput.
+Provides a **dedicated** `io_uring` worker on Linux, allowing individual sockets to **opt-in** to trade CPU for lower latency and higher throughput.
 
 Delivers stunningly superior throughput and lower latency compared to every other ZeroMQ implementation as shown in high-throughput [benchmarks](#benchmarks) included.
 
@@ -15,19 +15,15 @@ Delivers stunningly superior throughput and lower latency compared to every othe
 
 ## Performance Highlights
 
-TCP Loopback (`tcp://127.0.0.1`), PUSH/PULL Sockets, 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
+TCP Loopback PUSH/PULL Sockets Fan-In, 10-second window, Adaptive Throttling disabled.
 
-Standard · 4 workers
+<sub>Linux release build, AMD Ryzen 5 7640U Balanced Power Profile.</sub>
 
-- **3.5 M msg/s** - 64 B
-- **~17 GB/s** - 32 KB · cork
+Standard, 4 workers | **3.5 M msg/s** - 64 B | **~17 GB/s** - 32 KB · cork
 
-io_uring + cork · 4 workers
+io_uring + cork, 4 workers | **6.5 M msg/s** - 64 B |  **7.9 GB/s** - 32 KB · multishot + zerocopy (600 second sustained)
 
-- **6.5 M msg/s** - 64 B
-- **7.9 GB/s** - 32 KB · multishot + zerocopy (600 second sustained)
-
-**WARNING**: Always do your own testing for production use. Benchmarks tell a narrative against one environment and library configuration at a snapshot of time. Never trust any benchmarks especially library comparison benchmarks done over a short duration. Benchmarks are *always* out of date and these numbers are provided as tongue in cheek numbers: No universal guarantees ;).
+**WARNING**: Always do your own testing for production use. Benchmarks tell a narrative against one environment and library configuration at a snapshot of time. Never trust any benchmarks especially library comparison benchmarks done over a short duration. Benchmarks are *always* out of date, unreliable and these numbers are provided as tongue in cheek numbers: No universal guarantees ;).
 
 ## Project Status: Beta ⚠️
 

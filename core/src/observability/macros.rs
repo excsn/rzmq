@@ -322,25 +322,23 @@ macro_rules! log_carryover_drain {
 /// nothing when diagnostics are disabled.
 #[macro_export]
 macro_rules! log_delivery_gap {
-  ($handle:expr, $uri:expr, $error:expr, $egress_buf:expr, $core_carryover:expr, $pending_vectored:expr, $ingress_buf:expr, $outgoing_batch:expr) => {
+  ($handle:expr, $uri:expr, $error:expr, $egress_buf:expr, $core_carryover:expr, $ingress_buf:expr, $outgoing_batch:expr) => {
     #[cfg(feature = "diagnostics")]
     {
       let egress_msgs = $egress_buf.pending_messages();
       let carryover_msgs = $core_carryover.len();
-      let vectored_msgs = $pending_vectored.len();
       let ingress_msgs = $ingress_buf.len();
       let batch_msgs = $outgoing_batch.len();
-      let dropped = egress_msgs + carryover_msgs + vectored_msgs + ingress_msgs + batch_msgs;
+      let dropped = egress_msgs + carryover_msgs + ingress_msgs + batch_msgs;
       if dropped > 0 {
         println!(
           "[DELIVERY-GAP pid={} sca={}] terminating with {} undelivered msg(s) \
-           (egress={} carryover={} vectored={} ingress={} batch={}) uri={} error={:?}",
+           (egress={} carryover={} ingress={} batch={}) uri={} error={:?}",
           ::std::process::id(),
           $handle,
           dropped,
           egress_msgs,
           carryover_msgs,
-          vectored_msgs,
           ingress_msgs,
           batch_msgs,
           $uri,

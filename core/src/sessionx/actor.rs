@@ -311,11 +311,8 @@ where
         .take()
         .expect("write_half must be present at operational start");
 
-      let use_owned_write = write_half.supports_owned_write();
       let sndhwm = self.zmtp_engine.config().sndhwm.max(1);
       let sndbatch_count = self.zmtp_engine.config().sndbatch_count;
-      let mut pending_vectored: std::collections::VecDeque<Vec<bytes::Bytes>> =
-        std::collections::VecDeque::new();
 
       let mut core_carryover: std::collections::VecDeque<FrameBatch> =
         std::collections::VecDeque::new();
@@ -358,25 +355,14 @@ where
 
         if !core_carryover.is_empty()
           && self.current_phase == ConnectionPhaseX::Operational
-          && if use_owned_write {
-            pending_vectored.is_empty()
-          } else {
-            egress_buffer.pending_messages() < sndhwm
-          }
+          && egress_buffer.pending_messages() < sndhwm
         {
           log_carryover_drain!(self.handle, core_carryover.len());
           outgoing_batch.clear();
           let pending = egress_buffer.pending_messages();
           self.fill_outgoing_batch(&mut outgoing_batch, &mut core_carryover, pending, sndhwm);
           self
-            .stage_outgoing_batch(
-              &outgoing_batch,
-              &mut egress_buffer,
-              &mut pending_vectored,
-              use_owned_write,
-              sndhwm,
-              &adaptive_throttle,
-            )
+            .stage_outgoing_batch(&outgoing_batch, &mut egress_buffer, sndhwm, &adaptive_throttle)
             .await;
         }
 
@@ -503,22 +489,11 @@ where
             }
           }
 
-          // Unified write arm.
-          write_res = async {
-            if !egress_buffer.is_empty() {
-              let r = EgressDriver::new(&mut write_half, &mut egress_buffer, sndbatch_count, self.handle).await;
-              r?;
-              Ok::<bool, ZmqError>(true)
-            } else {
-              let bufs = pending_vectored.front().cloned().unwrap_or_default();
-              write_half.write_owned(bufs).await
-                .map_err(|e| ZmqError::from_io_endpoint(e, "egress write"))?;
-              Ok(false)
-            }
-          }, if !egress_buffer.is_empty()
-            || (use_owned_write && pending_vectored.front().is_some()) => {
+          // Write arm: cancel-safe drain of the egress buffer.
+          write_res = EgressDriver::new(&mut write_half, &mut egress_buffer, sndbatch_count, self.handle),
+            if !egress_buffer.is_empty() => {
             match write_res {
-              Ok(true) => {
+              Ok(()) => {
                 self.zmtp_engine.record_activity();
                 if self.is_currently_congested
                   && egress_buffer.pending_messages() < sndhwm
@@ -534,10 +509,6 @@ where
                   }
                 }
               }
-              Ok(false) => {
-                pending_vectored.pop_front();
-                self.zmtp_engine.record_activity();
-              }
               Err(e) => {
                 self.set_fatal_error(e).await;
               }
@@ -549,11 +520,7 @@ where
             if self.current_phase == ConnectionPhaseX::Operational
               && self.core_pipe_manager.is_attached()
               && core_carryover.is_empty()
-              && if use_owned_write {
-                pending_vectored.is_empty()
-              } else {
-                egress_buffer.pending_messages() < sndhwm
-              } => {
+              && egress_buffer.pending_messages() < sndhwm => {
             log_gating_failure!(egress_buffer.pending_messages(), sndhwm);
             match maybe_msgs_from_core {
               Ok(first_msgs) => {
@@ -562,14 +529,7 @@ where
                 let pending = egress_buffer.pending_messages();
                 self.fill_outgoing_batch(&mut outgoing_batch, &mut core_carryover, pending, sndhwm);
                 self
-                  .stage_outgoing_batch(
-                    &outgoing_batch,
-                    &mut egress_buffer,
-                    &mut pending_vectored,
-                    use_owned_write,
-                    sndhwm,
-                    &adaptive_throttle,
-                  )
+                  .stage_outgoing_batch(&outgoing_batch, &mut egress_buffer, sndhwm, &adaptive_throttle)
                   .await;
               }
               Err(_) => {
@@ -594,7 +554,6 @@ where
           self.error_for_drop_guard,
           egress_buffer,
           core_carryover,
-          pending_vectored,
           ingress_buffer,
           outgoing_batch
         );
@@ -960,16 +919,12 @@ where
     }
   }
 
-  /// Frames `outgoing_batch` and stages it for the write arm — into
-  /// `pending_vectored` on the owned-write path or `egress_buffer` (with
-  /// congestion-event bookkeeping) on the buffered path — then applies the
-  /// egress throttle.
+  /// Frames `outgoing_batch` into `egress_buffer` for the write arm (with
+  /// congestion-event bookkeeping), then applies the egress throttle.
   async fn stage_outgoing_batch(
     &mut self,
     outgoing_batch: &[FrameBatch],
     egress_buffer: &mut EgressBuffer,
-    pending_vectored: &mut std::collections::VecDeque<Vec<bytes::Bytes>>,
-    use_owned_write: bool,
     sndhwm: usize,
     adaptive_throttle: &AdaptiveThrottle,
   ) {
@@ -982,25 +937,18 @@ where
       outgoing_batch.len() as u32,
     );
 
-    if use_owned_write {
-      match self.zmtp_engine.frame_batch_vectored(outgoing_batch) {
-        Ok(bufs) => pending_vectored.push_back(bufs),
-        Err(e) => self.set_fatal_error(e).await,
-      }
-    } else {
-      match self.zmtp_engine.frame_batch(outgoing_batch) {
-        Ok(bytes) => {
-          egress_buffer.push(bytes, outgoing_batch.len());
-          if !self.is_currently_congested && egress_buffer.pending_messages() >= sndhwm {
-            self.is_currently_congested = true;
-            if let Some(ref tx) = self.actor_config.monitor_tx {
-              let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri).to_owned();
-              let _ = tx.try_send(SocketEvent::ConnectionCongested { endpoint: ep });
-            }
+    match self.zmtp_engine.frame_batch(outgoing_batch) {
+      Ok(bytes) => {
+        egress_buffer.push(bytes, outgoing_batch.len());
+        if !self.is_currently_congested && egress_buffer.pending_messages() >= sndhwm {
+          self.is_currently_congested = true;
+          if let Some(ref tx) = self.actor_config.monitor_tx {
+            let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri).to_owned();
+            let _ = tx.try_send(SocketEvent::ConnectionCongested { endpoint: ep });
           }
         }
-        Err(e) => self.set_fatal_error(e).await,
       }
+      Err(e) => self.set_fatal_error(e).await,
     }
 
     if throttle_guard.should_throttle() {
