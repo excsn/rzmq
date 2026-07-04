@@ -366,103 +366,18 @@ where
         {
           log_carryover_drain!(self.handle, core_carryover.len());
           outgoing_batch.clear();
-          let wire_size = |msgs: &FrameBatch| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
-          let hwm_budget = sndhwm
-            .saturating_sub(egress_buffer.pending_messages())
-            .max(1);
-          let max_count = self.zmtp_engine.config().sndbatch_count.min(hwm_budget);
-          let max_bytes = self.zmtp_engine.config().sndbatch_bytes;
-
-          // Use our pre-calculated on-demand physical limit for overfill checks
-          let max_bytes = self.zmtp_engine.config().sndbatch_bytes_physical;
-          let logical_max_bytes = self.zmtp_engine.config().sndbatch_bytes;
-          let mut total_bytes = 0usize;
-
-          // First, drain as much as possible from core_carryover
-          while !core_carryover.is_empty() && outgoing_batch.len() < max_count {
-            let next_msg = core_carryover.pop_front().unwrap();
-            let size = wire_size(&next_msg);
-            if total_bytes + size > max_bytes && !outgoing_batch.is_empty() {
-              core_carryover.push_front(next_msg);
-              break;
-            }
-            total_bytes += size;
-            outgoing_batch.push(next_msg);
-          }
-
-          // Then, if there is still room, top up from the core_pipe_manager
-          let start_len = outgoing_batch.len();
-          if start_len < max_count && total_bytes < logical_max_bytes {
-            // Dynamically calculate actual remaining slots based on the average size of current messages
-            let avg_size = if start_len > 0 {
-              total_bytes / start_len
-            } else {
-              32768
-            };
-            let remaining_bytes = max_bytes.saturating_sub(total_bytes);
-            let needed_by_bytes = if avg_size > 0 {
-              remaining_bytes / avg_size
-            } else {
-              0
-            };
-
-            let needed = (max_count - start_len).min(needed_by_bytes);
-
-            if needed > 0 {
-              let drained = self
-                .core_pipe_manager
-                .try_recv_batch_from_core(&mut outgoing_batch, needed);
-
-              if drained > 0 {
-                let mut i = start_len;
-                while i < outgoing_batch.len() {
-                  let size = wire_size(&outgoing_batch[i]);
-                  if total_bytes + size > max_bytes && i > 0 {
-                    // We exceeded the byte limit!
-                    // Move the overflow into carryover for the next cycle and stop.
-                    core_carryover.extend(outgoing_batch.drain(i..));
-                    break;
-                  }
-                  total_bytes += size;
-                  i += 1;
-                }
-              }
-            }
-          }
-
-          if !outgoing_batch.is_empty() {
-            counter!(global, global_drained_msgs, add, outgoing_batch.len() as u64);
-          }
-
-          let throttle_guard = adaptive_throttle.begin_work_bulk(
-            crate::throttle::Direction::Egress,
-            outgoing_batch.len() as u32,
-          );
-
-          if use_owned_write {
-            match self.zmtp_engine.frame_batch_vectored(&outgoing_batch) {
-              Ok(bufs) => pending_vectored.push_back(bufs),
-              Err(e) => self.set_fatal_error(e).await,
-            }
-          } else {
-            match self.zmtp_engine.frame_batch(&outgoing_batch) {
-              Ok(bytes) => {
-                egress_buffer.push(bytes, outgoing_batch.len());
-                if !self.is_currently_congested && egress_buffer.pending_messages() >= sndhwm {
-                  self.is_currently_congested = true;
-                  if let Some(ref tx) = self.actor_config.monitor_tx {
-                    let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri).to_owned();
-                    let _ = tx.try_send(SocketEvent::ConnectionCongested { endpoint: ep });
-                  }
-                }
-              }
-              Err(e) => self.set_fatal_error(e).await,
-            }
-          }
-
-          if throttle_guard.should_throttle() {
-            yield_now().await;
-          }
+          let pending = egress_buffer.pending_messages();
+          self.fill_outgoing_batch(&mut outgoing_batch, &mut core_carryover, pending, sndhwm);
+          self
+            .stage_outgoing_batch(
+              &outgoing_batch,
+              &mut egress_buffer,
+              &mut pending_vectored,
+              use_owned_write,
+              sndhwm,
+              &adaptive_throttle,
+            )
+            .await;
         }
 
         let mut pong_timeout_future = futures::future::pending().left_future();
@@ -643,101 +558,19 @@ where
             match maybe_msgs_from_core {
               Ok(first_msgs) => {
                 outgoing_batch.clear();
-                let wire_size = |msgs: &FrameBatch| {
-                  msgs.iter().map(|m| m.size() + 9).sum::<usize>()
-                };
-                let mut total_bytes = wire_size(&first_msgs);
                 outgoing_batch.push(first_msgs);
-
-                let hwm_budget =
-                  sndhwm.saturating_sub(egress_buffer.pending_messages());
-                let max_count = self
-                  .zmtp_engine
-                  .config()
-                  .sndbatch_count
-                  .min(hwm_budget.max(1));
-                // Use our pre-calculated on-demand physical limit for overfill checks
-                let max_bytes = self.zmtp_engine.config().sndbatch_bytes_physical;
-                let logical_max_bytes = self.zmtp_engine.config().sndbatch_bytes;
-
-                let start_len = outgoing_batch.len();
-
-                let start_len = outgoing_batch.len();
-                if start_len < max_count && total_bytes < logical_max_bytes {
-                  let avg_size = total_bytes / start_len;
-                  let remaining_bytes = max_bytes.saturating_sub(total_bytes);
-                  let needed_by_bytes = if avg_size > 0 { remaining_bytes / avg_size } else { 0 };
-
-                  let needed = (max_count - start_len).min(needed_by_bytes);
-
-                  if needed > 0 {
-                    let drained = self.core_pipe_manager.try_recv_batch_from_core(
-                      &mut outgoing_batch,
-                      needed,
-                    );
-
-                    if drained > 0 {
-                      let mut i = start_len;
-                      while i < outgoing_batch.len() {
-                        let size = wire_size(&outgoing_batch[i]);
-                        if total_bytes + size > max_bytes && i > 0 {
-                          // We exceeded the byte limit!
-                          // Move the overflow into carryover for the next cycle and stop.
-                          core_carryover.extend(outgoing_batch.drain(i..));
-                          break;
-                        }
-                        total_bytes += size;
-                        i += 1;
-                      }
-                    }
-                  }
-                }
-
-                if !outgoing_batch.is_empty() {
-                  counter!(global, global_drained_msgs, add, outgoing_batch.len() as u64);
-                }
-
-                let throttle_guard = adaptive_throttle.begin_work_bulk(
-                  crate::throttle::Direction::Egress,
-                  outgoing_batch.len() as u32,
-                );
-
-                if use_owned_write {
-                  match self.zmtp_engine.frame_batch_vectored(&outgoing_batch) {
-                    Ok(bufs) => pending_vectored.push_back(bufs),
-                    Err(e) => self.set_fatal_error(e).await,
-                  }
-                } else {
-                  match self.zmtp_engine.frame_batch(&outgoing_batch) {
-                    Ok(bytes) => {
-                      egress_buffer.push(bytes, outgoing_batch.len());
-                      if !self.is_currently_congested
-                        && egress_buffer.pending_messages() >= sndhwm
-                      {
-                        self.is_currently_congested = true;
-                        if let Some(ref tx) =
-                          self.actor_config.monitor_tx
-                        {
-                          let ep = clean_endpoint_uri(
-                            &self
-                              .actor_config
-                              .logical_target_endpoint_uri,
-                          ).to_owned();
-                          let _ = tx.try_send(
-                            SocketEvent::ConnectionCongested {
-                              endpoint: ep,
-                            },
-                          );
-                        }
-                      }
-                    }
-                    Err(e) => self.set_fatal_error(e).await,
-                  }
-                }
-
-                if throttle_guard.should_throttle() {
-                  yield_now().await;
-                }
+                let pending = egress_buffer.pending_messages();
+                self.fill_outgoing_batch(&mut outgoing_batch, &mut core_carryover, pending, sndhwm);
+                self
+                  .stage_outgoing_batch(
+                    &outgoing_batch,
+                    &mut egress_buffer,
+                    &mut pending_vectored,
+                    use_owned_write,
+                    sndhwm,
+                    &adaptive_throttle,
+                  )
+                  .await;
               }
               Err(_) => {
                 tracing::info!(sca_handle = self.handle, "Pipe from SocketCore closed.");
@@ -1043,6 +876,135 @@ where
           endpoint: self.actor_config.connected_endpoint_uri.clone(),
         });
       }
+    }
+  }
+
+  /// Fills `outgoing_batch` for one egress round, keeping the HWM/budget math
+  /// in a single place: drains the `core_carryover` backlog first (a no-op when
+  /// empty — the fresh-recv arm is gated on that), then tops up from the core
+  /// pipe, all within the per-round `sndbatch_count`/`sndbatch_bytes` budgets
+  /// and the remaining HWM budget (`sndhwm - pending_messages`, floored at 1 so
+  /// a full buffer still moves one message). Messages that overflow the byte
+  /// budget are pushed back to `core_carryover` for the next round.
+  ///
+  /// `outgoing_batch` may arrive pre-seeded (the fresh-recv arm pushes the
+  /// just-awaited message before calling); seeded bytes count against the
+  /// budgets.
+  fn fill_outgoing_batch(
+    &mut self,
+    outgoing_batch: &mut Vec<FrameBatch>,
+    core_carryover: &mut std::collections::VecDeque<FrameBatch>,
+    pending_messages: usize,
+    sndhwm: usize,
+  ) {
+    let wire_size = |msgs: &FrameBatch| msgs.iter().map(|m| m.size() + 9).sum::<usize>();
+    let hwm_budget = sndhwm.saturating_sub(pending_messages).max(1);
+    let max_count = self.zmtp_engine.config().sndbatch_count.min(hwm_budget);
+    // Pre-calculated on-demand physical limit for overfill checks.
+    let max_bytes = self.zmtp_engine.config().sndbatch_bytes_physical;
+    let logical_max_bytes = self.zmtp_engine.config().sndbatch_bytes;
+
+    let mut total_bytes: usize = outgoing_batch.iter().map(wire_size).sum();
+
+    // Phase 1: drain as much as possible from the carryover backlog.
+    while !core_carryover.is_empty() && outgoing_batch.len() < max_count {
+      let next_msg = core_carryover.pop_front().unwrap();
+      let size = wire_size(&next_msg);
+      if total_bytes + size > max_bytes && !outgoing_batch.is_empty() {
+        core_carryover.push_front(next_msg);
+        break;
+      }
+      total_bytes += size;
+      outgoing_batch.push(next_msg);
+    }
+
+    // Phase 2: if there is still room, top up from the core pipe.
+    let start_len = outgoing_batch.len();
+    if start_len < max_count && total_bytes < logical_max_bytes {
+      // Dynamically calculate actual remaining slots based on the average size
+      // of the messages batched so far.
+      let avg_size = if start_len > 0 {
+        total_bytes / start_len
+      } else {
+        32768
+      };
+      let remaining_bytes = max_bytes.saturating_sub(total_bytes);
+      let needed_by_bytes = if avg_size > 0 {
+        remaining_bytes / avg_size
+      } else {
+        0
+      };
+
+      let needed = (max_count - start_len).min(needed_by_bytes);
+
+      if needed > 0 {
+        let drained = self
+          .core_pipe_manager
+          .try_recv_batch_from_core(outgoing_batch, needed);
+
+        if drained > 0 {
+          let mut i = start_len;
+          while i < outgoing_batch.len() {
+            let size = wire_size(&outgoing_batch[i]);
+            if total_bytes + size > max_bytes && i > 0 {
+              // We exceeded the byte limit!
+              // Move the overflow into carryover for the next cycle and stop.
+              core_carryover.extend(outgoing_batch.drain(i..));
+              break;
+            }
+            total_bytes += size;
+            i += 1;
+          }
+        }
+      }
+    }
+  }
+
+  /// Frames `outgoing_batch` and stages it for the write arm — into
+  /// `pending_vectored` on the owned-write path or `egress_buffer` (with
+  /// congestion-event bookkeeping) on the buffered path — then applies the
+  /// egress throttle.
+  async fn stage_outgoing_batch(
+    &mut self,
+    outgoing_batch: &[FrameBatch],
+    egress_buffer: &mut EgressBuffer,
+    pending_vectored: &mut std::collections::VecDeque<Vec<bytes::Bytes>>,
+    use_owned_write: bool,
+    sndhwm: usize,
+    adaptive_throttle: &AdaptiveThrottle,
+  ) {
+    if !outgoing_batch.is_empty() {
+      counter!(global, global_drained_msgs, add, outgoing_batch.len() as u64);
+    }
+
+    let throttle_guard = adaptive_throttle.begin_work_bulk(
+      crate::throttle::Direction::Egress,
+      outgoing_batch.len() as u32,
+    );
+
+    if use_owned_write {
+      match self.zmtp_engine.frame_batch_vectored(outgoing_batch) {
+        Ok(bufs) => pending_vectored.push_back(bufs),
+        Err(e) => self.set_fatal_error(e).await,
+      }
+    } else {
+      match self.zmtp_engine.frame_batch(outgoing_batch) {
+        Ok(bytes) => {
+          egress_buffer.push(bytes, outgoing_batch.len());
+          if !self.is_currently_congested && egress_buffer.pending_messages() >= sndhwm {
+            self.is_currently_congested = true;
+            if let Some(ref tx) = self.actor_config.monitor_tx {
+              let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri).to_owned();
+              let _ = tx.try_send(SocketEvent::ConnectionCongested { endpoint: ep });
+            }
+          }
+        }
+        Err(e) => self.set_fatal_error(e).await,
+      }
+    }
+
+    if throttle_guard.should_throttle() {
+      yield_now().await;
     }
   }
 
