@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use parking_lot::Mutex as ParkingMutex;
 
@@ -10,6 +11,7 @@ use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
+use crate::socket::options::SocketOptions;
 use crate::socket::patterns::AnonymousIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 
@@ -18,18 +20,23 @@ pub(crate) struct PullSocket {
   core: Arc<SocketCore>,
   ingress_engine: AnonymousIngressEngine,
   pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
+  /// Lock-free snapshot of socket options so the hot `recv`/`recv_multipart` path
+  /// reads `rcvtimeo` without taking the `core_state` RwLock per message. Refreshed
+  /// on `set_option`. Mirrors `PushSocket::cached_options`.
+  cached_options: ArcSwap<SocketOptions>,
 }
 
 impl PullSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let (max_conn, rcvbatch_count) = {
+    let (max_conn, rcvbatch_count, options_snapshot) = {
       let opts = &core.core_state.read().options;
-      (opts.max_connections.unwrap_or(1024), opts.rcvbatch_count)
+      (opts.max_connections.unwrap_or(1024), opts.rcvbatch_count, opts.clone())
     };
     Self {
       core,
       ingress_engine: AnonymousIngressEngine::new(max_conn, rcvbatch_count),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
+      cached_options: ArcSwap::from(options_snapshot),
     }
   }
 }
@@ -68,7 +75,7 @@ impl ISocket for PullSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
+    let rcvtimeo_opt = self.cached_options.load().rcvtimeo;
     self.ingress_engine.recv(rcvtimeo_opt).await
   }
 
@@ -80,12 +87,16 @@ impl ISocket for PullSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
+    let rcvtimeo_opt = self.cached_options.load().rcvtimeo;
     self.ingress_engine.recv_multipart(rcvtimeo_opt).await
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
-    delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec())
+    let result = delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec());
+    if result.is_ok() {
+      self.cached_options.store(self.core.core_state.read().options.clone());
+    }
+    result
   }
 
   async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {

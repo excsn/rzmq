@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use parking_lot::{Mutex as ParkingMutex, RwLock, RwLockReadGuard};
 
@@ -13,7 +14,7 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
-use crate::socket::options::{SUBSCRIBE, UNSUBSCRIBE};
+use crate::socket::options::{SocketOptions, SUBSCRIBE, UNSUBSCRIBE};
 use crate::socket::patterns::PrefixMatcher;
 use crate::{Blob, delegate_to_core};
 
@@ -24,13 +25,17 @@ pub(crate) struct SubSocket {
   ingress_engine: AnonymousIngressEngine,
   pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
+  /// Lock-free snapshot of socket options so the hot `recv`/`recv_multipart` path
+  /// reads `rcvtimeo` without taking the `core_state` RwLock per message. Refreshed
+  /// on `set_option`. Mirrors `PushSocket::cached_options`.
+  cached_options: ArcSwap<SocketOptions>,
 }
 
 impl SubSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let (max_conn, rcvbatch_count) = {
+    let (max_conn, rcvbatch_count, options_snapshot) = {
       let opts = &core.core_state.read().options;
-      (opts.max_connections.unwrap_or(1024), opts.rcvbatch_count)
+      (opts.max_connections.unwrap_or(1024), opts.rcvbatch_count, opts.clone())
     };
     Self {
       core,
@@ -38,6 +43,7 @@ impl SubSocket {
       ingress_engine: AnonymousIngressEngine::new(max_conn, rcvbatch_count),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
+      cached_options: ArcSwap::from(options_snapshot),
     }
   }
 
@@ -155,7 +161,7 @@ impl ISocket for SubSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
+    let rcvtimeo_opt: Option<Duration> = self.cached_options.load().rcvtimeo;
     self.ingress_engine.recv(rcvtimeo_opt).await
   }
 
@@ -167,14 +173,20 @@ impl ISocket for SubSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-    let rcvtimeo_opt: Option<Duration> = self.core_state_read().options.rcvtimeo;
+    let rcvtimeo_opt: Option<Duration> = self.cached_options.load().rcvtimeo;
     self.ingress_engine.recv_multipart(rcvtimeo_opt).await
   }
 
   async fn set_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
     match option {
       SUBSCRIBE | UNSUBSCRIBE => self.set_pattern_option(option, value).await,
-      _ => delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec()),
+      _ => {
+        let result = delegate_to_core!(self, UserSetOpt, option: option, value: value.to_vec());
+        if result.is_ok() {
+          self.cached_options.store(self.core.core_state.read().options.clone());
+        }
+        result
+      }
     }
   }
 
