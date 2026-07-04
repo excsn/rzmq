@@ -65,7 +65,10 @@ impl ZmqMessageProcessor {
     let mut greedy_buf = [0u8; INGRESS_GREEDY_CHUNK];
     while total_read < max_greedy_read {
       match reader.try_read_chunk(&mut greedy_buf) {
-        Ok(0) => return Err(ZmqError::ConnectionClosed),
+        // EOF during greedy drain: do NOT discard bytes already read this cycle.
+        // Process them now; the next read_and_process call's initial read_buf
+        // will return 0 and surface ConnectionClosed after this batch is delivered.
+        Ok(0) => break,
         Ok(n) => {
           buf.extend_from_slice(&greedy_buf[..n]);
           total_read += n;
