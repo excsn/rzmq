@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::sync::{
   Arc, Weak,
-  atomic::{AtomicBool, AtomicUsize, Ordering},
+  atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use parking_lot::RwLock;
@@ -83,6 +83,34 @@ pub(crate) fn pipe_lwm(capacity: usize, drain_delta: usize) -> usize {
   (capacity / 2).max(capacity.saturating_sub(drain_delta))
 }
 
+// ---------------------------------------------------------------------------
+// Packed reserved/queued counter
+//
+// Both counters live in one AtomicU64 — reserved in bits 63..32, queued in
+// bits 31..0 — so the hot paths that update both (batch send commit, consumer
+// pop) pay a single RMW instead of two, and every observer reads a coherent
+// snapshot of the pair from one load. Each field is bounded by the pipe
+// capacity (rcvhwm) plus in-flight sends — far below 2^32 — so field
+// arithmetic can never carry or borrow across the 32-bit boundary.
+// ---------------------------------------------------------------------------
+
+/// One reservation (bits 63..32).
+const RESERVED_ONE: u64 = 1 << 32;
+/// One committed message (bits 31..0).
+const QUEUED_ONE: u64 = 1;
+
+/// Extracts the committed-message count from a packed counter value.
+#[inline(always)]
+fn queued_of(counts: u64) -> usize {
+  (counts & u32::MAX as u64) as usize
+}
+
+/// Extracts the reservation count from a packed counter value.
+#[inline(always)]
+fn reserved_of(counts: u64) -> usize {
+  (counts >> 32) as usize
+}
+
 /// Diagnostic invariant audit (debug / `diagnostics` builds only).
 ///
 /// Invariant: every committed item must have a live reservation, i.e.
@@ -105,9 +133,11 @@ fn audit_slot<T: Send + 'static>(slot: &PipeSlot<T>, site: &str, occupancy: impl
   #[cfg(feature = "diagnostics")]
   {
     let occ = occupancy();
-    let reserved = slot.reserved_count.load(Ordering::Acquire);
+    // One load yields a coherent (reserved, queued) snapshot of the pair.
+    let counts = slot.counts.load(Ordering::Acquire);
+    let reserved = reserved_of(counts);
     if reserved < occ && !slot.audit_reported.swap(true, Ordering::AcqRel) {
-      let queued = slot.queued_count.load(Ordering::Acquire);
+      let queued = queued_of(counts);
       println!(
         "[RPQ-DESYNC pid={} pipe={} site={}] reserved({}) < occupancy({}) \
          — item(s) in channel with no backing reservation; queued={}",
@@ -130,15 +160,17 @@ pub(crate) struct PipeSlot<T: Send + 'static> {
   rx: ExclusiveCell<spsc::BoundedAsyncReceiver<T>>,
   /// Channel capacity, mirrored here so observers never touch `rx`/`tx`.
   capacity: usize,
-  /// Active send reservations: in-flight (not yet committed) + committed messages.
-  /// Incremented at the START of every send attempt (before the channel write).
-  /// Decremented on cancellation (RAII) or on consumer pop.
-  /// Invariant: reserved_count >= queued_count at all times.
-  pub(crate) reserved_count: AtomicUsize,
-  /// Committed messages physically present in `rx`.
-  /// Incremented AFTER a successful channel write; decremented on consumer pop.
-  /// Invariant: queued_count == reserved_count when no sends are in flight.
-  pub(crate) queued_count: AtomicUsize,
+  /// Packed pair — reserved in bits 63..32, queued in bits 31..0.
+  ///
+  /// Reserved: active send reservations, in-flight (not yet committed) +
+  /// committed messages. Incremented at the START of every send attempt
+  /// (before the channel write); decremented on cancellation (RAII) or on
+  /// consumer pop. Invariant: reserved >= queued at all times.
+  ///
+  /// Queued: committed messages physically present in `rx`. Incremented AFTER
+  /// a successful channel write; decremented on consumer pop. Invariant:
+  /// queued == reserved when no sends are in flight.
+  pub(crate) counts: AtomicU64,
   /// Pre-computed low-water mark: wakeup fires when len() drops below this.
   pub(crate) lwm: usize,
   /// Diagnostic latch ensuring the desync audit prints at most once per slot.
@@ -156,7 +188,12 @@ impl<T: Send + 'static> PipeSlot<T> {
   /// lagging by the commit window), which is sufficient for the
   /// congestion/drain heuristics built on it.
   pub fn len(&self) -> usize {
-    self.queued_count.load(Ordering::Acquire)
+    queued_of(self.counts.load(Ordering::Acquire))
+  }
+
+  /// Active send reservations (in-flight + committed). See `counts`.
+  pub fn reserved(&self) -> usize {
+    reserved_of(self.counts.load(Ordering::Acquire))
   }
 
   pub fn capacity(&self) -> usize {
@@ -195,7 +232,7 @@ struct SendReservation<T: Send + 'static> {
 
 impl<T: Send + 'static> SendReservation<T> {
   fn new(slot: Arc<PipeSlot<T>>) -> Self {
-    slot.reserved_count.fetch_add(1, Ordering::AcqRel);
+    slot.counts.fetch_add(RESERVED_ONE, Ordering::AcqRel);
     Self {
       slot,
       committed: false,
@@ -211,9 +248,40 @@ impl<T: Send + 'static> Drop for SendReservation<T> {
   fn drop(&mut self) {
     if !self.committed {
       // Cancelled or errored — roll back the reservation.
-      self.slot.reserved_count.fetch_sub(1, Ordering::AcqRel);
+      self.slot.counts.fetch_sub(RESERVED_ONE, Ordering::AcqRel);
     }
     // Committed reservations are released by the consumer on pop.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Ready-token push
+// ---------------------------------------------------------------------------
+
+/// Pushes a slot's ready token onto the activation channel.
+///
+/// `Full` is transient by construction — each live pipe holds at most one
+/// token and the channel is sized with headroom (see `ReadyPipeQueue::new`) —
+/// so the loop spins with a yield rather than going async. Returns `false` if
+/// the ready channel is closed; callers map that to their local closed
+/// handling (error on producer paths, ignore on consumer re-enqueue).
+fn push_ready_token<T: Send + 'static>(
+  ready_tx: &AsyncSender<Arc<PipeSlot<T>>>,
+  slot: &Arc<PipeSlot<T>>,
+  site: &str,
+) -> bool {
+  let mut spins = 0usize;
+  loop {
+    match ready_tx.try_send(Arc::clone(slot)) {
+      Ok(()) => return true,
+      Err(TrySendError::Full(_)) => {
+        spins += 1;
+        log_rpq_spin_deadlock!(spins, site, "Full");
+        std::thread::yield_now();
+      }
+      Err(TrySendError::Closed(_)) => return false,
+      Err(TrySendError::Sent(_)) => unreachable!(),
+    }
   }
 }
 
@@ -229,9 +297,13 @@ pub(crate) struct ReadyPipeQueue<T: Send + 'static> {
 
 impl<T: Send + 'static> ReadyPipeQueue<T> {
   /// `ready_capacity` must be at least the maximum number of registered pipes:
-  /// each pipe occupies at most one slot in the ready list at a time.
+  /// each pipe occupies at most one slot in the ready list at a time. The
+  /// channel is sized at 2× that: tokens of freshly deregistered pipes linger
+  /// until popped as stale, so occupancy can transiently exceed the live-pipe
+  /// count under connection churn — the headroom keeps the producer-side
+  /// token push from ever spinning on `Full` in practice.
   pub fn new(ready_capacity: usize) -> Self {
-    let (tx, rx) = bounded_async(ready_capacity.max(1));
+    let (tx, rx) = bounded_async((ready_capacity * 2).max(1));
     Self {
       pipes: Arc::new(RwLock::new(HashMap::new())),
       ready_rx: rx,
@@ -263,8 +335,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
       tx: ExclusiveCell::new(tx),
       rx: ExclusiveCell::new(rx),
       capacity: capacity.max(1),
-      reserved_count: AtomicUsize::new(0),
-      queued_count: AtomicUsize::new(0),
+      counts: AtomicU64::new(0),
       lwm: pipe_lwm(capacity, drain_delta),
       audit_reported: AtomicBool::new(false),
       #[cfg(feature = "io-uring")]
@@ -296,26 +367,17 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
       // just above), so we are the exclusive consumer right now.
       match unsafe { slot.rx.get_mut() }.try_recv() {
         Ok(item) => {
-          let prev = slot.queued_count.fetch_sub(1, Ordering::AcqRel);
-          slot.reserved_count.fetch_sub(1, Ordering::AcqRel);
-          debug_assert!(prev > 0);
+          // One RMW releases both the committed message and its reservation.
+          let prev = slot
+            .counts
+            .fetch_sub(RESERVED_ONE + QUEUED_ONE, Ordering::AcqRel);
+          let prev_queued = queued_of(prev);
+          debug_assert!(prev_queued > 0);
           audit_slot(&slot, "pop", || unsafe { slot.rx.get_mut() }.len());
 
-          if prev > 1 {
+          if prev_queued > 1 {
             // More committed messages remain — keep this pipe on the ready list.
-            let mut spins = 0usize;
-            loop {
-              match self.ready_tx.try_send(Arc::clone(&slot)) {
-                Ok(()) => break,
-                Err(TrySendError::Full(_)) => {
-                  spins += 1;
-                  log_rpq_spin_deadlock!(spins, "pop spinning on ready_tx", "Full");
-                  std::thread::yield_now();
-                }
-                Err(TrySendError::Closed(_)) => break,
-                Err(TrySendError::Sent(_)) => unreachable!(),
-              }
-            }
+            push_ready_token(&self.ready_tx, &slot, "pop spinning on ready_tx");
           }
 
           #[cfg(feature = "io-uring")]
@@ -361,25 +423,16 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
       // just above), so we are the exclusive consumer right now.
       match unsafe { slot.rx.get_mut() }.try_recv() {
         Ok(item) => {
-          let prev = slot.queued_count.fetch_sub(1, Ordering::AcqRel);
-          slot.reserved_count.fetch_sub(1, Ordering::AcqRel);
-          debug_assert!(prev > 0);
+          // One RMW releases both the committed message and its reservation.
+          let prev = slot
+            .counts
+            .fetch_sub(RESERVED_ONE + QUEUED_ONE, Ordering::AcqRel);
+          let prev_queued = queued_of(prev);
+          debug_assert!(prev_queued > 0);
           audit_slot(&slot, "try_pop", || unsafe { slot.rx.get_mut() }.len());
 
-          if prev > 1 {
-            let mut spins = 0usize;
-            loop {
-              match self.ready_tx.try_send(Arc::clone(&slot)) {
-                Ok(()) => break,
-                Err(TrySendError::Full(_)) => {
-                  spins += 1;
-                  log_rpq_spin_deadlock!(spins, "try_pop spinning on ready_tx", "Full");
-                  std::thread::yield_now();
-                }
-                Err(TrySendError::Closed(_)) => break,
-                Err(TrySendError::Sent(_)) => unreachable!(),
-              }
-            }
+          if prev_queued > 1 {
+            push_ready_token(&self.ready_tx, &slot, "try_pop spinning on ready_tx");
           }
 
           #[cfg(feature = "io-uring")]
@@ -450,11 +503,12 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
   /// Drains up to `max` committed messages from `slot` into `out` while the
   /// caller holds the slot's ready token. Returns `None` for a stale token.
   fn drain_slot(&self, slot: &Arc<PipeSlot<T>>, out: &mut Vec<T>, max: usize) -> Option<(usize, usize)> {
-    // Only committed messages may be popped: capping at queued_count keeps the
-    // counter decrement below from racing a producer's post-write increment.
-    // Committed items are always physically present in rx (the increment
-    // happens after the channel write), so the batch read cannot come short.
-    let committed = slot.queued_count.load(Ordering::Acquire);
+    // Only committed messages may be popped: capping at the committed count
+    // keeps the counter decrement below from racing a producer's post-write
+    // increment. Committed items are always physically present in rx (the
+    // increment happens after the channel write), so the batch read cannot
+    // come short.
+    let committed = slot.len();
     let cap = committed.min(max.max(1));
     if cap == 0 {
       return None;
@@ -468,25 +522,15 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
     };
     debug_assert!(got > 0 && got <= committed);
 
-    let prev = slot.queued_count.fetch_sub(got, Ordering::AcqRel);
-    slot.reserved_count.fetch_sub(got, Ordering::AcqRel);
+    // One RMW releases the whole batch: got committed messages + reservations.
+    let prev = slot
+      .counts
+      .fetch_sub(got as u64 * (RESERVED_ONE + QUEUED_ONE), Ordering::AcqRel);
     audit_slot(slot, "pop_batch", || unsafe { slot.rx.get_mut() }.len());
 
-    if prev > got {
+    if queued_of(prev) > got {
       // More committed messages remain — keep this pipe on the ready list.
-      let mut spins = 0usize;
-      loop {
-        match self.ready_tx.try_send(Arc::clone(slot)) {
-          Ok(()) => break,
-          Err(TrySendError::Full(_)) => {
-            spins += 1;
-            log_rpq_spin_deadlock!(spins, "pop_batch spinning on ready_tx", "Full");
-            std::thread::yield_now();
-          }
-          Err(TrySendError::Closed(_)) => break,
-          Err(TrySendError::Sent(_)) => unreachable!(),
-        }
-      }
+      push_ready_token(&self.ready_tx, slot, "pop_batch spinning on ready_tx");
     }
 
     #[cfg(feature = "io-uring")]
@@ -558,26 +602,16 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
 
     // Message is committed to the channel. Seal the reservation so Drop
     // does not roll it back; the consumer's pop() will release it instead.
-    let prev = slot.queued_count.fetch_add(1, Ordering::AcqRel);
+    let prev = slot.counts.fetch_add(QUEUED_ONE, Ordering::AcqRel);
     reservation.commit();
 
-    if prev == 0 {
-      let mut spins = 0usize;
-      loop {
-        match self.ready_tx.try_send(Arc::clone(&slot)) {
-          Ok(()) => break,
-          Err(TrySendError::Full(_)) => {
-            spins += 1;
-            log_rpq_spin_deadlock!(spins, "send spinning on ready_tx", "Full");
-            std::thread::yield_now();
-          }
-          Err(TrySendError::Closed(_)) => return Err(ZmqError::ConnectionClosed),
-          Err(TrySendError::Sent(_)) => unreachable!(),
-        }
-      }
+    if queued_of(prev) == 0
+      && !push_ready_token(&self.ready_tx, &slot, "send spinning on ready_tx")
+    {
+      return Err(ZmqError::ConnectionClosed);
     }
 
-    audit_slot(&slot, "send", || slot.queued_count.load(Ordering::Acquire));
+    audit_slot(&slot, "send", || slot.len());
     Ok(())
   }
 
@@ -593,28 +627,16 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     // SAFETY: this ReadyPipeSender is the pipe's single producer.
     unsafe { slot.tx.get_mut() }.try_send(item)?;
 
-    let prev = slot.queued_count.fetch_add(1, Ordering::AcqRel);
+    let prev = slot.counts.fetch_add(QUEUED_ONE, Ordering::AcqRel);
     reservation.commit();
 
-    if prev == 0 {
-      // 0→1 transition: ready queue capacity must be >= max registered
-      // pipes so this should never spin more than one iteration.
-      let mut spins = 0usize;
-      loop {
-        match self.ready_tx.try_send(Arc::clone(&slot)) {
-          Ok(()) => break,
-          Err(TrySendError::Full(_)) => {
-            spins += 1;
-            log_rpq_spin_deadlock!(spins, "try_send spinning on ready_tx", "Full");
-            std::thread::yield_now();
-          }
-          Err(TrySendError::Closed(_)) => break,
-          Err(TrySendError::Sent(_)) => unreachable!(),
-        }
-      }
+    if queued_of(prev) == 0 {
+      // 0→1 transition. Closed ready channel is ignored here (matches the
+      // pre-helper behavior: the item is already committed to the pipe).
+      push_ready_token(&self.ready_tx, &slot, "try_send spinning on ready_tx");
     }
 
-    audit_slot(&slot, "try_send", || slot.queued_count.load(Ordering::Acquire));
+    audit_slot(&slot, "try_send", || slot.len());
     Ok(())
   }
 
@@ -637,7 +659,9 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     }
 
     // Bulk reservation upfront — one atomic instead of N.
-    slot.reserved_count.fetch_add(n, Ordering::AcqRel);
+    slot
+      .counts
+      .fetch_add(n as u64 * RESERVED_ONE, Ordering::AcqRel);
 
     let mut sent_batches = 0usize;
     let mut total_weight = 0usize;
@@ -652,9 +676,9 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
           sent_batches += 1;
           total_weight += weight;
           // Inline increment — consumer may pop the item before the batch ends;
-          // updating immediately keeps queued_count >= physical channel occupancy.
-          let prev = slot.queued_count.fetch_add(1, Ordering::AcqRel);
-          if prev == 0 {
+          // updating immediately keeps queued >= physical channel occupancy.
+          let prev = slot.counts.fetch_add(QUEUED_ONE, Ordering::AcqRel);
+          if queued_of(prev) == 0 {
             had_zero_transition = true;
           }
         }
@@ -673,31 +697,16 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     // Roll back any reservations for items we couldn't push.
     if sent_batches < n {
       slot
-        .reserved_count
-        .fetch_sub(n - sent_batches, Ordering::AcqRel);
+        .counts
+        .fetch_sub((n - sent_batches) as u64 * RESERVED_ONE, Ordering::AcqRel);
     }
 
-    // Guaranteed wakeup on 0→1 transition. ready_capacity >= max registered
-    // pipes, so the spin almost never executes more than one iteration.
+    // Guaranteed wakeup on 0→1 transition.
     if had_zero_transition {
-      let mut spins = 0usize;
-      loop {
-        match self.ready_tx.try_send(Arc::clone(&slot)) {
-          Ok(()) => break,
-          Err(TrySendError::Full(_)) => {
-            spins += 1;
-            log_rpq_spin_deadlock!(spins, "try_send_batch spinning on ready_tx", "Full");
-            std::thread::yield_now();
-          }
-          Err(TrySendError::Closed(_)) => break,
-          Err(TrySendError::Sent(_)) => unreachable!(),
-        }
-      }
+      push_ready_token(&self.ready_tx, &slot, "try_send_batch spinning on ready_tx");
     }
 
-    audit_slot(&slot, "try_send_batch", || {
-      slot.queued_count.load(Ordering::Acquire)
-    });
+    audit_slot(&slot, "try_send_batch", || slot.len());
     total_weight
   }
 
@@ -717,27 +726,19 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
 
       if sent_this_pass > 0 {
         total_sent += sent_this_pass;
-        slot.reserved_count.fetch_add(sent_this_pass, Ordering::AcqRel);
-        let prev = slot.queued_count.fetch_add(sent_this_pass, Ordering::AcqRel);
+        // Items are already committed to the channel, so reserve + commit the
+        // whole pass in one RMW instead of two.
+        let prev = slot.counts.fetch_add(
+          sent_this_pass as u64 * (RESERVED_ONE + QUEUED_ONE),
+          Ordering::AcqRel,
+        );
 
-        if prev == 0 {
-          let mut spins = 0usize;
-          loop {
-            match self.ready_tx.try_send(Arc::clone(&slot)) {
-              Ok(()) => break,
-              Err(TrySendError::Full(_)) => {
-                spins += 1;
-                log_rpq_spin_deadlock!(spins, "send_batch_mut spinning on ready_tx", "Full");
-                std::thread::yield_now();
-              }
-              Err(TrySendError::Closed(_)) => return Err(ZmqError::ConnectionClosed),
-              Err(TrySendError::Sent(_)) => unreachable!(),
-            }
-          }
+        if queued_of(prev) == 0
+          && !push_ready_token(&self.ready_tx, &slot, "send_batch_mut spinning on ready_tx")
+        {
+          return Err(ZmqError::ConnectionClosed);
         }
-        audit_slot(&slot, "send_batch_mut_sync_pass", || {
-          slot.queued_count.load(Ordering::Acquire)
-        });
+        audit_slot(&slot, "send_batch_mut_sync_pass", || slot.len());
       }
 
       if items.is_empty() {
@@ -776,46 +777,27 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
       drop(guard);
 
       total_sent += 1;
-      slot.reserved_count.fetch_add(1, Ordering::AcqRel);
-      let prev = slot.queued_count.fetch_add(1, Ordering::AcqRel);
+      let prev = slot
+        .counts
+        .fetch_add(RESERVED_ONE + QUEUED_ONE, Ordering::AcqRel);
 
-      if prev == 0 {
-        let mut spins = 0usize;
-        loop {
-          match self.ready_tx.try_send(Arc::clone(&slot)) {
-            Ok(()) => break,
-            Err(TrySendError::Full(_)) => {
-              spins += 1;
-              log_rpq_spin_deadlock!(spins, "send_batch_mut spinning on ready_tx", "Full");
-              std::thread::yield_now();
-            }
-            Err(TrySendError::Closed(_)) => return Err(ZmqError::ConnectionClosed),
-            Err(TrySendError::Sent(_)) => unreachable!(),
-          }
-        }
+      if queued_of(prev) == 0
+        && !push_ready_token(&self.ready_tx, &slot, "send_batch_mut spinning on ready_tx")
+      {
+        return Err(ZmqError::ConnectionClosed);
       }
-      audit_slot(&slot, "send_batch_mut_async_pass", || {
-        slot.queued_count.load(Ordering::Acquire)
-      });
+      audit_slot(&slot, "send_batch_mut_async_pass", || slot.len());
     }
 
     Ok(total_sent)
   }
 
   pub fn queued_count(&self) -> usize {
-    self
-      .slot
-      .upgrade()
-      .map(|s| s.queued_count.load(Ordering::Relaxed))
-      .unwrap_or(0)
+    self.slot.upgrade().map(|s| s.len()).unwrap_or(0)
   }
 
   pub fn reserved_count(&self) -> usize {
-    self
-      .slot
-      .upgrade()
-      .map(|s| s.reserved_count.load(Ordering::Relaxed))
-      .unwrap_or(0)
+    self.slot.upgrade().map(|s| s.reserved()).unwrap_or(0)
   }
 
   pub fn len(&self) -> usize {
@@ -1027,7 +1009,9 @@ impl PipeMessageSender {
           None => return 0,
         };
 
-        slot.reserved_count.fetch_add(match_count, Ordering::AcqRel);
+        slot
+          .counts
+          .fetch_add(match_count as u64 * RESERVED_ONE, Ordering::AcqRel);
 
         let mut sent_batches = 0usize;
         let mut total_frames = 0usize;
@@ -1043,8 +1027,8 @@ impl PipeMessageSender {
               Ok(()) => {
                 sent_batches += 1;
                 total_frames += frame_count;
-                let prev = slot.queued_count.fetch_add(1, Ordering::AcqRel);
-                if prev == 0 {
+                let prev = slot.counts.fetch_add(QUEUED_ONE, Ordering::AcqRel);
+                if queued_of(prev) == 0 {
                   had_zero_transition = true;
                 }
               }
@@ -1065,25 +1049,18 @@ impl PipeMessageSender {
         }
 
         if sent_batches < match_count {
-          slot
-            .reserved_count
-            .fetch_sub(match_count - sent_batches, Ordering::AcqRel);
+          slot.counts.fetch_sub(
+            (match_count - sent_batches) as u64 * RESERVED_ONE,
+            Ordering::AcqRel,
+          );
         }
 
         if had_zero_transition {
-          let mut spins = 0usize;
-          loop {
-            match sender.ready_tx.try_send(Arc::clone(&slot)) {
-              Ok(()) => break,
-              Err(TrySendError::Full(_)) => {
-                spins += 1;
-                log_rpq_spin_deadlock!(spins, "try_send_batch filtered spinning on ready_tx", "Full");
-                std::thread::yield_now();
-              }
-              Err(TrySendError::Closed(_)) => break,
-              Err(TrySendError::Sent(_)) => unreachable!(),
-            }
-          }
+          push_ready_token(
+            &sender.ready_tx,
+            &slot,
+            "try_send_batch filtered spinning on ready_tx",
+          );
         }
 
         total_frames
@@ -1229,7 +1206,7 @@ mod tests {
             let has_items = rx_len > 0;
             // reserved_count covers both in-flight and committed messages so
             // a non-zero value means a wakeup signal is guaranteed to arrive.
-            let reserved = slot.reserved_count.load(Ordering::Acquire);
+            let reserved = slot.reserved();
             let has_ready_signal = !queue.ready_rx.is_empty();
 
             if has_items && reserved == 0 && !has_ready_signal {
@@ -1238,7 +1215,7 @@ mod tests {
                 pipe_id,
                 rx_len,
                 reserved,
-                slot.queued_count.load(Ordering::Acquire),
+                slot.len(),
                 queue.ready_rx.len()
               );
               lost_wakeup_detected = true;
@@ -1419,12 +1396,12 @@ mod pop_counter_desync_regression {
     // is the only remaining accessor.
     assert_eq!(unsafe { slot.rx.get_mut() }.len(), 0, "rx not fully drained");
     assert_eq!(
-      slot.queued_count.load(Ordering::Acquire),
+      slot.len(),
       0,
       "queued_count leaked"
     );
     assert_eq!(
-      slot.reserved_count.load(Ordering::Acquire),
+      slot.reserved(),
       0,
       "reserved_count leaked"
     );
@@ -1453,14 +1430,14 @@ use super::*;
     let slot = pipes.get(&1).unwrap().clone();
     drop(pipes);
 
-    let reserved_before = slot.reserved_count.load(Ordering::Acquire);
-    let queued_before = slot.queued_count.load(Ordering::Acquire);
+    let reserved_before = slot.reserved();
+    let queued_before = slot.len();
 
     // Drop the blocking future mid-flight.
     let _ = timeout(Duration::from_millis(20), sender.send(200)).await;
 
-    let reserved_after = slot.reserved_count.load(Ordering::Acquire);
-    let queued_after = slot.queued_count.load(Ordering::Acquire);
+    let reserved_after = slot.reserved();
+    let queued_after = slot.len();
 
     assert_eq!(
       reserved_after, reserved_before,
@@ -1505,8 +1482,8 @@ use super::*;
     // Give any racing completions a moment to settle.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let reserved = slot.reserved_count.load(Ordering::Acquire);
-    let queued = slot.queued_count.load(Ordering::Acquire);
+    let reserved = slot.reserved();
+    let queued = slot.len();
 
     assert_eq!(
       reserved, queued,
@@ -1576,8 +1553,8 @@ use super::*;
 
     let pipes = queue.pipes.read();
     let slot = pipes.get(&1).unwrap();
-    let reserved = slot.reserved_count.load(Ordering::Acquire);
-    let queued = slot.queued_count.load(Ordering::Acquire);
+    let reserved = slot.reserved();
+    let queued = slot.len();
     drop(pipes);
 
     assert_eq!(

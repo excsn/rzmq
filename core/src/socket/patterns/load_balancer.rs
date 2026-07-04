@@ -1,7 +1,8 @@
 use crate::ZmqError;
 use crate::socket::connection_iface::ISocketConnection;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 #[derive(Clone)]
@@ -10,23 +11,22 @@ pub(crate) struct Peer {
   pub iface: Arc<dyn ISocketConnection>,
 }
 
-struct BalancerState {
-  peers: Vec<Arc<Peer>>,
-  next_idx: usize,
-}
-
 /// Distributes access to available connections in a round-robin fashion.
 pub(crate) struct LoadBalancer {
-  /// Stores the available connections and current round-robin index.
-  state: Mutex<BalancerState>,
+  /// Available connections. Writes only on add/remove; the send hot path
+  /// takes a shared read lock.
+  peers: RwLock<Vec<Arc<Peer>>>,
+  /// Monotonic round-robin cursor; `fetch_add % len` selects the next peer,
+  /// so selection needs no exclusive lock.
+  next_idx: AtomicUsize,
   notify_waiters: Arc<Notify>,
-  deactivated: std::sync::atomic::AtomicBool,
+  deactivated: AtomicBool,
 }
 
 impl std::fmt::Debug for LoadBalancer {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("LoadBalancer")
-      .field("peer_count", &self.state.lock().peers.len())
+      .field("peer_count", &self.peers.read().len())
       .finish()
   }
 }
@@ -34,12 +34,10 @@ impl std::fmt::Debug for LoadBalancer {
 impl Default for LoadBalancer {
   fn default() -> Self {
     Self {
-      state: Mutex::new(BalancerState {
-        peers: Vec::new(),
-        next_idx: 0,
-      }),
+      peers: RwLock::new(Vec::new()),
+      next_idx: AtomicUsize::new(0),
       notify_waiters: Arc::new(Notify::new()),
-      deactivated: std::sync::atomic::AtomicBool::new(false),
+      deactivated: AtomicBool::new(false),
     }
   }
 }
@@ -52,9 +50,9 @@ impl LoadBalancer {
 
   /// Adds a connection to the set available for load balancing.
   pub fn add_connection(&self, endpoint_uri: String, iface: Arc<dyn ISocketConnection>) {
-    let mut state = self.state.lock();
-    if !state.peers.iter().any(|p| p.uri == endpoint_uri) {
-      state.peers.push(Arc::new(Peer {
+    let mut peers = self.peers.write();
+    if !peers.iter().any(|p| p.uri == endpoint_uri) {
+      peers.push(Arc::new(Peer {
         uri: endpoint_uri.clone(),
         iface,
       }));
@@ -66,17 +64,13 @@ impl LoadBalancer {
   }
 
   /// Removes a connection (by its endpoint URI) from the set.
+  ///
+  /// The round-robin cursor is not adjusted: selection is `cursor % len`, so a
+  /// membership change perturbs the rotation by at most one slot.
   pub fn remove_connection(&self, endpoint_uri: &str) {
-    let mut state = self.state.lock();
-    if let Some(pos) = state.peers.iter().position(|p| p.uri == endpoint_uri) {
-      state.peers.remove(pos);
-
-      // Adjust the index so we don't skip the next peer or go out of bounds
-      if pos < state.next_idx && state.next_idx > 0 {
-        state.next_idx -= 1;
-      } else if state.next_idx >= state.peers.len() {
-        state.next_idx = 0;
-      }
+    let mut peers = self.peers.write();
+    if let Some(pos) = peers.iter().position(|p| p.uri == endpoint_uri) {
+      peers.remove(pos);
       tracing::trace!(uri = %endpoint_uri, "LoadBalancer removed connection");
     } else {
       tracing::trace!(uri = %endpoint_uri, "LoadBalancer: Connection not found for removal.");
@@ -86,34 +80,27 @@ impl LoadBalancer {
   /// Selects the next connection for sending using round-robin.
   /// Returns `None` if no connections are available.
   pub fn get_next_connection(&self) -> Option<Arc<Peer>> {
-    let mut state = self.state.lock();
-    let len = state.peers.len();
+    let peers = self.peers.read();
+    let len = peers.len();
     if len == 0 {
       return None;
     }
 
-    // Bounds check to ensure safety if list shrank
-    if state.next_idx >= len {
-      state.next_idx = 0;
-    }
+    // Lock-free rotation: the shared read lock only guards the Vec itself.
+    let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % len;
 
     // Cheap atomic increment on the Arc instead of a deep String clone
-    let peer = Arc::clone(&state.peers[state.next_idx]);
-
-    // Advance the round-robin index
-    state.next_idx = (state.next_idx + 1) % len;
-
-    Some(peer)
+    Some(Arc::clone(&peers[idx]))
   }
 
   /// Waits until at least one connection is available in the balancer.
   pub async fn wait_for_connection(&self) -> Result<(), ZmqError> {
     let notify = self.notify_waiters.clone();
     loop {
-      if self.deactivated.load(std::sync::atomic::Ordering::Acquire) {
+      if self.deactivated.load(Ordering::Acquire) {
         return Err(ZmqError::InvalidState("Socket closed".into()));
       }
-      if !self.state.lock().peers.is_empty() {
+      if !self.peers.read().is_empty() {
         return Ok(());
       }
       notify.notified().await;
@@ -122,19 +109,17 @@ impl LoadBalancer {
 
   /// Checks if any connections are currently registered.
   pub fn has_connections(&self) -> bool {
-    !self.state.lock().peers.is_empty()
+    !self.peers.read().is_empty()
   }
 
   /// Returns the current number of connections being managed by the load balancer.
   pub fn connection_count(&self) -> usize {
-    self.state.lock().peers.len()
+    self.peers.read().len()
   }
 
   /// Deactivates the load balancer and unblocks all waiting senders.
   pub fn deactivate(&self) {
-    self
-      .deactivated
-      .store(true, std::sync::atomic::Ordering::Release);
+    self.deactivated.store(true, Ordering::Release);
     self.notify_waiters.notify_waiters();
   }
 }

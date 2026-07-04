@@ -262,7 +262,7 @@ macro_rules! cancel_guard_complete {
 /// are disabled.
 #[macro_export]
 macro_rules! log_rpq_spin_deadlock {
-  ($spins:expr, $label:literal, $err:expr) => {
+  ($spins:expr, $label:expr, $err:expr) => {
     #[cfg(feature = "diagnostics")]
     if $spins % 1_000_000 == 0 {
       println!(
