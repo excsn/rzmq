@@ -46,6 +46,11 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   write_half: Option<S::WriteHalf>,
   /// Temporary read buffer used only during the handshake loop.
   handshake_read_buf: BytesMut,
+  /// Data messages decoded during the handshake pass (e.g. a SUB's SUBSCRIBE
+  /// frame that arrived bundled with the peer's final handshake bytes). These
+  /// must be replayed into the operational ingress rather than dropped, or the
+  /// early message is lost. See the operational-loop drain.
+  pending_handshake_ingress: Vec<FrameBatch>,
 
   core_pipe_manager: CorePipeManagerX,
 
@@ -139,6 +144,7 @@ where
       read_half: Some(read_half),
       write_half: Some(write_half),
       handshake_read_buf: BytesMut::with_capacity(GREETING_LENGTH * 4),
+      pending_handshake_ingress: Vec::new(),
       core_pipe_manager: CorePipeManagerX::new(),
       command_mailbox_receiver,
       system_event_receiver,
@@ -288,6 +294,13 @@ where
     // ── OPERATIONAL LOOP ──────────────────────────────────────────────────────
     if self.current_phase == ConnectionPhaseX::Operational {
       let mut message_processor = ZmqMessageProcessor::new();
+
+      // Replay any data messages that were decoded during the handshake pass
+      // (before the ingress pipe was active) so they reach the socket first and
+      // in order — e.g. a SUB's SUBSCRIBE bundled with its final handshake bytes.
+      if !self.pending_handshake_ingress.is_empty() {
+        ingress_buffer.append(&mut self.pending_handshake_ingress);
+      }
 
       let mut read_half = self
         .read_half
@@ -959,7 +972,13 @@ where
           self.set_fatal_error(e).await;
           return;
         }
-        AppAction::DeliverMessage(_) => {}
+        AppAction::DeliverMessage(batch) => {
+          // A data frame arrived bundled with the peer's final handshake bytes
+          // (e.g. a SUB's SUBSCRIBE sent the instant it went operational). The
+          // operational ingress isn't running yet, so stash it for replay rather
+          // than dropping it.
+          self.pending_handshake_ingress.push(batch);
+        }
       }
     }
   }

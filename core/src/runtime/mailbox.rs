@@ -6,7 +6,7 @@ use fibre::mpsc;
 /// Default capacity for bounded mailboxes created by the `mailbox()` helper function.
 /// This capacity applies to the single mailbox used by `SocketCore` and other simpler actors.
 /// It can be tuned based on expected load and performance characteristics.
-pub const DEFAULT_MAILBOX_CAPACITY: usize = 128;
+pub const DEFAULT_MAILBOX_CAPACITY: usize = 256;
 
 /// The async sending end of an actor's mailbox.
 /// Used by Tokio tasks to send commands to `SocketCore`.

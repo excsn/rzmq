@@ -19,7 +19,6 @@ async fn bound_endpoint(socket: &rzmq::Socket) -> Result<String, ZmqError> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
 async fn test_massive_nested_topic_subscription_storm() -> Result<(), ZmqError> {
   let ctx = common::test_context();
 

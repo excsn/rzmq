@@ -150,6 +150,137 @@ async fn test_pub_sub_tcp_multiple_subs() -> Result<(), ZmqError> {
   Ok(())
 }
 
+// --- Test: PUB-side selective routing to distinct subscribers ---
+// Two subscribers with different topics; the publisher must route each message
+// only to the interested subscriber (PUB-side filtering), not broadcast.
+#[tokio::test]
+#[serial]
+async fn test_pub_sub_two_topics_selective() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  {
+    let pub_socket = ctx.socket(SocketType::Pub)?;
+    let sub_a = ctx.socket(SocketType::Sub)?;
+    let sub_b = ctx.socket(SocketType::Sub)?;
+    let endpoint = "tcp://127.0.0.1:5623";
+
+    pub_socket.bind(endpoint).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    sub_a.connect(endpoint).await?;
+    sub_b.connect(endpoint).await?;
+    sub_a.set_option_raw(SUBSCRIBE, b"A").await?;
+    sub_b.set_option_raw(SUBSCRIBE, b"B").await?;
+    tokio::time::sleep(Duration::from_millis(200)).await; // subscription propagation
+
+    pub_socket.send(Msg::from_static(b"A:for-a")).await?;
+    pub_socket.send(Msg::from_static(b"B:for-b")).await?;
+
+    // Each subscriber gets exactly its own topic...
+    let ra = common::recv_timeout(&sub_a, LONG_TIMEOUT).await?;
+    assert_eq!(ra.data().unwrap(), b"A:for-a");
+    let rb = common::recv_timeout(&sub_b, LONG_TIMEOUT).await?;
+    assert_eq!(rb.data().unwrap(), b"B:for-b");
+
+    // ...and nothing else (the other topic was filtered at the PUB).
+    assert!(matches!(
+      common::recv_timeout(&sub_a, SHORT_TIMEOUT).await,
+      Err(ZmqError::Timeout)
+    ));
+    assert!(matches!(
+      common::recv_timeout(&sub_b, SHORT_TIMEOUT).await,
+      Err(ZmqError::Timeout)
+    ));
+  }
+  ctx.term().await?;
+  Ok(())
+}
+
+// --- Test: overlapping-prefix subscriptions deliver exactly once ---
+// A single subscriber subscribed to both "a" and "ab" must receive a message
+// with topic "abc" exactly one time (the matcher de-duplicates the peer even
+// though two of its subscriptions are prefixes of the topic).
+#[tokio::test]
+#[serial]
+async fn test_pub_sub_overlapping_prefix_dedup() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  {
+    let pub_socket = ctx.socket(SocketType::Pub)?;
+    let sub_socket = ctx.socket(SocketType::Sub)?;
+    let endpoint = "tcp://127.0.0.1:5624";
+
+    pub_socket.bind(endpoint).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    sub_socket.connect(endpoint).await?;
+    sub_socket.set_option_raw(SUBSCRIBE, b"a").await?;
+    sub_socket.set_option_raw(SUBSCRIBE, b"ab").await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    pub_socket.send(Msg::from_static(b"abc")).await?;
+
+    let first = common::recv_timeout(&sub_socket, LONG_TIMEOUT).await?;
+    assert_eq!(first.data().unwrap(), b"abc");
+
+    // Must NOT be delivered a second time.
+    let second = common::recv_timeout(&sub_socket, SHORT_TIMEOUT).await;
+    assert!(
+      matches!(second, Err(ZmqError::Timeout)),
+      "overlapping prefixes must deliver exactly once, got {:?}",
+      second
+    );
+  }
+  ctx.term().await?;
+  Ok(())
+}
+
+// --- Test: one subscriber detaching does not disturb the others ---
+// Validates that removing a peer from the PUB matcher/distributor (and freeing
+// its index) leaves the remaining subscriber able to keep receiving.
+#[tokio::test]
+#[serial]
+async fn test_pub_sub_detach_preserves_other_subs() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  {
+    let pub_socket = ctx.socket(SocketType::Pub)?;
+    let sub_keep = ctx.socket(SocketType::Sub)?;
+    let endpoint = "tcp://127.0.0.1:5625";
+
+    pub_socket.bind(endpoint).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    sub_keep.connect(endpoint).await?;
+    sub_keep.set_option_raw(SUBSCRIBE, b"").await?;
+
+    {
+      let sub_drop = ctx.socket(SocketType::Sub)?;
+      sub_drop.connect(endpoint).await?;
+      sub_drop.set_option_raw(SUBSCRIBE, b"").await?;
+      tokio::time::sleep(Duration::from_millis(200)).await;
+
+      pub_socket.send(Msg::from_static(b"round1")).await?;
+      assert_eq!(
+        common::recv_timeout(&sub_keep, LONG_TIMEOUT).await?.data().unwrap(),
+        b"round1"
+      );
+      assert_eq!(
+        common::recv_timeout(&sub_drop, LONG_TIMEOUT).await?.data().unwrap(),
+        b"round1"
+      );
+      // sub_drop leaves scope here -> detaches from the PUB.
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await; // allow detach to propagate
+
+    // The surviving subscriber must still receive after the other detached.
+    pub_socket.send(Msg::from_static(b"round2")).await?;
+    assert_eq!(
+      common::recv_timeout(&sub_keep, LONG_TIMEOUT).await?.data().unwrap(),
+      b"round2"
+    );
+  }
+  ctx.term().await?;
+  Ok(())
+}
+
 // --- IPC Tests ---
 
 #[tokio::test]

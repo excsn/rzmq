@@ -2,7 +2,7 @@ use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::SocketCore;
-use crate::socket::patterns::Distributor;
+use crate::socket::patterns::{Distributor, PipeMessageSender, SubscriptionMatcher};
 use crate::socket::ISocket;
 use crate::{delegate_to_core, Blob, MsgFlags};
 
@@ -10,14 +10,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 
 /// Implements the PUB (Publish) socket pattern.
+///
+/// Filtering happens on the publisher (like libzmq's XPUB): each subscriber's
+/// `\x01`/`\x00` subscription frames are consumed on the session thread into a
+/// shared [`SubscriptionMatcher`] (via a [`PipeMessageSender::SubscriptionSink`]),
+/// and each outgoing message is matched against it so it is enqueued only to the
+/// interested peers.
 #[derive(Debug)]
 pub(crate) struct PubSocket {
   core: Arc<SocketCore>,
   distributor: Distributor,
-  pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
+  /// Publisher-side subscription database (topic prefix -> subscribed peers).
+  matcher: Arc<SubscriptionMatcher>,
+  /// Ingress senders created in `pipe_attached`, handed to the session actor via
+  /// `get_incoming_pipe_sender`.
+  pending_pipe_senders: Mutex<HashMap<usize, PipeMessageSender>>,
 }
 
 impl PubSocket {
@@ -25,7 +35,33 @@ impl PubSocket {
     Self {
       core,
       distributor: Distributor::new(),
-      pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
+      matcher: Arc::new(SubscriptionMatcher::new()),
+      pending_pipe_senders: Mutex::new(HashMap::new()),
+    }
+  }
+
+  /// Matches one logical message against the subscription database and fans it
+  /// out to interested peers, cleaning up any peers that errored during send.
+  async fn dispatch(&self, frames: FrameBatch) -> Result<(), ZmqError> {
+    match self
+      .distributor
+      .send_matched_multipart(frames, &self.matcher, self.core.handle)
+      .await
+    {
+      Ok(()) => Ok(()),
+      Err(failed_peers) => {
+        for (peer_idx, error_detail) in failed_peers {
+          tracing::debug!(
+            handle = self.core.handle,
+            peer_idx,
+            error = %error_detail,
+            "PUB removing disconnected/errored peer found during send"
+          );
+          self.distributor.remove_peer_by_idx(peer_idx);
+          self.matcher.remove_peer(peer_idx);
+        }
+        Ok(()) // Still Ok(()) to the user, as per ZMQ PUB behavior.
+      }
     }
   }
 }
@@ -72,22 +108,9 @@ impl ISocket for PubSocket {
       "PubSocket::send distributing message"
     );
 
-    match self.distributor.send_to_all(&msg, self.core.handle).await {
-      Ok(()) => Ok(()),
-      Err(failed_uris_with_errors) => {
-        for (uri, error_detail) in failed_uris_with_errors {
-          tracing::debug!(
-            handle = self.core.handle,
-            uri = %uri,
-            error = %error_detail,
-            "PUB removing disconnected/errored peer URI found during send"
-          );
-          // Remove the URI directly from the distributor.
-          self.distributor.remove_peer_uri(&uri);
-        }
-        Ok(()) // Still return Ok(()) to the user, as per ZMQ PUB behavior.
-      }
-    }
+    let mut frames = FrameBatch::new();
+    frames.push(msg);
+    self.dispatch(frames).await
   }
 
   async fn recv(&self) -> Result<Msg, ZmqError> {
@@ -106,7 +129,7 @@ impl ISocket for PubSocket {
       return Ok(());
     }
 
-    // Adjust MORE flags for the logical ZMQ message parts
+    // Adjust MORE flags for the logical ZMQ message parts.
     let num_frames = frames.len();
     for (i, frame) in frames.iter_mut().enumerate() {
       if i < num_frames - 1 {
@@ -117,25 +140,7 @@ impl ISocket for PubSocket {
     }
     // `frames` now correctly represents the ZMTP frames of one logical ZMQ message.
 
-    match self
-      .distributor
-      .send_to_all_multipart(frames, self.core.handle)
-      .await
-    {
-      Ok(()) => Ok(()),
-      Err(failed_uris_with_errors) => {
-        for (uri, error_detail) in failed_uris_with_errors {
-          tracing::debug!(
-            handle = self.core.handle,
-            uri = %uri,
-            error = %error_detail,
-            "PUB send_multipart: Removing disconnected/errored peer URI from distributor."
-          );
-          self.distributor.remove_peer_uri(&uri);
-        }
-        Ok(())
-      }
-    }
+    self.dispatch(frames).await
   }
 
   async fn recv_multipart(&self) -> Result<FrameBatch, ZmqError> {
@@ -154,13 +159,15 @@ impl ISocket for PubSocket {
   }
 
   async fn handle_pipe_event(&self, _pipe_id: usize, _event: Command) -> Result<(), ZmqError> {
+    // Inbound subscription frames are consumed by the SubscriptionSink ingress
+    // sender on the session thread, not via pipe events.
     Ok(())
   }
 
   async fn pipe_attached(
     &self,
     pipe_read_id: usize,
-    _pipe_write_id: usize, // No longer directly used by PubSocket for Distributor
+    _pipe_write_id: usize,
     _peer_identity: Option<&[u8]>,
   ) {
     let (endpoint_uri_opt, connection_iface_opt) = {
@@ -179,12 +186,17 @@ impl ISocket for PubSocket {
     };
 
     if let (Some(endpoint_uri), Some(iface)) = (endpoint_uri_opt, connection_iface_opt) {
-      tracing::debug!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "PUB attaching connection");
-      self
-        .pipe_read_to_endpoint_uri
-        .write()
-        .insert(pipe_read_id, endpoint_uri.clone()); // Guard dropped
-      self.distributor.add_peer(endpoint_uri, iface);
+      let peer_idx = self
+        .distributor
+        .add_peer(pipe_read_id, endpoint_uri.clone(), iface);
+      tracing::debug!(handle = self.core.handle, pipe_read_id, peer_idx, uri = %endpoint_uri, "PUB attaching connection");
+
+      // Ingress sender that folds this peer's subscription frames into the matcher.
+      let sender = PipeMessageSender::SubscriptionSink {
+        peer_idx,
+        matcher: Arc::clone(&self.matcher),
+      };
+      self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
     } else {
       tracing::warn!(
         handle = self.core.handle,
@@ -207,17 +219,22 @@ impl ISocket for PubSocket {
   async fn pipe_detached(&self, pipe_read_id: usize) {
     tracing::debug!(handle = self.core.handle, pipe_read_id, "PUB detaching connection");
 
-    let maybe_endpoint_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id); // Guard dropped
+    self.pending_pipe_senders.lock().remove(&pipe_read_id);
 
-    if let Some(endpoint_uri) = maybe_endpoint_uri {
-      self.distributor.remove_peer_uri(&endpoint_uri); // Uses its own internal lock
-      tracing::trace!(handle = self.core.handle, pipe_read_id, uri = %endpoint_uri, "PUB removed detached connection from distributor");
+    if let Some(peer_idx) = self.distributor.remove_peer_by_pipe(pipe_read_id) {
+      // Purge the peer's subscriptions before its index can be recycled.
+      self.matcher.remove_peer(peer_idx);
+      tracing::trace!(handle = self.core.handle, pipe_read_id, peer_idx, "PUB removed detached connection");
     } else {
       tracing::warn!(
         handle = self.core.handle,
         pipe_read_id,
-        "PUB detach: Endpoint URI not found for read ID in local map. Distributor may not be updated."
+        "PUB detach: peer not found for read ID. Distributor may not be updated."
       );
     }
+  }
+
+  fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {
+    self.pending_pipe_senders.lock().remove(&pipe_read_id)
   }
 }

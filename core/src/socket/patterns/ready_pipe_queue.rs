@@ -15,6 +15,7 @@ use fibre::{RecvError, TryRecvError, TrySendError};
 
 use crate::error::ZmqError;
 use crate::message::FrameBatch;
+use crate::socket::patterns::sub_matcher::SubscriptionMatcher;
 use crate::socket::patterns::trie::SubscriptionTrie;
 use crate::log_rpq_spin_deadlock;
 
@@ -856,6 +857,37 @@ pub(crate) enum PipeMessageSender {
   DirectAddressed {
     sender: ReadyPipeSender<FrameBatch>,
   },
+  /// Consumes inbound frames as PUB-side subscription commands (`[0x01|0x00] +
+  /// topic`) on the session thread, updating `matcher` for `peer_idx` instead of
+  /// queueing. Used by the PUB socket so it can filter on the publisher side.
+  SubscriptionSink {
+    peer_idx: u32,
+    matcher: Arc<SubscriptionMatcher>,
+  },
+}
+
+/// Applies a single inbound subscription frame body of the form
+/// `[0x01|0x00] + topic` to `matcher` for `peer_idx`. `0x01` subscribes, `0x00`
+/// unsubscribes; any other/empty body is ignored.
+#[inline]
+fn apply_subscription_frame(matcher: &SubscriptionMatcher, peer_idx: u32, body: &[u8]) {
+  match body.first() {
+    Some(0x01) => matcher.subscribe(peer_idx, &body[1..]),
+    Some(0x00) => {
+      matcher.unsubscribe(peer_idx, &body[1..]);
+    }
+    _ => {}
+  }
+}
+
+/// Applies every frame of one logical message as a subscription command,
+/// returning the number of frames consumed.
+#[inline]
+fn apply_subscription_batch(matcher: &SubscriptionMatcher, peer_idx: u32, batch: &FrameBatch) -> usize {
+  for frame in batch.iter() {
+    apply_subscription_frame(matcher, peer_idx, frame.data().unwrap_or(&[]));
+  }
+  batch.len()
 }
 
 /// Debug-only invariant: one send call = one complete logical message.
@@ -885,6 +917,7 @@ impl PipeMessageSender {
       Self::DirectAnonymous(s) => s.bind_uring_wakeup(wakeup),
       Self::FilteredAnonymous { sender, .. } => sender.bind_uring_wakeup(wakeup),
       Self::DirectAddressed { sender } => sender.bind_uring_wakeup(wakeup),
+      Self::SubscriptionSink { .. } => {}
     }
   }
 
@@ -901,6 +934,10 @@ impl PipeMessageSender {
         }
       }
       Self::DirectAddressed { sender } => sender.send(batch).await,
+      Self::SubscriptionSink { peer_idx, matcher } => {
+        apply_subscription_batch(matcher, *peer_idx, &batch);
+        Ok(())
+      }
     }
   }
 
@@ -924,6 +961,13 @@ impl PipeMessageSender {
         }
         sender.send_batch_mut(items).await
       }
+      Self::SubscriptionSink { peer_idx, matcher } => {
+        let mut consumed = 0usize;
+        for batch in items.drain(..) {
+          consumed += apply_subscription_batch(matcher, *peer_idx, &batch);
+        }
+        Ok(consumed)
+      }
     }
   }
 
@@ -940,6 +984,10 @@ impl PipeMessageSender {
         }
       }
       Self::DirectAddressed { sender } => sender.try_send(batch),
+      Self::SubscriptionSink { peer_idx, matcher } => {
+        apply_subscription_batch(matcher, *peer_idx, &batch);
+        Ok(())
+      }
     }
   }
 
@@ -1043,6 +1091,14 @@ impl PipeMessageSender {
       }
 
       Self::DirectAddressed { sender } => sender.try_send_batch(items, |b| b.len()),
+
+      Self::SubscriptionSink { peer_idx, matcher } => {
+        let mut consumed = 0usize;
+        while let Some(batch) = items.pop_front() {
+          consumed += apply_subscription_batch(matcher, *peer_idx, &batch);
+        }
+        consumed
+      }
     }
   }
 
@@ -1051,6 +1107,7 @@ impl PipeMessageSender {
       Self::DirectAnonymous(s) => s.queued_count(),
       Self::FilteredAnonymous { sender, .. } => sender.queued_count(),
       Self::DirectAddressed { sender } => sender.queued_count(),
+      Self::SubscriptionSink { .. } => 0,
     }
   }
 
@@ -1059,6 +1116,7 @@ impl PipeMessageSender {
       Self::DirectAnonymous(s) => s.reserved_count(),
       Self::FilteredAnonymous { sender, .. } => sender.reserved_count(),
       Self::DirectAddressed { sender } => sender.reserved_count(),
+      Self::SubscriptionSink { .. } => 0,
     }
   }
 
@@ -1067,6 +1125,7 @@ impl PipeMessageSender {
       Self::DirectAnonymous(s) => s.len(),
       Self::FilteredAnonymous { sender, .. } => sender.len(),
       Self::DirectAddressed { sender } => sender.len(),
+      Self::SubscriptionSink { .. } => 0,
     }
   }
 
@@ -1075,6 +1134,7 @@ impl PipeMessageSender {
       Self::DirectAnonymous(s) => s.capacity(),
       Self::FilteredAnonymous { sender, .. } => sender.capacity(),
       Self::DirectAddressed { sender } => sender.capacity(),
+      Self::SubscriptionSink { .. } => 0,
     }
   }
 
@@ -1083,6 +1143,7 @@ impl PipeMessageSender {
       Self::DirectAnonymous(s) => s.is_congested(),
       Self::FilteredAnonymous { sender, .. } => sender.is_congested(),
       Self::DirectAddressed { sender } => sender.is_congested(),
+      Self::SubscriptionSink { .. } => false,
     }
   }
 
@@ -1091,6 +1152,7 @@ impl PipeMessageSender {
       Self::DirectAnonymous(s) => s.is_drained(),
       Self::FilteredAnonymous { sender, .. } => sender.is_drained(),
       Self::DirectAddressed { sender } => sender.is_drained(),
+      Self::SubscriptionSink { .. } => true,
     }
   }
 }
@@ -1101,6 +1163,9 @@ impl std::fmt::Debug for PipeMessageSender {
       Self::DirectAnonymous(_) => write!(f, "PipeMessageSender::DirectAnonymous"),
       Self::FilteredAnonymous { .. } => write!(f, "PipeMessageSender::FilteredAnonymous"),
       Self::DirectAddressed { .. } => write!(f, "PipeMessageSender::DirectAddressed"),
+      Self::SubscriptionSink { peer_idx, .. } => {
+        write!(f, "PipeMessageSender::SubscriptionSink(peer_idx={peer_idx})")
+      }
     }
   }
 }

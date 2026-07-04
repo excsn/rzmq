@@ -7,6 +7,7 @@ pub mod outgoing_orchestrator;
 pub mod pipe_coordinator;
 pub mod ready_pipe_queue;
 pub mod router;
+pub mod sub_matcher;
 pub mod trie;
 
 pub(crate) use anonymous_ingress::AnonymousIngressEngine;
@@ -18,4 +19,5 @@ pub(crate) use outgoing_orchestrator::OutgoingMessageOrchestrator;
 pub(crate) use pipe_coordinator::WritePipeCoordinator;
 pub(crate) use ready_pipe_queue::{ReadyPipeQueue, ReadyPipeSender, PipeMessageSender};
 pub(crate) use router::RouterMap;
+pub(crate) use sub_matcher::SubscriptionMatcher;
 pub(crate) use trie::SubscriptionTrie;
