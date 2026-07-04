@@ -16,10 +16,6 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
 
   fn write_msg_batch(&mut self, batch: &[FrameBatch]) -> Result<Bytes, ZmqError>;
 
-  fn is_passthrough(&self) -> bool {
-    false
-  }
-
   fn write_msg_split(&mut self, msg: Msg) -> Result<(Bytes, Option<Bytes>), ZmqError> {
     let mut fb = FrameBatch::new();
     fb.push(msg);
@@ -63,10 +59,6 @@ impl NullFramer {
 }
 
 impl ISecureFramer for NullFramer {
-  fn is_passthrough(&self) -> bool {
-    true
-  }
-
   fn try_read_msg(&mut self, network_buffer: &mut BytesMut) -> Result<Option<Msg>, ZmqError> {
     self.parser.decode_from_buffer(network_buffer)
   }
@@ -120,6 +112,16 @@ impl LengthPrefixedFramer {
       framer: ZmtpFrameEncoder::new(sndbatch_count * 9, sndbatch_bytes_physical),
     }
   }
+
+  /// Encrypt already-serialized ZMTP plaintext and prepend the 2-byte length
+  /// prefix. Shared by `write_msg_multipart` and `write_msg_batch`.
+  fn frame_with_length_prefix(&mut self, plaintext: &[u8]) -> Result<Bytes, ZmqError> {
+    let ciphertext = self.cipher.encrypt(plaintext)?;
+    let mut out = BytesMut::with_capacity(2 + ciphertext.len());
+    out.put_u16(ciphertext.len() as u16);
+    out.extend_from_slice(&ciphertext);
+    Ok(out.freeze())
+  }
 }
 
 impl ISecureFramer for LengthPrefixedFramer {
@@ -148,19 +150,11 @@ impl ISecureFramer for LengthPrefixedFramer {
 
   fn write_msg_multipart(&mut self, msgs: FrameBatch) -> Result<Bytes, ZmqError> {
     let plaintext = self.framer.frame_contiguous(&[msgs])?;
-    let ciphertext = self.cipher.encrypt(&plaintext)?;
-    let mut out = BytesMut::with_capacity(2 + ciphertext.len());
-    out.put_u16(ciphertext.len() as u16);
-    out.extend_from_slice(&ciphertext);
-    Ok(out.freeze())
+    self.frame_with_length_prefix(&plaintext)
   }
 
   fn write_msg_batch(&mut self, batch: &[FrameBatch]) -> Result<Bytes, ZmqError> {
     let plaintext = self.framer.frame_contiguous(batch)?;
-    let ciphertext = self.cipher.encrypt(&plaintext)?;
-    let mut out = BytesMut::with_capacity(2 + ciphertext.len());
-    out.put_u16(ciphertext.len() as u16);
-    out.extend_from_slice(&ciphertext);
-    Ok(out.freeze())
+    self.frame_with_length_prefix(&plaintext)
   }
 }
