@@ -41,7 +41,7 @@ impl AnonymousIngressEngine {
     &self,
     pipe_id: usize,
     capacity: usize,
-    trie: Arc<crate::socket::patterns::SubscriptionTrie>,
+    trie: Arc<crate::socket::patterns::PrefixMatcher>,
     drain_delta: usize,
   ) -> PipeMessageSender {
     let sender = self.queue.register_pipe(pipe_id, capacity, drain_delta);

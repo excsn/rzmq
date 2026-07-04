@@ -15,8 +15,7 @@ use fibre::{RecvError, TryRecvError, TrySendError};
 
 use crate::error::ZmqError;
 use crate::message::FrameBatch;
-use crate::socket::patterns::sub_matcher::SubscriptionMatcher;
-use crate::socket::patterns::trie::SubscriptionTrie;
+use crate::socket::patterns::sub_matcher::{PrefixMatcher, SubscriptionMatcher};
 use crate::log_rpq_spin_deadlock;
 
 #[cfg(feature = "io-uring")]
@@ -852,7 +851,7 @@ pub(crate) enum PipeMessageSender {
   DirectAnonymous(ReadyPipeSender<FrameBatch>),
   FilteredAnonymous {
     sender: ReadyPipeSender<FrameBatch>,
-    trie: Arc<SubscriptionTrie>,
+    trie: Arc<PrefixMatcher>,
   },
   DirectAddressed {
     sender: ReadyPipeSender<FrameBatch>,

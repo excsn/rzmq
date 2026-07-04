@@ -14,13 +14,13 @@ use crate::socket::ISocket;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::options::{SUBSCRIBE, UNSUBSCRIBE};
-use crate::socket::patterns::SubscriptionTrie;
+use crate::socket::patterns::PrefixMatcher;
 use crate::{Blob, delegate_to_core};
 
 #[derive(Debug)]
 pub(crate) struct SubSocket {
   core: Arc<SocketCore>,
-  subscriptions: Arc<SubscriptionTrie>,
+  subscriptions: Arc<PrefixMatcher>,
   ingress_engine: AnonymousIngressEngine,
   pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
@@ -34,7 +34,7 @@ impl SubSocket {
     };
     Self {
       core,
-      subscriptions: Arc::new(SubscriptionTrie::new()),
+      subscriptions: Arc::new(PrefixMatcher::new()),
       ingress_engine: AnonymousIngressEngine::new(max_conn, rcvbatch_count),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
