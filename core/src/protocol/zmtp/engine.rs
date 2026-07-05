@@ -177,6 +177,35 @@ impl ZmtpEngine {
 
   pub fn on_network_bytes(&mut self, data: Bytes) -> EngineOutput {
     self.network_read_accumulator.extend_from_slice(&data);
+    self.drive()
+  }
+
+  /// The unparsed partial-frame remainder carried between reads. The tokio
+  /// session actor copies this small slice into the front of a *fresh* read
+  /// buffer, then frames directly from that buffer via `drive_buf`.
+  pub fn carry(&self) -> &[u8] {
+    &self.network_read_accumulator
+  }
+
+  /// Frame directly from a caller-owned, freshly-allocated buffer instead of
+  /// copying each read into the internal accumulator. `buf` must already hold
+  /// `[carry() | newly-read bytes]` contiguously. It is moved in as the parse
+  /// buffer (no copy); payloads are sliced zero-copy from it; whatever partial
+  /// frame is left becomes the next `carry()`.
+  ///
+  /// Each call hands in a fresh, unshared buffer, so the reads/reserves that
+  /// filled it never hit `BytesMut`'s realloc-on-shared path. The previous
+  /// buffer (pinned by outstanding payload `Bytes`) is dropped here and freed
+  /// once the app consumes those payloads. This removes the per-read copy into
+  /// the accumulator ("copy B") without the pinning penalty.
+  pub fn drive_buf(&mut self, buf: BytesMut) -> EngineOutput {
+    self.network_read_accumulator = buf;
+    self.drive()
+  }
+
+  /// Run the protocol state machine over the current accumulator contents
+  /// (already appended via `on_network_bytes`, or moved in via `drive_buf`).
+  pub fn drive(&mut self) -> EngineOutput {
     let mut out = EngineOutput::new();
 
     match self.phase {

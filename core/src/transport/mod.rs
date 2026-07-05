@@ -47,6 +47,14 @@ pub(crate) trait ZmtpReadHalf: AsyncRead + Unpin + Send + std::fmt::Debug + 'sta
   fn try_read_chunk(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
     Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
   }
+
+  /// Non-blocking synchronous read appending into the spare capacity of `buf`,
+  /// advancing its length. Default returns `WouldBlock` (mirrors
+  /// `try_read_chunk`). TCP and IPC override with their native `try_read_buf`
+  /// so the greedy drain reads straight into the caller's fresh parse buffer.
+  fn try_read_buf(&mut self, _buf: &mut bytes::BytesMut) -> std::io::Result<usize> {
+    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+  }
 }
 
 /// Extension trait for write halves used by the session actor.
@@ -85,6 +93,9 @@ impl ZmtpReadHalf for tokio::net::tcp::OwnedReadHalf {
   fn try_read_chunk(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
     tokio::net::tcp::OwnedReadHalf::try_read(self, buf)
   }
+  fn try_read_buf(&mut self, buf: &mut bytes::BytesMut) -> std::io::Result<usize> {
+    tokio::net::tcp::OwnedReadHalf::try_read_buf(self, buf)
+  }
 }
 
 // Empty impl — TCP uses the EgressBuffer + AsyncWrite path.
@@ -105,6 +116,9 @@ impl ZmtpStdStream for tokio::net::TcpStream {
 impl ZmtpReadHalf for tokio::net::unix::OwnedReadHalf {
   fn try_read_chunk(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
     tokio::net::unix::OwnedReadHalf::try_read(self, buf)
+  }
+  fn try_read_buf(&mut self, buf: &mut bytes::BytesMut) -> std::io::Result<usize> {
+    tokio::net::unix::OwnedReadHalf::try_read_buf(self, buf)
   }
 }
 

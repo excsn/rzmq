@@ -71,6 +71,11 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   /// clone; the actor never sends on the pipe while that future is active, so
   /// the pipe's single-producer contract is preserved.
   incoming_pipe_sender: Option<Arc<PipeMessageSender>>,
+  /// Ingress read strategy, resolved once from the ingress kind when pipes
+  /// attach: `true` (frame-in-place, no accumulator copy) for addressed sockets
+  /// (REP/DEALER/ROUTER), `false` (copy into accumulator) for anonymous ones
+  /// (PULL/SUB). See `ZmqMessageProcessor::read_and_process`.
+  ingress_frame_in_place: bool,
   is_currently_congested: bool,
 
   #[cfg(target_os = "linux")]
@@ -157,6 +162,7 @@ where
       session_regulator: SessionRegulator::new(regulator_min_lifespan),
       _connection_permit: connection_permit,
       incoming_pipe_sender: None,
+      ingress_frame_in_place: false,
       is_currently_congested: false,
       cork_info,
     };
@@ -447,7 +453,7 @@ where
           // Ingress network read: gated on the buffer AND the in-flight pipe
           // send (the buffer is empty-by-move while the send future is active)
           // to propagate TCP backpressure.
-          ingress_res = message_processor.read_and_process(&mut read_half, &mut self.zmtp_engine),
+          ingress_res = message_processor.read_and_process(&mut read_half, &mut self.zmtp_engine, self.ingress_frame_in_place),
             if ingress_buffer.is_empty() && !ingress_send_fut_active => {
             match ingress_res {
               Ok(engine_out) => {
@@ -646,6 +652,13 @@ where
         }
 
         self.incoming_pipe_sender = incoming_pipe_sender.map(Arc::new);
+        // Resolve the ingress read strategy once: addressed sockets
+        // (REP/DEALER/ROUTER) frame in place; anonymous ones (PULL/SUB) and the
+        // PUB subscription sink copy into the accumulator.
+        self.ingress_frame_in_place = matches!(
+          self.incoming_pipe_sender.as_deref(),
+          Some(PipeMessageSender::DirectAddressed { .. })
+        );
         self
           .core_pipe_manager
           .attach(rx_from_core, core_pipe_read_id_for_incoming_routing);
