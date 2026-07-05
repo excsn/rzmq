@@ -124,6 +124,11 @@ pub struct UringWorker {
   /// extra non-sleeping loop iteration; the authoritative pre-sleep double-check
   /// (real channel `is_empty()` probes) remains the correctness guard.
   pub(crate) work_signal_gen: Arc<AtomicUsize>,
+  /// Clone of this worker's own op sender, embedded into each `ZmtpSmartConnection` at
+  /// registration so fd-targeted control ops route back to the owning worker. Because the
+  /// worker holds a sender to its own channel, shutdown uses the explicit
+  /// `UringOpRequest::ShutdownWorker` op rather than op-channel closure.
+  pub(crate) self_op_tx: SignalingOpSender,
 
   /// Scratchpad for active file descriptors to avoid hot-path heap allocations.
   pub(crate) active_fds_scratch: Vec<RawFd>,
@@ -193,13 +198,25 @@ impl UringWorker {
       Arc::clone(&pool_slot),
     );
 
+    let self_op_tx = signaling_op_sender.clone();
+
+    // Ring construction happens on the worker thread; without this handshake a ring-init
+    // failure (e.g. ENOMEM under memory pressure) would leave a dead sender in the pool.
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), ZmqError>>(1);
+
     let worker_thread_join_handle = std::thread::Builder::new()
       .name("rzmq-io-uring-worker".into())
       .spawn(move || { // config is moved here
         // Build the ring, optionally with SQPOLL, with graceful privilege fallback.
         let mut actual_sqpoll_enabled = config.sqpoll_enabled;
+        // CQ sized 4× the SQ (kernel default is 2×): a multishot recv whose CQE hits a
+        // full CQ is TERMINATED by the kernel, and a lost terminal CQE leaves the reader
+        // believing it is still armed — a permanent per-connection read stall. Bursts of
+        // data + ENOBUFS + rearm CQEs across many fds overflow a 2× CQ in practice.
+        let cq_entries = config.ring_entries * 4;
         let ring_result: Result<IoUring, ZmqError> = {
           let mut builder = io_uring::IoUring::builder();
+          builder.setup_cqsize(cq_entries);
           if config.sqpoll_enabled {
             builder.setup_sqpoll(config.sqpoll_idle_ms);
           }
@@ -215,7 +232,9 @@ impl UringWorker {
                  or kernel < 5.11). Falling back to standard non-SQPOLL mode."
               );
               actual_sqpoll_enabled = false;
-              io_uring::IoUring::builder()
+              let mut fallback_builder = io_uring::IoUring::builder();
+              fallback_builder.setup_cqsize(cq_entries);
+              fallback_builder
                 .build(config.ring_entries)
                 .map_err(|e| ZmqError::Internal(format!("io_uring fallback build failed: {}", e)))
             }
@@ -224,6 +243,7 @@ impl UringWorker {
         };
         match ring_result {
           Ok(ring) => {
+            let _ = ready_tx.send(Ok(()));
             info!(
               "UringWorker: io_uring ring initialized. entries={}, sqpoll={}",
               config.ring_entries, actual_sqpoll_enabled
@@ -309,6 +329,7 @@ impl UringWorker {
               cfg_egress_cap: (config.ring_entries as usize / 16).clamp(8, 128),
               worker_asleep,
               work_signal_gen,
+              self_op_tx,
               active_fds_scratch: Vec::with_capacity(256),
               cqe_scratch: Vec::with_capacity(256),
               metrics: Arc::new(UringMetrics::default()),
@@ -326,13 +347,26 @@ impl UringWorker {
           }
           Err(e) => {
             error!("UringWorker: io_uring initialization failed — cannot start: {}", e);
+            let _ = ready_tx.send(Err(e.clone()));
             Err(e)
           }
         }
       })
       .map_err(|e| ZmqError::Internal(format!("Failed to spawn UringWorker thread: {:?}", e)))?;
 
-    Ok((signaling_op_sender, worker_thread_join_handle))
+    match ready_rx.recv() {
+      Ok(Ok(())) => Ok((signaling_op_sender, worker_thread_join_handle)),
+      Ok(Err(e)) => {
+        let _ = worker_thread_join_handle.join();
+        Err(e)
+      }
+      Err(_) => {
+        let _ = worker_thread_join_handle.join();
+        Err(ZmqError::Internal(
+          "UringWorker thread exited before signaling ring readiness".into(),
+        ))
+      }
+    }
   }
 }
 

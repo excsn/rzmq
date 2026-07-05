@@ -314,6 +314,7 @@ impl UringWorker {
           event_fd,
           std::sync::Arc::clone(&self.worker_asleep),
           std::sync::Arc::clone(&self.work_signal_gen),
+          self.self_op_tx.clone(),
           engine_cfg.sndtimeo,
         ));
 
@@ -459,6 +460,14 @@ impl UringWorker {
         );
         self.fds_needing_close_initiated_pass.push_back(fd);
       }
+      UringOpRequest::ShutdownWorker => {
+        // Explicit drain trigger: connection objects hold SignalingOpSender clones (and the
+        // worker holds its own via self_op_tx), so op-channel closure alone can no longer fire.
+        info!("UringWorker: Received explicit ShutdownWorker op.");
+        if self.state == WorkerState::Running {
+          self.transition_to_draining();
+        }
+      }
     }
   }
 }
@@ -488,6 +497,7 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
 
   let mut profiler = LoopProfiler::new(Duration::from_millis(10), 10000);
   let mut kernel_poll_timeout_duration = KERNEL_POLL_INITIAL;
+  let mut cq_overflow_warned = false;
 
   while worker.state != WorkerState::Stopped {
     profiler.loop_start();
@@ -497,6 +507,25 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         if worker.op_rx.is_closed() {
           worker.transition_to_draining();
           continue;
+        }
+
+        // CQ overflow: the kernel is holding a backlog of CQEs it could not post — and
+        // it TERMINATES multishot ops whose completions hit a full CQ. Flush the backlog
+        // promptly (enter with GETEVENTS) so terminal CQEs reach their readers instead of
+        // leaving them armed-in-name-only forever.
+        if unsafe { worker.ring.submission_shared().cq_overflow() } {
+          if !cq_overflow_warned {
+            cq_overflow_warned = true;
+            warn!(
+              "UringWorker: completion queue overflow detected — kernel-side CQE backlog; \
+               multishot ops may have been terminated by the kernel. Flushing via GETEVENTS."
+            );
+          }
+          let zero_ts = types::Timespec::new();
+          let flush_args = types::SubmitArgs::new().timespec(&zero_ts);
+          let _ = worker.ring.submitter().submit_with_args(1, &flush_args);
+        } else {
+          cq_overflow_warned = false;
         }
 
         // Cross-phase variables shared across all phase blocks.

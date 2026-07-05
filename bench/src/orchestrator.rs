@@ -131,6 +131,9 @@ async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
       crate::cli::UringStrategy::LowPower => "low-power",
     };
     base_args.push(format!("--uring-strategy={}", strategy_str));
+    // Propagate worker count — the orchestrator does no socket I/O itself, so the
+    // flag only matters in the server/client child processes.
+    base_args.push(format!("--uring-workers={}", args.uring_workers));
   }
 
   let run_id = run_id_base();

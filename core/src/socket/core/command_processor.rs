@@ -236,6 +236,13 @@ pub(crate) async fn process_socket_command(
       let synthetic_read_id = core_arc.context.inner().next_handle();
       let synthetic_write_id = core_arc.context.inner().next_handle();
 
+      // Fd-targeted control ops must reach the worker that owns this fd; its op sender is
+      // embedded in the connection object built at registration.
+      let owning_worker_tx = connection_iface
+        .as_any()
+        .downcast_ref::<crate::io_uring_backend::zmtp_handler::ZmtpSmartConnection>()
+        .map(|conn| conn.worker_op_tx());
+
       let endpoint_info = EndpointInfo {
         mailbox: core_arc.command_sender(),
         task_handle: None,
@@ -272,8 +279,8 @@ pub(crate) async fn process_socket_command(
       // deliver it to the worker handler so it can push decoded messages straight to the
       // ReadyPipeQueue — no intermediate UringPipeReader task needed.
       if let Some(ingress_sender) = socket_logic_strong.get_incoming_pipe_sender(synthetic_read_id) {
-        match crate::uring::global_state::get_global_uring_worker_op_tx() {
-          Ok(mut worker_tx) => {
+        match owning_worker_tx {
+          Some(mut worker_tx) => {
             let ud = core_arc.context.inner().next_handle() as u64;
             let (reply_tx, reply_rx) = oneshot::oneshot::<Result<crate::io_uring_backend::ops::UringOpCompletion, crate::ZmqError>>();
             let req = crate::io_uring_backend::ops::UringOpRequest::AttachIngressSender {
@@ -292,8 +299,8 @@ pub(crate) async fn process_socket_command(
               }
             }
           }
-          Err(e) => {
-            tracing::warn!(handle=core_handle, %endpoint_uri, "AttachIngressSender: worker tx unavailable: {}", e);
+          None => {
+            tracing::warn!(handle=core_handle, %endpoint_uri, "AttachIngressSender: connection_iface is not a ZmtpSmartConnection; no owning-worker sender.");
           }
         }
       }

@@ -5,9 +5,9 @@ use crate::io_uring_backend::connection_handler::OutgoingMessage;
 use crate::io_uring_backend::ops::UringOpRequest;
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::ops::{WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING};
-use crate::message::{FrameBatch, Msg};
 #[cfg(feature = "io-uring")]
-use crate::uring;
+use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
+use crate::message::{FrameBatch, Msg};
 #[cfg(feature = "io-uring")]
 use crate::Context;
 
@@ -92,6 +92,8 @@ pub(crate) struct UringFdConnection {
   mpsc_tx: mpsc::BoundedAsyncSender<OutgoingMessage>,
   event_fd: eventfd::EventFD,
   worker_asleep: Arc<AtomicU8>,
+  /// Op sender of the worker that owns this fd; fd-targeted control ops must go here.
+  worker_op_tx: SignalingOpSender,
   context: Context,
 }
 
@@ -114,6 +116,7 @@ impl UringFdConnection {
     mpsc_tx: mpsc::BoundedAsyncSender<OutgoingMessage>,
     event_fd: eventfd::EventFD,
     worker_asleep: Arc<AtomicU8>,
+    worker_op_tx: SignalingOpSender,
     context: Context,
   ) -> Self {
     Self {
@@ -121,6 +124,7 @@ impl UringFdConnection {
       mpsc_tx,
       event_fd,
       worker_asleep,
+      worker_op_tx,
       context,
     }
   }
@@ -179,7 +183,7 @@ impl ISocketConnection for UringFdConnection {
       reply_tx,
     };
     
-    let mut worker_op_tx = uring::global_state::get_global_uring_worker_op_tx()?;
+    let mut worker_op_tx = self.worker_op_tx.clone();
     worker_op_tx.send(req).await.map_err(|e| {
       ZmqError::Internal(format!("UringWorker op channel error for close: {}", e))
     })?;

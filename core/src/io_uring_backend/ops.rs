@@ -102,6 +102,10 @@ pub enum UringOpRequest {
     fd: RawFd,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
+  /// Explicit worker shutdown, sent by `shutdown_uring_backend` to each pool worker.
+  /// Connection objects hold `SignalingOpSender` clones, so the op channel closing can
+  /// no longer be the sole drain trigger — worker exit must not depend on sender refcounts.
+  ShutdownWorker,
 }
 
 impl UringOpRequest {
@@ -117,6 +121,7 @@ impl UringOpRequest {
       | Self::ResumeConnection { user_data, .. }
       | Self::StartFdReadLoop { user_data, .. }
       | Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
+      Self::ShutdownWorker => 0,
     }
   }
 
@@ -132,6 +137,7 @@ impl UringOpRequest {
       Self::ResumeConnection { .. } => "ResumeConnection".to_string(),
       Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
       Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
+      Self::ShutdownWorker => "ShutdownWorker".to_string(),
     }
   }
 
@@ -149,6 +155,7 @@ impl UringOpRequest {
       | Self::Connect { reply_tx, .. }
       | Self::StartFdReadLoop { reply_tx, .. }
       | Self::ShutdownConnectionHandler { reply_tx, .. } => Some(reply_tx),
+      Self::ShutdownWorker => None,
     }
   }
 }
@@ -235,6 +242,7 @@ impl fmt::Debug for UringOpRequest {
         .field("user_data", user_data)
         .field("fd", fd)
         .finish_non_exhaustive(),
+      UringOpRequest::ShutdownWorker => f.debug_struct("ShutdownWorker").finish(),
     }
   }
 }

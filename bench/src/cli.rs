@@ -102,6 +102,11 @@ pub struct Cli {
   #[cfg(feature = "io-uring")]
   #[arg(long, value_enum, default_value_t = UringStrategy::Balanced)]
   pub uring_strategy: UringStrategy,
+
+  /// Number of io_uring worker threads (0 = cores-based default)
+  #[cfg(feature = "io-uring")]
+  #[arg(long, default_value_t = 0)]
+  pub uring_workers: usize,
 }
 
 /// Polling strategy profile for the io_uring worker thread.

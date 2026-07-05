@@ -31,6 +31,10 @@ fn init_uring() -> bool {
       default_recv_buffer_size: 4096,
       default_send_buffer_count: 16,
       default_send_buffer_size: 65536,
+      // These tests exercise starvation of a SINGLE worker's send pool / recv buffer ring
+      // (e.g. 32 senders vs 16 ZC buffers). Sharding connections across N workers would
+      // multiply the pools and dilute the exhaustion pressure the tests exist to create.
+      num_workers: 1,
       ..Default::default()
     }) {
       Ok(()) => URING_AVAILABLE.store(true, Ordering::Relaxed),

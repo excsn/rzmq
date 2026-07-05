@@ -387,10 +387,11 @@ async fn test_concurrent_term_and_op() -> Result<(), ZmqError> {
       // Branch 2: Send task signals completion first
       _ = finished_sending.notified() => {
           println!("Send task finished notification received first.");
-          // Send task finished, now explicitly wait for termination to also signal completion.
-          println!("Awaiting final termination signal after send task finished...");
-           _ = termination_complete.notified().await; // Wait for the signal
-          println!("Final termination signal received after send task finished.");
+          // Do NOT re-await termination_complete here: the term task signals via
+          // notify_waiters(), which stores no permit — if it fired between the select
+          // race and a fresh notified() registration, the signal is lost and the test
+          // hangs forever. The post-select `term_task.await` below is the authoritative
+          // completion join.
       }
       // Branch 3: Overall timeout
       _ = tokio::time::sleep(Duration::from_secs(5)) => {
@@ -400,8 +401,11 @@ async fn test_concurrent_term_and_op() -> Result<(), ZmqError> {
 
   // --- Post-select checks ---
 
-  // Check the result of the termination task *after* select ensures it was signalled
-  let term_final_result = term_task.await; // Join the termination task
+  // Check the result of the termination task *after* select ensures it was signalled.
+  // Watchdog: a genuine ctx.term() hang must fail the test loudly, not stall the runner.
+  let term_final_result = tokio::time::timeout(Duration::from_secs(10), term_task)
+    .await
+    .expect("Timed out waiting for termination task to join — ctx.term() hung");
   match term_final_result {
     Ok(Ok(())) => {
       println!("Termination task joined successfully.");

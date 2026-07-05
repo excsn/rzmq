@@ -98,6 +98,20 @@ pub struct UringConfig {
   pub sqpoll_idle_ms: u32,
   /// Controls the user-space spinning behavior when the worker thread is idle.
   pub polling_strategy: UringPollingStrategy,
+  /// Number of `UringWorker` threads (each with its own ring, buffer pools, and fd set).
+  /// Connections are assigned round-robin at registration and stay on their worker for life.
+  /// Note: buffer pools are registered per ring, so pinned memory scales with this value,
+  /// and with `sqpoll_enabled` each worker gets its own kernel poll thread.
+  pub num_workers: usize,
+}
+
+/// Cores-based default worker count: `available_parallelism() - 2`, clamped to `[1, 8]`.
+pub fn default_uring_num_workers() -> usize {
+  std::thread::available_parallelism()
+    .map(|n| n.get())
+    .unwrap_or(1)
+    .saturating_sub(2)
+    .clamp(1, 8)
 }
 
 impl Default for UringConfig {
@@ -119,6 +133,7 @@ impl Default for UringConfig {
       sqpoll_enabled: false,
       sqpoll_idle_ms: 1000,
       polling_strategy: UringPollingStrategy::balanced(),
+      num_workers: default_uring_num_workers(),
     }
   }
 }
@@ -185,16 +200,44 @@ pub fn initialize_uring_backend(config: UringConfig) -> Result<(), ZmqError> {
         config
       );
 
-      let factories: Vec<Arc<dyn ProtocolHandlerFactory>> = vec![];
-      let (signaling_op_tx, worker_join_handle) = UringWorker::spawn_with_config(config, factories)
-        .map_err(|e| {
-          error!("Failed to spawn UringWorker: {}", e);
-          e
-        })?;
+      let num_workers = config.num_workers.max(1);
+      let mut senders = Vec::with_capacity(num_workers);
+      let mut handles = Vec::with_capacity(num_workers);
+      for worker_idx in 0..num_workers {
+        let factories: Vec<Arc<dyn ProtocolHandlerFactory>> = vec![];
+        match UringWorker::spawn_with_config(config, factories) {
+          Ok((signaling_op_tx, worker_join_handle)) => {
+            senders.push(signaling_op_tx);
+            handles.push(worker_join_handle);
+          }
+          Err(e) => {
+            // Rings and their registered buffer pools are pinned memory; later workers can
+            // hit limits (RLIMIT_MEMLOCK / memcg ENOMEM) that the first did not. A smaller
+            // pool beats no backend — degrade to the workers that spawned.
+            if senders.is_empty() {
+              error!("Failed to spawn UringWorker 1/{}: {}", num_workers, e);
+              return Err(e);
+            }
+            warn!(
+              "Failed to spawn UringWorker {}/{}: {}. Continuing with {} worker(s).",
+              worker_idx + 1,
+              num_workers,
+              e,
+              senders.len()
+            );
+            break;
+          }
+        }
+      }
 
-      *global_state::get_uring_worker_op_tx_mutex().lock() = Some(signaling_op_tx);
-      *global_state::get_uring_worker_join_handle_mutex().lock() = Some(worker_join_handle);
-      debug!("io_uring::initialize: Global UringWorker spawned and its handles stored.");
+      let spawned = senders.len();
+      *global_state::get_uring_worker_pool_mutex().lock() =
+        Some(global_state::UringWorkerPool::new(senders));
+      *global_state::get_uring_worker_join_handles_mutex().lock() = handles;
+      debug!(
+        "io_uring::initialize: {} UringWorker(s) spawned and their handles stored.",
+        spawned
+      );
 
       URING_BACKEND_INITIALIZED.store(true, Ordering::SeqCst);
       info!("Global io_uring backend successfully initialized.");
@@ -221,28 +264,46 @@ pub async fn shutdown_uring_backend() -> Result<(), ZmqError> {
 
   info!("Shutting down global io_uring backend...");
 
-  // Signal the worker to stop by closing its op channel.
-  let taken_op_tx = global_state::get_uring_worker_op_tx_mutex().lock().take();
-  if taken_op_tx.is_some() {
-    debug!("io_uring::shutdown: Signaled UringWorker to stop by closing its op channel.");
+  // Signal all workers to stop. Connection objects (and each worker's own self_op_tx) hold
+  // sender clones, so channel closure cannot be the drain trigger — send the explicit
+  // ShutdownWorker op instead. The send also wakes a sleeping worker via its eventfd.
+  let taken_pool = global_state::get_uring_worker_pool_mutex().lock().take();
+  if let Some(pool) = taken_pool {
+    let mut senders = pool.into_senders();
+    let n = senders.len();
+    for sender in senders.iter_mut() {
+      if let Err(e) = sender.send(crate::io_uring_backend::ops::UringOpRequest::ShutdownWorker).await {
+        warn!("io_uring::shutdown: ShutdownWorker send failed (worker already gone?): {}", e);
+      }
+    }
+    drop(senders);
+    debug!(
+      "io_uring::shutdown: Sent ShutdownWorker to {} UringWorker(s) and dropped pool senders.",
+      n
+    );
   }
-  drop(taken_op_tx);
 
-  // Join the worker thread.
-  if let Some(worker_handle) = global_state::get_uring_worker_join_handle_mutex()
-    .lock()
-    .take()
-  {
-    debug!("io_uring::shutdown: Joining UringWorker thread...");
-    spawn_blocking(move || match worker_handle.join() {
-      Ok(Ok(())) => info!("UringWorker thread joined successfully."),
-      Ok(Err(e)) => error!("UringWorker thread exited with error: {}", e),
-      Err(e) => error!("Failed to join UringWorker thread (panic): {:?}", e),
+  // Join all worker threads.
+  let worker_handles: Vec<_> =
+    std::mem::take(&mut *global_state::get_uring_worker_join_handles_mutex().lock());
+  if worker_handles.is_empty() {
+    warn!("io_uring::shutdown: No UringWorker JoinHandles found. Cannot join.");
+  } else {
+    debug!(
+      "io_uring::shutdown: Joining {} UringWorker thread(s)...",
+      worker_handles.len()
+    );
+    spawn_blocking(move || {
+      for (idx, worker_handle) in worker_handles.into_iter().enumerate() {
+        match worker_handle.join() {
+          Ok(Ok(())) => info!("UringWorker thread {} joined successfully.", idx),
+          Ok(Err(e)) => error!("UringWorker thread {} exited with error: {}", idx, e),
+          Err(e) => error!("Failed to join UringWorker thread {} (panic): {:?}", idx, e),
+        }
+      }
     })
     .await
     .map_err(|e| ZmqError::Internal(format!("spawn_blocking for worker join failed: {}", e)))?;
-  } else {
-    warn!("io_uring::shutdown: UringWorker JoinHandle was None. Cannot join.");
   }
 
   info!("Global io_uring backend shutdown complete.");

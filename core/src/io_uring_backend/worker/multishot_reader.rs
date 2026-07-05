@@ -36,6 +36,11 @@ pub(crate) struct MultishotReader {
   cancel_op_user_data: Option<UserData>,
   /// Flow control state for kernel-level backpressure.
   flow_state: MultishotFlowState,
+  /// A `RequestNewRingReadMultishot` blueprint has been emitted but not yet submitted.
+  /// Blueprints can sit in the work_map across loop iterations (SQE budget, SQ-full
+  /// re-queue); without this latch every `prepare_sqes` call would emit a duplicate,
+  /// double-arming the fd and leaking the first op's ring buffers on CQE mismatch.
+  arm_pending: bool,
 }
 
 impl MultishotReader {
@@ -47,6 +52,7 @@ impl MultishotReader {
       is_active: false,
       cancel_op_user_data: None,
       flow_state: MultishotFlowState::Paused,
+      arm_pending: false,
     }
   }
 
@@ -82,11 +88,14 @@ impl MultishotReader {
     self.buffer_group_id
   }
 
-  /// Called by handler to signal intent to start a multishot read.
-  pub fn prepare_recv_multi_intent(&self) -> Option<HandlerSqeBlueprint> {
-    if self.is_active || self.cancel_op_user_data.is_some() {
+  /// Called by handler to signal intent to start a multishot read. Latches until the
+  /// blueprint is actually submitted (`mark_operation_submitted`) so repeated
+  /// `prepare_sqes` calls cannot double-arm the fd while a blueprint is still queued.
+  pub fn prepare_recv_multi_intent(&mut self) -> Option<HandlerSqeBlueprint> {
+    if self.is_active || self.cancel_op_user_data.is_some() || self.arm_pending {
       return None;
     }
+    self.arm_pending = true;
     Some(HandlerSqeBlueprint::RequestNewRingReadMultishot {
       fd: self.fd,
       bgid: self.buffer_group_id,
@@ -98,6 +107,7 @@ impl MultishotReader {
     self.active_op_user_data = Some(op_user_data);
     self.is_active = true;
     self.cancel_op_user_data = None;
+    self.arm_pending = false;
     self.flow_state = MultishotFlowState::Reading;
     tracing::debug!(
       "[MultishotReader FD={}] Marked as active in kernel with UserData {} — flow state: Reading.",
@@ -181,8 +191,9 @@ impl MultishotReader {
         if errno == libc::ENOBUFS {
           // Non-fatal: kernel buffer ring temporarily exhausted. Notify the handler to
           // set its throttle flag so `prepare_sqes` won't immediately resubmit and spin.
-          // The handler also sends a `ResumeConnection` to the worker op channel so the
-          // read is re-armed after the worker sleeps and Tokio drains the receive queues.
+          // Recovery: the consumer's low-water-mark wakeup (ready_pipe_queue) and the
+          // worker's timed kernel wait both bring the loop back to `prepare_sqes`, which
+          // re-arms the read once the throttle clears.
           tracing::debug!(
             "[MultishotReader FD={}] Buffer ring exhausted (ENOBUFS). Notifying handler.",
             self.fd
@@ -378,6 +389,7 @@ impl MultishotReader {
     self.is_active = false;
     self.active_op_user_data = None;
     self.cancel_op_user_data = None;
+    self.arm_pending = false;
     self.flow_state = MultishotFlowState::Paused;
   }
 }

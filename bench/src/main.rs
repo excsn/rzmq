@@ -35,17 +35,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       UringStrategy::Balanced => UringPollingStrategy::balanced(),
       UringStrategy::LowPower => UringPollingStrategy::low_power(),
     };
-    let config = UringConfig {
+    let mut config = UringConfig {
       polling_strategy,
       default_send_zerocopy: args.uring_zerocopy,
       default_recv_multishot: args.uring_multishot,
       ..UringConfig::default()
     };
+    if args.uring_workers > 0 {
+      config.num_workers = args.uring_workers;
+    }
     if let Err(e) = initialize_uring_backend(config) {
       error!("Failed to initialize io_uring backend: {}", e);
       return Err(e.into());
     }
-    info!("io_uring backend initialized with strategy: {:?}", args.uring_strategy);
+    info!(
+      "io_uring backend initialized with strategy: {:?}, workers: {}, available_parallelism: {}",
+      args.uring_strategy,
+      config.num_workers,
+      std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+    );
   }
 
   match args.role {

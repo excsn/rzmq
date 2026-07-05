@@ -99,7 +99,8 @@ pub(crate) fn build_sqe_for_external_request(
     UringOpRequest::AttachIngressSender { .. } |
     UringOpRequest::ResumeConnection { .. } |
     UringOpRequest::StartFdReadLoop { .. } |
-    UringOpRequest::ShutdownConnectionHandler { .. } => {
+    UringOpRequest::ShutdownConnectionHandler { .. } |
+    UringOpRequest::ShutdownWorker => {
         tracing::trace!(
             "build_sqe_for_external_request: Op '{}' does not produce a direct SQE from this function.",
             request.op_name_str()

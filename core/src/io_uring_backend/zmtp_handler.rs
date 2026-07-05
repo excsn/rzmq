@@ -18,6 +18,7 @@ use crate::io_uring_backend::{
     HandlerIoOps, HandlerSqeBlueprint, UringConnectionHandler, UringWorkerInterface, WorkerIoConfig,
   },
   ops::{HANDLER_INTERNAL_SEND_OP_UD, UserData, WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING},
+  signaling_op_sender::SignalingOpSender,
   worker::{InternalOpTracker, MultishotReader},
 };
 use crate::message::FrameBatch;
@@ -39,6 +40,9 @@ pub(crate) struct ZmtpSmartConnection {
   /// Bumped on every successful egress enqueue so a spinning worker detects the
   /// batch via a single relaxed load instead of iterating every egress channel.
   work_signal_gen: Arc<AtomicUsize>,
+  /// Op sender of the worker that owns this fd. Fd-targeted control ops
+  /// (AttachIngressSender/Resume/Shutdown) must go here, not to the global pool.
+  worker_op_tx: SignalingOpSender,
   sndtimeo: Option<Duration>,
 }
 
@@ -58,6 +62,7 @@ impl ZmtpSmartConnection {
     event_fd: eventfd::EventFD,
     worker_asleep: Arc<AtomicU8>,
     work_signal_gen: Arc<AtomicUsize>,
+    worker_op_tx: SignalingOpSender,
     sndtimeo: Option<Duration>,
   ) -> Self {
     Self {
@@ -66,8 +71,14 @@ impl ZmtpSmartConnection {
       event_fd,
       worker_asleep,
       work_signal_gen,
+      worker_op_tx,
       sndtimeo,
     }
+  }
+
+  /// Clone of the owning worker's op sender, for fd-targeted control ops.
+  pub(crate) fn worker_op_tx(&self) -> SignalingOpSender {
+    self.worker_op_tx.clone()
   }
 
   fn signal_worker(&self) {
@@ -204,6 +215,11 @@ pub(crate) struct ZmtpUringHandler {
   write_in_flight: u32,
   event_fd: eventfd::EventFD,
   worker_asleep: Arc<AtomicU8>,
+  /// Diagnostic: first instant reads were observed un-armed while the connection is
+  /// open (recovery-wedge detector). Cleared whenever the reader is actively reading.
+  read_stall_since: Option<Instant>,
+  /// Diagnostic: last time the stall WARN fired, to rate-limit to one per 5s.
+  read_stall_last_log: Option<Instant>,
 }
 
 unsafe impl Sync for ZmtpUringHandler {}
@@ -240,6 +256,45 @@ impl ZmtpUringHandler {
       write_in_flight: 0,
       event_fd,
       worker_asleep,
+      read_stall_since: None,
+      read_stall_last_log: None,
+    }
+  }
+
+  /// Recovery-wedge detector: a live non-PUSH connection whose kernel read stays
+  /// un-armed for more than 5s can no longer make ingress progress — log the full
+  /// gating state (spillover / throttle / sender congestion / reader state machine)
+  /// so a stall in the wild names its own cause. Cold path: evaluated once per
+  /// `prepare_sqes`, logs at most once per 5s per fd.
+  fn observe_read_stall(&mut self) {
+    let reading = self
+      .multishot_reader
+      .as_ref()
+      .map_or(true, |r| r.is_reading());
+    if reading || self.is_closing || self.engine.config().socket_type_name.as_str() == "PUSH" {
+      self.read_stall_since = None;
+      return;
+    }
+    let now = Instant::now();
+    let since = *self.read_stall_since.get_or_insert(now);
+    let stalled = now.duration_since(since);
+    if stalled >= Duration::from_secs(5)
+      && self
+        .read_stall_last_log
+        .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(5))
+    {
+      self.read_stall_last_log = Some(now);
+      warn!(
+        fd = self.fd,
+        stalled_secs = stalled.as_secs(),
+        spillover_len = self.spillover.len(),
+        is_throttled = self.is_throttled.load(Ordering::Acquire),
+        ingress_attached = self.ingress_sender.is_some(),
+        sender_congested = ?self.ingress_sender.as_ref().map(|s| s.is_congested()),
+        sender_drained = ?self.ingress_sender.as_ref().map(|s| s.is_drained()),
+        reader = ?self.multishot_reader,
+        "ZmtpUringHandler: reads un-armed >5s — recovery wedge diagnostic"
+      );
     }
   }
 
@@ -525,6 +580,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
         }
       }
     }
+    self.observe_read_stall();
 
     // (b) Coalesce/Batch egress messages into a single, high-throughput write SQE.
     // Lock the queue draining if we currently have an unacknowledged write in-flight.
@@ -687,10 +743,12 @@ impl UringConnectionHandler for ZmtpUringHandler {
       return true;
     }
     
-    // PUSH and PUB sockets never receive payload data in the Data phase.
+    // PUSH sockets never receive payload data in the Data phase.
     // This drops the EAGAIN CQE storm to exactly 0.
+    // PUB must NOT be included: subscription/unsubscribe frames arrive from SUB peers
+    // at any time during the Data phase, so PUB reads must stay armed.
     let socket_type = self.engine.config().socket_type_name.as_str();
-    if (socket_type == "PUSH" || socket_type == "PUB")
+    if socket_type == "PUSH"
       && self.engine.phase == crate::protocol::zmtp::engine::ZmtpPhase::Data
     {
       return true;
