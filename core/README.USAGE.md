@@ -438,7 +438,14 @@ async fn subscribe_example(sub_socket: &rzmq::Socket) -> Result<(), ZmqError> {
 ```
 
 ### Monitoring Socket Events
-Track socket lifecycle events:
+Track socket lifecycle events. The `SocketEvent` enum (non-exhaustive) currently emits:
+
+*   **Listener**: `Listening`, `BindFailed`, `Accepted`, `AcceptFailed`
+*   **Connecter**: `Connected`, `ConnectDelayed`, `ConnectRetried`, `ConnectFailed`
+*   **Connection/session**: `Closed`, `Disconnected`
+*   **Handshake/security**: `HandshakeSucceeded`, `HandshakeFailed`
+*   **Backpressure/congestion**: `ConnectionCongested` (egress pipe hit send HWM; peer skipped via write-ready skip), `ConnectionUncongested` (egress pipe drained below HWM; peer re-enters rotation)
+
 ```rust
 use rzmq::socket::SocketEvent;
 async fn monitor_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
@@ -455,7 +462,8 @@ async fn monitor_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
                 SocketEvent::HandshakeSucceeded { endpoint } => {
                     println!("Handshake succeeded with {}", endpoint);
                 }
-                // Handle other events like Listening, Accepted, BindFailed, HandshakeFailed etc.
+                // Handle other events like Listening, Accepted, BindFailed,
+                // HandshakeFailed, ConnectionCongested, ConnectionUncongested, etc.
                 _ => println!("Monitor: {:?}", event),
             }
         }

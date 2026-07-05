@@ -298,6 +298,8 @@ Represents significant events occurring within a socket or its connections, used
     *   `Disconnected { endpoint: String }`
     *   `HandshakeFailed { endpoint: String, error_msg: String }`
     *   `HandshakeSucceeded { endpoint: String }`
+    *   `ConnectionCongested { endpoint: String }` — the connection's egress pipe reached its send HWM; the socket is actively skipping this peer via write-ready skip.
+    *   `ConnectionUncongested { endpoint: String }` — the connection's egress pipe drained below its send HWM; the peer re-enters the load-balancer rotation.
 
 ## 6. Public Functions (Free-standing)
 
@@ -317,9 +319,9 @@ Represents significant events occurring within a socket or its connections, used
 
 ### In `rzmq::socket::events`:
 
-*   `pub type MonitorSender = fibre::mpmc::AsyncSender<SocketEvent>`
+*   `pub type MonitorSender = fibre::mpsc::BoundedAsyncSender<SocketEvent>`
     *   The sending end of the channel used for socket monitor events.
-*   `pub type MonitorReceiver = fibre::mpmc::AsyncReceiver<SocketEvent>`
+*   `pub type MonitorReceiver = fibre::mpsc::BoundedAsyncReceiver<SocketEvent>`
     *   The receiving end of the channel used for socket monitor events.
 
 ## 8. Public Constants
