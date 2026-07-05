@@ -13,19 +13,15 @@ It provides a familiar ZeroMQ-style API within the Rust async ecosystem, **striv
 
 ## Performance Highlights
 
-Throughput - TCP Loopback (`tcp://127.0.0.1`), PUSH/PULL Sockets, 10-second window, Linux release build on an AMD Ryzen 5 7640U Balanced Power Profile with Adaptive Throttling disabled.
+TCP Loopback PUSH/PULL Sockets Fan-In, 10-second window, Adaptive Throttling disabled.
 
-Standard · 4 workers
+<sub>Linux release build, AMD Ryzen 5 7640U Balanced Power Profile.</sub>
 
-- **3.5 M msg/s** - 64 B
-- **~17 GB/s** - 32 KB · cork
+Standard, 4 workers | **6.1 M msg/s** - 64 B | **~17 GB/s** - 32 KB · cork
 
-io_uring + cork · 4 workers
+io_uring, 4 workers | **6.5 M msg/s** - 64 B · cork |  **7.9 GB/s** - 32 KB · multishot + zerocopy (600 second sustained)
 
-- **6.5 M msg/s** - 64 B
-- **7.9 GB/s** - 32 KB · multishot + zerocopy (600 second sustained)
-
-**WARNING**: Always do your own testing for production use. Benchmarks tell a narrative against one environment and library configuration at a snapshot of time. Never trust any benchmarks especially library comparison benchmarks done over a short duration. Benchmarks are *always* out of date and these numbers are provided as tongue in cheek numbers: No universal guarantees ;).
+**WARNING**: Always do your own testing for production use. Benchmarks tell a narrative against one environment and library configuration at a snapshot of time. Never trust any benchmarks especially library comparison benchmarks done over a short duration. Benchmarks are *always* out of date, unreliable and these numbers are provided as tongue in cheek numbers: No universal guarantees ;).
 
 ## Project Status: Beta ⚠️
 
