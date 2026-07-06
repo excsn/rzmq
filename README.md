@@ -7,7 +7,7 @@
 
 Implements the ZMTP 2/3.1 wire protocol with familiar ZeroMQ socket patterns.
 
-Provides a **dedicated** `io_uring` worker on Linux, allowing individual sockets to **opt-in** to trade CPU for lower latency and higher throughput.
+Provides **dedicated** `io_uring` workers on Linux, allowing individual sockets to **opt-in** to trade CPU for lower latency and higher throughput.
 
 Delivers stunningly superior throughput and lower latency compared to every other ZeroMQ implementation as shown in high-throughput [benchmarks](#benchmarks) included.
 
@@ -19,9 +19,11 @@ TCP Loopback PUSH/PULL Sockets Fan-In, 10-second window, Adaptive Throttling dis
 
 <sub>Linux release build, AMD Ryzen 5 7640U Balanced Power Profile.</sub>
 
-Standard, 4 workers | **6.1 M msg/s** - 64 B | **~17 GB/s** - 32 KB · cork
+Standard, 4 PULL | **6.1 M msg/s** - 64 B | **~17 GB/s** - 32 KB · cork
 
-io_uring, 4 workers | **6.5 M msg/s** - 64 B · cork |  **7.9 GB/s** - 32 KB · multishot + zerocopy (600 second sustained)
+io_uring, 4 PULL | **6.5 M msg/s** - 64 B · cork |  **7.9 GB/s** - 32 KB · multishot + zerocopy (600 second sustained)
+
+io_uring/4 workers, 8 PULL | **3.4 M msg/s** - 4 KB · multishot | **~17.3 GB/s** - 32 KB · multishot + cork
 
 **WARNING**: Always do your own testing for production use. Benchmarks tell a narrative against one environment and library configuration at a snapshot of time. Never trust any benchmarks especially library comparison benchmarks done over a short duration. Benchmarks are *always* out of date, unreliable and these numbers are provided as tongue in cheek numbers: No universal guarantees ;).
 

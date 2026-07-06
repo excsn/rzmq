@@ -7,6 +7,7 @@ use crate::io_uring_backend::connection_handler::ProtocolHandlerFactory;
 use crate::io_uring_backend::worker::UringWorker;
 use crate::socket::options::calculate_required_slot_size;
 
+use std::ops::Div;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -86,6 +87,11 @@ pub struct UringConfig {
   pub default_recv_multishot: bool,
   pub default_recv_buffer_count: usize,
   pub default_recv_buffer_size: usize,
+  /// Zero-copy send buffer slots. This is a TOTAL budget across all workers: at
+  /// initialization it is divided by `num_workers` (floor of 2 per worker) so
+  /// adding shards does not multiply pinned/registered memory — oversized
+  /// per-worker pools trip `RLIMIT_MEMLOCK` (`register_buffers` → ENOMEM) and
+  /// silently disable ZC on the workers that fail.
   pub default_send_buffer_count: usize,
   pub default_send_buffer_size: usize,
   /// Enable `IORING_SETUP_SQPOLL`: the kernel spawns a dedicated thread that polls
@@ -100,16 +106,19 @@ pub struct UringConfig {
   pub polling_strategy: UringPollingStrategy,
   /// Number of `UringWorker` threads (each with its own ring, buffer pools, and fd set).
   /// Connections are assigned round-robin at registration and stay on their worker for life.
-  /// Note: buffer pools are registered per ring, so pinned memory scales with this value,
-  /// and with `sqpoll_enabled` each worker gets its own kernel poll thread.
+  /// Note: recv buffer rings are registered per ring so their pinned memory scales with
+  /// this value; the zero-copy send budget (`default_send_buffer_count`) is split across
+  /// workers instead. With `sqpoll_enabled` each worker gets its own kernel poll thread.
   pub num_workers: usize,
 }
 
-/// Cores-based default worker count: `available_parallelism() - 2`, clamped to `[1, 8]`.
+/// Cores-based default worker count: `ceil(available_parallelism() / 2) - 2`,
+/// clamped to `[1, 8]`.
 pub fn default_uring_num_workers() -> usize {
   std::thread::available_parallelism()
     .map(|n| n.get())
     .unwrap_or(1)
+    .div_ceil(2)
     .saturating_sub(2)
     .clamp(1, 8)
 }
@@ -201,11 +210,27 @@ pub fn initialize_uring_backend(config: UringConfig) -> Result<(), ZmqError> {
       );
 
       let num_workers = config.num_workers.max(1);
+
+      // Each worker registers its own SendBufferPool with the kernel, and that
+      // memory is pinned (counted against RLIMIT_MEMLOCK). Treat the configured
+      // send-slot count as a TOTAL budget and split it across the shards —
+      // otherwise N workers pin N× the intended memory and `register_buffers`
+      // fails with ENOMEM on later workers, silently disabling ZC for them.
+      let mut worker_config = config;
+      if config.default_send_zerocopy && num_workers > 1 {
+        worker_config.default_send_buffer_count =
+          (config.default_send_buffer_count / num_workers).max(2);
+        info!(
+          "Zero-copy send pool budget split across {} workers: {} slots each ({} total configured).",
+          num_workers, worker_config.default_send_buffer_count, config.default_send_buffer_count
+        );
+      }
+
       let mut senders = Vec::with_capacity(num_workers);
       let mut handles = Vec::with_capacity(num_workers);
       for worker_idx in 0..num_workers {
         let factories: Vec<Arc<dyn ProtocolHandlerFactory>> = vec![];
-        match UringWorker::spawn_with_config(config, factories) {
+        match UringWorker::spawn_with_config(worker_config, factories) {
           Ok((signaling_op_tx, worker_join_handle)) => {
             senders.push(signaling_op_tx);
             handles.push(worker_join_handle);

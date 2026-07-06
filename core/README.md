@@ -21,6 +21,8 @@ Standard, 4 workers | **6.1 M msg/s** - 64 B | **~17 GB/s** - 32 KB · cork
 
 io_uring, 4 workers | **6.5 M msg/s** - 64 B · cork |  **7.9 GB/s** - 32 KB · multishot + zerocopy (600 second sustained)
 
+io_uring, 4 sharded rings (8 conns) | **3.4 M msg/s** - 4 KB · multishot | **~17.3 GB/s** - 32 KB · multishot + cork
+
 **WARNING**: Always do your own testing for production use. Benchmarks tell a narrative against one environment and library configuration at a snapshot of time. Never trust any benchmarks especially library comparison benchmarks done over a short duration. Benchmarks are *always* out of date, unreliable and these numbers are provided as tongue in cheek numbers: No universal guarantees ;).
 
 ## Project Status: Beta ⚠️
