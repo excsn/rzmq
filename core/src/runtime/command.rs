@@ -134,6 +134,16 @@ pub enum Command {
     endpoint_uri: String,
     error: ZmqError,
   },
+
+  /// Edge-triggered ingress backpressure notification from an io_uring connection
+  /// handler, keyed by URI. SocketCore translates it into a
+  /// `ConnectionCongested`/`ConnectionUncongested` monitor event, mirroring the
+  /// tokio session path.
+  #[cfg(feature = "io-uring")]
+  UringConnectionCongestion {
+    endpoint_uri: String,
+    congested: bool,
+  },
 }
 
 impl Command {
@@ -161,6 +171,8 @@ impl Command {
       Command::UringConnectionEstablished { .. } => "UringConnectionEstablished",
       #[cfg(feature = "io-uring")]
       Command::UringFdError { .. } => "UringFdError",
+      #[cfg(feature = "io-uring")]
+      Command::UringConnectionCongestion { .. } => "UringConnectionCongestion",
     }
   }
 }

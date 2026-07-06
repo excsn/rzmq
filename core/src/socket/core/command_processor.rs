@@ -141,6 +141,9 @@ pub(crate) async fn process_socket_command(
       // Internal commands like PipeClosedByPeer might still need processing if they arrive.
       // However, PipeReaderTasks should stop if SocketCore is shutting down.
       // For now, these are primarily handled by ISocket::handle_pipe_event.
+      // Congestion edges racing a shutdown carry no obligation — drop quietly.
+      #[cfg(feature = "io-uring")]
+      Command::UringConnectionCongestion { .. } => {}
       _ => {
         tracing::warn!(handle = core_handle, cmd_name = %command_name_str, "Unhandled or unexpected command during shutdown.");
       }
@@ -341,6 +344,25 @@ pub(crate) async fn process_socket_command(
         current_shutdown_phase != ShutdownPhase::Running,
       )
       .await;
+    }
+
+    #[cfg(feature = "io-uring")]
+    Command::UringConnectionCongestion {
+      endpoint_uri,
+      congested,
+    } => {
+      // Edge-triggered by the uring connection handler; translate to the same
+      // monitor events the tokio session path emits.
+      let event = if congested {
+        SocketEvent::ConnectionCongested {
+          endpoint: endpoint_uri,
+        }
+      } else {
+        SocketEvent::ConnectionUncongested {
+          endpoint: endpoint_uri,
+        }
+      };
+      core_arc.core_state.read().send_monitor_event(event);
     }
 
     Command::NewConnectionEstablished {

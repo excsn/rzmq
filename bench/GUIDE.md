@@ -36,6 +36,7 @@ On modern Linux kernels, the `io_uring` backend bypasses the standard reactor-po
 
 *   **Zero-Copy Send (`--uring-zerocopy`):** Maps pages from a pre-registered send buffer pool directly into the network device's DMA engine, avoiding memory copies between user space and kernel space during transmit operations.
 *   **Multishot Receive (`--uring-multishot`):** Issues a single, persistent read request to the kernel. As data arrives, the kernel automatically assigns a buffer from a pre-registered receive buffer ring to hold the payload and pushes a completion entry, eliminating the need to re-submit read requests after every receive event.
+*   **Sharded Workers (`--uring-workers <N>`):** The backend runs `N` independent `UringWorker` threads, each with its own ring, buffer pools, and fd set. Connections are assigned round-robin at registration time and stay on their worker for life, so a multi-connection benchmark spreads its I/O across rings with no cross-worker synchronization. The default (`0`) resolves to a cores-based value: `available_parallelism() - 2`, clamped to `[1, 8]`. Pass `--uring-workers 1` to force all connections onto a single ring (the pre-sharding topology, useful for isolating per-ring behavior or reproducing single-worker results), or a higher value to measure sharding scalability. Note that pinned buffer-pool memory scales with `N`, and with SQPOLL enabled each worker gets its own kernel poll thread.
 
  ### Fixed Configuration: Adaptive Throttling Disabled
 
@@ -182,6 +183,21 @@ The custom `io_uring` backend is currently implemented only for **TCP network so
     ```bash
     cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern pub-sub --msg-size 512 --use-io-uring --uring-multishot
     ```
+
+#### Sharded io_uring Execution (`--uring-workers`)
+
+By default the backend spawns a cores-based number of `UringWorker` threads (`available_parallelism() - 2`, clamped to `[1, 8]`) and shards connections across them round-robin. Override this with `--uring-workers <N>` to control the shard count explicitly. The flag is forwarded to both the server and client processes in orchestrate mode.
+
+*   **Single worker (all connections on one ring — baseline / repro topology):**
+    ```bash
+    cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 4096 --concurrency 8 --use-io-uring --uring-multishot --uring-workers 1
+    ```
+*   **Sharded scaling sweep (compare against the single-worker baseline):**
+    ```bash
+    cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 4096 --concurrency 8 --use-io-uring --uring-multishot --uring-workers 4
+    ```
+
+> Sharding only helps when there are multiple connections to distribute (`--concurrency > 1`, or patterns that open several sockets). A single-connection ping-pong workload lives on one worker regardless of `N`; the extra rings only add pinned buffer-pool memory (each worker registers its own pools, and with SQPOLL each also gets its own kernel poll thread).
 
 ---
 

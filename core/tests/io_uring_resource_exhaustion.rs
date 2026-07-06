@@ -4,6 +4,7 @@ use rzmq::socket::options::{
   IO_URING_RCVMULTISHOT, IO_URING_SESSION_ENABLED, IO_URING_SNDZEROCOPY, LAST_ENDPOINT, LINGER,
   RCVHWM, RCVTIMEO, SNDHWM, SNDTIMEO,
 };
+use rzmq::socket::SocketEvent;
 use rzmq::uring::{initialize_uring_backend, UringConfig};
 use rzmq::{Msg, SocketType, ZmqError};
 use serial_test::serial;
@@ -375,6 +376,100 @@ async fn test_multishot_recv_buffer_ring_starvation() -> Result<(), ZmqError> {
     TOTAL_MSGS, received
   );
 
+  ctx.term().await?;
+  Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Test 2.4 — Ingress Congestion Monitor Events (io_uring receiver)
+//
+// The uring connection handler reports ingress backpressure to SocketCore via
+// Command::UringConnectionCongestion, which SocketCore translates into
+// ConnectionCongested / ConnectionUncongested monitor events (mirroring the
+// tokio session path). This test forces both edges:
+//   1. A tiny RCVHWM (8) with an idle receiver — the sender's burst fills the
+//      ingress pipe, the handler's try_send hits Full → ConnectionCongested.
+//   2. Draining every message empties the pipe and flushes spillover →
+//      ConnectionUncongested.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_uring_ingress_congestion_monitor_events() -> Result<(), ZmqError> {
+  if !init_uring() {
+    return Ok(());
+  }
+
+  let ctx = common::test_context();
+
+  // Receiver: io_uring multishot PULL with a tiny ingress pipe so a modest
+  // burst congests it while the app isn't consuming.
+  let pull = ctx.socket(SocketType::Pull)?;
+  pull.set_option_raw(RCVHWM, &8i32.to_ne_bytes()).await?;
+  pull.set_option_raw(LINGER, &1_000i32.to_ne_bytes()).await?;
+  pull.set_option_raw(IO_URING_SESSION_ENABLED, &1i32.to_ne_bytes()).await?;
+  pull.set_option_raw(IO_URING_RCVMULTISHOT, &1i32.to_ne_bytes()).await?;
+
+  // Monitor must exist before the connection so no event is missed.
+  let monitor_rx = pull.monitor_default().await?;
+
+  pull.bind("tcp://127.0.0.1:0").await?;
+  let endpoint = bound_endpoint(&pull).await?;
+  tokio::time::sleep(Duration::from_millis(50)).await;
+
+  // Sender: plain tokio path; the congestion under test is receiver-side.
+  let push = ctx.socket(SocketType::Push)?;
+  push.set_option_raw(SNDHWM, &1_000i32.to_ne_bytes()).await?;
+  push.set_option_raw(SNDTIMEO, &5_000i32.to_ne_bytes()).await?;
+  push.set_option_raw(LINGER, &60_000i32.to_ne_bytes()).await?;
+  push.connect(&endpoint).await?;
+  tokio::time::sleep(Duration::from_millis(100)).await;
+
+  const BURST: u32 = 200;
+  let payload = vec![0xCC_u8; 1024];
+  for _ in 0..BURST {
+    push.send(Msg::from_vec(payload.clone())).await?;
+  }
+
+  // Edge 1: receiver idle, ingress pipe capacity 8 — the burst must congest it.
+  let congested = common::wait_for_monitor_event(
+    &monitor_rx,
+    Duration::from_secs(10),
+    Duration::from_millis(100),
+    |e| matches!(e, SocketEvent::ConnectionCongested { .. }),
+  )
+  .await;
+  assert!(
+    congested.is_ok(),
+    "expected ConnectionCongested while receiver is idle: {:?}",
+    congested
+  );
+
+  // Edge 2: drain everything; backpressure releases and the handler must
+  // report Uncongested (the event may fire mid-drain — the monitor channel
+  // buffers it either way).
+  let mut received = 0u32;
+  while received < BURST {
+    common::recv_timeout(&pull, Duration::from_secs(10)).await?;
+    received += 1;
+  }
+
+  let uncongested = common::wait_for_monitor_event(
+    &monitor_rx,
+    Duration::from_secs(10),
+    Duration::from_millis(100),
+    |e| matches!(e, SocketEvent::ConnectionUncongested { .. }),
+  )
+  .await;
+  assert!(
+    uncongested.is_ok(),
+    "expected ConnectionUncongested after draining {} messages: {:?}",
+    BURST,
+    uncongested
+  );
+
+  push.close().await?;
+  pull.close().await?;
   ctx.term().await?;
   Ok(())
 }

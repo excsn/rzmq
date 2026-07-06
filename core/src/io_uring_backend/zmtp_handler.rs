@@ -202,6 +202,10 @@ pub(crate) struct ZmtpUringHandler {
   /// True when the ingress pipe queue is full (rcvhwm). Reads are throttled until
   /// SocketCore sends `ResumeConnection`.
   is_throttled: AtomicBool,
+  /// Last congestion state reported to SocketCore via
+  /// `Command::UringConnectionCongestion` (edge-triggered latch, mirrors the
+  /// tokio session path's ConnectionCongested/Uncongested monitor events).
+  ingress_congestion_notified: AtomicBool,
   multishot_reader: Option<MultishotReader>,
   is_closing: bool,
   /// Clean EOF arrived while ingress batches were still stashed in `spillover`
@@ -222,8 +226,10 @@ pub(crate) struct ZmtpUringHandler {
   worker_asleep: Arc<AtomicU8>,
   /// Diagnostic: first instant reads were observed un-armed while the connection is
   /// open (recovery-wedge detector). Cleared whenever the reader is actively reading.
+  #[cfg(feature = "diagnostics")]
   read_stall_since: Option<Instant>,
   /// Diagnostic: last time the stall WARN fired, to rate-limit to one per 5s.
+  #[cfg(feature = "diagnostics")]
   read_stall_last_log: Option<Instant>,
   /// Message-conservation audit: logical messages the engine emitted via
   /// `AppAction::DeliverMessage`. Compared against `ingress_committed` at close.
@@ -259,6 +265,7 @@ impl ZmtpUringHandler {
       ingress_sender: None,
       spillover: VecDeque::new(),
       is_throttled: AtomicBool::new(false),
+      ingress_congestion_notified: AtomicBool::new(false),
       multishot_reader: None,
       is_closing: false,
       eof_drain_pending: false,
@@ -270,7 +277,9 @@ impl ZmtpUringHandler {
       write_in_flight: 0,
       event_fd,
       worker_asleep,
+      #[cfg(feature = "diagnostics")]
       read_stall_since: None,
+      #[cfg(feature = "diagnostics")]
       read_stall_last_log: None,
       #[cfg(feature = "diagnostics")]
       ingress_emitted: 0,
@@ -284,35 +293,50 @@ impl ZmtpUringHandler {
   /// gating state (spillover / throttle / sender congestion / reader state machine)
   /// so a stall in the wild names its own cause. Cold path: evaluated once per
   /// `prepare_sqes`, logs at most once per 5s per fd.
+  ///
+  /// Diagnostics-gated. Reads held off by backpressure (ingress throttled or
+  /// spillover pending — the same conditions `should_throttle_reads` enforces)
+  /// are NOT stalls: that is flow control working, and under a saturating
+  /// workload (e.g. a slow SUB behind fast publishers) it persists for long
+  /// stretches legitimately. The clock only accumulates while reads are
+  /// un-armed with no gating reason.
   fn observe_read_stall(&mut self) {
-    let reading = self
-      .multishot_reader
-      .as_ref()
-      .map_or(true, |r| r.is_reading());
-    if reading || self.is_closing || self.engine.config().socket_type_name.as_str() == "PUSH" {
-      self.read_stall_since = None;
-      return;
-    }
-    let now = Instant::now();
-    let since = *self.read_stall_since.get_or_insert(now);
-    let stalled = now.duration_since(since);
-    if stalled >= Duration::from_secs(5)
-      && self
-        .read_stall_last_log
-        .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(5))
+    #[cfg(feature = "diagnostics")]
     {
-      self.read_stall_last_log = Some(now);
-      warn!(
-        fd = self.fd,
-        stalled_secs = stalled.as_secs(),
-        spillover_len = self.spillover.len(),
-        is_throttled = self.is_throttled.load(Ordering::Acquire),
-        ingress_attached = self.ingress_sender.is_some(),
-        sender_congested = ?self.ingress_sender.as_ref().map(|s| s.is_congested()),
-        sender_drained = ?self.ingress_sender.as_ref().map(|s| s.is_drained()),
-        reader = ?self.multishot_reader,
-        "ZmtpUringHandler: reads un-armed >5s — recovery wedge diagnostic"
-      );
+      let reading = self
+        .multishot_reader
+        .as_ref()
+        .map_or(true, |r| r.is_reading());
+      if reading
+        || self.is_closing
+        || self.engine.config().socket_type_name.as_str() == "PUSH"
+        || self.is_throttled.load(Ordering::Acquire)
+        || !self.spillover.is_empty()
+      {
+        self.read_stall_since = None;
+        return;
+      }
+      let now = Instant::now();
+      let since = *self.read_stall_since.get_or_insert(now);
+      let stalled = now.duration_since(since);
+      if stalled >= Duration::from_secs(5)
+        && self
+          .read_stall_last_log
+          .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(5))
+      {
+        self.read_stall_last_log = Some(now);
+        warn!(
+          fd = self.fd,
+          stalled_secs = stalled.as_secs(),
+          spillover_len = self.spillover.len(),
+          is_throttled = self.is_throttled.load(Ordering::Acquire),
+          ingress_attached = self.ingress_sender.is_some(),
+          sender_congested = ?self.ingress_sender.as_ref().map(|s| s.is_congested()),
+          sender_drained = ?self.ingress_sender.as_ref().map(|s| s.is_drained()),
+          reader = ?self.multishot_reader,
+          "ZmtpUringHandler: reads un-armed >5s — recovery wedge diagnostic"
+        );
+      }
     }
   }
 
@@ -403,11 +427,13 @@ impl ZmtpUringHandler {
                     self.ingress_committed += 1;
                   }
                   self.is_throttled.store(false, Ordering::Release);
+                  self.notify_ingress_congestion(false);
                 }
                 Err(fibre::TrySendError::Full(returned_batch)) => {
                   // Stash the un-sent batch instead of dropping it on the floor!
                   self.spillover.push_back(returned_batch);
                   self.is_throttled.store(true, Ordering::Release);
+                  self.notify_ingress_congestion(true);
                   trace!(
                     fd = self.fd,
                     "ZmtpUringHandler: ingress queue full, stashed batch to spillover"
@@ -460,6 +486,28 @@ impl ZmtpUringHandler {
     }
   }
 
+  /// Edge-triggered ingress-congestion monitor notification. Routed as a command
+  /// to SocketCore (which owns the monitor channel), mirroring the tokio session
+  /// path's `ConnectionCongested`/`ConnectionUncongested` events. The latch makes
+  /// repeated calls with an unchanged state free, so every throttle set/clear
+  /// site can call this unconditionally.
+  fn notify_ingress_congestion(&self, congested: bool) {
+    if self
+      .ingress_congestion_notified
+      .swap(congested, Ordering::AcqRel)
+      == congested
+    {
+      return;
+    }
+    let _ = self
+      .worker_io_config
+      .socket_mailbox
+      .try_send(Command::UringConnectionCongestion {
+        endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
+        congested,
+      });
+  }
+
   /// Attempt to drain the stashed spillover batches into the socket's ReadyPipeQueue.
   /// If the queue becomes congested again, it puts the batch back and maintains the throttle.
   fn try_drain_spillover(&mut self) {
@@ -479,6 +527,7 @@ impl ZmtpUringHandler {
             // Main queue is full again: put the batch back at the front and keep throttled
             self.spillover.push_front(returned_batch);
             self.is_throttled.store(true, Ordering::Release);
+            self.notify_ingress_congestion(true);
             return;
           }
           Err(_) => {
@@ -495,6 +544,7 @@ impl ZmtpUringHandler {
       }
       // Spillover fully flushed: we can safely clear the throttle flag
       self.is_throttled.store(false, Ordering::Release);
+      self.notify_ingress_congestion(false);
       trace!(fd = self.fd, "ZmtpUringHandler: spillover fully drained");
     }
   }
@@ -849,6 +899,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
       if let Some(ref sender) = self.ingress_sender {
         if sender.is_drained() {
           self.is_throttled.store(false, Ordering::Release);
+          self.notify_ingress_congestion(false);
           return false;
         }
       }
@@ -867,6 +918,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
     self.ingress_sender = Some(sender);
     // Clear any throttle that may have been set before the sender arrived.
     self.is_throttled.store(false, Ordering::Release);
+    self.notify_ingress_congestion(false);
   }
 
   fn resume_ingress(&mut self) {
@@ -875,6 +927,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
       "ZmtpUringHandler: resume_ingress — clearing throttle"
     );
     self.is_throttled.store(false, Ordering::Release);
+    self.notify_ingress_congestion(false);
   }
 
   /// Returns true when there is pending egress data or a close deadline is armed,
