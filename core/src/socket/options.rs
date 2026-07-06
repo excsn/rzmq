@@ -277,6 +277,10 @@ pub(crate) struct ZmtpEngineConfig {
   pub handshake_timeout: Option<Duration>,
   pub rcvtimeo: Option<Duration>,
   pub sndtimeo: Option<Duration>,
+  /// LINGER socket option: bounds how long a session drains queued egress on a
+  /// clean shutdown before sending FIN. `None` = infinite (ZMQ -1, the default),
+  /// `Some(0)` = drop pending immediately, `Some(d)` = drain up to `d`.
+  pub linger: Option<Duration>,
   // io-uring specific options
   pub use_send_zerocopy: bool,
   pub use_recv_multishot: bool,
@@ -331,6 +335,7 @@ impl Default for ZmtpEngineConfig {
       handshake_timeout: None,
       rcvtimeo: None,
       sndtimeo: None,
+      linger: None,
       use_send_zerocopy: false,
       use_recv_multishot: false,
       use_cork: false,
@@ -437,6 +442,7 @@ impl From<&SocketOptions> for ZmtpEngineConfig {
       handshake_timeout: options.handshake_ivl,
       rcvtimeo: options.rcvtimeo,
       sndtimeo: options.sndtimeo,
+      linger: options.linger,
       use_send_zerocopy: options.io_uring.send_zerocopy,
       use_recv_multishot: options.io_uring.recv_multishot,
       use_cork: options.tcp_cork,

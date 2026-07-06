@@ -204,6 +204,11 @@ pub(crate) struct ZmtpUringHandler {
   is_throttled: AtomicBool,
   multishot_reader: Option<MultishotReader>,
   is_closing: bool,
+  /// Clean EOF arrived while ingress batches were still stashed in `spillover`
+  /// (typically messages that raced ahead of `AttachIngressSender`). ZMQ semantics
+  /// require everything received before the FIN to reach the application, so the
+  /// teardown (UringFdError + RequestClose) is deferred until spillover drains.
+  eof_drain_pending: bool,
   /// Non-blocking delayed close (replaces `thread::sleep`).
   /// Armed when `NetAction::ScheduleClose(Some(delay))` fires; `prepare_sqes` polls it.
   close_deadline: Option<Instant>,
@@ -220,6 +225,14 @@ pub(crate) struct ZmtpUringHandler {
   read_stall_since: Option<Instant>,
   /// Diagnostic: last time the stall WARN fired, to rate-limit to one per 5s.
   read_stall_last_log: Option<Instant>,
+  /// Message-conservation audit: logical messages the engine emitted via
+  /// `AppAction::DeliverMessage`. Compared against `ingress_committed` at close.
+  #[cfg(feature = "diagnostics")]
+  ingress_emitted: u64,
+  /// Message-conservation audit: logical messages successfully committed into the
+  /// ingress pipe channel (direct sends + spillover drains).
+  #[cfg(feature = "diagnostics")]
+  ingress_committed: u64,
 }
 
 unsafe impl Sync for ZmtpUringHandler {}
@@ -248,6 +261,7 @@ impl ZmtpUringHandler {
       is_throttled: AtomicBool::new(false),
       multishot_reader: None,
       is_closing: false,
+      eof_drain_pending: false,
       close_deadline: None,
       use_send_zerocopy,
       use_recv_multishot,
@@ -258,6 +272,10 @@ impl ZmtpUringHandler {
       worker_asleep,
       read_stall_since: None,
       read_stall_last_log: None,
+      #[cfg(feature = "diagnostics")]
+      ingress_emitted: 0,
+      #[cfg(feature = "diagnostics")]
+      ingress_committed: 0,
     }
   }
 
@@ -367,6 +385,10 @@ impl ZmtpUringHandler {
           }
         }
         AppAction::DeliverMessage(batch) => {
+          #[cfg(feature = "diagnostics")]
+          {
+            self.ingress_emitted += 1;
+          }
           if let Some(ref sender) = self.ingress_sender {
             // FIFO Guard: if we already have stashed batches, we must append to spillover
             // first to preserve strict FIFO delivery order.
@@ -376,6 +398,10 @@ impl ZmtpUringHandler {
             } else {
               match sender.try_send_sync(batch) {
                 Ok(()) => {
+                  #[cfg(feature = "diagnostics")]
+                  {
+                    self.ingress_committed += 1;
+                  }
                   self.is_throttled.store(false, Ordering::Release);
                 }
                 Err(fibre::TrySendError::Full(returned_batch)) => {
@@ -443,7 +469,12 @@ impl ZmtpUringHandler {
     if let Some(ref sender) = self.ingress_sender {
       while let Some(batch) = self.spillover.pop_front() {
         match sender.try_send_sync(batch) {
-          Ok(()) => {}
+          Ok(()) => {
+            #[cfg(feature = "diagnostics")]
+            {
+              self.ingress_committed += 1;
+            }
+          }
           Err(fibre::TrySendError::Full(returned_batch)) => {
             // Main queue is full again: put the batch back at the front and keep throttled
             self.spillover.push_front(returned_batch);
@@ -451,7 +482,12 @@ impl ZmtpUringHandler {
             return;
           }
           Err(_) => {
-            // Receiver dropped; discard remainder.
+            // Receiver dropped; discard remainder. Real message loss — always logged.
+            warn!(
+              fd = self.fd,
+              discarded = self.spillover.len() + 1,
+              "ZmtpUringHandler: ingress receiver gone — discarding stashed batches"
+            );
             self.spillover.clear();
             return;
           }
@@ -515,8 +551,23 @@ impl UringConnectionHandler for ZmtpUringHandler {
     );
 
     if bytes.is_empty() {
-      info!(fd = self.fd, "ZmtpUringHandler: EOF from peer");
       self.is_closing = true;
+      if !self.spillover.is_empty() {
+        // Clean FIN with ingress batches still stashed handler-side (typically
+        // messages that raced ahead of AttachIngressSender). Everything received
+        // before EOF must still reach the application, so defer the teardown:
+        // prepare_sqes keeps draining spillover and completes the close (UringFdError
+        // + RequestClose) once nothing is stranded here.
+        info!(
+          fd = self.fd,
+          stashed = self.spillover.len(),
+          ingress_attached = self.ingress_sender.is_some(),
+          "ZmtpUringHandler: EOF from peer — deferring close until stashed ingress drains"
+        );
+        self.eof_drain_pending = true;
+        return HandlerIoOps::new();
+      }
+      info!(fd = self.fd, "ZmtpUringHandler: EOF from peer");
       let _ = self
         .worker_io_config
         .socket_mailbox
@@ -564,6 +615,28 @@ impl UringConnectionHandler for ZmtpUringHandler {
 
   fn prepare_sqes(&mut self, interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
     if self.is_closing && self.close_deadline.is_none() {
+      if self.eof_drain_pending {
+        // Deferred EOF teardown: flush stashed ingress toward the consumer. The
+        // worker re-enters here on consumer low-water-mark wakeups, on the attach
+        // op arriving, and on its timed-wait fallback, so this makes progress
+        // without the reader being armed.
+        self.try_drain_spillover();
+        if self.spillover.is_empty() {
+          self.eof_drain_pending = false;
+          info!(
+            fd = self.fd,
+            "ZmtpUringHandler: deferred EOF drain complete — closing connection"
+          );
+          let _ = self
+            .worker_io_config
+            .socket_mailbox
+            .try_send(Command::UringFdError {
+              endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
+              error: ZmqError::ConnectionClosed,
+            });
+          return HandlerIoOps::new().add_blueprint(HandlerSqeBlueprint::RequestClose);
+        }
+      }
       return HandlerIoOps::new();
     }
 
@@ -683,6 +756,18 @@ impl UringConnectionHandler for ZmtpUringHandler {
   }
 
   fn fd_has_been_closed(&mut self) {
+    // Message-conservation audit: final per-connection totals. emitted != committed
+    // (with spillover empty) means messages died inside this handler.
+    #[cfg(feature = "diagnostics")]
+    if self.ingress_emitted != self.ingress_committed {
+      warn!(
+        fd = self.fd,
+        emitted = self.ingress_emitted,
+        committed = self.ingress_committed,
+        spillover_remaining = self.spillover.len(),
+        "[MSG-CONSERVATION] ZmtpUringHandler closed with emitted != committed"
+      );
+    }
     info!(fd = self.fd, "ZmtpUringHandler: fd_has_been_closed");
     self.is_closing = true;
     self.close_deadline = None;

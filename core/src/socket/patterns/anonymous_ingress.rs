@@ -50,7 +50,11 @@ impl AnonymousIngressEngine {
 
   pub fn deregister_pipe(&self, pipe_id: usize) {
     self.queue.deregister_pipe(pipe_id);
-    self.cache.lock().frames.clear();
+    // Deliberately does NOT clear the consumer frame cache: `frames` holds
+    // already-received messages from ALL pipes flattened together, so clearing it
+    // on one pipe's detach would drop other pipes' messages — and messages
+    // received before a peer disconnect must still be delivered (ZMQ semantics).
+    // The cache is only cleared on `close()`, when the whole socket shuts down.
   }
 
   pub fn close(&self) {

@@ -760,6 +760,19 @@ pub(crate) fn process_all_cqes(
     if !is_multishot_read_pending_more && !was_delegated_to_multishot_handler {
       op_details_taken_for_final_processing =
         worker.internal_op_tracker.take_op_details(cqe_user_data);
+      // Invariant guard: this CQE matched no eventfd poll, no external op, no
+      // internal op, and no multishot reader — it is about to be silently dropped.
+      // Any hit here is evidence of user_data recycling misattribution or lost
+      // tracking.
+      #[cfg(feature = "diagnostics")]
+      if op_details_taken_for_final_processing.is_none() {
+        warn!(
+          ud = cqe_user_data,
+          res = cqe_result,
+          flags = format_args!("{:#x}", cqe_flags),
+          "[CQE Proc] UNMATCHED CQE — matches no tracker or reader; dropping"
+        );
+      }
     }
 
     if let Some(op_details) = op_details_taken_for_final_processing {

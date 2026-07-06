@@ -176,8 +176,42 @@ pub(crate) struct PipeSlot<T: Send + 'static> {
   /// Diagnostic latch ensuring the desync audit prints at most once per slot.
   #[allow(dead_code)]
   pub(crate) audit_reported: AtomicBool,
+  /// Diagnostic (message-conservation audit): cumulative messages ever committed
+  /// to this slot's channel. Compared against `total_popped` on Drop — a nonzero
+  /// difference means messages died inside the slot.
+  #[cfg(feature = "diagnostics")]
+  pub(crate) total_committed: AtomicU64,
+  /// Diagnostic (message-conservation audit): cumulative messages ever popped by
+  /// the consumer from this slot's channel.
+  #[cfg(feature = "diagnostics")]
+  pub(crate) total_popped: AtomicU64,
   #[cfg(feature = "io-uring")]
   pub(crate) uring_wakeup: Arc<OnceLock<UringWakeup>>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl<T: Send + 'static> Drop for PipeSlot<T> {
+  fn drop(&mut self) {
+    // Message-conservation audit: this is the last strong reference — anything
+    // committed but never popped is lost with the channel right here.
+    let committed = self.total_committed.load(Ordering::Relaxed);
+    let popped = self.total_popped.load(Ordering::Relaxed);
+    if committed != popped {
+      tracing::warn!(
+        pipe_id = self.pipe_id,
+        committed,
+        popped,
+        stranded = committed - popped,
+        "[MSG-CONSERVATION] PipeSlot dropped with undelivered messages"
+      );
+    } else {
+      tracing::debug!(
+        pipe_id = self.pipe_id,
+        committed,
+        "[MSG-CONSERVATION] PipeSlot dropped clean (committed == popped)"
+      );
+    }
+  }
 }
 
 impl<T: Send + 'static> PipeSlot<T> {
@@ -338,6 +372,10 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
       counts: AtomicU64::new(0),
       lwm: pipe_lwm(capacity, drain_delta),
       audit_reported: AtomicBool::new(false),
+      #[cfg(feature = "diagnostics")]
+      total_committed: AtomicU64::new(0),
+      #[cfg(feature = "diagnostics")]
+      total_popped: AtomicU64::new(0),
       #[cfg(feature = "io-uring")]
       uring_wakeup,
     });
@@ -351,7 +389,35 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
   }
 
   pub fn deregister_pipe(&self, pipe_id: usize) {
-    self.pipes.write().remove(&pipe_id);
+    let removed = self.pipes.write().remove(&pipe_id);
+    // Message-conservation audit. After this removal the slot survives only
+    // through ready tokens (Arc clones in ready_rx / held by the consumer).
+    // strong_count == 1 here means OUR binding is the last one — with messages
+    // still queued they are unreachable and will be lost when `slot` drops.
+    #[cfg(feature = "diagnostics")]
+    if let Some(slot) = &removed {
+      let queued = slot.len();
+      let refs = Arc::strong_count(slot);
+      if queued > 0 && refs == 1 {
+        tracing::warn!(
+          pipe_id,
+          queued,
+          committed = slot.total_committed.load(Ordering::Relaxed),
+          popped = slot.total_popped.load(Ordering::Relaxed),
+          "[MSG-CONSERVATION] deregister_pipe: messages queued but NO ready token references the slot — unreachable"
+        );
+      } else {
+        tracing::debug!(
+          pipe_id,
+          queued,
+          strong_refs = refs,
+          committed = slot.total_committed.load(Ordering::Relaxed),
+          popped = slot.total_popped.load(Ordering::Relaxed),
+          "[MSG-CONSERVATION] deregister_pipe"
+        );
+      }
+    }
+    drop(removed);
   }
 
   pub async fn pop(&self) -> Result<(usize, T), ZmqError> {
@@ -373,6 +439,8 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
             .fetch_sub(RESERVED_ONE + QUEUED_ONE, Ordering::AcqRel);
           let prev_queued = queued_of(prev);
           debug_assert!(prev_queued > 0);
+          #[cfg(feature = "diagnostics")]
+          slot.total_popped.fetch_add(1, Ordering::Relaxed);
           audit_slot(&slot, "pop", || unsafe { slot.rx.get_mut() }.len());
 
           if prev_queued > 1 {
@@ -402,12 +470,23 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
 
           return Ok((slot.pipe_id, item));
         }
-        Err(TryRecvError::Empty) => {
+        Err(_e @ TryRecvError::Empty) | Err(_e @ TryRecvError::Disconnected) => {
           // Stale ready signal (deregistration or close race). queued_count is
           // authoritative; if the channel is empty the signal is invalid — discard.
+          // Invariant guard: discarding the token of a slot that still has
+          // committed messages orphans them (no other token will ever come if
+          // the producer is gone) — that must never happen silently.
+          #[cfg(feature = "diagnostics")]
+          if slot.len() > 0 {
+            tracing::warn!(
+              pipe_id = slot.pipe_id,
+              queued = slot.len(),
+              error = ?_e,
+              "[MSG-CONSERVATION] pop: ready token discarded while messages are committed"
+            );
+          }
           continue;
         }
-        Err(TryRecvError::Disconnected) => continue,
       }
     }
   }
@@ -429,6 +508,8 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
             .fetch_sub(RESERVED_ONE + QUEUED_ONE, Ordering::AcqRel);
           let prev_queued = queued_of(prev);
           debug_assert!(prev_queued > 0);
+          #[cfg(feature = "diagnostics")]
+          slot.total_popped.fetch_add(1, Ordering::Relaxed);
           audit_slot(&slot, "try_pop", || unsafe { slot.rx.get_mut() }.len());
 
           if prev_queued > 1 {
@@ -457,11 +538,31 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
 
           return Some((slot.pipe_id, item));
         }
-        Err(TryRecvError::Empty) => {
+        Err(_e @ TryRecvError::Empty) => {
           // Stale ready signal — discard, let caller yield.
+          #[cfg(feature = "diagnostics")]
+          if slot.len() > 0 {
+            tracing::warn!(
+              pipe_id = slot.pipe_id,
+              queued = slot.len(),
+              error = ?_e,
+              "[MSG-CONSERVATION] try_pop: ready token discarded while messages are committed"
+            );
+          }
           return None;
         }
-        Err(TryRecvError::Disconnected) => continue,
+        Err(_e @ TryRecvError::Disconnected) => {
+          #[cfg(feature = "diagnostics")]
+          if slot.len() > 0 {
+            tracing::warn!(
+              pipe_id = slot.pipe_id,
+              queued = slot.len(),
+              error = ?_e,
+              "[MSG-CONSERVATION] try_pop: ready token discarded while messages are committed"
+            );
+          }
+          continue;
+        }
       }
     }
   }
@@ -518,7 +619,19 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
     // consumer right now.
     let got = match unsafe { slot.rx.get_mut() }.try_recv_batch_mut(out, cap) {
       Ok(n) => n,
-      Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return None,
+      Err(_e @ TryRecvError::Empty) | Err(_e @ TryRecvError::Disconnected) => {
+        // Invariant guard: committed > 0 here (cap > 0), yet the channel read
+        // failed — the token is about to be discarded with messages still
+        // committed. Must never happen silently.
+        #[cfg(feature = "diagnostics")]
+        tracing::warn!(
+          pipe_id = slot.pipe_id,
+          committed,
+          error = ?_e,
+          "[MSG-CONSERVATION] drain_slot: ready token discarded while messages are committed"
+        );
+        return None;
+      }
     };
     debug_assert!(got > 0 && got <= committed);
 
@@ -526,6 +639,8 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
     let prev = slot
       .counts
       .fetch_sub(got as u64 * (RESERVED_ONE + QUEUED_ONE), Ordering::AcqRel);
+    #[cfg(feature = "diagnostics")]
+    slot.total_popped.fetch_add(got as u64, Ordering::Relaxed);
     audit_slot(slot, "pop_batch", || unsafe { slot.rx.get_mut() }.len());
 
     if queued_of(prev) > got {
@@ -603,6 +718,8 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     // Message is committed to the channel. Seal the reservation so Drop
     // does not roll it back; the consumer's pop() will release it instead.
     let prev = slot.counts.fetch_add(QUEUED_ONE, Ordering::AcqRel);
+    #[cfg(feature = "diagnostics")]
+    slot.total_committed.fetch_add(1, Ordering::Relaxed);
     reservation.commit();
 
     if queued_of(prev) == 0
@@ -628,6 +745,8 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     unsafe { slot.tx.get_mut() }.try_send(item)?;
 
     let prev = slot.counts.fetch_add(QUEUED_ONE, Ordering::AcqRel);
+    #[cfg(feature = "diagnostics")]
+    slot.total_committed.fetch_add(1, Ordering::Relaxed);
     reservation.commit();
 
     if queued_of(prev) == 0 {
@@ -700,6 +819,10 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
         .counts
         .fetch_sub((n - sent_batches) as u64 * RESERVED_ONE, Ordering::AcqRel);
     }
+    #[cfg(feature = "diagnostics")]
+    slot
+      .total_committed
+      .fetch_add(sent_batches as u64, Ordering::Relaxed);
 
     // Guaranteed wakeup on 0→1 transition.
     if had_zero_transition {
@@ -732,6 +855,10 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
           sent_this_pass as u64 * (RESERVED_ONE + QUEUED_ONE),
           Ordering::AcqRel,
         );
+        #[cfg(feature = "diagnostics")]
+        slot
+          .total_committed
+          .fetch_add(sent_this_pass as u64, Ordering::Relaxed);
 
         if queued_of(prev) == 0
           && !push_ready_token(&self.ready_tx, &slot, "send_batch_mut spinning on ready_tx")
@@ -780,6 +907,8 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
       let prev = slot
         .counts
         .fetch_add(RESERVED_ONE + QUEUED_ONE, Ordering::AcqRel);
+      #[cfg(feature = "diagnostics")]
+      slot.total_committed.fetch_add(1, Ordering::Relaxed);
 
       if queued_of(prev) == 0
         && !push_ready_token(&self.ready_tx, &slot, "send_batch_mut spinning on ready_tx")
@@ -1054,6 +1183,10 @@ impl PipeMessageSender {
             Ordering::AcqRel,
           );
         }
+        #[cfg(feature = "diagnostics")]
+        slot
+          .total_committed
+          .fetch_add(sent_batches as u64, Ordering::Relaxed);
 
         if had_zero_transition {
           push_ready_token(

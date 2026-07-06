@@ -78,6 +78,23 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   ingress_frame_in_place: bool,
   is_currently_congested: bool,
 
+  /// LINGER-compliant drain: set when a *clean* shutdown trigger (Stop command,
+  /// SocketClosing/ContextTerminating broadcast, mailbox closed) arrives while
+  /// Operational. Instead of exiting the loop immediately — which drops queued
+  /// egress (core pipe, carryover, egress buffer) on the floor — the loop keeps
+  /// running with only the drain-relevant arms making progress, and transitions
+  /// to ShuttingDownStream once all outbound queues are empty or the linger
+  /// deadline expires.
+  graceful_drain_requested: bool,
+  /// Absolute deadline for the graceful drain, derived from the LINGER option
+  /// at trigger time. `None` while draining = infinite linger (ZMQ -1).
+  graceful_drain_deadline: Option<TokioInstant>,
+  /// The command mailbox returned Err (all senders dropped). Latched so the
+  /// select arm can be disabled — otherwise a closed mailbox is always ready
+  /// and the biased select would spin on it during a graceful drain, starving
+  /// the write arm.
+  command_mailbox_closed: bool,
+
   #[cfg(target_os = "linux")]
   cork_info: Option<crate::sessionx::cork::TcpCorkInfoX>,
   #[cfg(not(target_os = "linux"))]
@@ -164,6 +181,9 @@ where
       incoming_pipe_sender: None,
       ingress_frame_in_place: false,
       is_currently_congested: false,
+      graceful_drain_requested: false,
+      graceful_drain_deadline: None,
+      command_mailbox_closed: false,
       cork_info,
     };
 
@@ -372,6 +392,33 @@ where
             .await;
         }
 
+        // Graceful-drain completion check (LINGER path): all outbound queues
+        // empty means everything the app queued has been handed to the kernel —
+        // safe to FIN now.
+        if self.graceful_drain_requested
+          && self.core_pipe_manager.len() == 0
+          && core_carryover.is_empty()
+          && egress_buffer.is_empty()
+        {
+          self.graceful_drain_requested = false;
+          self.graceful_drain_deadline = None;
+          tracing::info!(
+            sca_handle = self.handle,
+            "SCA graceful drain complete — transitioning to ShuttingDownStream."
+          );
+          self.current_phase = ConnectionPhaseX::ShuttingDownStream;
+          continue 'operational; // while-condition exits the loop
+        }
+
+        // Linger deadline for the graceful drain; pending() when not draining
+        // or when linger is infinite.
+        let mut drain_deadline_future = futures::future::pending().left_future();
+        if self.graceful_drain_requested {
+          if let Some(deadline) = self.graceful_drain_deadline {
+            drain_deadline_future = tokio::time::sleep_until(deadline).right_future();
+          }
+        }
+
         let mut pong_timeout_future = futures::future::pending().left_future();
         if self.zmtp_engine.is_waiting_for_pong() {
           if let Some(deadline_std) = self.zmtp_engine.get_pong_deadline() {
@@ -383,11 +430,14 @@ where
         tokio::select! {
           biased;
 
-          maybe_cmd = self.command_mailbox_receiver.recv() => {
+          maybe_cmd = self.command_mailbox_receiver.recv(), if !self.command_mailbox_closed => {
             match maybe_cmd {
               Ok(command) => self.process_command(command).await,
               Err(_) => {
                 tracing::info!(sca_handle = self.handle, "SCA Command mailbox closed.");
+                // Latch: a closed mailbox is always-ready; without disabling this
+                // arm the biased select would spin here during a graceful drain.
+                self.command_mailbox_closed = true;
                 self.transition_to_shutdown_stream(None).await;
               }
             }
@@ -422,6 +472,21 @@ where
 
           _ = pong_timeout_future, if self.zmtp_engine.is_waiting_for_pong() => {
             self.set_fatal_error(ZmqError::Timeout).await;
+          }
+
+          // LINGER deadline expired mid-drain: give up and FIN. Real message
+          // loss (matching ZMQ linger semantics) — always logged.
+          _ = drain_deadline_future, if self.graceful_drain_requested && self.graceful_drain_deadline.is_some() => {
+            tracing::warn!(
+              sca_handle = self.handle,
+              egress_pending = egress_buffer.pending_messages(),
+              core_carryover = core_carryover.len(),
+              core_pipe_queued = self.core_pipe_manager.len(),
+              "SCA: LINGER deadline expired during graceful drain — discarding remaining egress"
+            );
+            self.graceful_drain_requested = false;
+            self.graceful_drain_deadline = None;
+            self.current_phase = ConnectionPhaseX::ShuttingDownStream;
           }
 
           // Drain ingress buffer: decouples network read from application pipe send.
@@ -548,6 +613,36 @@ where
         }
 
         log_session_diagnostics!(last_log_ms, self, ingress_buffer, egress_buffer, sndhwm, core_carryover);
+      }
+
+      // Message-conservation audit: anything still queued when the operational
+      // loop exits dies with this actor unless a later phase drains it. One log
+      // line per connection at shutdown — egress loss becomes provable from the
+      // log instead of inferred.
+      #[cfg(feature = "diagnostics")]
+      {
+        let residual_egress = egress_buffer.pending_messages();
+        let residual_carryover = core_carryover.len();
+        let residual_core_pipe = self.core_pipe_manager.len();
+        let residual_ingress = ingress_buffer.len();
+        if residual_egress + residual_carryover + residual_core_pipe + residual_ingress > 0 {
+          tracing::warn!(
+            sca_handle = self.handle,
+            uri = %self.actor_config.connected_endpoint_uri,
+            phase = ?self.current_phase,
+            egress_pending = residual_egress,
+            core_carryover = residual_carryover,
+            core_pipe_queued = residual_core_pipe,
+            ingress_pending = residual_ingress,
+            "[MSG-CONSERVATION] SCA exiting operational loop with undrained queues"
+          );
+        } else {
+          tracing::debug!(
+            sca_handle = self.handle,
+            phase = ?self.current_phase,
+            "[MSG-CONSERVATION] SCA exiting operational loop clean (all queues empty)"
+          );
+        }
       }
 
       self.read_half = Some(read_half);
@@ -1011,6 +1106,29 @@ where
           "Transitioning directly to Terminating phase due to error."
         );
         self.current_phase = ConnectionPhaseX::Terminating;
+      } else if self.current_phase == ConnectionPhaseX::Operational {
+        // Clean shutdown while operational: honor LINGER. Queued egress (core
+        // pipe, carryover, egress buffer) must reach TCP before the FIN, so we
+        // stay Operational in "draining" mode; the loop transitions to
+        // ShuttingDownStream once outbound queues are empty or the linger
+        // deadline expires. LINGER=0 keeps the historical drop-immediately path.
+        let linger = self.zmtp_engine.config().linger;
+        if linger == Some(Duration::ZERO) {
+          tracing::info!(
+            sca_handle = self.handle,
+            "Transitioning to ShuttingDownStream phase (LINGER=0, discarding pending egress)."
+          );
+          self.current_phase = ConnectionPhaseX::ShuttingDownStream;
+        } else if !self.graceful_drain_requested {
+          self.graceful_drain_requested = true;
+          self.graceful_drain_deadline = linger.map(|d| TokioInstant::now() + d);
+          tracing::info!(
+            sca_handle = self.handle,
+            linger = ?linger,
+            core_pipe_queued = self.core_pipe_manager.len(),
+            "SCA clean stop — draining outbound queues before FIN (LINGER-bounded)."
+          );
+        }
       } else {
         tracing::info!(
           sca_handle = self.handle,

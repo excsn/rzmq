@@ -177,6 +177,20 @@ impl MultishotReader {
 
       if cqe_res < 0 {
         let errno = -cqe_res;
+        // Invariant guard: every error branch below treats the op as terminal and
+        // clears tracking. If the kernel ever sets F_MORE on a negative-result CQE,
+        // the op is in fact STILL ARMED — clearing tracking would orphan a live
+        // kernel op and free its user_data for recycling.
+        #[cfg(feature = "diagnostics")]
+        if (cqe_flags & IOURING_CQE_F_MORE) != 0 {
+          tracing::warn!(
+            fd = self.fd,
+            ud = cqe_ud,
+            errno,
+            flags = format_args!("{:#x}", cqe_flags),
+            "[MultishotReader] negative-result CQE carries F_MORE — kernel op still armed but will be treated as terminal!"
+          );
+        }
         if errno == libc::ECANCELED as i32 {
           // The original multishot CQE arrived with -ECANCELED (from our ASYNC_CANCEL).
           // Transition to Paused and clean up — this is not an error.
@@ -195,8 +209,10 @@ impl MultishotReader {
           // worker's timed kernel wait both bring the loop back to `prepare_sqes`, which
           // re-arms the read once the throttle clears.
           tracing::debug!(
-            "[MultishotReader FD={}] Buffer ring exhausted (ENOBUFS). Notifying handler.",
-            self.fd
+            "[MultishotReader FD={}] Buffer ring exhausted (ENOBUFS, ud {}, flags {:#x}). Notifying handler.",
+            self.fd,
+            cqe_ud,
+            cqe_flags
           );
           self.active_op_user_data = None;
           self.is_active = false;
