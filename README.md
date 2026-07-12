@@ -9,7 +9,7 @@ Implements the ZMTP 2/3.1 wire protocol with familiar ZeroMQ socket patterns.
 
 Provides **dedicated** `io_uring` workers on Linux, allowing individual sockets to **opt-in** to trade CPU for lower latency and higher throughput.
 
-Delivers stunningly superior throughput and lower latency compared to every other ZeroMQ implementation as shown in high-throughput [benchmarks](#benchmarks) included.
+Delivers stunningly superior throughput and lower latency compared to every other ZeroMQ implementation as shown in high-throughput [benchmarks](#benchmarks) included. No one comes close.
 
 ***Fast, boring and correct.***
 

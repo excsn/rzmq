@@ -51,7 +51,6 @@ socket2 = { version = "0.6", features = ["all"] }
 # --- Utilities ---
 atomic_float = "^1"
 bitflags = "^2.4"
-dashmap = "^5.5"
 hex = "0.4.3"
 linked-hash-map = "^0.5.6"
 once_cell = "^1"

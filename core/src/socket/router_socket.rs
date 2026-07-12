@@ -10,8 +10,7 @@ use crate::socket::patterns::AddressedIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::socket::patterns::{FramingLatch, RouterMap, WritePipeCoordinator, router_auto_decode, router_auto_encode};
 
-use dashmap::DashMap;
-use parking_lot::Mutex as ParkingMutex;
+use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -30,6 +29,14 @@ struct ActiveFragmentedSend {
   _permit: OwnedSemaphorePermit,
 }
 
+/// Per-pipe identity state: the routing identity plus whether it is finalized
+/// (see the identity-finalization gate comment on `RouterSocket::peer_states`).
+#[derive(Debug)]
+struct PeerIdentityState {
+  identity: Blob,
+  finalized: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct RouterSocket {
   core: Arc<SocketCore>,
@@ -37,7 +44,6 @@ pub(crate) struct RouterSocket {
   ingress_engine: AddressedIngressEngine,
   pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
   frame_recv_buffer: ParkingMutex<Option<VecDeque<Msg>>>,
-  pipe_to_identity_shared_map: Arc<DashMap<usize, Blob>>,
   current_send_target: TokioMutex<Option<ActiveFragmentedSend>>,
   pipe_send_coordinator: Arc<WritePipeCoordinator>,
   framing: FramingLatch,
@@ -48,8 +54,10 @@ pub(crate) struct RouterSocket {
   // ahead of the identity event and be delivered with `pipe:N` instead of the peer's
   // announced identity. We hold a pending pipe's batches until it finalizes, then
   // release them in arrival order — mirroring the io-uring path's atomic attach.
-  /// Presence of a `pipe_read_id` key means that pipe's identity is finalized.
-  pipe_finalized: Arc<DashMap<usize, ()>>,
+  /// Per-pipe identity + finalization state, keyed by `pipe_read_id`.
+  /// Lock order: never acquire `held_ingress` while holding a `peer_states` guard
+  /// (the reverse nesting in `take_finalized_held` is the sanctioned one).
+  peer_states: ParkingRwLock<HashMap<usize, PeerIdentityState>>,
   /// Per-pipe FIFO of batches received while the pipe was still pending.
   held_ingress: ParkingMutex<HashMap<usize, VecDeque<FrameBatch>>>,
   /// Total batches across `held_ingress`; lets the recv hot path skip the lock.
@@ -70,11 +78,10 @@ impl RouterSocket {
       ingress_engine: AddressedIngressEngine::new(max_conn, rcvbatch_count),
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       frame_recv_buffer: ParkingMutex::new(None),
-      pipe_to_identity_shared_map: Arc::new(DashMap::new()),
       current_send_target: TokioMutex::new(None),
       pipe_send_coordinator: Arc::new(WritePipeCoordinator::new()),
       framing: FramingLatch::new(router_auto_encode, router_auto_decode),
-      pipe_finalized: Arc::new(DashMap::new()),
+      peer_states: ParkingRwLock::new(HashMap::new()),
       held_ingress: ParkingMutex::new(HashMap::new()),
       held_count: AtomicUsize::new(0),
       identity_finalized_notify: Arc::new(Notify::new()),
@@ -84,9 +91,28 @@ impl RouterSocket {
   /// Marks a pipe's identity as finalized and wakes any recv waiting to release
   /// held batches. Idempotent — both `pipe_attached(Some(id))` (io-uring atomic
   /// attach) and `update_peer_identity` (every successful handshake) may call it.
+  /// May fire for a pipe with no identity entry (the `update_peer_identity`
+  /// warn path); the gate must still open, so a placeholder entry is created.
   fn finalize_pipe(&self, pipe_read_id: usize) {
-    self.pipe_finalized.insert(pipe_read_id, ());
+    self
+      .peer_states
+      .write()
+      .entry(pipe_read_id)
+      .and_modify(|s| s.finalized = true)
+      .or_insert_with(|| PeerIdentityState {
+        identity: Self::pipe_id_to_placeholder_identity(pipe_read_id),
+        finalized: true,
+      });
     self.identity_finalized_notify.notify_waiters();
+  }
+
+  /// True once the pipe's identity has been finalized (gate open).
+  fn is_pipe_finalized(&self, pipe_read_id: usize) -> bool {
+    self
+      .peer_states
+      .read()
+      .get(&pipe_read_id)
+      .is_some_and(|s| s.finalized)
   }
 
   /// Buffers a batch that arrived before its pipe finalized.
@@ -109,7 +135,7 @@ impl RouterSocket {
     let mut held = self.held_ingress.lock();
     let target = held
       .keys()
-      .find(|pid| self.pipe_finalized.contains_key(*pid))
+      .find(|pid| self.is_pipe_finalized(**pid))
       .copied()?;
     let queue = held.get_mut(&target).expect("key just found");
     let batch = queue.pop_front();
@@ -150,7 +176,7 @@ impl RouterSocket {
           .ingress_engine
           .recv_logical_message(Some(Duration::ZERO))
           .await?;
-        if self.pipe_finalized.contains_key(&pid) {
+        if self.is_pipe_finalized(pid) {
           return Ok((pid, batch));
         }
         // Pending: buffer it and re-loop; if nothing else is ready the next
@@ -178,7 +204,7 @@ impl RouterSocket {
         }
         popped = self.ingress_engine.pop() => {
           let (pid, batch) = popped?;
-          if self.pipe_finalized.contains_key(&pid) {
+          if self.is_pipe_finalized(pid) {
             return Ok((pid, batch));
           }
           self.hold_pending_batch(pid, batch);
@@ -211,9 +237,10 @@ impl RouterSocket {
 
     // First, determine the sender's identity from our internal map.
     let identity_blob = self
-      .pipe_to_identity_shared_map
+      .peer_states
+      .read()
       .get(&pipe_read_id)
-      .map(|entry| entry.value().clone())
+      .map(|state| state.identity.clone())
       .unwrap_or_else(|| {
         tracing::warn!(
           handle = self.core.handle,
@@ -769,9 +796,13 @@ impl ISocket for RouterSocket {
         .router_map_for_send
         .add_peer(identity_to_use.clone(), pipe_read_id, endpoint_uri)
         .await;
-      self
-        .pipe_to_identity_shared_map
-        .insert(pipe_read_id, identity_to_use);
+      self.peer_states.write().insert(
+        pipe_read_id,
+        PeerIdentityState {
+          identity: identity_to_use,
+          finalized: false,
+        },
+      );
       self.pipe_send_coordinator.add_pipe(pipe_read_id).await;
 
       // Register per-pipe ingress channel.
@@ -837,9 +868,15 @@ impl ISocket for RouterSocket {
           peer_socket_type_opt.as_deref(),
         )
         .await;
-      self
-        .pipe_to_identity_shared_map
-        .insert(pipe_read_id, new_identity);
+      // Single atomic write: the identity update and the gate opening cannot be
+      // observed separately (the trailing finalize_pipe below is then a no-op).
+      self.peer_states.write().insert(
+        pipe_read_id,
+        PeerIdentityState {
+          identity: new_identity,
+          finalized: true,
+        },
+      );
     } else {
       tracing::warn!(
         handle = self.core.handle,
@@ -879,7 +916,6 @@ impl ISocket for RouterSocket {
       .router_map_for_send
       .remove_peer_by_read_pipe(pipe_read_id)
       .await;
-    self.pipe_to_identity_shared_map.remove(&pipe_read_id);
 
     self.pipe_send_coordinator.remove_pipe(pipe_read_id).await;
 
@@ -900,7 +936,7 @@ impl ISocket for RouterSocket {
     // before its identity was resolved, so the messages can never be routed
     // with a real identity (ZMQ permits message loss on disconnect). Wake any
     // recv waiting on a finalize so it re-evaluates without this pipe.
-    self.pipe_finalized.remove(&pipe_read_id);
+    self.peer_states.write().remove(&pipe_read_id);
     if let Some(dropped) = self.held_ingress.lock().remove(&pipe_read_id) {
       if !dropped.is_empty() {
         self.held_count.fetch_sub(dropped.len(), Ordering::AcqRel);
