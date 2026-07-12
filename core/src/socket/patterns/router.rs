@@ -111,7 +111,7 @@ impl RouterMap {
           "RouterMap removed peer by identity (forward map)."
       );
 
-      // Now, find and remove the reverse mapping.
+      // Remove the reverse mapping.
       let mut pipe_to_id_guard = self.read_pipe_to_identity.write();
       let mut key_to_remove: Option<usize> = None;
       for (key, val) in pipe_to_id_guard.iter() {

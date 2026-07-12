@@ -346,7 +346,6 @@ pub(crate) async fn handle_actor_stopping_event(
   let core_handle = core_arc.handle;
   
   // First, perform the resource cleanup regardless of the shutdown phase.
-  // This removes the endpoint from the main map.
   // This function returns true if the cleanup might warrant a reconnect.
   let should_consider_reconnect = pipe_manager::cleanup_stopped_child_resources(
       core_arc.clone(),
@@ -361,7 +360,6 @@ pub(crate) async fn handle_actor_stopping_event(
   // Now, acquire the coordinator lock to update the shutdown state.
   let mut coordinator = core_arc.shutdown_coordinator.lock().await;
 
-  // We no longer need to check if the state is Running at the top. We handle all cases.
   match coordinator.state {
     ShutdownPhase::Running => {
       // Child stopped unexpectedly.

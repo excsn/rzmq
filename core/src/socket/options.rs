@@ -513,7 +513,7 @@ pub(crate) fn parse_secs_duration_option(value: &[u8]) -> Result<Option<Duration
   let val = parse_i32_option(value)?;
   match val {
     0..=i32::MAX => Ok(Some(Duration::from_secs(val as u64))),
-    // Negative values invalid? Or does -1 mean system default? Check ZMQ spec/impl. Assume invalid for now.
+    // Treat negative values as invalid.
     _ => Err(ZmqError::InvalidOptionValue(0)),
   }
 }
@@ -673,7 +673,7 @@ pub(crate) fn parse_string_option(value: &[u8], option_id: i32) -> Result<String
   String::from_utf8(value.to_vec()).map_err(|_| ZmqError::InvalidOptionValue(option_id))
 }
 
-// --- New Helper Functions for Applying/Retrieving Core Options ---
+// --- Helper Functions for Applying/Retrieving Core Options ---
 
 /// Applies a core-level socket option value to the `SocketOptions` struct.
 /// This function centralizes the logic for parsing and setting options that

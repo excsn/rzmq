@@ -41,7 +41,6 @@ pub(crate) async fn process_socket_command(
 
   let command_name_str = command.variant_name();
   // Log command only at trace level or if it's an unexpected one.
-  // tracing::trace!(handle = core_handle, cmd_name = %command_name_str, "SocketCore processing command");
 
   // Check shutdown phase before processing most commands
   let current_shutdown_phase = core_arc.shutdown_coordinator.lock().await.state;
@@ -451,7 +450,6 @@ async fn handle_user_bind(
                   is_outbound_connection: false,
                   peer_socket_type: None,
                   // Listeners don't have a single ISocketConnection; they manage multiple.
-                  // We need a dummy or specialized ISocketConnection here if the field is mandatory.
                   connection_iface: Arc::new(crate::socket::connection_iface::DummyConnection),
                 },
               );
@@ -787,7 +785,6 @@ async fn handle_user_disconnect(
     match conn_iface.close_connection().await {
       Ok(()) => {
         // The actual removal from endpoints map will happen when ActorStopping is processed.
-        // For now, we've initiated the close.
         disconnect_result = Ok(());
       }
       Err(e) => {
@@ -839,8 +836,7 @@ async fn handle_user_unbind(
     // The ActorStopping handler will then remove it from endpoints map.
     if listener_mailbox.send(Command::Stop).await.is_err() {
       tracing::warn!(handle = core_handle, uri = %uri, "Failed to send Stop to Listener on unbind (already stopped?).");
-      // If send fails, listener might be gone. We might still need to remove from map if it wasn't cleaned yet.
-      // However, ActorStopping should handle the map removal.
+      // If send fails the listener is likely already gone; ActorStopping handles the map removal.
       unbind_result = Ok(()); // Consider unbind successful if listener is already gone.
     } else {
       unbind_result = Ok(()); // Stop command sent successfully.
@@ -914,10 +910,8 @@ where
 {
   let mut core_s_write = core_arc.core_state.write();
 
-  // Clone the current options
   let mut new_options_instance = (*core_s_write.options).clone();
 
-  // Apply the changes using the passed-in callback
   let apply_result = applier(&mut new_options_instance);
 
   if apply_result.is_ok() {
@@ -941,7 +935,6 @@ async fn handle_get_option(
   }
 
   let core_s_read = core_arc.core_state.read();
-  // Delegate to the new helper in options.rs
   options::retrieve_core_option_value(&core_s_read.options, &core_s_read, option)
 }
 

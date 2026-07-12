@@ -33,7 +33,6 @@ use tracing::{debug, error, info, trace, warn};
 const KERNEL_POLL_INITIAL: Duration = Duration::from_millis(1);
 const KERNEL_POLL_MAX_DURATION: Duration = Duration::from_millis(128);
 
-// Helper from the original `sqe_builder` module, now integrated here.
 fn socket_addr_to_sockaddr_storage(
   addr: &SocketAddr,
   storage: &mut libc::sockaddr_storage,

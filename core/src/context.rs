@@ -139,8 +139,7 @@ impl ContextInner {
       } else {
         tracing::debug!("Published ContextTerminating event via bus.");
       }
-      // Direct Stop commands to individual sockets are removed.
-      // Actors now rely on the ContextTerminating event or SocketClosing events from their parents.
+      // Actors rely on the ContextTerminating event (or SocketClosing from their parents) to stop.
     } else {
       tracing::debug!("Context shutdown already initiated.");
     }
@@ -151,7 +150,6 @@ impl ContextInner {
   pub(crate) async fn wait_for_termination(&self) {
     if !self.shutdown_initiated.load(AtomicOrdering::Acquire) {
       tracing::warn!("Context::term waiting but shutdown not initiated? Proceeding anyway.");
-      // Consider initiating shutdown here if it's a valid recovery path: self.shutdown().await;
     }
     let initial_count = self.actor_wait_group.get_count();
     tracing::debug!(
@@ -178,7 +176,6 @@ impl ContextInner {
             "Context wait_for_termination timed out! {} actors may not have stopped correctly.",
             final_count // This count still includes the listener if it hasn't exited.
         );
-        // Consider returning an error or panicking here for critical applications.
       }
     }
   }
@@ -357,8 +354,6 @@ impl Context {
       }
       // Note: Even if publish fails, we MUST decrement the WaitGroup below.
     } else {
-      // Optional: Trace successful publish if needed, but can be noisy.
-      // tracing::trace!(actor_handle = handle_id, ?actor_type, "Published ActorStopping event");
     }
 
     // --- Unconditionally decrement the WaitGroup ---
@@ -382,17 +377,12 @@ impl Context {
           handle_id, actor_type
         );
       }
-      // Consider if panicking here is appropriate, maybe only in debug builds.
-      // panic!("WaitGroup done() called with count zero for handle {} ({:?})", handle_id, actor_type);
     }
   }
 }
 
 impl fmt::Debug for Context {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    // Provide a more informative Debug representation if useful,
-    // e.g., number of active sockets, shutdown status.
-    // For now, keep it simple.
     f.debug_struct("Context").finish_non_exhaustive()
   }
 }

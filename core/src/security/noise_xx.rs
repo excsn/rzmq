@@ -205,7 +205,6 @@ impl NoiseXxMechanism {
             Some("NOISE_XX: Server public key mismatch. Connection rejected.".into());
 
           // SnowError::Decrypt is often used to signal an authentication/integrity failure.
-          // Another option could be a custom error or mapping to a more specific ZmqError later.
           return Err(SnowError::Decrypt);
         }
         tracing::debug!(
@@ -214,8 +213,7 @@ impl NoiseXxMechanism {
           "Server static public key successfully verified against configuration."
         );
       } else {
-        // This case should ideally be caught by NoiseXxMechanism::new() if a client doesn't have
-        // the server's PK configured for the XX pattern. This is a defensive check.
+        // Defensive check; NoiseXxMechanism::new() should have required the server PK.
         let err_msg = "NOISE_XX Client: Configuration error - missing expected remote server public key for verification post-handshake.".to_string();
         tracing::error!("{}", err_msg);
         self.current_status = MechanismStatus::Error;
@@ -236,9 +234,6 @@ impl NoiseXxMechanism {
         "Learned and cryptographically verified client's static public key: {:?}",
         handshake_derived_peer_pk.as_slice()
       );
-      // Potentially store this learned client PK in self.configured_remote_static_pk_bytes if that field
-      // is meant to hold the *actual* peer's key after handshake for servers.
-      // self.configured_remote_static_pk_bytes = Some(handshake_derived_peer_pk.try_into().unwrap_or_else(|_| panic!("PK len mismatch")));
     }
 
     // If all checks passed, transition to transport mode and set status to Ready.
@@ -269,7 +264,6 @@ impl NoiseXxMechanism {
         self.current_status = MechanismStatus::Error;
         self.error_reason_str = Some(err_msg);
         // Put the HandshakeState back if transition failed, though its internal state might be bad
-        // self.state = Some(handshake_state_to_consume); // This is tricky, snow might have invalidated it.
         // It's safer to consider it an error state.
         Err(e)
       }

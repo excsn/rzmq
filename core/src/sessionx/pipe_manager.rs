@@ -4,7 +4,6 @@ use crate::message::FrameBatch;
 use fibre::{RecvError, TryRecvError};
 use fibre::mpsc::BoundedAsyncReceiver;
 
-// Import the state struct we defined earlier
 use super::states::CorePipeManagerXState;
 
 #[derive(Debug)]

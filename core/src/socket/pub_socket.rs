@@ -138,7 +138,6 @@ impl ISocket for PubSocket {
         frame.set_flags(frame.flags() & !MsgFlags::MORE);
       }
     }
-    // `frames` now correctly represents the ZMTP frames of one logical ZMQ message.
 
     self.dispatch(frames).await
   }

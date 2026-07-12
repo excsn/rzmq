@@ -145,16 +145,7 @@ pub enum ZmqError {
   /// This usually indicates a logic error or an unexpected state that should not occur.
   #[error("Internal library error: {0}")]
   Internal(String),
-  // MailboxSendError and TaskJoinError variants could be added later if more specific
-  // internal error reporting for actor communication or task management is needed.
-  // e.g., #[error("Internal actor mailbox send error: {0}")] MailboxSendError(String),
-  // e.g., #[error("Internal actor task join error")] TaskJoinError,
 
-  // Placeholder for transport-specific errors if features like io_uring are added
-  // and expose their own error types that need to be wrapped.
-  // #[cfg(feature = "io-uring")]
-  // #[error("io_uring error: {0}")]
-  // Uring( /* io_uring::Error or its string representation */ ),
 }
 
 /// Manual implementation of `From<std::io::Error>` for `ZmqError`.

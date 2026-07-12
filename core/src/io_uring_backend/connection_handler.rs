@@ -306,7 +306,7 @@ pub trait UringConnectionHandler: Send {
 pub trait ProtocolHandlerFactory: Send + Sync + 'static {
   fn id(&self) -> &'static str;
 
-  // This is now the primary method for the generic worker to call
+  // Primary method for the generic worker to call.
   fn create_handler(
     &self,
     fd: RawFd,

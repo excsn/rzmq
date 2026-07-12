@@ -82,14 +82,13 @@ pub(crate) async fn process_system_event(
           {
             // Scoped write lock
             let mut core_s_write = core_arc.core_state.write();
-            // First, clone the URI from the mapping. This releases any borrow on core_s_write related to the lookup.
+            // Clone the URI first to release the lookup borrow on the write guard.
             let uri_opt = core_s_write
               .pipe_read_id_to_endpoint_uri
               .get(&connection_identifier)
               .cloned();
 
             if let Some(uri) = uri_opt {
-              // Now, perform the mutable lookup using the cloned URI.
               if let Some(ep_info) = core_s_write.endpoints.get_mut(&uri) {
                 tracing::debug!(
                     handle = core_handle,

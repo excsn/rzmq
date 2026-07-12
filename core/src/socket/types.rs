@@ -196,13 +196,11 @@ impl Socket {
     let (monitor_tx, monitor_rx) = bounded_async(capacity.max(1)); // Ensure capacity is at least 1.
     let (reply_tx, reply_rx) = oneshot::oneshot();
 
-    // Create a UserMonitor command to send to the SocketCore.
     let cmd = Command::UserMonitor {
       monitor_tx,
       reply_tx,
     };
 
-    // Send the command to the SocketCore's command mailbox.
     self
       .core_command_sender
       .send(cmd)
@@ -211,7 +209,6 @@ impl Socket {
         ZmqError::Internal("Mailbox send error during monitor setup".into())
       })?;
 
-    // Wait for the SocketCore to acknowledge that the monitor has been set up.
     // The `??` propagates the `RecvError` from `reply_rx.await` and then the `Result<(), ZmqError>` inside.
     reply_rx.recv().await.map_err(|_recv_error| {
       ZmqError::Internal("Reply channel error during monitor setup".into())

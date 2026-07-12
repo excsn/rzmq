@@ -91,9 +91,8 @@ impl ZmqMessageProcessor {
 
     let mut total_read = n;
 
-    // CRITICAL FIX: Synchronous Starvation Prevention — enforce a strict byte
-    // ceiling per async cycle so a fast link (localhost) can't hijack the OS
-    // thread and starve the Tokio executor.
+    // Enforce a strict byte ceiling per async cycle so a fast link (localhost)
+    // can't hijack the OS thread and starve the Tokio executor.
     let max_greedy_read = engine.config().rcvbatch_bytes.max(INGRESS_GREEDY_CHUNK);
 
     // 2. Greedy synchronous drain up to the configured batch limit.

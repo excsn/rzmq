@@ -44,8 +44,6 @@ pub(crate) async fn run_command_loop(
   let mut final_error_for_actorstop: Option<ZmqError> = None;
 
   // The main loop
-  // The Result<(), ZmqError> is conceptual for the loop's success/failure.
-  // If an unrecoverable error occurs, we'll set final_error_for_actorstop and break.
   let _loop_result: Result<(), ()> = async { // Changed to Result<(), ()> for loop structure
     loop {
       let current_shutdown_phase = {
@@ -311,7 +309,6 @@ pub(crate) async fn run_command_loop(
   );
 
   // 1. Close the public-facing API resources to unblock any waiting user tasks.
-  //    This is the most critical part of the fix.
   if let Err(e) = socket_logic_strong.process_command(Command::Stop).await {
     tracing::error!(
       handle = core_handle,
@@ -323,35 +320,9 @@ pub(crate) async fn run_command_loop(
     }
   }
 
-  // 2. Drain any remaining commands that arrived after shutdown started.
-  //    This prevents panics from senders whose receivers have been dropped.
-  // while let Some(cmd) = command_receiver.try_recv().ok() {
-  //     // Log and drop the command, replying with an error if possible.
-  //     tracing::warn!(handle = core_handle, cmd = %cmd.variant_name(), "Dropping command received during final shutdown.");
-  //     // Best-effort attempt to notify the caller that the socket is closed.
-  //     match cmd {
-  //         Command::UserBind { reply_tx, .. } |
-  //         Command::UserConnect { reply_tx, .. } |
-  //         Command::UserDisconnect { reply_tx, .. } |
-  //         Command::UserUnbind { reply_tx, .. } |
-  //         Command::UserSetOpt { reply_tx, .. } |
-  //         Command::UserMonitor { reply_tx, .. } |
-  //         Command::UserClose { reply_tx, .. } => {
-  //             let _ = reply_tx.send(Err(ZmqError::InvalidState("Socket closed")));
-  //         },
-  //         Command::UserGetOpt { reply_tx, .. } => {
-  //             let _ = reply_tx.send(Err(ZmqError::InvalidState("Socket closed")));
-  //         },
-  //         Command::UserRecv { reply_tx, .. } => {
-  //             let _ = reply_tx.send(Err(ZmqError::InvalidState("Socket closed")));
-  //         },
-  //         _ => {} // Other commands have no reply channel
-  //     }
-  // }
 
   // If loop exited due to an error that wasn't already part of a graceful shutdown,
   // ensure shutdown is initiated and as much cleanup as possible happens.
-  // This is more of a failsafe.
   let mut final_coord_guard = core_arc.shutdown_coordinator.lock().await;
   if final_coord_guard.state != ShutdownPhase::Finished {
     tracing::warn!(
@@ -360,21 +331,13 @@ pub(crate) async fn run_command_loop(
         "SocketCore loop exited prematurely or shutdown not fully completed. Attempting final cleanup."
     );
     // Attempt to run the final cleanup stages if not already done.
-    // This is tricky because we are outside the select loop.
-    // For simplicity, we'll assume that if the loop broke, final_coord_guard.state
-    // should ideally be ShutdownPhase::Finished. If not, it might indicate an
-    // unhandled error path within the loop.
-    // A robust approach here might involve re-running parts of the shutdown sequence
-    // if they weren't completed, but that adds complexity.
-    // For now, we ensure we move to Finished state.
+    // Ensure the state reaches Finished.
     final_coord_guard.state = ShutdownPhase::Finished;
     core_arc.is_running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
   }
   drop(final_coord_guard);
 
   // Unregister this socket from the context (if it was registered)
-  // This needs to be done carefully if context itself is shutting down.
-  // ContextInner::unregister_socket should be robust.
   core_arc.context.inner().unregister_socket(core_handle);
 
   // Unregister any bound inproc names.

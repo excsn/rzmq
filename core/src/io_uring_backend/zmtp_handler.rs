@@ -646,7 +646,6 @@ impl UringConnectionHandler for ZmtpUringHandler {
     if interface.is_write_completion {
       // Unlock the local serialization gate upon write completion
       self.write_in_flight = self.write_in_flight.saturating_sub(1);
-      // println!("write in flight completed {:?}", self.write_in_flight);
     }
 
     if cqe_result < 0 {

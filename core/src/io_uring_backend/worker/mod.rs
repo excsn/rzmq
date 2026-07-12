@@ -413,7 +413,7 @@ impl UringWorker {
   }
 }
 
-// --- Helper functions for address conversion (moved from sqe_builder or other places) ---
+// --- Helper functions for address conversion ---
 pub(crate) fn socket_addr_to_sockaddr_storage(
   addr: &SocketAddr,
   storage: &mut libc::sockaddr_storage,

@@ -354,7 +354,6 @@ mod reconnect_tests {
 }
 
 // --- Shutdown Coordinator ---
-// Stays here for now, can be moved to shutdown.rs later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownPhase {
   Running,

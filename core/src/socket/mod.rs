@@ -44,17 +44,12 @@ macro_rules! delegate_to_core {
   ($self:ident, $variant:ident, $($field:ident : $value:expr),+ $(,)?) => {
     {
       use fibre::oneshot;
-      // Create a oneshot channel for the reply.
       let (reply_tx, reply_rx) = oneshot::oneshot();
-      // Construct the command variant with its fields and the reply sender.
       // Ensure Command is accessible, e.g., via $crate::runtime::Command
       let cmd = $crate::runtime::Command::$variant { $($field : $value),+, reply_tx };
-      // Send the command to the SocketCore's command mailbox.
-      // ISocket::mailbox() provides the sender.
       $self.mailbox()
           .send(cmd)
           .await.map_err(|_send_error| $crate::error::ZmqError::Internal("Mailbox send error".into()))?;
-      // Await the reply from SocketCore.
       // The `??` propagates both the channel error and the inner Result error.
       reply_rx.recv().await.map_err(|_recv_error| $crate::error::ZmqError::Internal("Reply channel error".into()))?
     }

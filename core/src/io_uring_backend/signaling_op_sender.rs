@@ -62,8 +62,6 @@ impl SignalingOpSender {
           self.event_fd.as_raw_fd(), // Using AsRawFd for logging
           e
         );
-        // Depending on severity, could panic or return a custom error,
-        // but for now, the primary send_result is what's returned.
       } else {
         tracing::trace!(
           "[SignalingOpSender] Signaled eventfd {} with value {} after op send.",
@@ -72,7 +70,6 @@ impl SignalingOpSender {
         );
       }
     }
-    // Return the original result of the send operation.
     send_result
   }
 
@@ -125,7 +122,6 @@ impl SignalingOpSender {
   }
 }
 
-// Optional: Implement Debug manually if EventFD's Debug is not available or desired.
 impl std::fmt::Debug for SignalingOpSender {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("SignalingOpSender")

@@ -68,10 +68,7 @@ impl Drop for ActorDropGuard {
     }
 
     // NOTE: publish_actor_stopping involves sending on a broadcast channel.
-    // This is *usually* safe from drop if the receiver task is still running,
-    // but it's not ideal. A truly robust solution might involve
-    // a synchronous mechanism for the final WaitGroup decrement if possible,
-    // but the event system is the current design.
+    // This is safe from drop only while the receiver task is still running.
     self.context.publish_actor_stopping(
       self.handle_id,
       self.actor_type,

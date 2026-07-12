@@ -2,7 +2,6 @@ use super::{IDataCipher, ZmqError};
 use crate::{message::Metadata, security::framer::ISecureFramer};
 use std::fmt;
 
-// Define MechanismStatus enum properly here
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MechanismStatus {
   Initializing,   // Start state

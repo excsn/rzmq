@@ -168,7 +168,6 @@ impl ZmtpReady {
     // Prepend command name (length prefixed)
     let name = ZMTP_CMD_READY_NAME;
     body.put_u8(name.len() as u8); // Not ZMTP standard? Check spec 4.1 Command frame
-                                   // Re-checking: Yes, command name is length-prefixed string in body.
     body.put_slice(name);
     // Append encoded properties
     cmd.encode_properties(&mut body);

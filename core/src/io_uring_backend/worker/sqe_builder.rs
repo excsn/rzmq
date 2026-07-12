@@ -32,10 +32,7 @@ pub(crate) fn build_sqe_for_external_request(
   out_connect_fd: &mut Option<RawFd>,
   _ring_features_has_ext_arg: bool, // Parameter kept for future use if needed
 ) -> Result<Option<squeue::Entry>, UringOpCompletion> {
-  // Ensure out_connect_fd is reset for each call if it's reused.
-  // However, it's better if the caller manages its state.
-  // This function will only set it if it creates an FD for Connect.
-  // *out_connect_fd = None; // Caller should initialize this to None before calling.
+  // Sets *out_connect_fd only when it creates an FD for Connect; the caller initializes it to None.
 
   let user_data = request.get_user_data_ref(); // Use the helper
 
@@ -83,11 +80,8 @@ pub(crate) fn build_sqe_for_external_request(
         ))
     }
     UringOpRequest::RegisterRawBuffers { .. } => {
-        // This operation itself (registering buffers with IORING_REGISTER_BUFFERS)
-        // is usually done by the IoUring::register_buffers method directly on the ring,
-        // not as a typical SQE that goes through the submission queue for I/O.
-        // If the intent was a different kind of buffer registration, it needs clarification.
-        // For now, assume it's handled by UringWorker directly or not an SQE from here.
+        // Buffer registration (IORING_REGISTER_BUFFERS) goes through IoUring::register_buffers
+        // directly on the ring, not through an SQE; UringWorker handles it.
         tracing::trace!("build_sqe_for_external_request: RegisterRawBuffers is handled directly by worker, not as an SQE from here.");
         Ok(None)
     }

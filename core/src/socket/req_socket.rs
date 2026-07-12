@@ -137,7 +137,6 @@ impl ISocket for ReqSocket {
     // === ASYNC OPERATION: Find a Peer (No Lock Held) ===
     let peer = loop {
       if let Some(p) = self.load_balancer.get_next_connection() {
-        // We got the peer from the LoadBalancer. We assume it is active.
         break p;
       } else {
         if self.core.command_sender().is_closed() {

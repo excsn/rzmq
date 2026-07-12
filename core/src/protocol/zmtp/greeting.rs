@@ -164,7 +164,6 @@ impl ZmtpGreeting {
 
     // 1. Validate fixed signature markers (more robust than a full prefix match).
     // The spec guarantees the first byte is 0xFF, but the middle bytes have varied.
-    // We check the first byte and can optionally check the 10th byte (0x7F), though it was also part of the issue.
     // For maximum compatibility, checking only the first byte and padding is often sufficient.
     if data[0] != 0xFF {
       tracing::error!("Greeting does not start with 0xFF (got {:#04x})", data[0]);

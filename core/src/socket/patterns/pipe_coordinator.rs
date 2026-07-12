@@ -75,7 +75,6 @@ impl WritePipeCoordinator {
 
     match pipe_state_arc {
       Some(state) => {
-        // Check if the pipe is already marked for closing.
         if state.is_closing.load(Ordering::Relaxed) {
           return Err(ZmqError::HostUnreachable(
             "Target pipe is closing or has been detached".into(),

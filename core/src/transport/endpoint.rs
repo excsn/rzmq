@@ -63,8 +63,6 @@ pub(crate) fn parse_endpoint(endpoint_str: &str) -> Result<Endpoint, ZmqError> {
   }
 }
 
-// Optional: Add methods to Endpoint enum?
-// impl Endpoint { pub fn scheme(&self) -> &'static str { ... } }
 
 #[cfg(test)]
 mod additional_endpoint_tests {

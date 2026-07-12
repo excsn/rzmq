@@ -140,7 +140,7 @@ impl MultishotReader {
     cancel_sqe_user_data: UserData,
     _target_op_user_data: UserData,
   ) {
-    // _target_op_user_data should match self.active_op_user_data if logic is correct
+    // _target_op_user_data should match self.active_op_user_data.
     self.cancel_op_user_data = Some(cancel_sqe_user_data);
     // is_active remains true until cancel CQE or original op CQE without MORE.
     tracing::debug!(
@@ -165,7 +165,6 @@ impl MultishotReader {
 
     if Some(cqe_ud) == self.active_op_user_data {
       // This CQE is for our active multishot read operation.
-      // is_active should be true here if logic is correct.
       if !self.is_active {
         tracing::warn!(
           "[MultishotReader FD={}] CQE (ud {}) for active_op_user_data, but reader not marked active_in_kernel. State inconsistency?",

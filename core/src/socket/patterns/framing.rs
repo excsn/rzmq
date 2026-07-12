@@ -79,7 +79,6 @@ pub(crate) fn router_auto_encode(frames: &mut FrameBatch) {
   }
 
   // insert(1) shifts elements 1..end to the right.
-  // This is more efficient than allocating a new vector structure.
   if !frames.is_empty() {
     frames.insert(1, delimiter);
   }

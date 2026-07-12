@@ -47,16 +47,12 @@ pub(crate) struct RouterSocket {
   current_send_target: TokioMutex<Option<ActiveFragmentedSend>>,
   pipe_send_coordinator: Arc<WritePipeCoordinator>,
   framing: FramingLatch,
-  // --- Identity-finalization gate (Option 1: gate ingress on finalized identity) ---
-  // A pipe is "finalized" once its real ZMTP identity (or the placeholder for an
-  // anonymous peer) has been applied. The standard TCP/IPC path attaches the pipe
-  // with a placeholder *before* the handshake, so the first inbound message can race
-  // ahead of the identity event and be delivered with `pipe:N` instead of the peer's
-  // announced identity. We hold a pending pipe's batches until it finalizes, then
-  // release them in arrival order — mirroring the io-uring path's atomic attach.
+  // Identity-finalization gate: the standard TCP/IPC path attaches a pipe with a
+  // placeholder identity before the handshake, so a fast peer's first message could
+  // otherwise be delivered as `pipe:N`. Batches from a pending pipe are held and
+  // released in arrival order once its real identity lands.
   /// Per-pipe identity + finalization state, keyed by `pipe_read_id`.
-  /// Lock order: never acquire `held_ingress` while holding a `peer_states` guard
-  /// (the reverse nesting in `take_finalized_held` is the sanctioned one).
+  /// Lock order: `peer_states` may be acquired while holding `held_ingress`, never the reverse.
   peer_states: ParkingRwLock<HashMap<usize, PeerIdentityState>>,
   /// Per-pipe FIFO of batches received while the pipe was still pending.
   held_ingress: ParkingMutex<HashMap<usize, VecDeque<FrameBatch>>>,
@@ -235,7 +231,6 @@ impl RouterSocket {
     // The 'payload' is the entire message received from the peer, after stripping
     // a single leading delimiter IF the peer is a REQ or DEALER.
 
-    // First, determine the sender's identity from our internal map.
     let identity_blob = self
       .peer_states
       .read()
@@ -250,7 +245,6 @@ impl RouterSocket {
         Self::pipe_id_to_placeholder_identity(pipe_read_id)
       });
 
-    // Now, determine if we need to strip a delimiter based on the peer's socket type.
     let peer_socket_type = {
       let core_s = self.core.core_state.read();
       core_s
@@ -267,7 +261,6 @@ impl RouterSocket {
     match peer_socket_type.as_deref() {
       Some("REQ") | Some("DEALER") => {
         if !raw_zmtp_message.is_empty() && raw_zmtp_message[0].size() == 0 {
-          // Correctly strip the delimiter from REQ/DEALER peers.
           raw_zmtp_message.remove(0);
         } else {
           tracing::warn!(
@@ -281,8 +274,7 @@ impl RouterSocket {
         // Do nothing. The entire message is the payload from a ROUTER peer.
       }
       _ => {
-        // Default/Unknown: For backward compatibility or peers that don't announce type,
-        // we can try to guess. The old behavior was to strip a delimiter if present.
+        // Peer didn't announce a type: strip a leading delimiter if present.
         if !raw_zmtp_message.is_empty() && raw_zmtp_message[0].size() == 0 {
           raw_zmtp_message.remove(0);
         }
@@ -307,9 +299,6 @@ impl RouterSocket {
 
     if let Some(last_frame) = result_frames.last_mut() {
       last_frame.set_flags(last_frame.flags() & !MsgFlags::MORE);
-    } else if result_frames.is_empty() && !identity_blob.is_empty() {
-      // This case implies payload_frames_vec was empty.
-      // id_msg is already in result_frames with NOMORE flag set.
     }
     result_frames
   }
@@ -608,7 +597,6 @@ impl ISocket for RouterSocket {
     {
       Some(info) => info,
       None => {
-        // Peer not found.
         return if router_mandatory_opt {
           Err(ZmqError::HostUnreachable(format!(
             "Peer with identity {:?} not found (ROUTER_MANDATORY)",
@@ -622,7 +610,6 @@ impl ISocket for RouterSocket {
     };
 
     // 2. Look up the connection interface and pipe_read_id using the URI from PeerInfo.
-    // This is done in a tightly scoped lock.
     let (conn_iface_opt, pipe_read_id_opt) = {
       let core_s_read = self.core.core_state.read();
       core_s_read
@@ -639,8 +626,7 @@ impl ISocket for RouterSocket {
     let (conn_iface, pipe_read_id) = match (conn_iface_opt, pipe_read_id_opt) {
       (Some(iface), Some(id)) => (iface, id),
       _ => {
-        // The peer was in RouterMap but its EndpointInfo is gone. This is a stale entry.
-        // We should clean up the RouterMap and then decide what to do.
+        // Stale entry: peer is in RouterMap but its EndpointInfo is gone.
         self
           .router_map_for_send
           .remove_peer_by_identity(&destination_id_blob)
@@ -663,7 +649,6 @@ impl ISocket for RouterSocket {
       .acquire_send_permit(pipe_read_id, timeout_opt)
       .await
       .map_err(|e| {
-        // If acquiring the permit fails, decide whether to error or drop.
         if router_mandatory_opt {
           e
         } else {
@@ -677,7 +662,6 @@ impl ISocket for RouterSocket {
         .strategy
         .prepare_wire_frames(destination_identity_msg, frames, &self.framing);
 
-    // Final flag setting on the last frame
     if let Some(last_frame) = zmtp_wire_frames.last_mut() {
       last_frame.set_flags(last_frame.flags() & !MsgFlags::MORE);
     }
@@ -868,8 +852,6 @@ impl ISocket for RouterSocket {
           peer_socket_type_opt.as_deref(),
         )
         .await;
-      // Single atomic write: the identity update and the gate opening cannot be
-      // observed separately (the trailing finalize_pipe below is then a no-op).
       self.peer_states.write().insert(
         pipe_read_id,
         PeerIdentityState {
@@ -885,10 +867,8 @@ impl ISocket for RouterSocket {
       );
     }
 
-    // Finalize the identity gate regardless: this is the universal post-handshake
-    // signal (fired for every peer type, anonymous or not, on both transports).
-    // Releasing here even on the warn-path above avoids a stuck gate if the maps
-    // are transiently inconsistent.
+    // Universal post-handshake signal; also fires on the warn path above so the
+    // gate cannot stick if the maps are transiently inconsistent.
     self.finalize_pipe(pipe_read_id);
   }
 

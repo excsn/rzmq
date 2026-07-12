@@ -78,9 +78,6 @@ impl EventFdPoller {
   ) -> bool {
     if self.is_poll_submitted {
       // Already submitted, no action needed from this call.
-      // Consider if this should return true (already done) or false (no new SQE pushed *now*).
-      // For the main_loop, if it's already submitted, the loop doesn't need to retry this specific call.
-      // So, returning true as "the desired state of being submitted is met".
       return true;
     }
     if sq.is_full() {
@@ -140,10 +137,7 @@ impl EventFdPoller {
       // This is because the `UserData` has served its purpose for this specific poll instance.
 
       if cqe_result >= 0 {
-        // Poll successful (event occurred or timeout if poll had one, though our poll doesn't timeout by itself)
-        // Or, if IORING_CQE_F_NOTIFY is set, this means the poll operation was cancelled, not that the event fired.
         // For a simple POLLIN, a non-negative result usually means POLLIN is ready.
-        // (Note: IORING_CQE_F_MORE is for multi-shot polls, not directly relevant here yet)
         if (cqe_result as u32 & libc::POLLERR as u32) != 0 {
           tracing::error!(
             "[EventFdPoller] Eventfd poll (ud: {}) completed with POLLERR. FD: {}",

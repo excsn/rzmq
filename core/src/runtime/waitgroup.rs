@@ -33,14 +33,9 @@ impl WaitGroup {
     // Increment the counter. Relaxed ordering is sufficient for increments.
     let old_count = self.count.fetch_add(delta, Ordering::Relaxed);
 
-    // If the count *was* zero before adding, it means waiters might have been
-    // notified spuriously or the latch was already released. We need to ensure
-    // that subsequent `wait` calls will block correctly. `Notify` handles this:
-    // If notify_waiters() was called when count was 0, new permits are created.
-    // If we increment from 0, subsequent waits will correctly block until notified again.
-    // No specific action needed here regarding the Notify state reset.
+    // Incrementing from zero is fine: notify_waiters() only wakes already-registered
+    // waiters, so later wait() calls still block until the count returns to zero.
     if old_count == 0 {
-      // Optional: log when transitioning from zero
       tracing::trace!(delta, new_count = delta, "WaitGroup count increased from zero");
     }
   }
@@ -59,7 +54,6 @@ impl WaitGroup {
 
     if old_count == 0 {
       // This should not happen if add/done are used correctly.
-      // Restore count and panic or log error.
       self.count.fetch_add(1, Ordering::Relaxed); // Try to restore
       panic!("WaitGroup::done() called when count was already zero!");
     } else if old_count == 1 {

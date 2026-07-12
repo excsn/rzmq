@@ -224,7 +224,7 @@ impl Mechanism for PlainMechanism {
             tracing::debug!(mechanism = Self::NAME, "Client received WELCOME");
             self.state = PlainState::Ready;
 
-            // INSTRUCTION TO CALLER: We are done.
+            // Handshake complete.
             Ok(ProcessTokenAction::HandshakeComplete)
           } else if command_name == Self::CMD_ERROR {
             let reason = String::from_utf8_lossy(body).to_string();
@@ -333,9 +333,6 @@ impl Mechanism for PlainMechanism {
     // If ZAP were used, this would parse the reply and transition state.
     // Since we are bypassing ZAP for now, this method will not be called
     // if zap_request_needed() returns None.
-    // If it were called, and state was ServerAuthenticating:
-    //   Parse reply -> if OK, self.state = ServerSendWelcome;
-    //   else -> self.set_error_internal("ZAP auth failed"); return Err(...)
     Ok(())
   }
 
