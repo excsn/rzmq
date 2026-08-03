@@ -120,7 +120,7 @@ Supports a range of common socket options for fine-tuning behavior, including:
 *   Timeouts: `SNDTIMEO`, `RCVTIMEO`, `LINGER`
 *   Connection: `RECONNECT_IVL`, `RECONNECT_IVL_MAX`, `HANDSHAKE_IVL`
 *   TCP Keepalives: `TCP_KEEPALIVE`, `TCP_KEEPALIVE_IDLE`, `TCP_KEEPALIVE_CNT`, `TCP_KEEPALIVE_INTVL`
-*   Binding: `LAST_ENDPOINT` (read-only, to get actual bound endpoint, e.g., after binding to port 0)
+*   Binding: `LAST_ENDPOINT` (read-only, to get actual bound endpoint, e.g., after binding to port 0), `REUSE_PORT` (Unix-only `SO_REUSEPORT`, letting several listeners share one TCP port; see the [Usage Guide](./README.USAGE.md#sharing-a-tcp-port-so_reuseport))
 *   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE` (for SUB), `ROUTING_ID` (for DEALER/ROUTER identity), `ROUTER_MANDATORY`
 *   Keepalives: ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
 *   Adaptive throttle: `ADAPTIVE_THROTTLE` (enable/disable the I/O fairness engine; see `Socket::with_throttle_config` for full configuration)
@@ -177,6 +177,7 @@ tokio = { version = "1", features = ["full"] } # "full" feature recommended for 
     *   Core functionality: Tested on **macOS (ARM & x86)** and **Linux (Kernel 6.x recommended)**.
     *   `ipc` feature: Unix-like systems only.
     *   `io_uring` feature & `TCP_CORK` option: **Linux-only**.
+    *   `REUSE_PORT` option: Unix-only. Only Linux load-balances connections across listeners sharing a port; on macOS one listener takes all of them.
 *   **Modern Linux Kernel** (for `io_uring` feature):
     *   For basic `io_uring` functionality: Linux kernel 5.6+ is generally required.
     *   For advanced `io_uring` features used by `rzmq`:

@@ -115,6 +115,11 @@ impl TcpListener {
     let s = socket2::Socket::new(domain, socket2::Type::STREAM, None).map_err(ZmqError::from)?;
     s.set_reuse_address(true).map_err(ZmqError::from)?;
 
+    #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
+    if options.reuse_port {
+      s.set_reuse_port(true).map_err(ZmqError::from)?;
+    }
+
     if domain == socket2::Domain::IPV6 {
       s.set_only_v6(false).map_err(ZmqError::from)?; //TODO: Probably make this configurable with options
     }

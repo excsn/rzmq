@@ -12,7 +12,7 @@ use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::inproc_reader;
 use crate::socket::core::pipe_manager;
 
-use crate::socket::core::state::{EndpointInfo, EndpointType, ShutdownPhase};
+use crate::socket::core::state::{CoreState, EndpointInfo, EndpointType, ShutdownPhase, listener_key};
 use crate::socket::core::{SocketCore, shutdown};
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::socket::options::{self, *};
@@ -391,6 +391,13 @@ pub(crate) async fn process_socket_command(
   Ok(())
 }
 
+fn has_listener_on(core_state: &CoreState, uri: &str) -> bool {
+  core_state
+    .endpoints
+    .values()
+    .any(|ep| ep.endpoint_type == EndpointType::Listener && ep.endpoint_uri == uri)
+}
+
 async fn handle_user_bind(
   core_arc: Arc<SocketCore>,
   socket_logic: Arc<dyn ISocket>,
@@ -409,9 +416,9 @@ async fn handle_user_bind(
 
   match parse_result {
     Ok(Endpoint::Tcp(_addr, ref uri_from_parse)) => {
-      // Use parsed URI as key
       let core_s_read = core_arc.core_state.read();
-      if core_s_read.endpoints.contains_key(uri_from_parse) {
+      let reuse_port = core_s_read.options.reuse_port;
+      if !reuse_port && has_listener_on(&core_s_read, uri_from_parse) {
         bind_result = Err(ZmqError::AddrInUse(uri_from_parse.clone()));
       } else {
         let monitor_tx_clone = core_s_read.get_monitor_sender_clone();
@@ -432,13 +439,12 @@ async fn handle_user_bind(
         ) {
           Ok((listener_mailbox, listener_task_handle, resolved_uri)) => {
             let mut core_s_write = core_arc.core_state.write();
-            // Use resolved_uri as the key in endpoints map
-            if core_s_write.endpoints.contains_key(&resolved_uri) {
+            if !reuse_port && has_listener_on(&core_s_write, &resolved_uri) {
               listener_task_handle.abort(); // Abort newly created listener
               bind_result = Err(ZmqError::AddrInUse(resolved_uri));
             } else {
               core_s_write.endpoints.insert(
-                resolved_uri.clone(),
+                listener_key(&resolved_uri, child_actor_handle),
                 EndpointInfo {
                   mailbox: listener_mailbox,
                   task_handle: Some(listener_task_handle),
@@ -816,31 +822,33 @@ async fn handle_user_unbind(
     endpoint
   )));
 
-  let mut listener_to_stop: Option<(String, MailboxSender)> = None;
+  // REUSE_PORT allows several listeners to share one URI; unbind stops every one of them.
+  let mut listeners_to_stop: Vec<MailboxSender> = Vec::new();
   {
     let core_s_read = core_arc.core_state.read();
-    if let Some(ep_info) = core_s_read.endpoints.get(&endpoint) {
-      if ep_info.endpoint_type == EndpointType::Listener {
-        listener_to_stop = Some((endpoint.clone(), ep_info.mailbox.clone()));
-      } else {
-        unbind_result = Err(ZmqError::InvalidArgument(
-          "Cannot unbind a non-listener endpoint.".into(),
-        ));
+    for ep_info in core_s_read.endpoints.values() {
+      if ep_info.endpoint_uri == endpoint {
+        if ep_info.endpoint_type == EndpointType::Listener {
+          listeners_to_stop.push(ep_info.mailbox.clone());
+        } else {
+          unbind_result = Err(ZmqError::InvalidArgument(
+            "Cannot unbind a non-listener endpoint.".into(),
+          ));
+        }
       }
     }
   } // core_state read lock dropped
 
-  if let Some((uri, listener_mailbox)) = listener_to_stop {
-    tracing::info!(handle = core_handle, uri = %uri, "UserUnbind: Sending Stop to Listener actor.");
+  if !listeners_to_stop.is_empty() {
+    tracing::info!(handle = core_handle, uri = %endpoint, count = listeners_to_stop.len(), "UserUnbind: Sending Stop to Listener actors.");
     // Sending Stop will cause Listener to shutdown, publish ActorStopping.
     // The ActorStopping handler will then remove it from endpoints map.
-    if listener_mailbox.send(Command::Stop).await.is_err() {
-      tracing::warn!(handle = core_handle, uri = %uri, "Failed to send Stop to Listener on unbind (already stopped?).");
-      // If send fails the listener is likely already gone; ActorStopping handles the map removal.
-      unbind_result = Ok(()); // Consider unbind successful if listener is already gone.
-    } else {
-      unbind_result = Ok(()); // Stop command sent successfully.
+    for listener_mailbox in listeners_to_stop {
+      if listener_mailbox.send(Command::Stop).await.is_err() {
+        tracing::warn!(handle = core_handle, uri = %endpoint, "Failed to send Stop to Listener on unbind (already stopped?).");
+      }
     }
+    unbind_result = Ok(());
   } else {
     #[cfg(feature = "inproc")]
     if endpoint.starts_with("inproc://") {

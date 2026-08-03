@@ -80,6 +80,17 @@ pub const ADAPTIVE_THROTTLE: i32 = 1210;
 /// Boolean (0 or 1). Enabled by default (matching libzmq, which accepts v2 peers).
 pub const ALLOW_ZMTP2: i32 = 1220;
 
+/// Set `SO_REUSEPORT` on listening sockets, permitting several listeners to share one
+/// TCP address:port. Boolean (0 or 1), disabled by default. Must be set before `bind()`;
+/// the option snapshot is taken when the bind is processed.
+///
+/// Unix only; a no-op on Windows, Solaris and illumos. Every socket sharing the port must
+/// set it, including the first to bind, or later binds still fail with `EADDRINUSE`.
+/// On Linux the kernel load-balances incoming connections across the listeners. On macOS the
+/// shared bind succeeds but one listener receives every connection and the rest accept
+/// nothing (FreeBSD needs `SO_REUSEPORT_LB`; macOS has no equivalent).
+pub const REUSE_PORT: i32 = 1230;
+
 pub const SNDBATCH_COUNT: i32 = 1215; // Max logical messages to coalesce per outbound write
 pub const SNDBATCH_BYTES: i32 = 1216; // Max payload bytes to coalesce per outbound write
 pub const RCVBATCH_COUNT: i32 = 1217; // Max logical messages to extract per inbound wakeup
@@ -132,6 +143,7 @@ pub(crate) struct SocketOptions {
   // Add other commonly used options as needed
   // pub heartbeat_ttl: Option<Duration>, // TTL often derived from timeout
   pub tcp_cork: bool,
+  pub reuse_port: bool,
   pub sndbuf: Option<usize>,
   pub rcvbuf: Option<usize>,
   pub io_uring: IOURingSocketOptions,
@@ -176,6 +188,7 @@ impl Default for SocketOptions {
       router_mandatory: false, // Default ZMQ behavior is to drop silently
       allow_zmtp2: true,       // Accept ZMTP/2.0 peers by default (matches libzmq)
       tcp_cork: false,
+      reuse_port: false,
       sndbuf: None,
       rcvbuf: None,
       io_uring: Default::default(),
@@ -710,6 +723,7 @@ pub(crate) fn apply_core_option_value(
         MAXMSGSIZE => options.maxmsgsize = parse_maxmsgsize_option(value)?,
         MAX_CONNECTIONS => options.max_connections = parse_max_connections_option(value, option_id)?,
         TCP_CORK => options.tcp_cork = parse_bool_option(value)?,
+        REUSE_PORT => options.reuse_port = parse_bool_option(value)?,
         ALLOW_ZMTP2 => options.allow_zmtp2 = parse_bool_option(value)?,
         ZAP_DOMAIN => options.zap_domain = Some(parse_string_option(value, option_id)?),
         #[cfg(feature = "plain")]
@@ -806,6 +820,7 @@ pub(crate) fn retrieve_core_option_value(
         MAXMSGSIZE => Ok(options.maxmsgsize.to_ne_bytes().to_vec()),
         MAX_CONNECTIONS => Ok(options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
         TCP_CORK => Ok((options.tcp_cork as i32).to_ne_bytes().to_vec()),
+        REUSE_PORT => Ok((options.reuse_port as i32).to_ne_bytes().to_vec()),
         ALLOW_ZMTP2 => Ok((options.allow_zmtp2 as i32).to_ne_bytes().to_vec()),
         ZAP_DOMAIN => options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option ZAP_DOMAIN not set".into())),
         #[cfg(feature = "plain")]

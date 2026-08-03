@@ -365,6 +365,7 @@ Constants for socket option integer IDs.
 *   `pub const NOISE_XX_STATIC_SECRET_KEY: i32 = 1200` (Requires `noise_xx` feature)
 *   `pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201` (Requires `noise_xx` feature)
 *   `pub const MAX_CONNECTIONS: i32 = 1000`
+*   `pub const REUSE_PORT: i32 = 1230` (Unix only) - Set `SO_REUSEPORT` on listening sockets so several listeners can share one TCP address:port; value is `i32` (`1` = enabled, `0` = disabled, the default). Must be set before `bind`. Enabling it also lets a single socket `bind` the same endpoint more than once, giving it several accept loops; `unbind` stops all of them. A no-op on Windows, Solaris and illumos. See the [Sharing a TCP port](./README.USAGE.md#sharing-a-tcp-port-so_reuseport) section for the Linux vs macOS/BSD behaviour difference.
 *   `pub const ADAPTIVE_THROTTLE: i32 = 1210` - Enable (`1`) or disable (`0`) the adaptive I/O throttle; value is `i32`. Prefer `Socket::with_throttle_config()` for full configuration. Set before `bind`/`connect`.
 *   `pub const IO_URING_SNDZEROCOPY: i32 = 1170` (Requires `io-uring` feature)
 *   `pub const IO_URING_RCVMULTISHOT: i32 = 1171` (Requires `io-uring` feature)

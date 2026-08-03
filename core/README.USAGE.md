@@ -20,6 +20,7 @@ This guide provides a detailed overview of how to use the `rzmq` library, coveri
     *   [Sending and Receiving Messages](#sending-and-receiving-messages)
     *   [Multi-Part Messages](#multi-part-messages)
     *   [Socket Options](#socket-options)
+    *   [Sharing a TCP Port (`SO_REUSEPORT`)](#sharing-a-tcp-port-so_reuseport)
     *   [Monitoring Socket Events](#monitoring-socket-events)
     *   [Closing Sockets and Context Termination](#closing-sockets-and-context-termination)
 *   [Supported Socket Types](#supported-socket-types)
@@ -436,6 +437,36 @@ async fn subscribe_example(sub_socket: &rzmq::Socket) -> Result<(), ZmqError> {
     Ok(())
 }
 ```
+
+### Sharing a TCP Port (`SO_REUSEPORT`)
+
+By default one TCP address:port carries exactly one listener with one accept loop. Setting `REUSE_PORT` before `bind` applies `SO_REUSEPORT` to the listening socket, so several listeners can share the same port and accept work spreads across them.
+
+```rust
+use rzmq::socket::REUSE_PORT;
+
+async fn shard_a_port(ctx: &rzmq::Context) -> Result<(), rzmq::ZmqError> {
+    let endpoint = "tcp://0.0.0.0:5555";
+    let mut shards = Vec::new();
+    for _ in 0..4 {
+        let pull = ctx.socket(rzmq::SocketType::Pull)?;
+        pull.set_option(REUSE_PORT, 1i32).await?;
+        pull.bind(endpoint).await?;
+        shards.push(pull);
+    }
+    Ok(())
+}
+```
+
+The same option also lets a *single* socket `bind` one endpoint repeatedly, giving that socket several accept loops behind one message stream. `unbind` names the endpoint, not an individual listener, so it stops every listener sharing that URI.
+
+Constraints worth knowing before relying on it:
+
+*   **Unix only.** On Windows, Solaris and illumos the option is accepted and stored but never applied, so code stays portable without `cfg` branches.
+*   **Linux distributes, macOS does not.** Linux load-balances incoming connections across every listener on the port. On macOS the binds all succeed but a single listener receives every connection and the others accept nothing, so a sharded setup looks healthy while most of its consumers sit idle. FreeBSD needs `SO_REUSEPORT_LB` for distribution; macOS has no equivalent. Sharding is therefore a Linux deployment strategy, even though the binds succeed elsewhere.
+*   **Every binder must set it, including the first.** If the first listener on a port did not set `REUSE_PORT`, later binds still fail with `AddrInUse`.
+*   **Set it before `bind`.** Options are snapshotted when the bind is processed; setting it afterwards affects only subsequent binds.
+*   **Use an explicit port.** `tcp://host:0` asks the OS for an ephemeral port and each bind gets a different one. Bind the first socket to `:0`, read `LAST_ENDPOINT`, then bind the rest to that resolved URI.
 
 ### Monitoring Socket Events
 Track socket lifecycle events. The `SocketEvent` enum (non-exhaustive) currently emits:

@@ -549,8 +549,8 @@ pub(crate) async fn perform_final_pipe_cleanup(
           "Endpoints map not empty. Forcing clear. Rem: {}",
           core_state.endpoints.len()
         );
-        for (uri, ep) in core_state.endpoints.drain() {
-          endpoints_to_force_close.push((uri, ep.endpoint_type, ep.connection_iface));
+        for (_key, ep) in core_state.endpoints.drain() {
+          endpoints_to_force_close.push((ep.endpoint_uri, ep.endpoint_type, ep.connection_iface));
         }
       }
     }

@@ -103,6 +103,13 @@ impl ReconnectState {
   }
 }
 
+/// Key for a listener entry in [`CoreState::endpoints`]. `REUSE_PORT` allows several
+/// listeners to share one resolved URI, so the actor handle disambiguates them. `'#'` never
+/// appears in a resolved endpoint URI, keeping listener keys disjoint from session keys.
+pub(crate) fn listener_key(resolved_uri: &str, handle_id: usize) -> String {
+  format!("{}#{}", resolved_uri, handle_id)
+}
+
 /// Holds the mutable state for a `SocketCore` actor.
 #[derive(Debug)]
 pub(crate) struct CoreState {
@@ -113,7 +120,9 @@ pub(crate) struct CoreState {
   pub pipes_tx: HashMap<usize, BoundedAsyncSender<FrameBatch>>,
   // For Session-based path: Map Core's pipe_read_id -> JoinHandle of PipeReaderTask
   pub pipe_reader_task_handles: HashMap<usize, JoinHandle<()>>,
-  // Main map of active endpoints, keyed by resolved endpoint_uri
+  /// Main map of active endpoints. Sessions are keyed by their resolved peer URI; listeners
+  /// are keyed by [`listener_key`], since `REUSE_PORT` allows several on one URI. In both
+  /// cases `EndpointInfo::endpoint_uri` holds the user-facing URI, not the key.
   pub endpoints: HashMap<String, EndpointInfo>,
 
   // --- Reconnection State ---
