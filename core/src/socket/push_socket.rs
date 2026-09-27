@@ -4,7 +4,7 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
 use crate::socket::options::SocketOptions;
-use crate::socket::patterns::OutgoingMessageOrchestrator;
+use crate::socket::patterns::{OutgoingMessageOrchestrator, PartialMessage};
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
@@ -23,6 +23,7 @@ pub(crate) struct PushSocket {
   outgoing_orchestrator: OutgoingMessageOrchestrator,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
   cached_options: ArcSwap<SocketOptions>,
+  partial: PartialMessage,
 }
 
 impl PushSocket {
@@ -33,6 +34,7 @@ impl PushSocket {
       outgoing_orchestrator: OutgoingMessageOrchestrator::new(),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
       cached_options: ArcSwap::from(options_snapshot),
+      partial: PartialMessage::default(),
     }
   }
 }
@@ -69,14 +71,25 @@ impl ISocket for PushSocket {
     let sndtimeo = self.cached_options.load().sndtimeo;
     let wait_for_peer = !matches!(sndtimeo, Some(d) if d.is_zero());
 
-    let mut fb = FrameBatch::new();
-    fb.push(msg);
+    if !msg.is_more() && !self.partial.is_open() {
+      let mut fb = FrameBatch::new();
+      fb.push(msg);
+      return self.send_with_timeout(fb, wait_for_peer, sndtimeo).await;
+    }
+    let Some(fb) = self.partial.push(msg) else {
+      return Ok(());
+    };
     self.send_with_timeout(fb, wait_for_peer, sndtimeo).await
   }
 
   fn try_send_sync(&self, msg: Msg) -> Result<(), (Msg, ZmqError)> {
     if !self.core.is_running() {
       return Err((msg, ZmqError::InvalidState("Socket is closing".into())));
+    }
+    // A frame of a multipart message goes through the async path, which holds it
+    // until the message is complete.
+    if msg.is_more() || self.partial.is_open() {
+      return Err((msg, ZmqError::ResourceLimitReached));
     }
     let mut fb = FrameBatch::new();
     fb.push(msg);

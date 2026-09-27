@@ -2,7 +2,7 @@ use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::SocketCore;
-use crate::socket::patterns::{Distributor, PipeMessageSender, SubscriptionMatcher};
+use crate::socket::patterns::{Distributor, PartialMessage, PipeMessageSender, SubscriptionMatcher};
 use crate::socket::ISocket;
 use crate::{delegate_to_core, Blob, MsgFlags};
 
@@ -28,6 +28,7 @@ pub(crate) struct PubSocket {
   /// Ingress senders created in `pipe_attached`, handed to the session actor via
   /// `get_incoming_pipe_sender`.
   pending_pipe_senders: Mutex<HashMap<usize, PipeMessageSender>>,
+  partial: PartialMessage,
 }
 
 impl PubSocket {
@@ -37,6 +38,7 @@ impl PubSocket {
       distributor: Distributor::new(),
       matcher: Arc::new(SubscriptionMatcher::new()),
       pending_pipe_senders: Mutex::new(HashMap::new()),
+      partial: PartialMessage::default(),
     }
   }
 
@@ -108,8 +110,14 @@ impl ISocket for PubSocket {
       "PubSocket::send distributing message"
     );
 
-    let mut frames = FrameBatch::new();
-    frames.push(msg);
+    if !msg.is_more() && !self.partial.is_open() {
+      let mut frames = FrameBatch::new();
+      frames.push(msg);
+      return self.dispatch(frames).await;
+    }
+    let Some(frames) = self.partial.push(msg) else {
+      return Ok(());
+    };
     self.dispatch(frames).await
   }
 
