@@ -68,8 +68,8 @@ impl ZmqMessageProcessor {
     }
   }
 
-  /// Anonymous-ingress path (PULL, SUB): read into a fresh throwaway buffer and
-  /// hand it to the engine, which copies it once into the accumulator.
+  /// Anonymous-ingress path (PULL, SUB): read into a fresh buffer and hand it to
+  /// the engine, which copies it once into the accumulator.
   async fn read_accumulate<RH: ZmtpReadHalf>(
     &mut self,
     reader: &mut RH,
@@ -95,13 +95,16 @@ impl ZmqMessageProcessor {
     // can't hijack the OS thread and starve the Tokio executor.
     let max_greedy_read = engine.config().rcvbatch_bytes.max(INGRESS_GREEDY_CHUNK);
 
-    // 2. Greedy synchronous drain up to the configured batch limit.
-    let mut greedy_buf = [0u8; INGRESS_GREEDY_CHUNK];
-    while total_read < max_greedy_read {
-      match reader.try_read_chunk(&mut greedy_buf) {
+    // 2. Greedy synchronous drain up to the configured batch limit, straight into
+    // `buf`. A full first read means a busy stream, so the buffer grows once to
+    // the limit instead of doubling as reads arrive.
+    if buf.len() == buf.capacity() && total_read < max_greedy_read {
+      buf.reserve(max_greedy_read - total_read);
+    }
+    while total_read < max_greedy_read && buf.len() < buf.capacity() {
+      match reader.try_read_buf(&mut buf) {
         Ok(0) => break,
         Ok(k) => {
-          buf.extend_from_slice(&greedy_buf[..k]);
           total_read += k;
         }
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
