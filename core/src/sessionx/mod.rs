@@ -18,3 +18,6 @@ pub(crate) use iface::ScaConnectionIface;
 pub(crate) const INGRESS_GREEDY_CHUNK: usize = 65536;
 #[cfg(not(target_os = "macos"))]
 pub(crate) const INGRESS_GREEDY_CHUNK: usize = 65536 * 8;
+
+/// Most chunks one vectored egress write gathers.
+pub(crate) const MAX_EGRESS_IOVECS: usize = 64;

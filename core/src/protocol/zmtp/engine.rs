@@ -140,6 +140,12 @@ impl ZmtpEngine {
     self.framer.write_msg_batch(batch)
   }
 
+  /// Encode a batch as wire-order chunks for a vectored write: small frames are
+  /// coalesced, large payloads are referenced without a copy.
+  pub fn frame_batch_mixed(&mut self, batch: &[FrameBatch], out: &mut Vec<(Bytes, usize)>) -> Result<(), ZmqError> {
+    self.framer.frame_mixed(batch, out)
+  }
+
   /// Encode a batch for io-uring vectored write, returning multiple `Bytes` slices.
   ///
   /// Batches whose total payload is below `FLAT_THRESHOLD` are serialized into a single

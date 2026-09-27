@@ -27,6 +27,14 @@ pub(crate) trait ISecureFramer: Send + Sync + 'static {
     Ok(vec![self.write_msg_batch(batch)?])
   }
 
+  /// Appends the batch to `out` as wire-order chunks, each with the number of
+  /// logical messages it ends. Framers that must transform the bytes (encryption)
+  /// produce one chunk.
+  fn frame_mixed(&mut self, batch: &[FrameBatch], out: &mut Vec<(Bytes, usize)>) -> Result<(), ZmqError> {
+    out.push((self.write_msg_batch(batch)?, batch.len()));
+    Ok(())
+  }
+
   fn try_read_msgs_from_bytes(
     &mut self,
     data: Bytes,
@@ -90,6 +98,11 @@ impl ISecureFramer for NullFramer {
 
   fn frame_vectored(&mut self, batch: &[FrameBatch]) -> Result<Vec<Bytes>, ZmqError> {
     self.framer.frame_vectored(batch)
+  }
+
+  fn frame_mixed(&mut self, batch: &[FrameBatch], out: &mut Vec<(Bytes, usize)>) -> Result<(), ZmqError> {
+    self.framer.frame_mixed(batch, encoder::COPY_THRESHOLD, out);
+    Ok(())
   }
 }
 

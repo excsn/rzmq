@@ -17,7 +17,7 @@ use crate::{Blob, MailboxReceiver, counter, log_carryover_drain, log_delivery_ga
 
 use super::message_processor::ZmqMessageProcessor;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -28,6 +28,7 @@ use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
 use super::egress_buffer::EgressBuffer;
+use super::MAX_EGRESS_IOVECS;
 use super::egress_driver::EgressDriver;
 use super::pipe_manager::CorePipeManagerX;
 use super::states::ActorConfigX;
@@ -46,6 +47,8 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   write_half: Option<S::WriteHalf>,
   /// Temporary read buffer used only during the handshake loop.
   handshake_read_buf: BytesMut,
+  /// Reused per write cycle by `stage_outgoing_batch`.
+  egress_chunks: Vec<(Bytes, usize)>,
   /// Data messages decoded during the handshake pass (e.g. a SUB's SUBSCRIBE
   /// frame that arrived bundled with the peer's final handshake bytes). These
   /// must be replayed into the operational ingress rather than dropped, or the
@@ -166,6 +169,7 @@ where
       read_half: Some(read_half),
       write_half: Some(write_half),
       handshake_read_buf: BytesMut::with_capacity(GREETING_LENGTH * 4),
+      egress_chunks: Vec::with_capacity(MAX_EGRESS_IOVECS),
       pending_handshake_ingress: Vec::new(),
       core_pipe_manager: CorePipeManagerX::new(),
       command_mailbox_receiver,
@@ -338,7 +342,6 @@ where
         .expect("write_half must be present at operational start");
 
       let sndhwm = self.zmtp_engine.config().sndhwm.max(1);
-      let sndbatch_count = self.zmtp_engine.config().sndbatch_count;
 
       let mut core_carryover: std::collections::VecDeque<FrameBatch> =
         std::collections::VecDeque::new();
@@ -561,7 +564,7 @@ where
           }
 
           // Write arm: cancel-safe drain of the egress buffer.
-          write_res = EgressDriver::new(&mut write_half, &mut egress_buffer, sndbatch_count, self.handle),
+          write_res = EgressDriver::new(&mut write_half, &mut egress_buffer, MAX_EGRESS_IOVECS, self.handle),
             if !egress_buffer.is_empty() => {
             match write_res {
               Ok(()) => {
@@ -1045,9 +1048,12 @@ where
       outgoing_batch.len() as u32,
     );
 
-    match self.zmtp_engine.frame_batch(outgoing_batch) {
-      Ok(bytes) => {
-        egress_buffer.push(bytes, outgoing_batch.len());
+    self.egress_chunks.clear();
+    match self.zmtp_engine.frame_batch_mixed(outgoing_batch, &mut self.egress_chunks) {
+      Ok(()) => {
+        for (bytes, ended) in self.egress_chunks.drain(..) {
+          egress_buffer.push(bytes, ended);
+        }
         if !self.is_currently_congested && egress_buffer.pending_messages() >= sndhwm {
           self.is_currently_congested = true;
           if let Some(ref tx) = self.actor_config.monitor_tx {

@@ -2,6 +2,29 @@ use crate::error::ZmqError;
 use crate::message::{FrameBatch, MsgFlags};
 use bytes::{BufMut, Bytes, BytesMut};
 
+/// Payloads of at least this many bytes are written as their own chunk by
+/// `frame_mixed` instead of being copied into the coalesce buffer.
+pub(crate) const COPY_THRESHOLD: usize = 8 * 1024;
+
+/// Writes a ZMTP frame header: flags byte, then a 1-byte or 8-byte length.
+#[inline]
+fn put_header(buf: &mut BytesMut, flags: MsgFlags, len: usize) {
+  let mut zmtp_flags = 0u8;
+  if flags.contains(MsgFlags::MORE) {
+    zmtp_flags |= 0x01;
+  }
+  if flags.contains(MsgFlags::COMMAND) {
+    zmtp_flags |= 0x04;
+  }
+  if len <= 255 {
+    buf.put_u8(zmtp_flags);
+    buf.put_u8(len as u8);
+  } else {
+    buf.put_u8(zmtp_flags | 0x02);
+    buf.put_u64(len as u64);
+  }
+}
+
 /// Write-side ZMTP frame serialization engine.
 /// Manages reusable header and coalesce buffers to eliminate per-message allocation
 /// on the egress hot path. Does not handle reading or parsing.
@@ -58,6 +81,46 @@ impl ZmtpFrameEncoder {
     }
 
     Ok(self.coalesce_buffer.split().freeze())
+  }
+
+  /// Serializes a batch into chunks in wire order, each paired with the number
+  /// of logical messages whose last frame it ends. Headers and payloads below
+  /// `copy_threshold` are copied into runs of the coalesce buffer; larger
+  /// payloads are emitted as their own `Bytes` without a copy. A batch with no
+  /// large payload yields a single chunk identical to `frame_contiguous`.
+  pub fn frame_mixed(&mut self, batch: &[FrameBatch], copy_threshold: usize, out: &mut Vec<(Bytes, usize)>) {
+    let mut run_bytes = 0;
+    for group in batch {
+      for msg in group {
+        let len = msg.size();
+        run_bytes += if len <= 255 { 2 } else { 9 };
+        if len < copy_threshold {
+          run_bytes += len;
+        }
+      }
+    }
+    self.coalesce_buffer.reserve(run_bytes);
+
+    let mut completed = 0;
+    for group in batch {
+      let last = group.len().saturating_sub(1);
+      for (i, msg) in group.iter().enumerate() {
+        let ends_message = i == last;
+        let len = msg.size();
+        put_header(&mut self.coalesce_buffer, msg.flags(), len);
+        if len < copy_threshold {
+          self.coalesce_buffer.put_slice(msg.data().unwrap_or(&[]));
+          completed += usize::from(ends_message);
+        } else {
+          out.push((self.coalesce_buffer.split().freeze(), completed));
+          completed = 0;
+          out.push((msg.data_bytes().unwrap_or_default(), usize::from(ends_message)));
+        }
+      }
+    }
+    if !self.coalesce_buffer.is_empty() {
+      out.push((self.coalesce_buffer.split().freeze(), completed));
+    }
   }
 
   /// Carves headers out of the reusable header slab, pairing them with the
@@ -154,5 +217,91 @@ mod tests {
       original_ptr, vectored_ptr,
       "Zero-copy pointer matching failed!"
     );
+  }
+
+  fn mixed_batch(seed: u64, messages: usize) -> Vec<FrameBatch> {
+    let mut state = seed | 1;
+    let mut next = move || {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state
+    };
+    let sizes = [0usize, 1, 200, 255, 256, 4000, 8191, 8192, 20000, 70000];
+    (0..messages)
+      .map(|_| {
+        let frames = 1 + (next() % 3) as usize;
+        let msgs: Vec<Msg> = (0..frames)
+          .map(|f| {
+            let len = sizes[(next() % sizes.len() as u64) as usize];
+            let mut msg = Msg::from_vec((0..len).map(|b| (b % 251) as u8).collect());
+            let mut flags = MsgFlags::empty();
+            if f + 1 < frames {
+              flags |= MsgFlags::MORE;
+            }
+            if next() % 7 == 0 {
+              flags |= MsgFlags::COMMAND;
+            }
+            msg.set_flags(flags);
+            msg
+          })
+          .collect();
+        FrameBatch::from(msgs)
+      })
+      .collect()
+  }
+
+  #[test]
+  fn mixed_framing_is_byte_identical_to_contiguous() {
+    for seed in 1..200u64 {
+      for threshold in [0usize, 1, 256, 8192, usize::MAX] {
+        let batch = mixed_batch(seed, 1 + (seed % 12) as usize);
+        let expected = ZmtpFrameEncoder::new(64, 64).frame_contiguous(&batch).unwrap();
+
+        let mut chunks = Vec::new();
+        ZmtpFrameEncoder::new(64, 64).frame_mixed(&batch, threshold, &mut chunks);
+        let joined: Vec<u8> = chunks.iter().flat_map(|(b, _)| b.iter().copied()).collect();
+        assert_eq!(joined, &expected[..], "seed {} threshold {}", seed, threshold);
+
+        let counted: usize = chunks.iter().map(|(_, n)| n).sum();
+        assert_eq!(counted, batch.len(), "seed {} threshold {}", seed, threshold);
+      }
+    }
+  }
+
+  #[test]
+  fn mixed_framing_counts_each_message_on_the_chunk_that_ends_it() {
+    let small = Msg::from_static(b"head");
+    let mut large = Msg::from_vec(vec![7u8; COPY_THRESHOLD]);
+    large.set_flags(MsgFlags::empty());
+    let mut first = small.clone();
+    first.set_flags(MsgFlags::MORE);
+    let batch = vec![FrameBatch::from(vec![first, large]), FrameBatch::from(vec![small])];
+
+    let mut chunks = Vec::new();
+    ZmtpFrameEncoder::new(64, 64).frame_mixed(&batch, COPY_THRESHOLD, &mut chunks);
+    let counts: Vec<usize> = chunks.iter().map(|(_, n)| *n).collect();
+    assert_eq!(counts, vec![0, 1, 1], "run with header, large payload ending message 1, run with message 2");
+  }
+
+  #[test]
+  fn mixed_framing_passes_large_payloads_without_copying() {
+    let payload = Msg::from_vec(vec![3u8; 20000]);
+    let original = payload.data().unwrap().as_ptr();
+    let batch = vec![FrameBatch::from(vec![payload])];
+
+    let mut chunks = Vec::new();
+    ZmtpFrameEncoder::new(64, 64).frame_mixed(&batch, COPY_THRESHOLD, &mut chunks);
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[1].0.as_ptr(), original);
+  }
+
+  #[test]
+  fn mixed_framing_of_small_messages_is_one_chunk() {
+    let batch: Vec<FrameBatch> = (0..50).map(|_| FrameBatch::from(vec![Msg::from_vec(vec![1u8; 1000])])).collect();
+    let mut chunks = Vec::new();
+    ZmtpFrameEncoder::new(64, 64).frame_mixed(&batch, COPY_THRESHOLD, &mut chunks);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].1, 50);
   }
 }

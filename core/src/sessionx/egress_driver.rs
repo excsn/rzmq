@@ -55,10 +55,10 @@ impl<'a, W: ZmtpWriteHalf> Future for EgressDriver<'a, W> {
       let n = {
         // Create a 64-element stack array of IoSlices initialized with dummy data
         let dummy = &[];
-        let mut slices = [std::io::IoSlice::new(dummy); 64];
+        let mut slices = [std::io::IoSlice::new(dummy); super::MAX_EGRESS_IOVECS];
 
         // Fill the stack array directly from the buffer without heap allocation
-        let max_slices = this.max_iovecs.min(64);
+        let max_slices = this.max_iovecs.min(super::MAX_EGRESS_IOVECS);
         let count = this.egress_buffer.fill_slices(&mut slices[..max_slices]);
 
         match Pin::new(&mut *this.write_half).poll_write_vectored(cx, &slices[..count]) {
