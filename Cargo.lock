@@ -1511,7 +1511,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rzmq"
-version = "0.5.25"
+version = "0.5.26"
 dependencies = [
  "anyhow",
  "arc-swap",
