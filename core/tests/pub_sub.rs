@@ -2,7 +2,7 @@
 
 use rzmq::socket::options::{SUBSCRIBE, UNSUBSCRIBE};
 use rzmq::socket::SocketEvent;
-use rzmq::{Context, Msg, SocketType, ZmqError};
+use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
 use serial_test::serial;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -500,5 +500,75 @@ async fn test_pub_sub_subscriber_disconnects() -> Result<(), ZmqError> {
   println!("Terminating context...");
   ctx.term().await?;
   println!("Test test_pub_sub_subscriber_disconnects finished.");
+  Ok(())
+}
+
+// --- Test: Multipart message sent frame by frame ---
+
+async fn send_frame_by_frame(socket: &rzmq::Socket, frames: &[&'static [u8]]) -> Result<(), ZmqError> {
+  for (i, frame) in frames.iter().enumerate() {
+    let mut msg = Msg::from_static(frame);
+    if i < frames.len() - 1 {
+      msg.set_flags(MsgFlags::MORE);
+    }
+    socket.send(msg).await?;
+  }
+  Ok(())
+}
+
+/// The subscription matches the first frame of a message only; the frames
+/// after it travel with it whatever their bytes.
+async fn assert_frame_by_frame_multipart(pub_socket: &rzmq::Socket, sub_socket: &rzmq::Socket) -> Result<(), ZmqError> {
+  send_frame_by_frame(pub_socket, &[b"topic.b", b"other header", b"other payload"]).await?;
+  send_frame_by_frame(pub_socket, &[b"topic.a", b"header", b"payload"]).await?;
+
+  for (expected, more) in [(&b"topic.a"[..], true), (&b"header"[..], true), (&b"payload"[..], false)] {
+    let frame = common::recv_timeout(sub_socket, LONG_TIMEOUT).await?;
+    assert_eq!(frame.data().unwrap(), expected);
+    assert_eq!(frame.is_more(), more, "MORE flag on {:?}", String::from_utf8_lossy(expected));
+  }
+  assert!(
+    common::recv_timeout(sub_socket, SHORT_TIMEOUT).await.is_err(),
+    "the topic.b message is filtered out whole"
+  );
+  Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_pub_sub_tcp_multipart_sent_frame_by_frame() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  {
+    let pub_socket = ctx.socket(SocketType::Pub)?;
+    let sub_socket = ctx.socket(SocketType::Sub)?;
+    let endpoint = common::bind_and_resolve_tcp(&pub_socket).await?;
+
+    sub_socket.connect(&endpoint).await?;
+    sub_socket.set_option_raw(SUBSCRIBE, b"topic.a").await?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_frame_by_frame_multipart(&pub_socket, &sub_socket).await?;
+  }
+  ctx.term().await?;
+  Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_pub_sub_inproc_multipart_sent_frame_by_frame() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  {
+    let pub_socket = ctx.socket(SocketType::Pub)?;
+    let sub_socket = ctx.socket(SocketType::Sub)?;
+    let endpoint = common::unique_inproc_endpoint();
+
+    pub_socket.bind(&endpoint).await?;
+    sub_socket.connect(&endpoint).await?;
+    sub_socket.set_option_raw(SUBSCRIBE, b"topic.a").await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert_frame_by_frame_multipart(&pub_socket, &sub_socket).await?;
+  }
+  ctx.term().await?;
   Ok(())
 }

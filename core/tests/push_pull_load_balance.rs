@@ -612,3 +612,45 @@ async fn test_load_balance_slow_consumer_reentry() -> Result<(), ZmqError> {
   ctx.term().await?;
   Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Test 8 - Multipart Cohesion When Sent Frame by Frame
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_load_balance_multipart_sent_frame_by_frame() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  let push = ctx.socket(SocketType::Push)?;
+  let pull1 = ctx.socket(SocketType::Pull)?;
+  let pull2 = ctx.socket(SocketType::Pull)?;
+
+  let ep1 = common::bind_and_resolve_tcp(&pull1).await?;
+  let ep2 = common::bind_and_resolve_tcp(&pull2).await?;
+
+  push.connect(&ep1).await?;
+  push.connect(&ep2).await?;
+  tokio::time::sleep(Duration::from_millis(150)).await;
+
+  for frames in [[&b"A1"[..], b"A2", b"A3"], [&b"B1"[..], b"B2", b"B3"]] {
+    for (i, frame) in frames.iter().enumerate() {
+      let mut msg = Msg::from_vec(frame.to_vec());
+      if i < frames.len() - 1 {
+        msg.set_flags(MsgFlags::MORE);
+      }
+      push.send(msg).await?;
+    }
+  }
+
+  let res1 = timeout(LONG_TIMEOUT, pull1.recv_multipart()).await.map_err(|_| ZmqError::Timeout)??;
+  let res2 = timeout(LONG_TIMEOUT, pull2.recv_multipart()).await.map_err(|_| ZmqError::Timeout)??;
+
+  let tags = |res: &[Msg]| -> Vec<u8> { res.iter().map(|m| m.data().unwrap_or_default()[0]).collect() };
+  let (tags1, tags2) = (tags(&res1), tags(&res2));
+  assert_eq!(res1.len(), 3, "PULL1 must receive one whole message, got tags {:?}", tags1);
+  assert_eq!(res2.len(), 3, "PULL2 must receive one whole message, got tags {:?}", tags2);
+  assert!(tags1.iter().all(|t| *t == tags1[0]), "PULL1 got frames of two messages: {:?}", tags1);
+  assert!(tags2.iter().all(|t| *t == tags2[0]), "PULL2 got frames of two messages: {:?}", tags2);
+  assert_ne!(tags1[0], tags2[0], "each PULL gets a different message");
+
+  ctx.term().await?;
+  Ok(())
+}
