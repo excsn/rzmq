@@ -68,11 +68,6 @@ impl<'a, T> ReusableBoxFuture<'a, T> {
   pub fn get_pin(&mut self) -> Pin<&mut (dyn Future<Output = T> + Send)> {
     self.boxed.as_mut()
   }
-
-  /// Poll the future stored inside this box.
-  pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<T> {
-    self.get_pin().poll(cx)
-  }
 }
 
 impl<T> Future for ReusableBoxFuture<'_, T> {

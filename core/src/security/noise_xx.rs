@@ -4,9 +4,8 @@ use super::cipher::IDataCipher;
 use crate::error::ZmqError;
 use crate::security::framer::{ISecureFramer, LengthPrefixedFramer};
 use crate::security::mechanism::ProcessTokenAction;
-use crate::security::{Mechanism, MechanismStatus, Metadata};
+use crate::security::{Mechanism, MechanismStatus};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use snow::error::{Prerequisite, StateProblem};
 use snow::params::NoiseParams;
 use snow::{Error as SnowError, TransportState};
@@ -295,9 +294,6 @@ impl NoiseXxMechanism {
 
 #[async_trait::async_trait]
 impl Mechanism for NoiseXxMechanism {
-  fn name(&self) -> &'static str {
-    Self::NAME
-  }
 
   fn produce_token(&mut self) -> Result<Option<Vec<u8>>, ZmqError> {
     // If there's a message prepared by a previous process_token() call, prioritize sending it.
@@ -442,38 +438,8 @@ impl Mechanism for NoiseXxMechanism {
     self.current_status
   }
 
-  fn peer_identity(&self) -> Option<Vec<u8>> {
-    self.verified_peer_static_pk.clone()
-  }
-
-  fn metadata(&self) -> Option<Metadata> {
-    None
-  }
-
-  // set_error should also invalidate the Option<HandshakeState>
-  fn set_error(&mut self, reason: String) {
-    tracing::error!("NOISE_XX Mechanism error set: {}", reason);
-    self.current_status = MechanismStatus::Error;
-    self.error_reason_str = Some(reason);
-    self.state = None; // Invalidate/clear handshake state on error
-    self.transport_state = None; // Clear transport state too
-    self.pending_outgoing_handshake_msg = None;
-  }
-
   fn error_reason(&self) -> Option<&str> {
     self.error_reason_str.as_deref()
-  }
-
-  fn zap_request_needed(&mut self) -> Option<Vec<Vec<u8>>> {
-    None
-  }
-  fn process_zap_reply(&mut self, _reply_frames: &[Vec<u8>]) -> Result<(), ZmqError> {
-    Ok(())
-  }
-
-  // Required by the trait, for downcasting.
-  fn as_any(&self) -> &dyn std::any::Any {
-    self
   }
 
   fn into_framer(

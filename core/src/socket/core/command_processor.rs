@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::message::{FrameBatch, Msg};
+use crate::message::FrameBatch;
 #[cfg(any(feature = "io-uring", feature = "inproc"))]
 use crate::runtime::ActorType;
 use crate::runtime::system_events::ConnectionInteractionModel;

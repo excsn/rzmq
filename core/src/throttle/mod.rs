@@ -203,13 +203,6 @@ pub struct ThrottleGuard {
 }
 
 impl ThrottleGuard {
-  pub fn get_current_balance(&self) -> i32 {
-    self
-      .shared
-      .as_ref()
-      .map_or(0, |s| s.current_balance.load(Ordering::Relaxed))
-  }
-
   #[inline(always)]
   pub fn should_throttle(&self) -> bool {
     (self.should_throttle_fn)(self)

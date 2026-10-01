@@ -1,16 +1,12 @@
 use crate::error::ZmqError;
 use crate::message::{Msg, MsgFlags};
 use crate::protocol::zmtp::command::{ZMTP_FLAG_COMMAND, ZMTP_FLAG_LONG, ZMTP_FLAG_MORE};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 #[derive(Debug, Default, Clone, Copy)]
 enum ManualDecodingState {
   #[default]
   ReadHeader,
-  ReadBody {
-    flags: u8,
-    size: usize,
-  },
 }
 
 #[derive(Debug)]
@@ -210,28 +206,6 @@ impl ZmtpManualParser {
           msg.set_flags(rz_flags);
           return Ok(Some(msg));
         }
-        ManualDecodingState::ReadBody { flags, size } => {
-          if src.len() < size {
-            return Ok(None); // Not enough data for body
-          }
-
-          let body_bytes = src.split_to(size).freeze(); // Consumes body from src
-
-          // Reset state for next message
-          self.state = ManualDecodingState::ReadHeader;
-
-          // Construct rzmq Msg
-          let mut msg = Msg::from_bytes(body_bytes);
-          let mut rz_flags = MsgFlags::empty();
-          if (flags & ZMTP_FLAG_MORE) != 0 {
-            rz_flags |= MsgFlags::MORE;
-          }
-          if (flags & ZMTP_FLAG_COMMAND) != 0 {
-            rz_flags |= MsgFlags::COMMAND;
-          }
-          msg.set_flags(rz_flags);
-          return Ok(Some(msg));
-        }
       }
     }
   }
@@ -240,6 +214,7 @@ impl ZmtpManualParser {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use bytes::BufMut;
 
   fn long_frame_header(size: u64) -> BytesMut {
     let mut buf = BytesMut::new();
@@ -338,6 +313,7 @@ mod tests {
 #[cfg(test)]
 mod additional_robustness_tests {
   use super::*;
+  use bytes::BufMut;
 
   #[test]
   fn test_fragmented_stream_parsing() {

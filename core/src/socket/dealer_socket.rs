@@ -8,7 +8,7 @@ use crate::socket::core::SocketCore;
 use crate::socket::options::AUTO_DELIMITER;
 use crate::socket::patterns::AddressedIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
-use crate::socket::patterns::{FramingLatch, dealer_auto_decode, dealer_auto_encode};
+use crate::socket::patterns::{FramingLatch, dealer_auto_encode};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -160,7 +160,7 @@ impl DealerSocket {
       processor_task_handle: TokioMutex::new(Some(processor_jh)),
       processor_stop_signal: stop_signal_arc,
       current_send_transaction: TokioMutex::new(DealerSendTransaction::Idle),
-      framing: FramingLatch::new(dealer_auto_encode, dealer_auto_decode),
+      framing: FramingLatch::new(dealer_auto_encode),
     }
   }
 
@@ -261,9 +261,6 @@ impl DealerSocket {
 
 #[async_trait]
 impl ISocket for DealerSocket {
-  fn core(&self) -> &Arc<SocketCore> {
-    &self.core
-  }
   fn mailbox(&self) -> MailboxSender {
     self.core.command_sender()
   }
@@ -522,14 +519,6 @@ impl ISocket for DealerSocket {
     }
 
     Ok(true)
-  }
-
-  async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
-    match event {
-      Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {}
-      _ => {}
-    }
-    Ok(())
   }
 
   fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {

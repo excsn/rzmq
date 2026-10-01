@@ -18,15 +18,13 @@ pub(crate) struct FramingLatch {
   // Lookup tables for behavior.
   // Index 0 = Auto Logic, Index 1 = No-op (Manual)
   encoders: [FramingOp; 2],
-  decoders: [FramingOp; 2],
 }
 
 impl FramingLatch {
-  pub fn new(auto_encode: FramingOp, auto_decode: FramingOp) -> Self {
+  pub fn new(auto_encode: FramingOp) -> Self {
     Self {
       mode: AtomicUsize::new(0),
       encoders: [auto_encode, noop],
-      decoders: [auto_decode, noop],
     }
   }
 
@@ -38,13 +36,6 @@ impl FramingLatch {
     // Safety: idx & 1 ensures we never go out of bounds even if memory is corrupted,
     // allowing the compiler to elide bounds checks.
     (self.encoders[idx & 1])(frames);
-  }
-
-  /// Hot Path: Decode incoming frames.
-  #[inline(always)]
-  pub fn decode(&self, frames: &mut FrameBatch) {
-    let idx = self.mode.load(Ordering::Acquire);
-    (self.decoders[idx & 1])(frames);
   }
 
   /// Configuration: Switch to Manual mode.
@@ -84,13 +75,6 @@ pub(crate) fn router_auto_encode(frames: &mut FrameBatch) {
   }
 }
 
-pub(crate) fn router_auto_decode(frames: &mut FrameBatch) {
-  // Router receives [Identity, Delimiter, Payload...]. We remove index 1.
-  if frames.len() > 1 {
-    frames.remove(1);
-  }
-}
-
 pub(crate) fn dealer_auto_encode(frames: &mut FrameBatch) {
   // Dealer sends [Payload...]. We insert Delimiter at index 0 -> [Delimiter, Payload...]
   let mut delimiter = Msg::new();
@@ -98,13 +82,6 @@ pub(crate) fn dealer_auto_encode(frames: &mut FrameBatch) {
     delimiter.set_flags(MsgFlags::MORE);
   }
   frames.insert(0, delimiter);
-}
-
-pub(crate) fn dealer_auto_decode(frames: &mut FrameBatch) {
-  // Dealer receives [Delimiter, Payload...]. We remove index 0.
-  if !frames.is_empty() {
-    frames.remove(0);
-  }
 }
 
 #[cfg(test)]

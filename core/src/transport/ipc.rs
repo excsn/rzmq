@@ -46,7 +46,6 @@ pub(crate) struct IpcListener {
   listener_handle: Option<JoinHandle<()>>, // Option to allow taking it in run_command_loop
   context: Context,
   parent_socket_id: usize,
-  socket_logic: Arc<dyn ISocket>,
 }
 
 impl fmt::Debug for IpcListener {
@@ -62,7 +61,6 @@ impl fmt::Debug for IpcListener {
       .field("listener_handle_is_some", &self.listener_handle.is_some())
       .field("context_present", &true) // Avoid printing full context
       .field("parent_socket_id", &self.parent_socket_id)
-      .field("socket_logic_present", &true) // Placeholder for Arc<dyn ISocket>
       .finish()
   }
 }
@@ -109,7 +107,7 @@ impl IpcListener {
       resolved_uri.clone(),
       Arc::new(listener),
       options.clone(),
-      socket_logic.clone(),
+      socket_logic,
       context_handle_source.clone(),
       monitor_tx.clone(),
       context.clone(),
@@ -125,7 +123,6 @@ impl IpcListener {
       listener_handle: Some(accept_loop_task_jh),
       context: context.clone(),
       parent_socket_id,
-      socket_logic,
     };
 
     let cmd_loop_jh = tokio::spawn(listener_actor.run_command_loop(parent_socket_id));

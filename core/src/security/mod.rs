@@ -12,7 +12,6 @@ pub(crate) use null::NullMechanism;
 #[cfg(feature = "plain")]
 pub(crate) use plain::PlainMechanism;
 
-use crate::message::Metadata;
 use crate::{error::ZmqError, protocol::zmtp::ZmtpGreeting, socket::ZmtpEngineConfig};
 
 #[cfg(feature = "curve")]

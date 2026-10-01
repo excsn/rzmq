@@ -36,7 +36,6 @@ impl std::fmt::Debug for PinnedEgressBatch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum InternalOpType {
-  Accept,
   RingRead,
   Send,
   SendZeroCopy,
@@ -61,9 +60,7 @@ pub(crate) enum InternalOpPayload {
     app_op_ud: Option<UserData>,
     app_op_name: Option<String>,
   },
-  CancelTarget {
-    target_user_data: UserData,
-  },
+  CancelTarget,
   SendZeroCopy {
     send_buf_id: RegisteredSendBufferId,
     original_data: Bytes,
@@ -199,28 +196,6 @@ impl InternalOpTracker {
       }
     }
     removed
-  }
-
-  /// Finds all `UserData` for a given FD that match a predicate on the op_type.
-  pub fn find_ops_for_fd(
-    &self,
-    fd_to_find: RawFd,
-    predicate: impl Fn(InternalOpType) -> bool,
-  ) -> Vec<UserData> {
-    let mut result: Vec<UserData> = self
-      .op_to_details
-      .iter()
-      .filter(|(_, d)| d.fd == fd_to_find && predicate(d.op_type))
-      .map(|(k, _)| k as u64 + INTERNAL_OP_BASE)
-      .collect();
-    let from_notifs: Vec<UserData> = self
-      .pending_notifications
-      .iter()
-      .filter(|(_, d)| d.fd == fd_to_find && predicate(d.op_type))
-      .map(|(k, _)| *k)
-      .collect();
-    result.extend(from_notifs);
-    result
   }
 
   pub(crate) fn has_pending_read_op(&self, fd_to_check: RawFd) -> bool {

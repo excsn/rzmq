@@ -7,14 +7,6 @@ use crate::transport::ZmtpReadHalf;
 
 use super::INGRESS_GREEDY_CHUNK;
 
-/// Spare capacity granted to a fresh read buffer per reserve on the anonymous
-/// (accumulate) path. Kept modest relative to the greedy ceiling
-/// (`INGRESS_GREEDY_CHUNK`: 512 KB non-macOS, 64 KB macOS).
-#[cfg(not(target_os = "macos"))]
-const READ_CHUNK: usize = 65536 * 2;
-#[cfg(target_os = "macos")]
-const READ_CHUNK: usize = 65536;
-
 /// Initial size / reserve increment for the fresh frame-in-place buffer on the
 /// addressed path (REP/DEALER/ROUTER). Deliberately small: these sockets are
 /// request-response with small, low-pipelining messages, so a right-sized buffer

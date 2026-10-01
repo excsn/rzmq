@@ -74,11 +74,7 @@ macro_rules! delegate_to_core {
 /// unique characteristics of each ZMQ pattern. They typically embed an `Arc<SocketCore>`
 /// to interact with the underlying actor managing shared state and transport.
 #[async_trait]
-pub trait ISocket: Send + Sync + 'static {
-  /// Returns a reference to the underlying `SocketCore` instance.
-  /// This provides access to shared socket state and options if needed by the pattern logic.
-  fn core(&self) -> &Arc<SocketCore>;
-
+pub(crate) trait ISocket: Send + Sync + 'static {
   /// Returns a clone of the command `MailboxSender` for the `SocketCore` actor
   /// associated with this socket. This sender is used by the public `Socket` handle
   /// (and the `delegate_to_core!` macro) to send user-initiated commands to the `SocketCore`.
@@ -166,15 +162,6 @@ pub trait ISocket: Send + Sync + 'static {
   /// * `Ok(false)` if the command was not applicable and should be handled by `SocketCore` or ignored.
   /// * `Err(ZmqError)` if an error occurred during processing.
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError>;
-
-  /// Handles events originating from the data pipes connected to this socket.
-  /// These events are sent by `PipeReaderTask`s to the `SocketCore`'s command mailbox.
-  /// `SocketCore` then calls this method on the `ISocket` implementation.
-  ///
-  /// # Arguments
-  /// * `pipe_id` - The ID of the pipe (from `SocketCore`'s perspective, usually its read ID) where the event originated.
-  /// * `event_command` - The actual `Command` variant representing the pipe event (e.g., `PipeMessageReceived`, `PipeClosedByPeer`).
-  async fn handle_pipe_event(&self, pipe_id: usize, event_command: Command) -> Result<(), ZmqError>;
 
   /// Called by `SocketCore` when a new connection (represented by a pair of data pipes)
   /// is successfully established and attached to this socket.

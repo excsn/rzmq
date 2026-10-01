@@ -21,7 +21,7 @@ use tokio::task::Id as TaskId;
 /// Broader system notifications and lifecycle events are handled by `SystemEvent` on the `EventBus`.
 #[derive(Debug)]
 #[allow(dead_code)]
-pub enum Command {
+pub(crate) enum Command {
   // --- User Requests (from API Handle -> SocketCore's single command mailbox) ---
   /// Command to bind the socket to a local endpoint.
   UserBind {

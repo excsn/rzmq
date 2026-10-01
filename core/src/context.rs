@@ -213,11 +213,6 @@ impl ContextInner {
     self.inproc_registry.read().get(name).cloned()
   }
 
-  /// Gets the command mailbox sender for a specific registered socket.
-  pub(crate) fn get_socket_command_sender(&self, handle: usize) -> Option<MailboxSender> {
-    self.sockets.read().get(&handle).cloned()
-  }
-
   /// Provides access to the shared `EventBus` instance Arc.
   pub(crate) fn event_bus(&self) -> Arc<EventBus> {
     self.event_bus.clone()

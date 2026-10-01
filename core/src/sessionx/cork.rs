@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 
 /// State specific to TCP_CORK management on Linux.
 /// This struct will only be actively used if the underlying stream `S`

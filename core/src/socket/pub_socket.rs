@@ -70,10 +70,6 @@ impl PubSocket {
 
 #[async_trait]
 impl ISocket for PubSocket {
-  fn core(&self) -> &Arc<SocketCore> {
-    &self.core
-  }
-
   fn mailbox(&self) -> MailboxSender {
     self.core.command_sender()
   }
@@ -163,12 +159,6 @@ impl ISocket for PubSocket {
 
   async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {
     Ok(false)
-  }
-
-  async fn handle_pipe_event(&self, _pipe_id: usize, _event: Command) -> Result<(), ZmqError> {
-    // Inbound subscription frames are consumed by the SubscriptionSink ingress
-    // sender on the session thread, not via pipe events.
-    Ok(())
   }
 
   async fn pipe_attached(

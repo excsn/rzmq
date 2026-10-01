@@ -7,7 +7,6 @@ use crate::io_uring_backend::connection_handler::ProtocolHandlerFactory;
 use crate::io_uring_backend::worker::UringWorker;
 use crate::socket::options::calculate_required_slot_size;
 
-use std::ops::Div;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

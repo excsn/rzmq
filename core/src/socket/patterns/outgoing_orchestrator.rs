@@ -31,10 +31,6 @@ impl OutgoingMessageOrchestrator {
     self.load_balancer.has_connections()
   }
 
-  pub async fn wait_for_connection(&self) -> Result<(), ZmqError> {
-    self.load_balancer.wait_for_connection().await
-  }
-
   /// Synchronous single-pass route attempt. Rotates the load balancer and tries each peer
   /// once; returns ownership of the batch immediately if all peers are full or absent.
   /// Never blocks, never allocates. Callers fall back to `route_message` on `Err`.

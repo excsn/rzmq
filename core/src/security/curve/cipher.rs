@@ -1,8 +1,7 @@
 use crate::error::ZmqError;
 use crate::security::IDataCipher;
-use bytes::{Bytes, BytesMut};
 use dryoc::classic::crypto_box::{
-  crypto_box_detached_afternm, crypto_box_open_detached_afternm, Mac, Nonce,
+  crypto_box_detached_afternm, crypto_box_open_detached_afternm, Mac,
 };
 use dryoc::constants::CRYPTO_BOX_MACBYTES;
 use dryoc::dryocbox::NewByteArray;

@@ -27,7 +27,7 @@ use std::os::unix::io::{AsRawFd, IntoRawFd};
 
 use core::fmt;
 use std::io;
-use std::net::{SocketAddr as StdSocketAddr, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::sync::{Semaphore, broadcast};
 use tokio::task::{Id as TaskId, JoinHandle};
 use tokio::time::sleep;
-use tracing::{debug, error, info, trace, warn};
+use tracing::info;
 
 mod underlying_std_net {
   pub use tokio::net::TcpListener;
@@ -50,7 +50,6 @@ pub(crate) struct TcpListener {
   listener_handle: JoinHandle<()>,
   context: Context,
   parent_socket_id: usize,
-  socket_logic: Arc<dyn ISocket>,
 }
 
 impl fmt::Debug for TcpListener {
@@ -68,7 +67,6 @@ impl fmt::Debug for TcpListener {
       )
       .field("context_present", &true)
       .field("parent_socket_id", &self.parent_socket_id)
-      .field("socket_logic_present", &true)
       .finish()
   }
 }
@@ -164,7 +162,7 @@ impl TcpListener {
       Arc::new(tokio_listener),
       transport_cfg.clone(),
       options.clone(),
-      socket_logic.clone(),
+      socket_logic,
       context_handle_source.clone(),
       monitor_tx.clone(),
       context.clone(),
@@ -179,7 +177,6 @@ impl TcpListener {
       listener_handle: accept_loop_task_jh,
       context: context.clone(),
       parent_socket_id,
-      socket_logic,
     };
 
     let cmd_loop_jh = tokio::spawn(listener_actor.run_command_loop(parent_socket_id));

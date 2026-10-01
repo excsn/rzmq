@@ -49,7 +49,7 @@ pub enum ZmtpPhase {
   Closed,
 }
 
-pub struct ZmtpEngine {
+pub(crate) struct ZmtpEngine {
   config: Arc<ZmtpEngineConfig>,
   is_server: bool,
   pub phase: ZmtpPhase,
@@ -81,7 +81,7 @@ pub struct ZmtpEngine {
 }
 
 impl ZmtpEngine {
-  pub fn new(is_server: bool, config: Arc<ZmtpEngineConfig>) -> Self {
+  pub(crate) fn new(is_server: bool, config: Arc<ZmtpEngineConfig>) -> Self {
     let max_msg_size = config.max_msg_size;
     let sndbatch_count = config.sndbatch_count;
     let sndbatch_bytes_physical = config.sndbatch_bytes_physical;
@@ -131,7 +131,7 @@ impl ZmtpEngine {
     self.network_read_accumulator.len()
   }
 
-  pub fn config(&self) -> &Arc<ZmtpEngineConfig> {
+  pub(crate) fn config(&self) -> &Arc<ZmtpEngineConfig> {
     &self.config
   }
 

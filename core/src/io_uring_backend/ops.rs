@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use fibre::{mpsc, oneshot};
+use fibre::oneshot;
 
 pub const HANDLER_INTERNAL_SEND_OP_UD: UserData = 0;
 
@@ -141,23 +141,6 @@ impl UringOpRequest {
     }
   }
 
-  pub(crate) fn get_reply_tx_ref(
-    &self,
-  ) -> Option<&oneshot::Sender<Result<UringOpCompletion, ZmqError>>> {
-    match self {
-      Self::Nop { reply_tx, .. }
-      | Self::InitializeBufferRing { reply_tx, .. }
-      | Self::RegisterRawBuffers { reply_tx, .. }
-      | Self::Listen { reply_tx, .. }
-      | Self::RegisterExternalZmtpFd { reply_tx, .. }
-      | Self::AttachIngressSender { reply_tx, .. }
-      | Self::ResumeConnection { reply_tx, .. }
-      | Self::Connect { reply_tx, .. }
-      | Self::StartFdReadLoop { reply_tx, .. }
-      | Self::ShutdownConnectionHandler { reply_tx, .. } => Some(reply_tx),
-      Self::ShutdownWorker => None,
-    }
-  }
 }
 
 impl fmt::Debug for UringOpRequest {

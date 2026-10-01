@@ -41,9 +41,6 @@ impl PushSocket {
 
 #[async_trait]
 impl ISocket for PushSocket {
-  fn core(&self) -> &Arc<SocketCore> {
-    &self.core
-  }
   fn mailbox(&self) -> MailboxSender {
     self.core.command_sender()
   }
@@ -167,16 +164,6 @@ impl ISocket for PushSocket {
       _ => return Ok(false),
     }
     Ok(true)
-  }
-
-  async fn handle_pipe_event(&self, pipe_id: usize, event: Command) -> Result<(), ZmqError> {
-    tracing::warn!(
-      handle = self.core.handle,
-      pipe_id = pipe_id,
-      "PUSH socket received unexpected pipe event: {:?}",
-      event.variant_name()
-    );
-    Ok(())
   }
 
   async fn pipe_attached(

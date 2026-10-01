@@ -213,8 +213,8 @@ mod additional_router_map_tests {
 
   #[test]
   fn test_req_strategy_prepends_empty_delimiter() {
-    // FramingLatch::new takes fn pointers; closures that don't capture coerce to fn
-    let framing = FramingLatch::new(|_| {}, |_| {});
+    // FramingLatch::new takes a fn pointer; a closure that doesn't capture coerces to fn
+    let framing = FramingLatch::new(|_| {});
     let req_strat = ReqPeerStrategy;
 
     let id_msg = Msg::from_static(b"destination-identity");

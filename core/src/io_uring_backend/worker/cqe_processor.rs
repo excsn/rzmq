@@ -6,16 +6,13 @@ use super::internal_op_tracker::{
 use crate::io_uring_backend::connection_handler::{
   HandlerIoOps, HandlerSqeBlueprint, UringWorkerInterface,
 };
-use crate::io_uring_backend::ops::{UringOpCompletion, UserData, HANDLER_INTERNAL_SEND_OP_UD};
+use crate::io_uring_backend::ops::{UringOpCompletion, HANDLER_INTERNAL_SEND_OP_UD};
 use crate::io_uring_backend::worker::multishot_reader::IOURING_CQE_F_MORE;
 use crate::io_uring_backend::worker::UringWorker;
-use crate::message::{FrameBatch, Msg};
 use crate::socket::connection_iface::DummyConnection;
-use crate::{counter, metric_record_write_batch, uring, Command, ZmqError};
+use crate::{counter, metric_record_write_batch, Command, ZmqError};
 
-use io_uring::cqueue::Entry;
 use io_uring::{cqueue, opcode, squeue, types};
-use std::mem;
 use std::os::unix::io::RawFd;
 use tracing::{debug, error, info, trace, warn};
 
@@ -448,7 +445,7 @@ pub(crate) fn process_handler_blueprint(
       let cancel_op_user_data = internal_ops.new_op_id(
         fd,
         InternalOpType::AsyncCancel,
-        InternalOpPayload::CancelTarget { target_user_data },
+        InternalOpPayload::CancelTarget,
       );
       let entry = opcode::AsyncCancel::new(target_user_data)
         .build()
@@ -787,98 +784,6 @@ pub(crate) fn process_all_cqes(
       );
 
       match op_type {
-        InternalOpType::Accept => {
-          if cqe_result >= 0 {
-            let client_fd = cqe_result as RawFd;
-            let listener_fd = handler_fd;
-            let (factory_id_opt, protocol_config_opt, mailbox_opt) = {
-              let meta_opt = worker.handler_manager.get_listener_metadata(listener_fd);
-              (
-                meta_opt.map(|m| m.factory_id_for_accepted_connections.clone()),
-                meta_opt.map(|m| m.protocol_config_for_accepted.clone()),
-                meta_opt.map(|m| m.socket_mailbox.clone()),
-              )
-            };
-            if let (Some(factory_id), Some(protocol_config), Some(socket_mailbox)) =
-              (factory_id_opt, protocol_config_opt, mailbox_opt)
-            {
-              // Derive peer URI from the accepted FD; use DummyConnection for the internal path.
-              let peer_uri = crate::io_uring_backend::worker::get_peer_local_addr(client_fd)
-                .map(|(peer, _)| format!("tcp://{}", peer))
-                .unwrap_or_else(|_| format!("tcp-accepted-fd-{}", client_fd));
-              match worker.handler_manager.create_and_add_handler(
-                client_fd,
-                &factory_id,
-                &protocol_config,
-                true,
-                socket_mailbox,
-                peer_uri,
-                String::new(),
-                std::sync::Arc::new(DummyConnection),
-                worker.buffer_manager.as_ref(),
-                worker.default_buffer_ring_group_id_val,
-                0,
-              ) {
-                Ok(initial_ops) => {
-                  if !initial_ops.sqe_blueprints.is_empty() {
-                    new_work_generated.push((client_fd, initial_ops.sqe_blueprints));
-                  }
-                  if initial_ops.initiate_close_due_to_error {
-                    worker.fds_needing_close_initiated_pass.push_back(client_fd);
-                  }
-                }
-                Err(e) => {
-                  unsafe {
-                    libc::close(client_fd);
-                  }
-                  error!(
-                    "Failed to create handler for accepted client_fd {}: {}",
-                    client_fd, e
-                  );
-                }
-              }
-            } else {
-              unsafe {
-                libc::close(client_fd);
-              }
-              warn!(
-                "Could not find factory_id/protocol_config for listener fd {}",
-                listener_fd
-              );
-            }
-            if !is_worker_shutting_down {
-              let new_accept_ud = worker.internal_op_tracker.new_op_id(
-                listener_fd,
-                InternalOpType::Accept,
-                InternalOpPayload::None,
-              );
-              let mut client_addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
-              let mut client_addr_len = mem::size_of_val(&client_addr) as libc::socklen_t;
-              let accept_sqe = opcode::Accept::new(
-                types::Fd(listener_fd),
-                &mut client_addr as *mut _ as *mut _,
-                &mut client_addr_len,
-              )
-              .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-              .build()
-              .user_data(new_accept_ud);
-              unsafe {
-                if worker.ring.submission_shared().push(&accept_sqe).is_err() {
-                  error!(
-                    "Failed to re-submit Accept SQE for listener fd {}",
-                    listener_fd
-                  );
-                  worker
-                    .fds_needing_close_initiated_pass
-                    .push_back(listener_fd);
-                  worker.internal_op_tracker.take_op_details(new_accept_ud);
-                }
-              }
-            }
-          } else {
-            // Handle accept error, maybe re-submit accept
-          }
-        }
         InternalOpType::CloseFd => {
           if cqe_result >= 0 {
             info!(

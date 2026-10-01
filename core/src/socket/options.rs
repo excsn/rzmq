@@ -503,18 +503,6 @@ pub(crate) fn parse_bool_option(value: &[u8]) -> Result<bool, ZmqError> {
   Ok(parse_i32_option(value)? == 1)
 }
 
-/// Parses a byte slice representing a timeout or linger value in milliseconds.
-/// ZMQ uses -1 for infinite, 0 for immediate (no linger), >0 for duration.
-pub(crate) fn parse_duration_ms_option(value: &[u8]) -> Result<Option<Duration>, ZmqError> {
-  let val = parse_i32_option(value)?;
-  match val {
-    -1 => Ok(None),                                     // Infinite timeout / linger
-    0.. => Ok(Some(Duration::from_millis(val as u64))), // Non-negative -> Duration
-    // Negative values other than -1 are invalid for timeouts/linger
-    _ => Err(ZmqError::InvalidOptionValue(0)), // Use generic error
-  }
-}
-
 /// Parses a byte slice representing a duration in seconds for TCP Keepalive options.
 /// ZMQ uses integers for seconds. 0 might mean "use system default".
 pub(crate) fn parse_secs_duration_option(value: &[u8]) -> Result<Option<Duration>, ZmqError> {

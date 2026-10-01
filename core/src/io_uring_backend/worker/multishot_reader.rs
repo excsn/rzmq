@@ -61,16 +61,6 @@ impl MultishotReader {
     matches!(self.flow_state, MultishotFlowState::Reading) && self.is_active
   }
 
-  /// True while an ASYNC_CANCEL is in-flight (headroom absorption window).
-  pub fn is_pausing(&self) -> bool {
-    matches!(self.flow_state, MultishotFlowState::Pausing)
-  }
-
-  /// True when the kernel-side read is confirmed stopped.
-  pub fn is_paused(&self) -> bool {
-    matches!(self.flow_state, MultishotFlowState::Paused)
-  }
-
   /// Transition to `Paused` state. Called when the cancel CQE (or -ECANCELED on the
   /// original multishot CQE) is reaped.
   fn acknowledge_pause(&mut self) {
@@ -82,10 +72,6 @@ impl MultishotReader {
     self.is_active = false;
     self.active_op_user_data = None;
     self.cancel_op_user_data = None;
-  }
-
-  pub fn buffer_group_id(&self) -> u16 {
-    self.buffer_group_id
   }
 
   /// Called by handler to signal intent to start a multishot read. Latches until the
@@ -365,46 +351,10 @@ impl MultishotReader {
     }
   }
 
-  pub fn is_active(&self) -> bool {
-    self.is_active && self.cancel_op_user_data.is_none()
-  }
-
-  pub(crate) fn set_active(&mut self, user_data: UserData) {
-    if self.active_op_user_data == Some(user_data) {
-      self.is_active = true;
-      tracing::debug!(
-        "[MultishotReader FD={}] Marked as active with UserData {}.",
-        self.fd,
-        user_data
-      );
-    } else {
-      // Tracking ID mismatch — indicates out-of-order state transitions or a stale blueprint
-      // being re-submitted. Log at error level so regressions surface immediately.
-      tracing::error!(
-        fd = self.fd,
-        expected = ?self.active_op_user_data,
-        got = user_data,
-        "MultishotReader set_active out-of-order: tracking ID mismatch"
-      );
-    }
-  }
-
   /// Checks if the given CQE UserData matches any operation this reader is expecting.
   pub(crate) fn matches_cqe_user_data(&self, cqe_user_data: UserData) -> bool {
     self.active_op_user_data == Some(cqe_user_data)
       || self.cancel_op_user_data == Some(cqe_user_data)
   }
 
-  /// Called when the owning handler's FD is closed, ensuring the reader is marked inactive.
-  pub(crate) fn set_inactive_due_to_close(&mut self) {
-    tracing::debug!(
-      "[MultishotReader FD={}] Marked as inactive due to FD closure.",
-      self.fd
-    );
-    self.is_active = false;
-    self.active_op_user_data = None;
-    self.cancel_op_user_data = None;
-    self.arm_pending = false;
-    self.flow_state = MultishotFlowState::Paused;
-  }
 }

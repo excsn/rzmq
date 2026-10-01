@@ -1,5 +1,5 @@
-use super::{IDataCipher, ZmqError};
-use crate::{message::Metadata, security::framer::ISecureFramer};
+use super::ZmqError;
+use crate::security::framer::ISecureFramer;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,11 +23,8 @@ pub(crate) enum ProcessTokenAction {
 
 /// Trait for security mechanisms (NULL, PLAIN, etc.).
 /// Drives the security handshake state machine.
-pub trait Mechanism: Send + Sync + fmt::Debug + 'static {
+pub(crate) trait Mechanism: Send + Sync + fmt::Debug + 'static {
   // Needs to be Send + Sync if held by Engine actor
-
-  /// Returns the ASCII name of the mechanism (e.g., "NULL", "PLAIN").
-  fn name(&self) -> &'static str;
 
   /// Processes an incoming ZMTP security token (part of handshake).
   /// Updates the internal state machine.
@@ -51,32 +48,8 @@ pub trait Mechanism: Send + Sync + fmt::Debug + 'static {
     self.status() == MechanismStatus::Error
   }
 
-  /// Returns the identity of the peer, if established by the mechanism.
-  /// For Non-PLAIN, this is the peer's public key. For PLAIN, potentially the User-Id.
-  fn peer_identity(&self) -> Option<Vec<u8>>;
-
-  /// Provides any additional metadata derived from the handshake (e.g., ZAP User-Id).
-  /// This can be merged into outgoing/incoming messages.
-  fn metadata(&self) -> Option<Metadata>;
-
-  fn as_any(&self) -> &dyn std::any::Any;
-
-  /// Sets the mechanism's internal state to Error.
-  /// Called by the engine core when transport errors occur during handshake.
-  fn set_error(&mut self, reason: String);
-
   /// Returns the reason for the error state, if available.
   fn error_reason(&self) -> Option<&str>;
-
-  // --- ZAP Related Methods ---
-
-  /// Checks if the mechanism currently requires a ZAP request to be sent.
-  /// Returns the ZAP request frames if needed, otherwise None.
-  fn zap_request_needed(&mut self) -> Option<Vec<Vec<u8>>>;
-
-  /// Processes the ZAP reply received from the authenticator.
-  /// Updates the internal state machine based on the ZAP outcome.
-  fn process_zap_reply(&mut self, reply_frames: &[Vec<u8>]) -> Result<(), ZmqError>;
 
   /// Called after handshake is Ready. If this mechanism provides data-phase encryption,
   /// it consumes itself and returns an ISecureFramer and the established peer identity.

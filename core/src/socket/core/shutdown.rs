@@ -2,7 +2,7 @@ use crate::error::ZmqError;
 use crate::runtime::{ActorType, Command, SystemEvent};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::state::{CoreState, EndpointType, ShutdownCoordinator, ShutdownPhase};
-use crate::socket::core::{command_processor, pipe_manager, SocketCore};
+use crate::socket::core::{pipe_manager, SocketCore};
 use crate::socket::ISocket;
 
 use std::collections::HashMap;
@@ -11,10 +11,6 @@ use std::time::{Duration, Instant};
 
 // --- ShutdownCoordinator Methods ---
 impl ShutdownCoordinator {
-  pub(crate) fn current_phase(&self) -> ShutdownPhase {
-    self.state
-  }
-
   pub(crate) fn begin_shutdown_sequence(
     &mut self,
     core_handle: usize,
@@ -66,52 +62,6 @@ impl ShutdownCoordinator {
       }
     }
     true // Shutdown newly initiated
-  }
-
-  /// Records that a child actor (Listener) has stopped.
-  /// Returns true if this was the last pending entity (actor or connection),
-  /// triggering a potential move to Lingering.
-  fn record_child_actor_stopped(&mut self, child_actor_handle: usize, core_handle: usize) -> bool {
-    if self.state == ShutdownPhase::Finished {
-      return false;
-    }
-
-    if self
-      .pending_child_actors
-      .remove(&child_actor_handle)
-      .is_some()
-    {
-      tracing::debug!(
-        handle = core_handle,
-        child_id = child_actor_handle,
-        "Tracked child actor stopped."
-      );
-      return self.pending_child_actors.is_empty() && self.pending_connections_to_close.is_empty();
-    }
-    false
-  }
-
-  /// Records that an active connection (Session/UringFd) has been closed/stopped.
-  /// Returns true if this was the last pending entity (actor or connection),
-  /// triggering a potential move to Lingering.
-  fn record_connection_closed(&mut self, connection_id: usize, core_handle: usize) -> bool {
-    if self.state == ShutdownPhase::Finished {
-      return false;
-    }
-
-    if self
-      .pending_connections_to_close
-      .remove(&connection_id)
-      .is_some()
-    {
-      tracing::debug!(
-        handle = core_handle,
-        conn_id = connection_id,
-        "Tracked active connection closed/stopped."
-      );
-      return self.pending_connections_to_close.is_empty() && self.pending_child_actors.is_empty();
-    }
-    false
   }
 
   pub(crate) fn start_linger_if_needed(
@@ -358,7 +308,7 @@ pub(crate) async fn handle_actor_stopping_event(
   ).await;
 
   // Now, acquire the coordinator lock to update the shutdown state.
-  let mut coordinator = core_arc.shutdown_coordinator.lock().await;
+  let coordinator = core_arc.shutdown_coordinator.lock().await;
 
   match coordinator.state {
     ShutdownPhase::Running => {
@@ -396,35 +346,6 @@ pub(crate) async fn handle_actor_stopping_event(
           
           // Note: We do NOT spawn a task here. The main command_loop will pick this up.
         }
-      }
-    }
-    ShutdownPhase::StoppingChildren => {
-      // This is the expected path during a normal shutdown.
-      let mut was_last_pending = false;
-      match stopped_actor_type {
-        ActorType::Listener => {
-          if coordinator.record_child_actor_stopped(stopped_actor_id, core_handle) {
-            was_last_pending = true;
-          }
-        }
-        ActorType::Session => {
-          if coordinator.record_connection_closed(stopped_actor_id, core_handle) {
-            was_last_pending = true;
-          }
-        }
-        _ => { /* Other types aren't tracked by the coordinator's lists. */ }
-      }
-
-      // If this was the last pending entity, advance the state machine.
-      if was_last_pending {
-        tracing::debug!(
-          handle = core_handle,
-          "All children/connections now stopped. Moving to Lingering."
-        );
-        coordinator.state = ShutdownPhase::Lingering;
-        let linger_opt = core_arc.core_state.read().options.linger;
-        coordinator.start_linger_if_needed(linger_opt, core_handle);
-        // The main loop's check_and_advance_linger tick handles the rest.
       }
     }
     // If the event arrives while Lingering or later, it's a late arrival.

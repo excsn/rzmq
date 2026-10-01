@@ -9,7 +9,7 @@ use dryoc::classic::crypto_box::{
   crypto_box_beforenm, crypto_box_detached_afternm, crypto_box_keypair,
   crypto_box_open_detached_afternm, Mac, Nonce,
 };
-use dryoc::keypair::{PublicKey, SecretKey, StackKeyPair as Keypair};
+use dryoc::keypair::{PublicKey, StackKeyPair as Keypair};
 use dryoc::types::{ByteArray, Bytes, MutByteArray, MutBytes, NewByteArray, StackByteArray};
 use zeroize::Zeroize;
 
@@ -28,7 +28,6 @@ pub(crate) enum CurveHandshakePhase {
 
   // Terminal states
   Complete,
-  Error,
 }
 
 /// A state machine that encapsulates the logic and state for a ZMTP CurveZMQ handshake.

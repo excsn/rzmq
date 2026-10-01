@@ -43,10 +43,6 @@ impl PullSocket {
 
 #[async_trait]
 impl ISocket for PullSocket {
-  fn core(&self) -> &Arc<SocketCore> {
-    &self.core
-  }
-
   fn mailbox(&self) -> MailboxSender {
     self.core.command_sender()
   }
@@ -118,16 +114,6 @@ impl ISocket for PullSocket {
       _ => return Ok(false),
     }
     Ok(true)
-  }
-
-  async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
-    match event {
-      Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {
-        // Data frames pushed directly by actor via PipeMessageSender; no action here.
-      }
-      _ => {}
-    }
-    Ok(())
   }
 
   fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {

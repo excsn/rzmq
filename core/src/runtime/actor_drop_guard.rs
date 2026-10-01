@@ -1,9 +1,7 @@
 use tracing::debug;
 
-use crate::runtime::{ActorType, SystemEvent}; // Adjust imports as needed
+use crate::runtime::ActorType; // Adjust imports as needed
 use crate::{Context, ZmqError};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 pub(crate) struct ActorDropGuard {
   context: Context,

@@ -1,16 +1,12 @@
 #![allow(dead_code)]
 
 use crate::runtime::mailbox::MailboxSender as SessionCommandMailboxSender;
-use crate::socket::connection_iface::ISocketConnection;
 use crate::{error::ZmqError, Blob};
 
 use std::fmt;
 #[cfg(feature = "io-uring")]
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-
-use fibre::oneshot;
-use tokio::task::Id as TaskId;
 
 #[cfg(feature = "inproc")]
 use crate::message::FrameBatch;
@@ -43,7 +39,7 @@ pub enum ActorType {
 /// Events broadcast system-wide or within a socket's actor tree via the EventBus.
 /// These events are used for coordination and lifecycle management.
 #[derive(Clone)]
-pub enum SystemEvent {
+pub(crate) enum SystemEvent {
   /// Indicates the entire context is terminating. All actors should react by shutting down.
   /// Published by `ContextInner::shutdown`.
   ContextTerminating,
@@ -201,7 +197,7 @@ impl fmt::Debug for SystemEvent {
 
 // This enum describes how SocketCore interacts with an established connection.
 #[derive(Clone)] // ISocketConnection is Arc'd, RawFd is Copy, MailboxSender is Clone
-pub enum ConnectionInteractionModel {
+pub(crate) enum ConnectionInteractionModel {
   ViaSca {
     // SCA = SessionConnectionActor
     sca_mailbox: SessionCommandMailboxSender,

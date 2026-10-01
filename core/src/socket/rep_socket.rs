@@ -101,9 +101,6 @@ impl RepSocket {
 
 #[async_trait]
 impl ISocket for RepSocket {
-  fn core(&self) -> &Arc<SocketCore> {
-    &self.core
-  }
   fn mailbox(&self) -> MailboxSender {
     self.core.command_sender()
   }
@@ -260,16 +257,6 @@ impl ISocket for RepSocket {
       _ => return Ok(false),
     }
     Ok(true)
-  }
-
-  async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
-    match event {
-      Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {
-        // Data frames are pushed directly by the actor via PipeMessageSender; no action needed.
-      }
-      _ => {}
-    }
-    Ok(())
   }
 
   fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {

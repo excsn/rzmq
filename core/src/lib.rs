@@ -40,8 +40,8 @@ pub mod uring;
 pub use context::Context;
 pub use error::ZmqError;
 pub use message::{Blob, FrameBatch, Metadata, Msg, MsgFlags};
-pub use runtime::Command;
-pub(crate) use runtime::{MailboxReceiver, MailboxSender};
+pub(crate) use runtime::Command;
+pub(crate) use runtime::MailboxReceiver;
 
 pub(crate) use socket::core::CoreState;
 

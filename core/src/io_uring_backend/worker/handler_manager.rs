@@ -9,28 +9,17 @@ use crate::io_uring_backend::{
   ops::ProtocolConfig,
   UserData,
 };
-use crate::message::{FrameBatch, Msg};
 use crate::runtime::MailboxSyncSender;
 use crate::socket::connection_iface::ISocketConnection;
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use tracing::{debug, error, info, trace, warn};
-
-/// Metadata stored for active listener FDs.
-#[derive(Clone)]
-pub(crate) struct ListenerMetadata {
-  pub(crate) factory_id_for_accepted_connections: String,
-  pub(crate) protocol_config_for_accepted: ProtocolConfig,
-  /// Mailbox of the parent SocketCore — propagated to each accepted connection.
-  pub(crate) socket_mailbox: MailboxSyncSender,
-}
+use tracing::{debug, error, info, trace};
 
 pub(crate) struct HandlerManager {
   handlers: HashMap<RawFd, Box<dyn UringConnectionHandler + Send>>,
   factories: Arc<HashMap<String, Arc<dyn ProtocolHandlerFactory>>>,
-  listener_metadata: HashMap<RawFd, ListenerMetadata>,
 }
 
 impl HandlerManager {
@@ -42,12 +31,7 @@ impl HandlerManager {
     Self {
       handlers: HashMap::new(),
       factories: Arc::new(factory_map),
-      listener_metadata: HashMap::new(),
     }
-  }
-
-  pub(crate) fn get_active_fds(&self) -> Vec<RawFd> {
-    self.handlers.keys().copied().collect()
   }
 
   pub(crate) fn fill_active_fds(&self, dst: &mut Vec<RawFd>) {
@@ -158,23 +142,13 @@ impl HandlerManager {
   }
 
   pub fn remove_handler(&mut self, fd: RawFd) -> Option<Box<dyn UringConnectionHandler + Send>> {
-    debug!(
-      "HandlerManager: Removing handler for FD {}. Also removing listener metadata if it was a listener.",
-      fd
-    );
-    // If this FD was a listener, also remove its metadata.
-    // It's okay if it wasn't a listener; remove will do nothing.
-    self.listener_metadata.remove(&fd);
+    debug!("HandlerManager: Removing handler for FD {}.", fd);
     self.handlers.remove(&fd)
   }
 
   #[allow(dead_code)] // May be useful
   pub fn contains_handler_for(&self, fd: RawFd) -> bool {
     self.handlers.contains_key(&fd)
-  }
-
-  pub fn any_handler_throttled(&self) -> bool {
-    self.handlers.values().any(|h| h.should_throttle_reads())
   }
 
   /// True if any handler has spillover bytes that can now flow into the inbound channel
@@ -215,54 +189,6 @@ impl HandlerManager {
       }
     }
     all_ops
-  }
-
-  /// Stores metadata for a listener FD, including the factory ID, config, and parent socket mailbox.
-  pub fn add_listener_metadata(
-    &mut self,
-    listener_fd: RawFd,
-    factory_id_for_accepted_connections: String,
-    protocol_config_for_accepted: ProtocolConfig,
-    socket_mailbox: MailboxSyncSender,
-  ) {
-    info!(
-      "HandlerManager: Adding listener metadata for FD {}. Accepted conns will use factory '{}' with specific config.",
-      listener_fd, factory_id_for_accepted_connections
-    );
-    self.listener_metadata.insert(
-      listener_fd,
-      ListenerMetadata {
-        factory_id_for_accepted_connections,
-        protocol_config_for_accepted,
-        socket_mailbox,
-      },
-    );
-  }
-
-  /// Retrieves the stored metadata for a listener FD.
-  /// This is used by `cqe_processor` when an `Accept` SQE completes.
-  pub fn get_listener_metadata(&self, listener_fd: RawFd) -> Option<&ListenerMetadata> {
-    self.listener_metadata.get(&listener_fd)
-  }
-
-  #[allow(dead_code)] // May be useful
-  pub fn is_listener_fd(&self, fd: RawFd) -> bool {
-    self.listener_metadata.contains_key(&fd)
-  }
-
-  /// Removes all handlers, calling `fd_has_been_closed` on each.
-  /// Also clears all listener metadata.
-  pub fn drain_all_handlers_calling_closed(
-    &mut self,
-  ) -> Vec<Box<dyn UringConnectionHandler + Send>> {
-    info!("HandlerManager: Draining all handlers and calling fd_has_been_closed.");
-    let mut drained_handlers = Vec::new();
-    for (_fd, mut handler) in self.handlers.drain() {
-      handler.fd_has_been_closed(); // Notify handler
-      drained_handlers.push(handler);
-    }
-    self.listener_metadata.clear();
-    drained_handlers
   }
 
   #[allow(dead_code)] // May be used in shutdown sequence

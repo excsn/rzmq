@@ -117,4 +117,4 @@ mod stub {
 pub(crate) use active::{LoopProfiler, ProfileGuard};
 
 #[cfg(not(feature = "diagnostics"))]
-pub(crate) use stub::{LoopProfiler, ProfileGuard};
+pub(crate) use stub::LoopProfiler;

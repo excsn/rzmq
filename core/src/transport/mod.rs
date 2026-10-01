@@ -1,8 +1,6 @@
 pub mod endpoint;
 #[cfg(feature = "inproc")]
 pub mod inproc;
-#[cfg(feature = "inproc")]
-pub mod inproc_stream;
 #[cfg(feature = "ipc")]
 pub mod ipc;
 pub mod tcp;
@@ -64,9 +62,6 @@ pub(crate) trait ZmtpReadHalf: AsyncRead + Unpin + Send + std::fmt::Debug + 'sta
 /// actor entirely (see `io_uring_backend::zmtp_handler`), so no owned-write
 /// capability is modelled here.
 pub(crate) trait ZmtpWriteHalf: AsyncWrite + Unpin + Send + std::fmt::Debug + 'static {
-  /// Toggle TCP_CORK on the underlying socket. No-op for transports that do
-  /// not support it (TCP standard path, IPC, inproc).
-  fn set_cork(&self, _enable: bool) {}
 }
 
 /// Trait alias for full-duplex streams usable by ZMTP connection actors.
@@ -135,5 +130,3 @@ impl ZmtpStdStream for tokio::net::UnixStream {
     tokio::net::UnixStream::into_split(self)
   }
 }
-
-// InprocStream impl is in inproc_stream.rs

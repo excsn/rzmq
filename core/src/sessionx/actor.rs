@@ -14,7 +14,7 @@ use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::socket::ThrottlePriority;
 use crate::throttle::types::Priority;
 use crate::throttle::{AdaptiveThrottle, AdaptiveThrottleConfig};
-use crate::transport::{ZmtpStdStream, ZmtpWriteHalf};
+use crate::transport::ZmtpStdStream;
 use crate::{Blob, MailboxReceiver, counter, log_carryover_drain, log_delivery_gap, log_gating_failure, log_session_diagnostics};
 
 use super::message_processor::ZmqMessageProcessor;
@@ -35,8 +35,6 @@ use super::egress_driver::EgressDriver;
 use super::pipe_manager::CorePipeManagerX;
 use super::states::ActorConfigX;
 use super::types::ConnectionPhaseX;
-
-use std::sync::atomic::Ordering;
 
 pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   handle: usize,
@@ -124,7 +122,7 @@ where
     // Capture the raw fd for cork setup BEFORE consuming the stream via into_split.
     #[cfg(target_os = "linux")]
     let cork_info = {
-      use std::os::fd::AsRawFd;
+      
       if engine_config.use_cork {
         crate::sessionx::cork::try_create_cork_info(Some(&stream), true)
       } else {

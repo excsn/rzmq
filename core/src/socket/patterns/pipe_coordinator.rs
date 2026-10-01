@@ -43,7 +43,7 @@ impl WritePipeCoordinator {
   }
 
   // Called when a pipe is detached
-  pub async fn remove_pipe(&self, pipe_id: PipeId) -> Option<Arc<PipeState>> {
+  pub(crate) async fn remove_pipe(&self, pipe_id: PipeId) -> Option<Arc<PipeState>> {
     let mut states_guard = self.pipe_states.write();
     let removed_state = states_guard.remove(&pipe_id);
     if let Some(ref state) = removed_state {

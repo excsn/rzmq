@@ -3,7 +3,6 @@ use crate::error::ZmqError;
 use crate::transport::ZmtpWriteHalf;
 use crate::{counter, log_egress_diagnostics};
 use std::future::Future;
-use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 

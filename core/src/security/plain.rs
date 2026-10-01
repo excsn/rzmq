@@ -8,12 +8,11 @@ use crate::{
   Metadata, ZmqError,
 };
 
-use super::{cipher::PassThroughDataCipher, IDataCipher, Mechanism, MechanismStatus};
+use super::{Mechanism, MechanismStatus};
 
 /// State for the PLAIN security mechanism handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlainState {
-  Initializing, // Start state (not strictly used as we set initial state in new())
   // Client states
   ClientSendHello,     // Client -> Server: HELLO containing PLAIN details
   ClientExpectWelcome, // Client waiting for WELCOME from server
@@ -144,9 +143,6 @@ impl PlainMechanism {
 }
 
 impl Mechanism for PlainMechanism {
-  fn name(&self) -> &'static str {
-    Self::NAME
-  }
 
   fn process_token(&mut self, token: &[u8]) -> Result<ProcessTokenAction, ZmqError> {
     if token.is_empty() {
@@ -288,8 +284,7 @@ impl Mechanism for PlainMechanism {
 
   fn status(&self) -> MechanismStatus {
     match self.state {
-      PlainState::Initializing // Should not typically be in this observable state from outside
-      | PlainState::ClientSendHello
+      PlainState::ClientSendHello
       | PlainState::ClientExpectWelcome
       | PlainState::ServerExpectHello
       | PlainState::ServerSendWelcome => MechanismStatus::Handshaking,
@@ -298,42 +293,8 @@ impl Mechanism for PlainMechanism {
     }
   }
 
-  fn peer_identity(&self) -> Option<Vec<u8>> {
-    // For PLAIN, the 'identity' is the username.
-    // Server gets it from HELLO, client has it from config.
-    self.username.clone()
-  }
-
-  fn metadata(&self) -> Option<Metadata> {
-    // Return ZAP metadata if authentication provided any (future ZAP impl)
-    self._zap_metadata.clone()
-  }
-
-  fn as_any(&self) -> &dyn std::any::Any {
-    self
-  }
-
-  fn set_error(&mut self, reason: String) {
-    self.set_error_internal(reason);
-  }
-
   fn error_reason(&self) -> Option<&str> {
     self.error_reason.as_deref()
-  }
-
-  // --- ZAP Related Methods (Simplified for now) ---
-  fn zap_request_needed(&mut self) -> Option<Vec<Vec<u8>>> {
-    // For now, PLAIN server will not use ZAP explicitly via this mechanism.
-    // It transitions directly to ServerSendWelcome after HELLO.
-    // If ZAP were used, this would be called when state is ServerAuthenticating.
-    None
-  }
-
-  fn process_zap_reply(&mut self, _reply_frames: &[Vec<u8>]) -> Result<(), ZmqError> {
-    // If ZAP were used, this would parse the reply and transition state.
-    // Since we are bypassing ZAP for now, this method will not be called
-    // if zap_request_needed() returns None.
-    Ok(())
   }
 
   fn into_framer(

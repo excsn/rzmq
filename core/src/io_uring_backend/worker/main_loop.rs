@@ -8,25 +8,22 @@ use crate::io_uring_backend::connection_handler::{
 use crate::io_uring_backend::ops::{
   ProtocolConfig, UringOpCompletion, UringOpRequest, WAKEUP_STATE_ACTIVE, WAKEUP_STATE_SLEEPING,
 };
-use crate::io_uring_backend::worker::{InternalOpPayload, InternalOpType, WorkerState};
+use crate::io_uring_backend::worker::WorkerState;
 use crate::io_uring_backend::zmtp_handler::{ZmtpSmartConnection, ZmtpUringHandler};
 use crate::protocol::zmtp::engine::ZmtpEngine;
 use crate::uring::UringPollingStrategy;
 use crate::ZmqError;
 
 use crate::profiler::LoopProfiler;
-use crate::transport::endpoint::parse_endpoint;
 use crate::{counter, declare_timer, metric_time_phase, spawn_uring_observability};
 
-use std::collections::VecDeque;
 use std::mem;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use io_uring::{opcode, squeue, types};
+use io_uring::{opcode, types};
 use tracing::{debug, error, info, trace, warn};
 
 // Constants for the kernel polling strategy
@@ -233,9 +230,7 @@ impl UringWorker {
             protocol_config: Some(protocol_config),
             socket_mailbox: Some(socket_mailbox),
             fd_created_for_connect_op: Some(socket_fd),
-            listener_fd: None,
             target_fd_for_shutdown: None,
-            multipart_state: None,
           },
         );
 
@@ -273,9 +268,7 @@ impl UringWorker {
             protocol_config: None,
             socket_mailbox: None,
             fd_created_for_connect_op: None,
-            listener_fd: None,
             target_fd_for_shutdown: None,
-            multipart_state: None,
           },
         );
         unsafe {
@@ -452,9 +445,7 @@ impl UringWorker {
             protocol_config: None,
             socket_mailbox: None,
             fd_created_for_connect_op: None,
-            listener_fd: None,
             target_fd_for_shutdown: Some(fd),
-            multipart_state: None,
           },
         );
         self.fds_needing_close_initiated_pass.push_back(fd);
@@ -530,8 +521,8 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
         // Cross-phase variables shared across all phase blocks.
         declare_timer!(t_phase);
         let mut work_was_available = !worker.work_map.is_empty();
-        let mut sqes_submitted_to_kernel_this_batch = 0usize;
-        let mut cqe_processed_count = 0usize;
+        let mut sqes_submitted_to_kernel_this_batch: usize;
+        let cqe_processed_count: usize;
 
         // --- PHASE 1: GATHER ALL WORK ---
         {
@@ -976,10 +967,10 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               .any(|(_, d)| {
                 matches!(
                   d.op_type,
-                  InternalOpType::Send
-                    | InternalOpType::SendZeroCopy
-                    | InternalOpType::SendRawVectored
-                    | InternalOpType::SendZeroCopyLeased
+                  super::InternalOpType::Send
+                    | super::InternalOpType::SendZeroCopy
+                    | super::InternalOpType::SendRawVectored
+                    | super::InternalOpType::SendZeroCopyLeased
                 )
               });
             let total_egress_q: usize = worker
@@ -1083,15 +1074,4 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
   }
 
   Ok(())
-}
-
-// Add a helper trait to `fibre::oneshot::Sender` to simplify error handling
-trait ReplyTxExt<T> {
-  fn take_from_request(self) -> Self;
-}
-
-impl<T> ReplyTxExt<T> for fibre::oneshot::Sender<T> {
-  fn take_from_request(self) -> Self {
-    self
-  }
 }

@@ -9,7 +9,6 @@ mod internal_op_tracker;
 mod main_loop;
 mod multishot_reader;
 pub(crate) mod observability;
-mod sqe_builder;
 
 use crate::io_uring_backend::buffer_manager::BufferRingManager;
 use crate::io_uring_backend::connection_handler::{
@@ -19,7 +18,7 @@ use crate::io_uring_backend::ops::{UringOpRequest, WAKEUP_STATE_ACTIVE};
 use crate::io_uring_backend::send_buffer_pool::SendBufferPool;
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::io_uring_backend::UserData;
-use crate::uring::{global_state, UringConfig, UringPollingStrategy};
+use crate::uring::{UringConfig, UringPollingStrategy};
 use crate::ZmqError;
 
 use std::collections::{HashMap, VecDeque};
@@ -30,11 +29,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::sync::Arc;
 
-use fibre::mpmc::{unbounded, UnboundedAsyncSender as AsyncSender, UnboundedSyncReceiver as SyncReceiver, Sender as SyncSender};
+use fibre::mpmc::{unbounded, UnboundedAsyncSender as AsyncSender, UnboundedSyncReceiver as SyncReceiver};
 use fibre::mpsc;
 use io_uring::opcode;
 use io_uring::IoUring;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 // Publicly re-export for use within io_uring_backend module
 pub(crate) use eventfd_poller::EventFdPoller;
@@ -97,7 +96,6 @@ pub struct UringWorker {
     HashMap<RawFd, Arc<mpsc::BoundedSyncReceiver<crate::message::FrameBatch>>>,
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
-  cfg_send_buffer_count: usize, //TODO revisit
   cfg_send_buffer_size: usize,
   /// True when the io_uring ring was successfully initialized with `IORING_SETUP_SQPOLL`.
   /// Controls whether the main loop bypasses `submit()` when the kernel polling thread is active.
@@ -107,9 +105,6 @@ pub struct UringWorker {
   /// Total SQE budget per event-loop iteration across all connections: 75% of ring capacity.
   /// B_max = (3/4) * N — leaves 25% headroom for control ops (eventfd polls, cancels, accepts).
   pub(crate) cfg_max_batches_per_iteration: usize,
-  /// Max messages pulled from a single connection's MPSC channel per iteration.
-  /// B_batch = clamp(N/4, 64, 512) — prevents one hot connection from starving others.
-  pub(crate) cfg_worker_batch_limit: usize,
   /// Max in-flight egress blueprints per connection before draining pauses.
   /// L_egress = clamp(N/16, 8, 128) — scales pipeline depth with ring capacity.
   pub(crate) cfg_egress_cap: usize,
@@ -320,12 +315,10 @@ impl UringWorker {
               send_buffer_pool: worker_send_buffer_pool,
               fd_to_zmtp_egress_rx: HashMap::new(),
               cfg_send_zerocopy_enabled: effective_send_zerocopy_enabled_for_worker,
-              cfg_send_buffer_count: config.default_send_buffer_count,
               cfg_send_buffer_size: config.default_send_buffer_size,
               cfg_sqpoll_active: actual_sqpoll_enabled,
               cfg_polling_strategy: config.polling_strategy,
               cfg_max_batches_per_iteration: (config.ring_entries as usize * 3) / 4,
-              cfg_worker_batch_limit: (config.ring_entries as usize / 4).clamp(64, 512),
               cfg_egress_cap: (config.ring_entries as usize / 16).clamp(8, 128),
               worker_asleep,
               work_signal_gen,
@@ -409,42 +402,6 @@ impl UringWorker {
         "UringWorker draining transition: Error submitting cancellation SQEs: {}",
         e
       );
-    }
-  }
-}
-
-// --- Helper functions for address conversion ---
-pub(crate) fn socket_addr_to_sockaddr_storage(
-  addr: &SocketAddr,
-  storage: &mut libc::sockaddr_storage,
-) -> libc::socklen_t {
-  unsafe {
-    // Zero out the storage first to avoid garbage in padding bytes
-    // especially for sockaddr_in.
-    *(storage as *mut _ as *mut [u8; std::mem::size_of::<libc::sockaddr_storage>()]) =
-      [0; std::mem::size_of::<libc::sockaddr_storage>()];
-
-    match addr {
-      SocketAddr::V4(v4_addr) => {
-        let sockaddr_in: &mut libc::sockaddr_in = mem::transmute(storage);
-        sockaddr_in.sin_family = libc::AF_INET as libc::sa_family_t;
-        sockaddr_in.sin_port = v4_addr.port().to_be();
-        sockaddr_in.sin_addr = libc::in_addr {
-          s_addr: u32::from_ne_bytes(v4_addr.ip().octets()).to_be(),
-        };
-        mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
-      }
-      SocketAddr::V6(v6_addr) => {
-        let sockaddr_in6: &mut libc::sockaddr_in6 = mem::transmute(storage);
-        sockaddr_in6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-        sockaddr_in6.sin6_port = v6_addr.port().to_be();
-        sockaddr_in6.sin6_addr = libc::in6_addr {
-          s6_addr: v6_addr.ip().octets(),
-        };
-        sockaddr_in6.sin6_flowinfo = v6_addr.flowinfo(); // Already in network byte order from std
-        sockaddr_in6.sin6_scope_id = v6_addr.scope_id(); // Already in network byte order from std
-        mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
-      }
     }
   }
 }

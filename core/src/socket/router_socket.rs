@@ -8,7 +8,7 @@ use crate::socket::core::SocketCore;
 use crate::socket::options::{AUTO_DELIMITER, ROUTER_MANDATORY};
 use crate::socket::patterns::AddressedIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
-use crate::socket::patterns::{FramingLatch, RouterMap, WritePipeCoordinator, router_auto_decode, router_auto_encode};
+use crate::socket::patterns::{FramingLatch, RouterMap, WritePipeCoordinator, router_auto_encode};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use std::collections::{HashMap, VecDeque};
@@ -76,7 +76,7 @@ impl RouterSocket {
       frame_recv_buffer: ParkingMutex::new(None),
       current_send_target: TokioMutex::new(None),
       pipe_send_coordinator: Arc::new(WritePipeCoordinator::new()),
-      framing: FramingLatch::new(router_auto_encode, router_auto_decode),
+      framing: FramingLatch::new(router_auto_encode),
       peer_states: ParkingRwLock::new(HashMap::new()),
       held_ingress: ParkingMutex::new(HashMap::new()),
       held_count: AtomicUsize::new(0),
@@ -306,9 +306,6 @@ impl RouterSocket {
 
 #[async_trait]
 impl ISocket for RouterSocket {
-  fn core(&self) -> &Arc<SocketCore> {
-    &self.core
-  }
   fn mailbox(&self) -> MailboxSender {
     self.core.command_sender()
   }
@@ -730,15 +727,6 @@ impl ISocket for RouterSocket {
     }
 
     Ok(true)
-  }
-
-  async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
-    match event {
-      // Data frames are pushed directly by the actor via PipeMessageSender; no action needed.
-      Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {}
-      _ => {}
-    }
-    Ok(())
   }
 
   fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {

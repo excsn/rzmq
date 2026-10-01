@@ -8,12 +8,6 @@ use crate::ZmqError;
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 
-#[derive(Debug, Default)]
-pub(crate) struct MultipartSendState {
-  pub total_parts: usize,
-  pub completed_parts: usize,
-}
-
 #[derive(Debug)]
 pub(crate) struct ExternalOpContext {
   pub reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
@@ -22,36 +16,19 @@ pub(crate) struct ExternalOpContext {
   pub protocol_config: Option<ProtocolConfig>,
   pub socket_mailbox: Option<MailboxSyncSender>, // For Listen/Connect/RegisterExternalFd
   pub fd_created_for_connect_op: Option<RawFd>,  // For Connect, FD before CQE
-  pub listener_fd: Option<RawFd>,
   pub target_fd_for_shutdown: Option<RawFd>,
-  pub multipart_state: Option<MultipartSendState>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ExternalOpTracker {
   pub(crate) in_flight: HashMap<UserData, ExternalOpContext>,
-  pub(crate) next_id: UserData,
 }
 
 impl ExternalOpTracker {
   pub fn new() -> Self {
     Self {
       in_flight: HashMap::new(),
-      next_id: 1, // Start from 1, 0 might be special for io-uring or reserved
     }
-  }
-
-  /// Generates a new unique UserData for an external operation.
-  /// Ensures the ID stays within a range distinct from internal operations.
-  pub fn new_op_id(&mut self) -> UserData {
-    let id = self.next_id;
-    self.next_id = self.next_id.wrapping_add(1);
-    // Reserve 0 and ensure it doesn't wrap into the typical range for internal ops (e.g., >= 1_000_000_000)
-    // Adjust max value as needed. 999_999_999 gives plenty of IDs before internal range.
-    if self.next_id == 0 || self.next_id >= 1_000_000_000 {
-      self.next_id = 1;
-    }
-    id
   }
 
   pub fn add_op(&mut self, user_data: UserData, context: ExternalOpContext) {
@@ -67,15 +44,6 @@ impl ExternalOpTracker {
 
   pub fn take_op(&mut self, user_data: UserData) -> Option<ExternalOpContext> {
     self.in_flight.remove(&user_data)
-  }
-
-  /// Gets a mutable reference to an operation's context.
-  /// Used for updating multipart send state.
-  pub(crate) fn get_op_context_mut(
-    &mut self,
-    user_data: UserData,
-  ) -> Option<&mut ExternalOpContext> {
-    self.in_flight.get_mut(&user_data)
   }
 
   /// Takes an operation if it's a ShutdownConnectionHandler targeting the specified FD.

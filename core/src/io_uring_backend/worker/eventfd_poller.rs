@@ -26,23 +26,6 @@ impl std::fmt::Debug for EventFdPoller {
 }
 
 impl EventFdPoller {
-  pub fn new(
-    initial_event_fd_val: u32,
-    flags: eventfd::EfdFlags,
-    internal_op_tracker: &mut InternalOpTracker,
-  ) -> Result<Self, std::io::Error> {
-    let event_fd_instance = eventfd::EventFD::new(initial_event_fd_val, flags)?;
-    let initial_user_data = internal_op_tracker.new_op_id(
-      event_fd_instance.as_raw_fd(),
-      InternalOpType::EventFdPoll,
-      InternalOpPayload::None,
-    );
-    Ok(Self {
-      event_fd: event_fd_instance,
-      current_poll_user_data: initial_user_data,
-      is_poll_submitted: false,
-    })
-  }
 
   pub fn new_with_fd(
     event_fd_instance: eventfd::EventFD, // Takes ownership

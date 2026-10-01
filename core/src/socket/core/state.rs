@@ -163,10 +163,6 @@ impl CoreState {
     }
   }
 
-  pub(crate) fn get_pipe_sender(&self, pipe_write_id: usize) -> Option<BoundedAsyncSender<FrameBatch>> {
-    self.pipes_tx.get(&pipe_write_id).cloned()
-  }
-
   #[allow(dead_code)]
   pub(crate) fn get_reader_task_handle(&self, pipe_read_id: usize) -> Option<&JoinHandle<()>> {
     self.pipe_reader_task_handles.get(&pipe_read_id)
@@ -371,7 +367,6 @@ mod reconnect_tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownPhase {
   Running,
-  StoppingChildren,
   Lingering,
   CleaningPipes,
   Finished,

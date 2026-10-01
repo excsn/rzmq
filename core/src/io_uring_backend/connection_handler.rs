@@ -2,7 +2,7 @@
 
 use crate::message::{FrameBatch, Msg};
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
-use crate::{Blob, ZmqError};
+use crate::ZmqError;
 
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -114,9 +114,6 @@ pub struct SubmissionQueueWriter<'sq_borrow> {
   sq: &'sq_borrow mut io_uring::squeue::SubmissionQueue<'sq_borrow>,
 }
 impl<'sq_borrow> SubmissionQueueWriter<'sq_borrow> {
-  pub(crate) fn new(sq: &'sq_borrow mut io_uring::squeue::SubmissionQueue<'sq_borrow>) -> Self {
-    Self { sq }
-  }
   pub fn push(&mut self, entry: &io_uring::squeue::Entry) -> Result<(), String> {
     unsafe { self.sq.push(entry) }
       .map(|_| ())

@@ -10,7 +10,7 @@ const DEFAULT_EVENT_BUS_CAPACITY: usize = 256;
 /// A self-contained event bus for broadcasting system-wide events.
 /// Internally uses tokio::sync::broadcast.
 #[derive(Debug, Clone)]
-pub struct EventBus {
+pub(crate) struct EventBus {
   sender: Sender<SystemEvent>,
 }
 

@@ -5,7 +5,7 @@ use crate::error::ZmqError;
 use crate::security::curve::handshake::{CurveHandshake, CurveHandshakePhase};
 use crate::security::framer::{ISecureFramer, LengthPrefixedFramer};
 use crate::security::mechanism::ProcessTokenAction;
-use crate::security::{IDataCipher, Mechanism, MechanismStatus, Metadata};
+use crate::security::{Mechanism, MechanismStatus};
 
 /// The public-facing wrapper for the CurveZMQ security mechanism.
 /// This struct implements the `Mechanism` trait and holds the underlying handshake state machine.
@@ -24,9 +24,6 @@ impl CurveMechanism {
 
 #[async_trait]
 impl Mechanism for CurveMechanism {
-  fn name(&self) -> &'static str {
-    Self::NAME
-  }
 
   fn status(&self) -> MechanismStatus {
     self.status
@@ -102,38 +99,8 @@ impl Mechanism for CurveMechanism {
     Ok((framer, peer_identity))
   }
 
-  fn set_error(&mut self, reason: String) {
-    if self.status != MechanismStatus::Error {
-      self.status = MechanismStatus::Error;
-      self.error_reason = Some(reason);
-      self.handshake.phase = CurveHandshakePhase::Error;
-    }
-  }
-
   fn error_reason(&self) -> Option<&str> {
     self.error_reason.as_deref()
   }
 
-  fn peer_identity(&self) -> Option<Vec<u8>> {
-    self
-      .handshake
-      .remote_static_public_key
-      .as_ref()
-      .map(|pk| pk.as_slice().to_vec())
-  }
-
-  fn zap_request_needed(&mut self) -> Option<Vec<Vec<u8>>> {
-    None
-  }
-  fn process_zap_reply(&mut self, _reply_frames: &[Vec<u8>]) -> Result<(), ZmqError> {
-    Ok(())
-  }
-
-  fn as_any(&self) -> &dyn std::any::Any {
-    self
-  }
-
-  fn metadata(&self) -> Option<Metadata> {
-    None
-  }
 }

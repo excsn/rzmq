@@ -2,7 +2,7 @@ use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
-use crate::socket::core::{CoreState, SocketCore};
+use crate::socket::core::SocketCore;
 use crate::socket::patterns::LoadBalancer;
 use crate::socket::patterns::AddressedIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
@@ -10,7 +10,7 @@ use crate::{Blob, delegate_to_core};
 
 use async_trait::async_trait;
 use parking_lot::Mutex as ParkingLotMutex;
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,9 +76,6 @@ impl ReqSocket {
 
 #[async_trait]
 impl ISocket for ReqSocket {
-  fn core(&self) -> &Arc<SocketCore> {
-    &self.core
-  }
   fn mailbox(&self) -> MailboxSender {
     self.core.command_sender()
   }
@@ -317,14 +314,6 @@ impl ISocket for ReqSocket {
     }
 
     Ok(true)
-  }
-
-  async fn handle_pipe_event(&self, _pipe_id: usize, event: Command) -> Result<(), ZmqError> {
-    match event {
-      Command::PipeMessageReceived { .. } | Command::PipeMessageBatchReceived { .. } => {}
-      _ => {}
-    }
-    Ok(())
   }
 
   fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {

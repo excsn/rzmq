@@ -24,7 +24,7 @@ use crate::io_uring_backend::{
 use crate::message::FrameBatch;
 use crate::protocol::zmtp::{
   actions::{AppAction, EngineOutput, NetAction},
-  engine::{ZmtpEngine, ZmtpPhase},
+  engine::ZmtpEngine,
 };
 use crate::runtime::Command;
 use crate::socket::connection_iface::ISocketConnection;
@@ -476,14 +476,6 @@ impl ZmtpUringHandler {
     }
 
     ops
-  }
-
-  fn prepare_multishot_cancel(&mut self) -> Option<HandlerSqeBlueprint> {
-    if let Some(ref mut reader) = self.multishot_reader {
-      reader.prepare_cancel_intent()
-    } else {
-      None
-    }
   }
 
   /// Edge-triggered ingress-congestion monitor notification. Routed as a command
