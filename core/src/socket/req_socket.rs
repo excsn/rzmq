@@ -2,7 +2,6 @@ use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
-use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::{CoreState, SocketCore};
 use crate::socket::patterns::LoadBalancer;
 use crate::socket::patterns::AddressedIngressEngine;
@@ -50,10 +49,6 @@ impl ReqSocket {
       reply_available_notifier: Arc::new(Notify::new()),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
     }
-  }
-
-  fn core_state_read(&self) -> RwLockReadGuard<'_, CoreState> {
-    self.core.core_state.read()
   }
 
   fn process_incoming_zmtp_message_for_req(
