@@ -608,90 +608,101 @@ The throttle uses a static function pointer (`should_throttle_fn`) on the guard 
 
 ### Default Behavior
 
-The throttle is **enabled by default** on every socket with sensible production defaults:
+The throttle is **enabled by default** on every socket. `AdaptiveThrottleSocketConfig::default()` holds the settings it runs with:
 
-| Parameter | Default |
+| Field | Default |
 |---|---|
+| `enabled` | `true` |
 | `credit_per_message` | 5 |
 | `healthy_balance_width` | 1 024 000 |
 | `max_imbalance` | 6 553 600 |
 | `yield_after_n_consecutive` | 256 |
+| `nudge_interval_ops` | 100 |
+| `adaptive_learning_rate` | 0.05 |
+| `strategy` | `ThrottleStrategy::PowerCurve { exponent: 2.0 }` |
+| `priority` | `ThrottlePriority::Auto` (Egress for accepted connections, Ingress for outbound ones) |
 | `priority_boost_factor` | 5.0 |
-| `priority` | Role-derived per connection (Egress for servers, Ingress for clients) |
-| `enabled` | `true` |
 
-### Disabling the Throttle
+### Configuring the Throttle
 
-If your workload is already well-balanced and you want to avoid any overhead, disable the throttle before connecting:
+`ADAPTIVE_THROTTLE` takes an `AdaptiveThrottleSocketConfig`. Set it before `bind` or `connect`; afterwards the call returns `ZmqError::InvalidState`.
 
 ```rust
+use rzmq::socket::{AdaptiveThrottleSocketConfig, ThrottlePriority, ThrottleStrategy, ADAPTIVE_THROTTLE};
 use rzmq::{Context, SocketType, ZmqError};
-use rzmq::throttle::types::AdaptiveThrottleConfig;
 
 async fn example(ctx: &Context) -> Result<(), ZmqError> {
-    let socket = ctx.socket(SocketType::Push)?
-        .with_throttle_config(AdaptiveThrottleConfig { enabled: false, ..Default::default() })
-        .await?;
-
+    let socket = ctx.socket(SocketType::Dealer)?;
+    let config = AdaptiveThrottleSocketConfig {
+        yield_after_n_consecutive: 64,
+        strategy: ThrottleStrategy::Linear,
+        priority: ThrottlePriority::Egress,
+        ..Default::default()
+    };
+    socket.set_option(ADAPTIVE_THROTTLE, &config).await?;
     socket.connect("tcp://127.0.0.1:5555").await?;
     Ok(())
 }
 ```
 
-Alternatively, use the raw socket option:
+`Socket::with_throttle_config` does the same while building a socket:
 
 ```rust
-use rzmq::socket::ADAPTIVE_THROTTLE;
-
-socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?; // 0 = disabled, 1 = enabled
-```
-
-### Custom Configuration
-
-For full control over the throttle's behavior, construct an `AdaptiveThrottleConfig` and pass it via `with_throttle_config`. This must be called **before** any `bind` or `connect`.
-
-```rust
-use rzmq::throttle::types::{AdaptiveThrottleConfig, Priority};
-use rzmq::throttle::strategies::power_curve_strategy;
-
-let config = AdaptiveThrottleConfig {
-    enabled: true,
-    credit_per_message: 10,       // Heavier weight per message
-    healthy_balance_width: 512_000,
-    max_imbalance: 4_000_000,
-    yield_after_n_consecutive: 128,
-    nudge_interval_ops: 100,
-    adaptive_learning_rate: 0.05,
-    curve_factor: 2.0,            // Quadratic probability curve
-    strategy: power_curve_strategy,
-    priority: Priority::Egress,   // Favor outbound traffic
-    priority_boost_factor: 3.0,
-};
-
-let socket = ctx.socket(SocketType::Push)?
-    .with_throttle_config(config)
+let socket = ctx
+    .socket(SocketType::Dealer)?
+    .with_throttle_config(AdaptiveThrottleSocketConfig::default())
     .await?;
 ```
 
-### Priority
+### Turning the Throttle On or Off
 
-The `priority` field biases the throttle to favor one I/O direction:
-
-*   `Priority::Egress`: favor sending (typical for server-side reply sockets).
-*   `Priority::Ingress`: favor receiving (typical for client-side request sockets).
-*   `Priority::None`: treat both directions equally (default).
-
-> **Note:** The per-connection role (server vs. client) automatically overrides the `priority` field at connection time. You can set any other field in `AdaptiveThrottleConfig` via `with_throttle_config`, but the priority will be corrected to match the connection role unless you disable that behavior.
-
-### Checking Current State
-
-The `ADAPTIVE_THROTTLE` option can be read back to confirm the current enabled state:
+`ADAPTIVE_THROTTLE` also takes `1i32` or `0i32`, which changes `enabled` and leaves the other fields as they are. A workload that is already balanced can turn it off to skip the overhead:
 
 ```rust
-let raw = socket.get_option(rzmq::socket::ADAPTIVE_THROTTLE).await?;
-let enabled = i32::from_ne_bytes(raw.try_into().unwrap()) != 0;
-println!("Throttle enabled: {}", enabled);
+use rzmq::socket::ADAPTIVE_THROTTLE;
+use rzmq::{Context, SocketType, ZmqError};
+
+async fn example(ctx: &Context) -> Result<(), ZmqError> {
+    let socket = ctx.socket(SocketType::Push)?;
+    socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
+    socket.connect("tcp://127.0.0.1:5555").await?;
+    Ok(())
+}
 ```
+
+### Reading the Configuration
+
+`get_option(ADAPTIVE_THROTTLE)` returns the encoded config. Decode it with `FromBytes`:
+
+```rust
+use rzmq::socket::types::FromBytes;
+use rzmq::socket::{AdaptiveThrottleSocketConfig, ADAPTIVE_THROTTLE};
+
+let config = AdaptiveThrottleSocketConfig::from_bytes(&socket.get_option(ADAPTIVE_THROTTLE).await?)?;
+println!("Throttle enabled: {}", config.enabled);
+```
+
+A config set with `ThrottlePriority::Auto` reads back as `Auto`. The priority each connection resolved to is in the per-connection state below.
+
+### Reading Per-Connection State
+
+`ADAPTIVE_THROTTLE_STATS` is read-only and returns one `ThrottleStats` per connection that has a throttle. io_uring connections have no throttle and are not listed.
+
+```rust
+use rzmq::socket::types::FromBytes;
+use rzmq::socket::{ThrottleStats, ADAPTIVE_THROTTLE_STATS};
+
+let stats = Vec::<ThrottleStats>::from_bytes(&socket.get_option(ADAPTIVE_THROTTLE_STATS).await?)?;
+for s in &stats {
+    println!(
+        "{} priority={:?} balance={} learned={:.1} streak in/out={}/{}",
+        s.endpoint_uri, s.priority, s.current_balance, s.learned_balance,
+        s.consecutive_ingress, s.consecutive_egress,
+    );
+}
+```
+
+Each entry's fields are read separately while the connection runs, so they are not a single consistent instant.
 
 ## Error Handling
 

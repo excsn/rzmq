@@ -99,6 +99,18 @@ impl AdaptiveThrottle {
     }
   }
 
+  pub(crate) fn stats(&self, endpoint_uri: String) -> crate::socket::ThrottleStats {
+    let s = &self.shared;
+    crate::socket::ThrottleStats {
+      endpoint_uri,
+      priority: s.config.priority.into(),
+      current_balance: s.current_balance.load(Ordering::Relaxed),
+      learned_balance: s.learned_balance.load(Ordering::Relaxed),
+      consecutive_ingress: s.consecutive_ingress.load(Ordering::Relaxed),
+      consecutive_egress: s.consecutive_egress.load(Ordering::Relaxed),
+    }
+  }
+
   /// Records the intent to perform an I/O operation and returns a `ThrottleGuard`.
   ///
   /// This method performs an "anticipatory" update to the throttle's internal

@@ -76,44 +76,61 @@ Configuration for the global `io_uring` backend. This is used when calling `rzmq
     *   `default_send_buffer_count: rzmq::uring::DEFAULT_IO_URING_SND_BUFFER_COUNT` (16)
     *   `default_send_buffer_size: rzmq::uring::DEFAULT_IO_URING_SND_BUFFER_SIZE` (65536)
 
-### `rzmq::throttle::types::AdaptiveThrottleConfig` Struct
+### `rzmq::socket::AdaptiveThrottleSocketConfig` Struct
 
-Configuration for the per-connection adaptive I/O throttle. Pass to `Socket::with_throttle_config()` before connecting. Implements `Debug`, `Clone`, and `Default`.
+Adaptive throttle settings for a socket. Set with `Socket::set_option(ADAPTIVE_THROTTLE, config)` and read back with `AdaptiveThrottleSocketConfig::from_bytes(&socket.get_option(ADAPTIVE_THROTTLE).await?)`. Derives `Debug`, `Clone`, `PartialEq`. Implements `ToBytes` (owned and `&`) and `FromBytes`.
 
 *   **Public Fields**:
     *   `enabled: bool`
-        *   Master switch. When `false`, `begin_work` returns a zero-cost bypass guard with no atomic operations. Default: `true`.
+        *   When `false`, the throttle does no work on any connection.
     *   `credit_per_message: i32`
-        *   The unit of balance change per operation ("weight" of one message). Default: `5`.
+        *   Balance change per message: ingress adds it, egress subtracts it.
     *   `healthy_balance_width: u32`
-        *   Half-width of the "zone of tolerance" around the learned balance. No probabilistic throttling occurs inside this zone. Default: `1_024_000`.
+        *   Distance from the learned balance within which no probabilistic yield happens.
     *   `max_imbalance: u32`
-        *   Distance beyond the healthy zone at which throttling probability reaches 100%. Acts as a hard safety cap. Default: `6_553_600`.
+        *   Distance beyond the healthy zone at which the yield probability reaches 1.0. Must not be less than `healthy_balance_width`; the strategies subtract the two as `u32`.
     *   `yield_after_n_consecutive: u32`
-        *   Hard fairness rule: always yield after this many consecutive same-direction operations regardless of balance. Default: `256`.
+        *   Operations in one direction after which the throttle always yields.
     *   `nudge_interval_ops: u32`
-        *   Number of operations between forced EMA updates. Default: `100`.
+        *   Operations between updates of the learned balance.
     *   `adaptive_learning_rate: f64`
-        *   EMA smoothing factor (α). Range `[0.01, 0.2]`; smaller = slower adaptation. Default: `0.05`.
-    *   `curve_factor: f64`
-        *   Exponent for the probability curve (e.g. `2.0` = quadratic). Default: `2.0`.
-    *   `strategy: ThrottlingStrategy`
-        *   Function pointer to the probabilistic strategy. Use `rzmq::throttle::strategies::power_curve_strategy` (default) or supply a custom function matching `fn(&ThrottleStateView) -> f64`.
-    *   `priority: Priority`
-        *   Preferred I/O direction. See `rzmq::throttle::types::Priority`. Note: the per-connection role (server/client) overrides this at connection time. Default: `Priority::None`.
+        *   Weight of the current balance in the learned-balance moving average. Clamped to `0.01..=0.2` when a connection starts.
+    *   `strategy: ThrottleStrategy`
+    *   `priority: ThrottlePriority`
     *   `priority_boost_factor: f64`
-        *   Multiplier applied to yield probability when doing non-priority work during an imbalance. Values > 1.0 make the throttle more aggressive. Default: `5.0`.
+        *   Multiplier on the yield probability for work in the non-prioritised direction.
 
-*   **Default Values** (via `AdaptiveThrottleConfig::default()`): see field descriptions above.
+*   **Default Values** (via `AdaptiveThrottleSocketConfig::default()`):
+    *   `enabled: true`
+    *   `credit_per_message: 5`
+    *   `healthy_balance_width: 1024000`
+    *   `max_imbalance: 6553600`
+    *   `yield_after_n_consecutive: 256`
+    *   `nudge_interval_ops: 100`
+    *   `adaptive_learning_rate: 0.05`
+    *   `strategy: ThrottleStrategy::PowerCurve { exponent: 2.0 }`
+    *   `priority: ThrottlePriority::Auto`
+    *   `priority_boost_factor: 5.0`
 
-### `rzmq::throttle::types::Priority` Enum
+*   **Encoding** (48 bytes, integers and floats native-endian): version `u8` (`1`), `enabled` `u8` (`0` or `1`), `credit_per_message` `i32`, `healthy_balance_width` `u32`, `max_imbalance` `u32`, `yield_after_n_consecutive` `u32`, `nudge_interval_ops` `u32`, `adaptive_learning_rate` `f64`, strategy tag `u8` (`0` PowerCurve, `1` Linear), exponent `f64` (`0.0` for Linear), priority tag `u8` (`0` Auto, `1` Egress, `2` Ingress, `3` None), `priority_boost_factor` `f64`.
 
-Defines which I/O direction the throttle should favor.
+### `rzmq::socket::ThrottleStrategy` Enum
+
+Probability curve the throttle uses to decide whether to yield.
 
 *   **Variants**:
-    *   `Egress`: Favor outbound traffic. Typical for server-role connections.
-    *   `Ingress`: Favor inbound traffic. Typical for client-role connections.
-    *   `None`: No preference; treat both directions equally (default).
+    *   `PowerCurve { exponent: f64 }`: yield probability is `x^exponent`, where `x` is the imbalance beyond the healthy zone as a fraction of `max_imbalance - healthy_balance_width`.
+    *   `Linear`: yield probability is `x`.
+
+### `rzmq::socket::ThrottlePriority` Enum
+
+Which I/O direction the throttle favours when the balance drifts.
+
+*   **Variants**:
+    *   `Auto`: `Egress` for connections accepted by a listener, `Ingress` for outbound connections. Resolved per connection when it starts.
+    *   `Egress`
+    *   `Ingress`
+    *   `None`
 
 ## 3. Main Types and Their Public Methods
 
@@ -168,8 +185,8 @@ The public handle for an `rzmq` socket. Provides methods for network operations,
         *   Creates a monitoring channel for this socket with the specified event capacity.
     *   `pub async fn monitor_default(&self) -> Result<MonitorReceiver, ZmqError>`
         *   Creates a monitoring channel with default capacity (`rzmq::socket::DEFAULT_MONITOR_CAPACITY`).
-    *   `pub async fn with_throttle_config(self, config: AdaptiveThrottleConfig) -> Result<Self, ZmqError>`
-        *   Fluent builder that configures the adaptive I/O throttle for this socket and returns the socket. Must be called **before** any `bind` or `connect`. Currently propagates the `enabled` field via the `ADAPTIVE_THROTTLE` socket option; other fields take effect via the full `AdaptiveThrottleConfig` passed at construction time.
+    *   `pub async fn with_throttle_config(self, config: AdaptiveThrottleSocketConfig) -> Result<Self, ZmqError>`
+        *   Sets `ADAPTIVE_THROTTLE` to `config` and returns the socket. Returns `ZmqError::InvalidState` after `bind` or `connect`.
 
 ### `rzmq::Msg` Struct
 
@@ -237,6 +254,21 @@ A type map for associating arbitrary typed data with a `Msg`. Operations are asy
     *   `pub async fn is_empty(&self) -> bool`
     *   `pub async fn len(&self) -> usize`
 
+### `rzmq::socket::ThrottleStats` Struct
+
+State of one connection's adaptive throttle, read with `Vec::<ThrottleStats>::from_bytes(&socket.get_option(ADAPTIVE_THROTTLE_STATS).await?)`. Derives `Debug`, `Clone`, `PartialEq`. The fields are read without a common lock, so they are not one consistent instant.
+
+*   **Public Fields**:
+    *   `endpoint_uri: String`
+    *   `priority: ThrottlePriority`
+        *   The priority in effect for this connection, never `Auto`.
+    *   `current_balance: i32`
+    *   `learned_balance: f64`
+    *   `consecutive_ingress: u32`
+    *   `consecutive_egress: u32`
+
+*   **Encoding** (integers and floats native-endian): version `u8` (`1`), entry count `u32`, then per entry: URI length `u32`, URI bytes (UTF-8), priority tag `u8`, `current_balance` `i32`, `learned_balance` `f64`, `consecutive_ingress` `u32`, `consecutive_egress` `u32`.
+
 ## 4. Public Traits and Their Methods
 
 ### `rzmq::socket::ToBytes` Trait
@@ -256,6 +288,19 @@ A utility trait for converting various types into a `Vec<u8>`, used by `Socket::
     *   `bool` (converted to `1i32` or `0i32` then to bytes)
     *   `String`
     *   `&str`
+    *   `AdaptiveThrottleSocketConfig` and `&AdaptiveThrottleSocketConfig`
+
+### `rzmq::socket::types::FromBytes` Trait
+
+Decodes a structured option value returned by `Socket::get_option`.
+
+*   **Methods**:
+    *   `fn from_bytes(bytes: &[u8]) -> Result<Self, ZmqError>`
+        *   Returns `ZmqError::InvalidOptionValue(option_id)` for a wrong length, an unknown version or an unknown tag.
+
+*   **Implementors (within `rzmq`)**:
+    *   `AdaptiveThrottleSocketConfig`
+    *   `Vec<ThrottleStats>`
 
 ## 5. Public Enums (Non-Config)
 
@@ -366,7 +411,8 @@ Constants for socket option integer IDs.
 *   `pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201` (Requires `noise_xx` feature)
 *   `pub const MAX_CONNECTIONS: i32 = 1000`
 *   `pub const REUSE_PORT: i32 = 1230` (Unix only) - Set `SO_REUSEPORT` on listening sockets so several listeners can share one TCP address:port; value is `i32` (`1` = enabled, `0` = disabled, the default). Must be set before `bind`. Enabling it also lets a single socket `bind` the same endpoint more than once, giving it several accept loops; `unbind` stops all of them. A no-op on Windows, Solaris and illumos. See the [Sharing a TCP port](./README.USAGE.md#sharing-a-tcp-port-so_reuseport) section for the Linux vs macOS/BSD behaviour difference.
-*   `pub const ADAPTIVE_THROTTLE: i32 = 1210` - Enable (`1`) or disable (`0`) the adaptive I/O throttle; value is `i32`. Prefer `Socket::with_throttle_config()` for full configuration. Set before `bind`/`connect`.
+*   `pub const ADAPTIVE_THROTTLE: i32 = 1210` - Adaptive I/O throttle configuration. Set takes either an `AdaptiveThrottleSocketConfig` encoding or a 4-byte `i32` (`1` = enabled, `0` = disabled) that changes only `enabled`. Get returns the `AdaptiveThrottleSocketConfig` encoding. Setting it after `bind` or `connect` returns `ZmqError::InvalidState`.
+*   `pub const ADAPTIVE_THROTTLE_STATS: i32 = 1211` - Read-only. Get returns a `Vec<ThrottleStats>` encoding with one entry per connection that has a throttle; io_uring connections have none. Set returns `ZmqError::UnsupportedOption`.
 *   `pub const IO_URING_SNDZEROCOPY: i32 = 1170` (Requires `io-uring` feature)
 *   `pub const IO_URING_RCVMULTISHOT: i32 = 1171` (Requires `io-uring` feature)
 *   `pub const TCP_CORK: i32 = 1172` (Requires `io-uring` feature, Linux only)

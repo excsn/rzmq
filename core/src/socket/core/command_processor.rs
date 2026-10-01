@@ -255,6 +255,7 @@ pub(crate) async fn process_socket_command(
         target_endpoint_uri: Some(target_endpoint_uri),
         is_outbound_connection: is_outbound,
         connection_iface,
+        throttle: None,
         peer_socket_type: None,
       };
 
@@ -406,6 +407,7 @@ async fn handle_user_bind(
 ) {
   let core_handle = core_arc.handle;
   tracing::debug!(handle = core_handle, %endpoint, "Processing UserBind command");
+  core_arc.core_state.write().bind_or_connect_called = true;
 
   let parse_result = parse_endpoint(&endpoint);
   let context_clone = core_arc.context.clone(); // For spawning actors
@@ -457,6 +459,7 @@ async fn handle_user_bind(
                   peer_socket_type: None,
                   // Listeners don't have a single ISocketConnection; they manage multiple.
                   connection_iface: Arc::new(crate::socket::connection_iface::DummyConnection),
+                  throttle: None,
                 },
               );
               actual_uri_for_state_update = Some(resolved_uri);
@@ -508,6 +511,7 @@ async fn handle_user_bind(
                   is_outbound_connection: false,
                   peer_socket_type: None,
                   connection_iface: Arc::new(crate::socket::connection_iface::DummyConnection),
+                  throttle: None,
                 },
               );
               actual_uri_for_state_update = Some(resolved_uri);
@@ -576,6 +580,7 @@ async fn handle_user_connect(
 ) {
   let core_handle = core_arc.handle;
   tracing::debug!(handle = core_handle, uri = %endpoint_uri, "Processing UserConnect command");
+  core_arc.core_state.write().bind_or_connect_called = true;
 
   let parse_result = parse_endpoint(&endpoint_uri);
   match parse_result {
@@ -907,6 +912,12 @@ async fn handle_set_option(
     Err(e) => return Err(e), // Pattern returned a different error
   }
 
+  if option == options::ADAPTIVE_THROTTLE && core_arc.core_state.read().bind_or_connect_called {
+    return Err(ZmqError::InvalidState(
+      "ADAPTIVE_THROTTLE must be set before bind or connect",
+    ));
+  }
+
   update_core_option(&core_arc, |opts| {
     options::apply_core_option_value(opts, option, value)
   })
@@ -978,6 +989,7 @@ async fn handle_new_connection_established(
     ConnectionInteractionModel::ViaSca {
       sca_mailbox,
       sca_handle_id,
+      throttle,
     } => {
       tracing::debug!(
         handle = core_handle,
@@ -1017,6 +1029,7 @@ async fn handle_new_connection_established(
         is_outbound_connection: is_outbound_this_core_initiated,
         peer_socket_type: None,
         connection_iface: sca_iface,
+        throttle: Some(throttle),
       };
 
       {
@@ -1132,6 +1145,7 @@ async fn handle_new_connection_established(
         is_outbound_connection: is_outbound_this_core_initiated,
         peer_socket_type: None,
         connection_iface,
+        throttle: None,
       };
 
       {

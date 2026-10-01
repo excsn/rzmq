@@ -227,13 +227,10 @@ impl Socket {
   /// Call immediately after socket creation and before any binds or connects.
   pub async fn with_throttle_config(
     self,
-    config: crate::throttle::types::AdaptiveThrottleConfig,
+    config: crate::socket::throttle::AdaptiveThrottleSocketConfig,
   ) -> Result<Self, ZmqError> {
     self
-      .set_option_raw(
-        crate::socket::options::ADAPTIVE_THROTTLE,
-        &(config.enabled as i32).to_ne_bytes(),
-      )
+      .set_option(crate::socket::options::ADAPTIVE_THROTTLE, config)
       .await?;
     Ok(self)
   }
@@ -247,6 +244,11 @@ impl fmt::Debug for Socket {
 
 pub trait ToBytes {
   fn to_bytes(&self) -> Vec<u8>;
+}
+
+/// Decodes a structured option value returned by `Socket::get_option`.
+pub trait FromBytes: Sized {
+  fn from_bytes(bytes: &[u8]) -> Result<Self, ZmqError>;
 }
 
 impl ToBytes for Vec<u8> {

@@ -11,7 +11,9 @@ use crate::socket::ISocket;
 use crate::socket::events::{SocketEvent, clean_endpoint_uri};
 use crate::socket::options::ZmtpEngineConfig;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
-use crate::throttle::AdaptiveThrottle;
+use crate::socket::ThrottlePriority;
+use crate::throttle::types::Priority;
+use crate::throttle::{AdaptiveThrottle, AdaptiveThrottleConfig};
 use crate::transport::{ZmtpStdStream, ZmtpWriteHalf};
 use crate::{Blob, MailboxReceiver, counter, log_carryover_drain, log_delivery_gap, log_gating_failure, log_session_diagnostics};
 
@@ -69,6 +71,7 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   handshake_deadline: Option<TokioInstant>,
   socket_logic: Arc<dyn ISocket>,
   session_regulator: SessionRegulator,
+  adaptive_throttle: AdaptiveThrottle,
   _connection_permit: Option<OwnedSemaphorePermit>,
   /// Arc so the persistent ingress send future (`ingress_send_fut`) can own a
   /// clone; the actor never sends on the pipe while that future is active, so
@@ -117,7 +120,7 @@ where
     command_mailbox_receiver: MailboxReceiver,
     socket_logic: Arc<dyn ISocket>,
     connection_permit: Option<OwnedSemaphorePermit>,
-  ) -> JoinHandle<()> {
+  ) -> (JoinHandle<()>, AdaptiveThrottle) {
     // Capture the raw fd for cork setup BEFORE consuming the stream via into_split.
     #[cfg(target_os = "linux")]
     let cork_info = {
@@ -135,6 +138,14 @@ where
     let (read_half, write_half) = stream.into_split();
 
     let zmtp_engine = ZmtpEngine::new(actor_config.is_server_role, engine_config.clone());
+
+    let adaptive_throttle = {
+      let mut config: AdaptiveThrottleConfig = (&engine_config.throttle_config).into();
+      if engine_config.throttle_config.priority == ThrottlePriority::Auto {
+        config.priority = if actor_config.is_server_role { Priority::Egress } else { Priority::Ingress };
+      }
+      AdaptiveThrottle::new(config)
+    };
 
     let mut ping_check_timer = None;
     if let Some(ivl) = engine_config.heartbeat_ivl {
@@ -181,6 +192,7 @@ where
       handshake_deadline,
       socket_logic,
       session_regulator: SessionRegulator::new(regulator_min_lifespan),
+      adaptive_throttle: adaptive_throttle.clone(),
       _connection_permit: connection_permit,
       incoming_pipe_sender: None,
       ingress_frame_in_place: false,
@@ -192,7 +204,7 @@ where
     };
 
     let task_handle = tokio::spawn(actor.run_loop());
-    task_handle
+    (task_handle, adaptive_throttle)
   }
 
   async fn run_loop(mut self) {
@@ -211,15 +223,7 @@ where
       Some(self.parent_socket_id),
     );
 
-    let adaptive_throttle = {
-      let mut config = self.zmtp_engine.config().throttle_config.clone();
-      if self.actor_config.is_server_role {
-        config.priority = crate::throttle::types::Priority::Egress;
-      } else {
-        config.priority = crate::throttle::types::Priority::Ingress;
-      }
-      AdaptiveThrottle::new(config)
-    };
+    let adaptive_throttle = self.adaptive_throttle.clone();
 
     let mut outgoing_batch: Vec<FrameBatch> =
       Vec::with_capacity(self.zmtp_engine.config().sndbatch_count);

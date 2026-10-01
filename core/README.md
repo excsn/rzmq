@@ -85,7 +85,7 @@ For applications requiring the broadest `libzmq` feature set (e.g., ZAP), or sup
 
 ### Adaptive I/O Throttling
 
-A unique built-in fairness engine (not present in `libzmq`) that probabilistically balances ingress vs. egress work per connection, preventing starvation under asymmetric load. Enabled by default; disable or tune via `Socket::with_throttle_config()` or the `ADAPTIVE_THROTTLE` socket option. See [Usage Guide](./README.USAGE.md#adaptive-io-throttling) for details.
+A unique built-in fairness engine (not present in `libzmq`) that probabilistically balances ingress vs. egress work per connection, preventing starvation under asymmetric load. Enabled by default; configure it or switch it off with the `ADAPTIVE_THROTTLE` socket option and read per-connection state with `ADAPTIVE_THROTTLE_STATS`. See [Usage Guide](./README.USAGE.md#adaptive-io-throttling) for details.
 
 ### Core API
 Provides a `Context` for managing sockets and a `Socket` handle with async methods (`bind`, `connect`, `send`, `recv`, `set_option_raw`, `get_option`, `close`). A convenience `set_option` method is also available for types implementing the `ToBytes` trait.
@@ -123,7 +123,7 @@ Supports a range of common socket options for fine-tuning behavior, including:
 *   Binding: `LAST_ENDPOINT` (read-only, to get actual bound endpoint, e.g., after binding to port 0), `REUSE_PORT` (Unix-only `SO_REUSEPORT`, letting several listeners share one TCP port; see the [Usage Guide](./README.USAGE.md#sharing-a-tcp-port-so_reuseport))
 *   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE` (for SUB), `ROUTING_ID` (for DEALER/ROUTER identity), `ROUTER_MANDATORY`
 *   Keepalives: ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
-*   Adaptive throttle: `ADAPTIVE_THROTTLE` (enable/disable the I/O fairness engine; see `Socket::with_throttle_config` for full configuration)
+*   Adaptive throttle: `ADAPTIVE_THROTTLE` (configure the I/O fairness engine), `ADAPTIVE_THROTTLE_STATS` (read-only per-connection state)
 *   Legacy interop: `ALLOW_ZMTP2` (enable/disable transparent ZMTP/2.0 downgrade for legacy peers; default `true`)
 *   Security:
     *   `PLAIN_SERVER`, `PLAIN_USERNAME`, `PLAIN_PASSWORD` (requires `plain` feature)

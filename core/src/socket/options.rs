@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use crate::throttle::types::AdaptiveThrottleConfig;
+use crate::socket::throttle::{encode_throttle_stats, AdaptiveThrottleSocketConfig};
+use crate::socket::types::{FromBytes, ToBytes};
 use crate::{Blob, CoreState, ZmqError};
 
 pub const DEFAULT_SNDBATCH_COUNT: usize = 128;
@@ -75,6 +76,8 @@ pub const IO_URING_SESSION_ENABLED: i32 = 1175;
 pub const IO_URING_ZC_SEND_THRESHOLD: i32 = 1176;
 
 pub const ADAPTIVE_THROTTLE: i32 = 1210;
+/// Per-connection adaptive throttle state. Read-only.
+pub const ADAPTIVE_THROTTLE_STATS: i32 = 1211;
 
 /// Allow downgrading to the ZMTP/2.0 wire protocol when a peer announces it.
 /// Boolean (0 or 1). Enabled by default (matching libzmq, which accepts v2 peers).
@@ -154,7 +157,7 @@ pub(crate) struct SocketOptions {
   pub curve_options: CurveMechanismSocketOptions,
   #[cfg(feature = "noise_xx")]
   pub noise_xx_options: NoiseXxSocketOptions,
-  pub throttle_config: AdaptiveThrottleConfig,
+  pub throttle_config: AdaptiveThrottleSocketConfig,
   pub sndbatch_count: usize,
   pub sndbatch_bytes: usize,
   pub rcvbatch_count: usize,
@@ -199,15 +202,7 @@ impl Default for SocketOptions {
       noise_xx_options: NoiseXxSocketOptions::default(),
       #[cfg(feature = "curve")]
       curve_options: CurveMechanismSocketOptions::default(),
-      throttle_config: {
-        let mut c = AdaptiveThrottleConfig::default();
-        c.credit_per_message = 5;
-        c.healthy_balance_width = 1024000;
-        c.max_imbalance = 6553600;
-        c.yield_after_n_consecutive = 256;
-        c.priority_boost_factor = 5.0;
-        c
-      },
+      throttle_config: AdaptiveThrottleSocketConfig::default(),
       sndbatch_count: DEFAULT_SNDBATCH_COUNT,
       sndbatch_bytes: DEFAULT_SNDBATCH_BYTES,
       rcvbatch_count: DEFAULT_RCVBATCH_COUNT,
@@ -319,7 +314,7 @@ pub(crate) struct ZmtpEngineConfig {
   pub plain_password_for_engine: Option<String>,
   /// Maximum inbound frame size in bytes. -1 means unlimited.
   pub max_msg_size: i64,
-  pub throttle_config: AdaptiveThrottleConfig,
+  pub throttle_config: AdaptiveThrottleSocketConfig,
   pub sndhwm: usize,
   pub rcvhwm: usize,
   pub sndbatch_count: usize,
@@ -371,7 +366,7 @@ impl Default for ZmtpEngineConfig {
       #[cfg(feature = "plain")]
       plain_password_for_engine: None,
       max_msg_size: -1, // -1 = unlimited, mirrors SocketOptions::maxmsgsize default
-      throttle_config: AdaptiveThrottleConfig::default(),
+      throttle_config: AdaptiveThrottleSocketConfig::default(),
       sndhwm: 256,
       rcvhwm: 256,
       sndbatch_count: DEFAULT_SNDBATCH_COUNT,
@@ -777,14 +772,15 @@ pub(crate) fn apply_core_option_value(
         #[cfg(feature = "io-uring")]
         IO_URING_ZC_SEND_THRESHOLD => options.io_uring.zc_send_threshold = parse_i32_option(value)?.max(1) as usize,
 
-        ADAPTIVE_THROTTLE => options.throttle_config.enabled = parse_bool_option(value)?,
+        ADAPTIVE_THROTTLE if value.len() == 4 => options.throttle_config.enabled = parse_bool_option(value)?,
+        ADAPTIVE_THROTTLE => options.throttle_config = AdaptiveThrottleSocketConfig::from_bytes(value)?,
         SNDBATCH_COUNT => options.sndbatch_count = parse_i32_option(value)?.max(1) as usize,
         SNDBATCH_BYTES => options.sndbatch_bytes = parse_i32_option(value)?.max(1) as usize,
         RCVBATCH_COUNT => options.rcvbatch_count = parse_i32_option(value)?.max(1) as usize,
         RCVBATCH_BYTES => options.rcvbatch_bytes = parse_i32_option(value)?.max(1) as usize,
 
         // Options handled by pattern logic (ISocket) or read-only, or not applicable for set_option
-        SUBSCRIBE | UNSUBSCRIBE | LAST_ENDPOINT  /* Pattern specific */ | ROUTER_MANDATORY |
+        SUBSCRIBE | UNSUBSCRIBE | LAST_ENDPOINT  /* Pattern specific */ | ROUTER_MANDATORY | ADAPTIVE_THROTTLE_STATS |
         AUTO_DELIMITER | 16 /* ZMQ_TYPE (read-only) */ => return Err(ZmqError::UnsupportedOption(option_id)),
 
         _ => return Err(ZmqError::InvalidOption(option_id)), // Unknown option ID
@@ -850,7 +846,15 @@ pub(crate) fn retrieve_core_option_value(
         #[cfg(feature = "io-uring")]
         IO_URING_ZC_SEND_THRESHOLD => Ok((options.io_uring.zc_send_threshold as i32).to_ne_bytes().to_vec()),
 
-        ADAPTIVE_THROTTLE => Ok((options.throttle_config.enabled as i32).to_ne_bytes().to_vec()),
+        ADAPTIVE_THROTTLE => Ok(options.throttle_config.to_bytes()),
+        ADAPTIVE_THROTTLE_STATS => {
+            let stats: Vec<_> = core_s_reader
+                .endpoints
+                .values()
+                .filter_map(|ep| ep.throttle.as_ref().map(|t| t.stats(ep.endpoint_uri.clone())))
+                .collect();
+            Ok(encode_throttle_stats(&stats))
+        }
         SNDBATCH_COUNT => Ok((options.sndbatch_count as i32).to_ne_bytes().to_vec()),
         SNDBATCH_BYTES => Ok((options.sndbatch_bytes as i32).to_ne_bytes().to_vec()),
         RCVBATCH_COUNT => Ok((options.rcvbatch_count as i32).to_ne_bytes().to_vec()),

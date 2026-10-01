@@ -531,7 +531,7 @@ impl TcpListener {
                     mailbox(context_clone.inner().get_actor_mailbox_capacity());
 
                   // tokio_tcp_stream is moved into SessionConnectionActorX
-                  let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+                  let (sca_task_handle, sca_throttle) = SessionConnectionActorX::create_and_spawn(
                     sca_handle_id,
                     parent_socket_core_id,
                     tokio_tcp_stream,
@@ -545,6 +545,7 @@ impl TcpListener {
                   interaction_model_for_event = Some(ConnectionInteractionModel::ViaSca {
                     sca_mailbox: command_sender_for_sca,
                     sca_handle_id,
+                    throttle: sca_throttle,
                   });
                   managing_actor_task_id_for_event = Some(sca_task_handle.id());
                   connection_iface_for_event = None; // SocketCore creates ScaConnectionIface
@@ -1123,7 +1124,7 @@ impl TcpConnecter {
           let (command_sender_for_sca, command_receiver_for_sca) =
             mailbox(self.context.inner().get_actor_mailbox_capacity());
 
-          let sca_task_handle = SessionConnectionActorX::create_and_spawn(
+          let (sca_task_handle, sca_throttle) = SessionConnectionActorX::create_and_spawn(
             sca_handle_id,
             self.parent_socket_id,
             std_tokio_stream,
@@ -1137,6 +1138,7 @@ impl TcpConnecter {
           let interaction_model = ConnectionInteractionModel::ViaSca {
             sca_mailbox: command_sender_for_sca,
             sca_handle_id,
+            throttle: sca_throttle,
           };
 
           return Ok((

@@ -206,6 +206,7 @@ pub enum ConnectionInteractionModel {
     // SCA = SessionConnectionActor
     sca_mailbox: SessionCommandMailboxSender,
     sca_handle_id: usize,
+    throttle: crate::throttle::AdaptiveThrottle,
   },
   /// Connection is managed directly by the UringWorker using a RawFd.
   #[cfg(feature = "io-uring")]
@@ -234,6 +235,7 @@ impl fmt::Debug for ConnectionInteractionModel {
       ConnectionInteractionModel::ViaSca {
         sca_mailbox,
         sca_handle_id,
+        ..
       } => f
         .debug_struct("ViaSca")
         .field("sca_mailbox_closed", &sca_mailbox.is_closed())

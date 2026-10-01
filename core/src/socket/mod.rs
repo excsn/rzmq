@@ -10,6 +10,7 @@ pub mod patterns;
 pub mod types;
 
 pub(crate) mod connection_iface;
+pub(crate) mod throttle;
 
 pub mod dealer_socket;
 pub mod pub_socket;
@@ -218,6 +219,9 @@ pub trait ISocket: Send + Sync + 'static {
 pub use events::{MonitorReceiver, MonitorSender, SocketEvent, DEFAULT_MONITOR_CAPACITY};
 pub use options::*; // Re-export all socket option constants (e.g., SNDHWM).
 pub use types::{Socket, SocketType};
+pub use throttle::{
+  AdaptiveThrottleSocketConfig, ThrottlePriority, ThrottleStats, ThrottleStrategy,
+};
 
 /// Internal factory function to create and spawn the `SocketCore` actor and its
 /// associated `ISocket` pattern implementation.

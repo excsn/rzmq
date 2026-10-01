@@ -4,6 +4,7 @@ use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::events::{MonitorSender, clean_endpoint_uri};
 use crate::socket::options::SocketOptions;
 use crate::socket::types::SocketType;
+use crate::throttle::AdaptiveThrottle;
 use crate::socket::SocketEvent;
 
 use fibre::mpsc::BoundedAsyncSender;
@@ -39,6 +40,8 @@ pub(crate) struct EndpointInfo {
   pub peer_socket_type: Option<String>,
   /// The unified interface for sending messages and closing the connection.
   pub connection_iface: Arc<dyn ISocketConnection>,
+  /// Set only for connections driven by a session actor.
+  pub throttle: Option<AdaptiveThrottle>,
 }
 
 /// Enum to differentiate between Listener endpoints and active Session (connection) endpoints.
@@ -138,6 +141,7 @@ pub(crate) struct CoreState {
   pub(crate) bound_inproc_names: HashSet<String>,
   pub(crate) monitor_tx: Option<MonitorSender>,
   pub(crate) last_bound_endpoint: Option<String>,
+  pub(crate) bind_or_connect_called: bool,
 }
 
 impl CoreState {
@@ -155,6 +159,7 @@ impl CoreState {
       bound_inproc_names: HashSet::new(),
       monitor_tx: None,
       last_bound_endpoint: None,
+      bind_or_connect_called: false,
     }
   }
 
