@@ -3,7 +3,8 @@ use crate::error::ZmqError;
 use crate::runtime::{ActorType, system_events::ConnectionInteractionModel};
 use crate::socket::core::state::{EndpointInfo, EndpointType};
 use crate::socket::core::SocketCore;
-use crate::socket::{ISocket, SocketEvent};
+use crate::socket::patterns::PipeCredits;
+use crate::socket::{ISocket, SocketEvent, SocketType};
 
 #[cfg(feature = "inproc")]
 use crate::message::FrameBatch;
@@ -192,11 +193,17 @@ pub(crate) async fn process_inproc_binding_request_event(
   let (tx_to_binder, rx_for_binder) = bounded_async::<FrameBatch>(rcvhwm);
 
   let peer_identity = request.connector_identity.clone();
+  let binder_to_connector_credits = (binder_socket_type == SocketType::Pub)
+    .then(|| Arc::new(PipeCredits::new(request.connector_rx_sender.capacity())));
+  let connector_to_binder_credits = (request.connector_socket_type == SocketType::Pub)
+    .then(|| Arc::new(PipeCredits::new(tx_to_binder.capacity())));
   let response = InprocHandshakeResponse {
     binder_id: binder_core_handle,
     binder_socket_type,
     binder_identity,
     binder_rx_sender: tx_to_binder,
+    binder_to_connector_credits: binder_to_connector_credits.clone(),
+    connector_to_binder_credits: connector_to_binder_credits.clone(),
   };
 
   // Unblock the connector — it now has the sender to reach us.
@@ -213,6 +220,7 @@ pub(crate) async fn process_inproc_binding_request_event(
     monitor_tx,
     is_congested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     sndtimeo,
+    credits: binder_to_connector_credits,
   };
 
   let cmd = Command::NewConnectionEstablished {
@@ -222,6 +230,7 @@ pub(crate) async fn process_inproc_binding_request_event(
     interaction_model: ConnectionInteractionModel::ViaDirectInproc {
       local_rx: Arc::new(std::sync::Mutex::new(Some(rx_for_binder))),
       peer_identity,
+      rx_credits: connector_to_binder_credits,
     },
     managing_actor_task_id: None,
   };

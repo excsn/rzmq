@@ -719,6 +719,7 @@ where
         rx_from_core,
         core_pipe_read_id_for_incoming_routing,
         incoming_pipe_sender,
+        credits,
       } => {
         if self.handle != sca_handle_id {
           tracing::warn!(
@@ -727,6 +728,9 @@ where
             "Received ScaInitializePipes for wrong actor. Ignoring."
           );
           drop(rx_from_core);
+          if let Some(credits) = credits {
+            credits.close();
+          }
           return;
         }
         if self.core_pipe_manager.is_attached() {
@@ -735,6 +739,9 @@ where
             "Already attached. Ignoring ScaInitializePipes."
           );
           drop(rx_from_core);
+          if let Some(credits) = credits {
+            credits.close();
+          }
           return;
         }
 
@@ -748,6 +755,9 @@ where
             "Received ScaInitializePipes while shutting down. Dropping pipes."
           );
           drop(rx_from_core);
+          if let Some(credits) = credits {
+            credits.close();
+          }
           return;
         }
 
@@ -761,7 +771,7 @@ where
         );
         self
           .core_pipe_manager
-          .attach(rx_from_core, core_pipe_read_id_for_incoming_routing);
+          .attach(rx_from_core, core_pipe_read_id_for_incoming_routing, credits);
         tracing::info!(
           sca_handle = self.handle,
           core_read_id = core_pipe_read_id_for_incoming_routing,

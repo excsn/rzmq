@@ -121,7 +121,7 @@ Supports a range of common socket options for fine-tuning behavior, including:
 *   Connection: `RECONNECT_IVL`, `RECONNECT_IVL_MAX`, `HANDSHAKE_IVL`
 *   TCP Keepalives: `TCP_KEEPALIVE`, `TCP_KEEPALIVE_IDLE`, `TCP_KEEPALIVE_CNT`, `TCP_KEEPALIVE_INTVL`
 *   Binding: `LAST_ENDPOINT` (read-only, to get actual bound endpoint, e.g., after binding to port 0), `REUSE_PORT` (Unix-only `SO_REUSEPORT`, letting several listeners share one TCP port; see the [Usage Guide](./README.USAGE.md#sharing-a-tcp-port-so_reuseport))
-*   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE` (for SUB), `ROUTING_ID` (for DEALER/ROUTER identity), `ROUTER_MANDATORY`
+*   Pattern-specific: `SUBSCRIBE`, `UNSUBSCRIBE` (for SUB), `XPUB_NODROP` (PUB waits for room instead of dropping; see the [Usage Guide](./README.USAGE.md#publishing-to-slow-subscribers)), `ROUTING_ID` (for DEALER/ROUTER identity), `ROUTER_MANDATORY`
 *   Keepalives: ZMTP heartbeats (`HEARTBEAT_IVL`, `HEARTBEAT_TIMEOUT`)
 *   Adaptive throttle: `ADAPTIVE_THROTTLE` (configure the I/O fairness engine), `ADAPTIVE_THROTTLE_STATS` (read-only per-connection state)
 *   Legacy interop: `ALLOW_ZMTP2` (enable/disable transparent ZMTP/2.0 downgrade for legacy peers; default `true`)

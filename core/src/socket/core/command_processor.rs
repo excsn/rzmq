@@ -6,6 +6,8 @@ use crate::runtime::system_events::ConnectionInteractionModel;
 use crate::runtime::{Command, MailboxSender, SystemEvent};
 use crate::sessionx::ScaConnectionIface;
 use crate::socket::ISocket;
+use crate::socket::SocketType;
+use crate::socket::patterns::PipeCredits;
 use crate::socket::connection_iface::ISocketConnection;
 
 #[cfg(feature = "inproc")]
@@ -1008,7 +1010,12 @@ async fn handle_new_connection_established(
       let core_write_id = core_arc.context.inner().next_handle();
       let core_read_id = core_arc.context.inner().next_handle();
 
-      let sndtimeo_snapshot = core_arc.core_state.read().options.sndtimeo;
+      let (sndtimeo_snapshot, socket_type) = {
+        let core_s = core_arc.core_state.read();
+        (core_s.options.sndtimeo, core_s.socket_type)
+      };
+      let credits = (socket_type == SocketType::Pub)
+        .then(|| Arc::new(PipeCredits::new(tx_core_to_sca.capacity())));
 
       let sca_iface = Arc::new(ScaConnectionIface::new(
         sca_mailbox.clone(),
@@ -1016,6 +1023,7 @@ async fn handle_new_connection_established(
         tx_core_to_sca.clone(),
         core_write_id,
         sndtimeo_snapshot,
+        credits.clone(),
       ));
 
       let endpoint_info = EndpointInfo {
@@ -1075,6 +1083,7 @@ async fn handle_new_connection_established(
         rx_from_core: rx_sca_from_core,
         core_pipe_read_id_for_incoming_routing: core_read_id,
         incoming_pipe_sender,
+        credits,
       };
 
       if sca_mailbox.send(attach_cmd).await.is_err() {
@@ -1094,7 +1103,7 @@ async fn handle_new_connection_established(
     }
 
     #[cfg(feature = "inproc")]
-    ConnectionInteractionModel::ViaDirectInproc { local_rx, peer_identity } => {
+    ConnectionInteractionModel::ViaDirectInproc { local_rx, peer_identity, rx_credits } => {
       tracing::debug!(
         handle = core_handle,
         conn_uri = %endpoint_uri_from_event,
@@ -1181,6 +1190,7 @@ async fn handle_new_connection_established(
         reader_task_id,
         core_handle,
         rcvbatch_count,
+        rx_credits,
       );
 
       core_arc

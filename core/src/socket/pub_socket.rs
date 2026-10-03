@@ -2,12 +2,18 @@ use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::core::SocketCore;
+use crate::socket::options::{parse_i32_option, XPUB_NODROP};
+use crate::socket::patterns::distributor::Blocked;
 use crate::socket::patterns::{Distributor, PartialMessage, PipeMessageSender, SubscriptionMatcher};
 use crate::socket::ISocket;
 use crate::{delegate_to_core, Blob, MsgFlags};
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -29,6 +35,15 @@ pub(crate) struct PubSocket {
   /// `get_incoming_pipe_sender`.
   pending_pipe_senders: Mutex<HashMap<usize, PipeMessageSender>>,
   partial: PartialMessage,
+  /// XPUB_NODROP: a send reaches every matched peer or none, waiting up to
+  /// SNDTIMEO for room.
+  nodrop: AtomicBool,
+  /// FIFO turn for NODROP sends that had to wait, so a sender that just
+  /// finished cannot take a freed credit ahead of senders already waiting.
+  nodrop_turn: tokio::sync::Mutex<()>,
+  /// NODROP sends queued on or holding `nodrop_turn`. While it is non-zero a
+  /// new send queues behind them instead of trying the credits first.
+  nodrop_waiters: AtomicUsize,
 }
 
 impl PubSocket {
@@ -39,32 +54,107 @@ impl PubSocket {
       matcher: Arc::new(SubscriptionMatcher::new()),
       pending_pipe_senders: Mutex::new(HashMap::new()),
       partial: PartialMessage::default(),
+      nodrop: AtomicBool::new(false),
+      nodrop_turn: tokio::sync::Mutex::new(()),
+      nodrop_waiters: AtomicUsize::new(0),
     }
   }
 
   /// Matches one logical message against the subscription database and fans it
   /// out to interested peers, cleaning up any peers that errored during send.
   async fn dispatch(&self, frames: FrameBatch) -> Result<(), ZmqError> {
-    match self
-      .distributor
-      .send_matched_multipart(frames, &self.matcher, self.core.handle)
-      .await
-    {
-      Ok(()) => Ok(()),
-      Err(failed_peers) => {
-        for (peer_idx, error_detail) in failed_peers {
-          tracing::debug!(
-            handle = self.core.handle,
-            peer_idx,
-            error = %error_detail,
-            "PUB removing disconnected/errored peer found during send"
-          );
-          self.distributor.remove_peer_by_idx(peer_idx);
-          self.matcher.remove_peer(peer_idx);
+    if self.nodrop.load(Ordering::Relaxed) {
+      return self.dispatch_nodrop(frames).await;
+    }
+    let outcome = self.distributor.send_matched(frames, &self.matcher, self.core.handle);
+    self.remove_failed_peers(outcome.failed);
+    if outcome.dropped {
+      // A lossy send never waits, so without this a publish loop on a
+      // current-thread runtime never lets the session tasks drain full pipes.
+      tokio::task::consume_budget().await;
+    }
+    Ok(())
+  }
+
+  async fn dispatch_nodrop(&self, mut frames: FrameBatch) -> Result<(), ZmqError> {
+    let sndtimeo = self.core.core_state.read().options.sndtimeo;
+    if self.nodrop_waiters.load(Ordering::Acquire) == 0 {
+      match self.distributor.try_send_matched_all(frames, &self.matcher, self.core.handle) {
+        Ok(outcome) => {
+          self.remove_failed_peers(outcome.failed);
+          return Ok(());
         }
-        Ok(()) // Still Ok(()) to the user, as per ZMQ PUB behavior.
+        Err(blocked) => frames = blocked.frames,
       }
     }
+    if sndtimeo == Some(Duration::ZERO) {
+      return Err(ZmqError::ResourceLimitReached);
+    }
+
+    let deadline = sndtimeo.map(|timeout| Instant::now() + timeout);
+    let _waiting = WaiterGuard::enter(&self.nodrop_waiters);
+    let _turn = match deadline {
+      Some(deadline) => tokio::time::timeout_at(deadline, self.nodrop_turn.lock())
+        .await
+        .map_err(|_| ZmqError::Timeout)?,
+      None => self.nodrop_turn.lock().await,
+    };
+    loop {
+      let Blocked { frames: returned, credits } =
+        match self.distributor.try_send_matched_all(frames, &self.matcher, self.core.handle) {
+          Ok(outcome) => {
+            self.remove_failed_peers(outcome.failed);
+            return Ok(());
+          }
+          Err(blocked) => blocked,
+        };
+      frames = returned;
+
+      let drained = credits.drained();
+      tokio::pin!(drained);
+      drained.as_mut().enable();
+      if !credits.has_credit() && !credits.is_closed() {
+        match deadline {
+          Some(deadline) => {
+            if tokio::time::timeout_at(deadline, drained).await.is_err() {
+              return Err(ZmqError::Timeout);
+            }
+          }
+          None => drained.await,
+        }
+      }
+      if !self.core.is_running() {
+        return Err(ZmqError::InvalidState("Socket is closing".into()));
+      }
+    }
+  }
+
+  fn remove_failed_peers(&self, failed: Vec<(u32, ZmqError)>) {
+    for (peer_idx, error_detail) in failed {
+      tracing::debug!(
+        handle = self.core.handle,
+        peer_idx,
+        error = %error_detail,
+        "PUB removing disconnected/errored peer found during send"
+      );
+      self.distributor.remove_peer_by_idx(peer_idx);
+      self.matcher.remove_peer(peer_idx);
+    }
+  }
+}
+
+struct WaiterGuard<'a>(&'a AtomicUsize);
+
+impl<'a> WaiterGuard<'a> {
+  fn enter(waiters: &'a AtomicUsize) -> Self {
+    waiters.fetch_add(1, Ordering::AcqRel);
+    Self(waiters)
+  }
+}
+
+impl Drop for WaiterGuard<'_> {
+  fn drop(&mut self) {
+    self.0.fetch_sub(1, Ordering::AcqRel);
   }
 }
 
@@ -150,11 +240,20 @@ impl ISocket for PubSocket {
     Err(ZmqError::UnsupportedFeature("PUB sockets cannot receive messages"))
   }
 
-  async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
-    Err(ZmqError::UnsupportedOption(option))
+  async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
+    match option {
+      XPUB_NODROP => {
+        self.nodrop.store(parse_i32_option(value)? != 0, Ordering::Relaxed);
+        Ok(())
+      }
+      _ => Err(ZmqError::UnsupportedOption(option)),
+    }
   }
   async fn get_pattern_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
-    Err(ZmqError::UnsupportedOption(option))
+    match option {
+      XPUB_NODROP => Ok((self.nodrop.load(Ordering::Relaxed) as i32).to_ne_bytes().to_vec()),
+      _ => Err(ZmqError::UnsupportedOption(option)),
+    }
   }
 
   async fn process_command(&self, _command: Command) -> Result<bool, ZmqError> {

@@ -298,6 +298,8 @@ impl UringWorker {
         let sndhwm = engine_cfg.sndhwm.max(1);
         let (egress_tx, egress_rx) = fibre::mpsc::bounded::<crate::message::FrameBatch>(sndhwm);
         let egress_tx_async = egress_tx.to_async();
+        let egress_credits = (engine_cfg.socket_type_name == "PUB")
+          .then(|| std::sync::Arc::new(crate::socket::patterns::PipeCredits::new(egress_tx_async.capacity())));
 
         let event_fd = self.event_fd_poller.clone_event_fd();
         let connection_iface = std::sync::Arc::new(ZmtpSmartConnection::new(
@@ -308,6 +310,7 @@ impl UringWorker {
           std::sync::Arc::clone(&self.work_signal_gen),
           self.self_op_tx.clone(),
           engine_cfg.sndtimeo,
+          egress_credits.clone(),
         ));
 
         let worker_io_config = std::sync::Arc::new(WorkerIoConfig {
@@ -326,6 +329,7 @@ impl UringWorker {
           worker_io_config,
           engine,
           std::sync::Arc::clone(&egress_rx_arc),
+          egress_credits,
           use_zc,
           use_recv_multishot,
           if use_zc { self.cfg_send_buffer_size } else { 0 },

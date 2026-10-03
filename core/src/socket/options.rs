@@ -33,6 +33,8 @@ pub const HEARTBEAT_TTL: i32 = 40; // ZMQ_HEARTBEAT_TTL (Often derived from TIME
 pub const HANDSHAKE_IVL: i32 = 41; // ZMQ_HANDSHAKE_IVL
 
 pub const ROUTER_MANDATORY: i32 = 33;
+/// PUB: a send reaches every matched subscriber or none, waiting up to SNDTIMEO for room.
+pub const XPUB_NODROP: i32 = 69;
 pub const AUTO_DELIMITER: i32 = 42; // Router/Dealer Auto Delimiter insertion/stripping handling. Enabled by default.
 
 // Security Options

@@ -222,6 +222,8 @@ pub(crate) enum ConnectionInteractionModel {
     local_rx: Arc<std::sync::Mutex<Option<BoundedAsyncReceiver<FrameBatch>>>>,
     /// Peer identity known at handshake time, passed directly to `pipe_attached`.
     peer_identity: Option<Blob>,
+    /// Credits the reader returns for `local_rx`, present when the peer is PUB.
+    rx_credits: Option<Arc<crate::socket::patterns::PipeCredits>>,
   },
 }
 

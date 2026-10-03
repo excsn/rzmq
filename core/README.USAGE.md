@@ -27,6 +27,10 @@ This guide provides a detailed overview of how to use the `rzmq` library, coveri
 *   [Security Mechanisms](#security-mechanisms)
 *   [Using `io_uring` (Linux Specific)](#using-io_uring-linux-specific)
 *   [Adaptive I/O Throttling](#adaptive-io-throttling)
+*   [Publishing to Slow Subscribers](#publishing-to-slow-subscribers)
+    *   [Waiting for Every Subscriber (`XPUB_NODROP`)](#waiting-for-every-subscriber-xpub_nodrop)
+    *   [Bounding the Wait](#bounding-the-wait)
+    *   [Reading the Setting](#reading-the-setting)
 *   [Error Handling](#error-handling)
 
 ## Introduction
@@ -717,6 +721,75 @@ for s in &stats {
 ```
 
 Each entry's fields are read separately while the connection runs, so they are not a single consistent instant.
+
+## Publishing to Slow Subscribers
+
+A `PUB` never waits for a subscriber by default. Each subscriber has its own queue of up to `SNDHWM` messages. When that queue is full the subscriber misses the message and the other subscribers still get it:
+
+```rust
+use rzmq::socket::SNDHWM;
+use rzmq::{Context, Msg, SocketType, ZmqError};
+
+async fn example(ctx: &Context) -> Result<(), ZmqError> {
+    let publisher = ctx.socket(SocketType::Pub)?;
+    publisher.set_option(SNDHWM, 1000i32).await?;
+    publisher.bind("tcp://127.0.0.1:5556").await?;
+    // Returns once the message is queued for every subscriber that has room.
+    publisher
+        .send_multipart(vec![Msg::from_static(b"prices"), Msg::from_static(b"42")])
+        .await?;
+    Ok(())
+}
+```
+
+A [monitor](#monitoring-socket-events) reports `ConnectionCongested` when a subscriber's queue fills and `ConnectionUncongested` when it drains.
+
+### Waiting for Every Subscriber (`XPUB_NODROP`)
+
+With `XPUB_NODROP` set, each send reaches every matched subscriber or none of them. A send that finds a full subscriber waits for room instead of dropping:
+
+```rust
+use rzmq::socket::XPUB_NODROP;
+
+publisher.set_option(XPUB_NODROP, 1i32).await?;
+```
+
+A subscriber that disconnects stops holding sends back. Sends from cloned handles that have to wait complete in the order they started waiting.
+
+### Bounding the Wait
+
+`SNDTIMEO` decides how long a send waits for room. A send that gives up delivers to no subscriber. A send whose future is dropped delivers to none either:
+
+```rust
+use rzmq::socket::{SNDTIMEO, XPUB_NODROP};
+use rzmq::{Msg, Socket, ZmqError};
+
+async fn publish(publisher: &Socket, update: Vec<Msg>) -> Result<bool, ZmqError> {
+    publisher.set_option(XPUB_NODROP, 1i32).await?;
+    publisher.set_option(SNDTIMEO, 500i32).await?;
+    match publisher.send_multipart(update).await {
+        Ok(()) => Ok(true),
+        // A subscriber stayed full for 500 ms; no subscriber received the update.
+        Err(ZmqError::Timeout) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+```
+
+| `SNDTIMEO` | A send that finds a full subscriber |
+|---|---|
+| `-1` (default) | waits until there is room or the subscriber disconnects |
+| `0` | returns `ZmqError::ResourceLimitReached` at once |
+| positive (ms) | returns `ZmqError::Timeout` when the time runs out |
+
+### Reading the Setting
+
+```rust
+use rzmq::socket::XPUB_NODROP;
+
+let raw = publisher.get_option(XPUB_NODROP).await?;
+let nodrop = i32::from_ne_bytes(raw.try_into().unwrap()) != 0;
+```
 
 ## Error Handling
 

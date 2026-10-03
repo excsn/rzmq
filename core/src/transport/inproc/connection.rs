@@ -2,6 +2,7 @@ use crate::error::ZmqError;
 use crate::message::FrameBatch;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::events::{MonitorSender, SocketEvent, clean_endpoint_uri};
+use crate::socket::patterns::PipeCredits;
 use async_trait::async_trait;
 use fibre::mpsc::BoundedAsyncSender;
 use fibre::TrySendError;
@@ -18,6 +19,7 @@ pub(crate) struct DirectInprocConnection {
   pub monitor_tx: Option<MonitorSender>,
   pub is_congested: Arc<AtomicBool>,
   pub sndtimeo: Option<Duration>,
+  pub credits: Option<Arc<PipeCredits>>,
 }
 
 impl DirectInprocConnection {
@@ -110,8 +112,15 @@ impl ISocketConnection for DirectInprocConnection {
     }
   }
 
+  fn pipe_credits(&self) -> Option<&Arc<PipeCredits>> {
+    self.credits.as_ref()
+  }
+
   async fn close_connection(&self) -> Result<(), ZmqError> {
     self.peer_queue_sender.close();
+    if let Some(ref credits) = self.credits {
+      credits.close();
+    }
     Ok(())
   }
 
@@ -135,6 +144,7 @@ mod tests {
       monitor_tx: None,
       is_congested: Arc::new(AtomicBool::new(false)),
       sndtimeo: None,
+      credits: None,
     };
 
     let batch = FrameBatch::from(vec![Msg::from_static(b"hello-inproc")]);
@@ -155,6 +165,7 @@ mod tests {
       monitor_tx: None,
       is_congested: Arc::new(AtomicBool::new(false)),
       sndtimeo: None,
+      credits: None,
     };
 
     let batch1 = FrameBatch::from(vec![Msg::from_static(b"frame-1")]);
@@ -180,6 +191,7 @@ mod tests {
       monitor_tx: None,
       is_congested: Arc::new(AtomicBool::new(false)),
       sndtimeo: None,
+      credits: None,
     };
 
     drop(rx);

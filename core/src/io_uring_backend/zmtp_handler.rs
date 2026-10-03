@@ -29,6 +29,7 @@ use crate::protocol::zmtp::{
 use crate::runtime::Command;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
+use crate::socket::patterns::PipeCredits;
 
 
 pub(crate) struct ZmtpSmartConnection {
@@ -44,6 +45,7 @@ pub(crate) struct ZmtpSmartConnection {
   /// (AttachIngressSender/Resume/Shutdown) must go here, not to the global pool.
   worker_op_tx: SignalingOpSender,
   sndtimeo: Option<Duration>,
+  credits: Option<Arc<PipeCredits>>,
 }
 
 impl std::fmt::Debug for ZmtpSmartConnection {
@@ -64,6 +66,7 @@ impl ZmtpSmartConnection {
     work_signal_gen: Arc<AtomicUsize>,
     worker_op_tx: SignalingOpSender,
     sndtimeo: Option<Duration>,
+    credits: Option<Arc<PipeCredits>>,
   ) -> Self {
     Self {
       fd,
@@ -73,6 +76,7 @@ impl ZmtpSmartConnection {
       work_signal_gen,
       worker_op_tx,
       sndtimeo,
+      credits,
     }
   }
 
@@ -173,6 +177,10 @@ impl ISocketConnection for ZmtpSmartConnection {
     }
   }
 
+  fn pipe_credits(&self) -> Option<&Arc<PipeCredits>> {
+    self.credits.as_ref()
+  }
+
   async fn close_connection(&self) -> Result<(), ZmqError> {
     Ok(())
   }
@@ -193,6 +201,8 @@ pub(crate) struct ZmtpUringHandler {
   engine: ZmtpEngine,
   /// Egress channel receiver: SocketCore → handler (via ZmtpSmartConnection → egress_tx).
   egress_rx: Arc<fibre::mpsc::BoundedSyncReceiver<FrameBatch>>,
+  /// Credits returned for each batch drained from `egress_rx`, present when the socket is PUB.
+  egress_credits: Option<Arc<PipeCredits>>,
   /// Direct ingress sender: delivers decoded messages straight to the socket's ReadyPipeQueue.
   /// Set by `attach_ingress` after SocketCore completes pipe registration.
   ingress_sender: Option<PipeMessageSender>,
@@ -250,6 +260,7 @@ impl ZmtpUringHandler {
     worker_io_config: Arc<WorkerIoConfig>,
     engine: ZmtpEngine,
     egress_rx: Arc<fibre::mpsc::BoundedSyncReceiver<FrameBatch>>,
+    egress_credits: Option<Arc<PipeCredits>>,
     use_send_zerocopy: bool,
     use_recv_multishot: bool,
     send_buffer_slot_size: usize,
@@ -262,6 +273,7 @@ impl ZmtpUringHandler {
       worker_io_config,
       engine,
       egress_rx,
+      egress_credits,
       ingress_sender: None,
       spillover: VecDeque::new(),
       is_throttled: AtomicBool::new(false),
@@ -728,6 +740,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
           .unwrap_or(0);
 
         drained += additional;
+      }
+
+      if let Some(ref credits) = self.egress_credits {
+        credits.release(drained);
       }
 
       if drained > 0 {

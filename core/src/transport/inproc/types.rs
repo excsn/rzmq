@@ -1,8 +1,10 @@
 use crate::error::ZmqError;
 use crate::message::{Blob, FrameBatch};
+use crate::socket::patterns::PipeCredits;
 use crate::socket::types::SocketType;
 use fibre::mpsc::BoundedAsyncSender;
 use fibre::oneshot;
+use std::sync::Arc;
 
 pub(crate) struct InprocHandshakeRequest {
   pub connector_id: usize,
@@ -18,6 +20,10 @@ pub(crate) struct InprocHandshakeResponse {
   pub binder_socket_type: SocketType,
   pub binder_identity: Option<Blob>,
   pub binder_rx_sender: BoundedAsyncSender<FrameBatch>,
+  /// Credits for the binder-to-connector pipe, present when the binder is PUB.
+  pub binder_to_connector_credits: Option<Arc<PipeCredits>>,
+  /// Credits for the connector-to-binder pipe, present when the connector is PUB.
+  pub connector_to_binder_credits: Option<Arc<PipeCredits>>,
 }
 
 impl InprocHandshakeRequest {
@@ -64,6 +70,8 @@ mod tests {
       binder_socket_type: SocketType::Pull,
       binder_identity: None,
       binder_rx_sender: tx_to_binder,
+      binder_to_connector_credits: None,
+      connector_to_binder_credits: None,
     };
 
     assert!(request.verify_response(&valid_response).is_ok());
@@ -79,6 +87,8 @@ mod tests {
       binder_socket_type: SocketType::Pub,
       binder_identity: None,
       binder_rx_sender: tx_to_binder,
+      binder_to_connector_credits: None,
+      connector_to_binder_credits: None,
     };
 
     assert!(matches!(

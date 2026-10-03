@@ -1,29 +1,39 @@
 #![allow(dead_code)]
 
 use crate::message::FrameBatch;
+use crate::socket::patterns::PipeCredits;
 use fibre::{RecvError, TryRecvError};
 use fibre::mpsc::BoundedAsyncReceiver;
+use std::sync::Arc;
 
 use super::states::CorePipeManagerXState;
 
 #[derive(Debug)]
 pub(crate) struct CorePipeManagerX {
   pub(crate) state: CorePipeManagerXState,
+  credits: Option<Arc<PipeCredits>>,
 }
 
 impl CorePipeManagerX {
   pub(crate) fn new() -> Self {
     Self {
       state: CorePipeManagerXState::new(),
+      credits: None,
     }
   }
 
   /// Attaches the pipes and routing information received from SocketCore.
-  pub(crate) fn attach(&mut self, rx_from_core: BoundedAsyncReceiver<FrameBatch>, core_pipe_read_id_for_incoming_routing: usize) {
+  pub(crate) fn attach(
+    &mut self,
+    rx_from_core: BoundedAsyncReceiver<FrameBatch>,
+    core_pipe_read_id_for_incoming_routing: usize,
+    credits: Option<Arc<PipeCredits>>,
+  ) {
     if self.state.is_attached {
       return;
     }
     self.state.rx_from_core = Some(rx_from_core);
+    self.credits = credits;
     self.state.core_pipe_read_id_for_incoming_routing = Some(core_pipe_read_id_for_incoming_routing);
     self.state.is_attached = true;
   }
@@ -38,7 +48,9 @@ impl CorePipeManagerX {
   /// This is an async method that will await if the channel is empty.
   pub(crate) async fn recv_from_core(&self) -> Result<FrameBatch, RecvError> {
     if let Some(ref rx) = self.state.rx_from_core {
-      rx.recv().await
+      let batch = rx.recv().await?;
+      self.return_credits(1);
+      Ok(batch)
     } else {
       // This indicates a programming error: called before pipes are attached
       // or after they've been detached.
@@ -51,6 +63,9 @@ impl CorePipeManagerX {
   /// This method ensures `CorePipeManagerX` stops trying to use the pipes.
   pub(crate) fn detach_and_clear_pipes(&mut self) {
     let _ = self.state.rx_from_core.take();
+    if let Some(credits) = self.credits.take() {
+      credits.close();
+    }
     self.state.core_pipe_read_id_for_incoming_routing = None;
     self.state.is_attached = false;
   }
@@ -60,7 +75,9 @@ impl CorePipeManagerX {
   /// `Err(TryRecvError::Disconnected)` when not attached or the channel is closed.
   pub(crate) fn try_recv_from_core(&self) -> Result<FrameBatch, TryRecvError> {
     if let Some(ref rx) = self.state.rx_from_core {
-      rx.try_recv()
+      let batch = rx.try_recv()?;
+      self.return_credits(1);
+      Ok(batch)
     } else {
       Err(TryRecvError::Disconnected)
     }
@@ -76,9 +93,17 @@ impl CorePipeManagerX {
 
   pub(crate) fn try_recv_batch_from_core(&self, out: &mut Vec<FrameBatch>, max: usize) -> usize {
     if let Some(ref rx) = self.state.rx_from_core {
-      rx.try_recv_batch_mut(out, max).unwrap_or(0)
+      let received = rx.try_recv_batch_mut(out, max).unwrap_or(0);
+      self.return_credits(received);
+      received
     } else {
       0
+    }
+  }
+
+  fn return_credits(&self, received: usize) {
+    if let Some(ref credits) = self.credits {
+      credits.release(received);
     }
   }
 
@@ -99,7 +124,7 @@ mod additional_pipe_manager_tests {
 
     let (tx, rx) = fibre::mpsc::bounded_async::<FrameBatch>(1);
     let _ = tx; // keep sender alive
-    manager.attach(rx, 42);
+    manager.attach(rx, 42, None);
 
     assert!(manager.is_attached());
     assert_eq!(manager.state.core_pipe_read_id_for_incoming_routing, Some(42));

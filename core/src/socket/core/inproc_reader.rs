@@ -1,6 +1,7 @@
 use crate::message::FrameBatch;
 use crate::runtime::{ActorType, EventBus, SystemEvent};
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
+use crate::socket::patterns::PipeCredits;
 
 use fibre::mpsc::BoundedAsyncReceiver;
 use std::collections::VecDeque;
@@ -15,6 +16,7 @@ pub(crate) fn spawn(
   reader_task_id: usize,
   core_handle: usize,
   rcvbatch_count: usize,
+  credits: Option<Arc<PipeCredits>>,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
     let mut accumulator = FrameBatch::new();
@@ -27,6 +29,9 @@ pub(crate) fn spawn(
         Err(_) => break,
       }
       rx.try_recv_batch_mut(&mut drain_buf, rcvbatch_count - 1);
+      if let Some(ref credits) = credits {
+        credits.release(drain_buf.len());
+      }
 
       for batch in drain_buf.drain(..) {
         accumulator.extend(batch);
@@ -48,6 +53,9 @@ pub(crate) fn spawn(
       }
     }
 
+    if let Some(ref credits) = credits {
+      credits.close();
+    }
     tracing::debug!(reader_task_id, uri = %endpoint_uri, "DirectInproc reader task exiting.");
     let _ = event_bus.publish(SystemEvent::ActorStopping {
       handle_id: reader_task_id,

@@ -383,7 +383,7 @@ Constants for socket option integer IDs.
 *   `pub const SNDBUF: i32 = 11` - OS kernel send buffer size in bytes; value is `i32` (`0` = OS default); applies to TCP and IPC
 *   `pub const RCVBUF: i32 = 12` - OS kernel receive buffer size in bytes; value is `i32` (`0` = OS default); applies to TCP and IPC
 *   `pub const MAXMSGSIZE: i32 = 22` - maximum inbound frame size in bytes; value is `i64` (`-1` = unlimited, default)
-*   `pub const SNDHWM: i32 = 23`
+*   `pub const SNDHWM: i32 = 23` - Messages queued per peer before the socket's high-water mark action. A `PUB` drops a message for a subscriber at this limit and keeps sending to the others, unless `XPUB_NODROP` is set.
 *   `pub const RCVHWM: i32 = 24`
 *   `pub const LINGER: i32 = 17`
 *   `pub const SUBSCRIBE: i32 = 6`
@@ -403,6 +403,7 @@ Constants for socket option integer IDs.
 *   `pub const HEARTBEAT_TTL: i32 = 40`
 *   `pub const HANDSHAKE_IVL: i32 = 41`
 *   `pub const ROUTER_MANDATORY: i32 = 33`
+*   `pub const XPUB_NODROP: i32 = 69` - `PUB` only; value is `i32` (`0` = a subscriber at `SNDHWM` misses the message, the default; non-zero = each send reaches every matched subscriber or none of them). With it set, a send that finds a matched subscriber at `SNDHWM` waits for room as `SNDTIMEO` allows: `0` returns `ZmqError::ResourceLimitReached` at once, a positive value returns `ZmqError::Timeout` when it expires and `-1` (the default) waits until room appears or the subscriber disconnects. A refused, timed-out or cancelled send delivers to no subscriber. Waiting sends complete in arrival order across cloned handles. Can be set at any time. Get returns the `i32`. Any other socket type returns `ZmqError::InvalidOption`.
 *   `pub const ALLOW_ZMTP2: i32 = 1220` - Allow downgrading the handshake to the legacy ZMTP/2.0 wire protocol when a peer announces it; value is `i32` (`1` = enabled, default; `0` = reject v2 peers). ZMTP/2.0 sessions use NULL security only, exchange identities as bare frames (no `READY`), and have no heartbeats. Set before `bind`/`connect`.
 *   `pub const AUTO_DELIMITER: i32 = 42`
 *   `pub const ZAP_DOMAIN: i32 = 55`

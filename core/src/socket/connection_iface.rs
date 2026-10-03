@@ -8,6 +8,7 @@ use crate::io_uring_backend::ops::{WAKEUP_STATE_SIGNALED, WAKEUP_STATE_SLEEPING}
 #[cfg(feature = "io-uring")]
 use crate::io_uring_backend::signaling_op_sender::SignalingOpSender;
 use crate::message::{FrameBatch, Msg};
+use crate::socket::patterns::PipeCredits;
 #[cfg(feature = "io-uring")]
 use crate::Context;
 
@@ -17,7 +18,6 @@ use std::fmt;
 use std::os::{fd::AsRawFd, unix::io::RawFd};
 #[cfg(feature = "io-uring")]
 use std::sync::atomic::{AtomicU8, Ordering};
-#[cfg(feature = "io-uring")]
 use std::sync::Arc;
 #[cfg(feature = "io-uring")]
 use std::time::Duration;
@@ -54,6 +54,11 @@ pub(crate) trait ISocketConnection: Send + Sync + fmt::Debug {
   /// Synchronous fast-path. Returns Err with ownership if full or closed.
   fn try_send_multipart_owned_sync(&self, msgs: FrameBatch) -> Result<(), (FrameBatch, ZmqError)> {
     Err((msgs, ZmqError::ResourceLimitReached)) // Default fallback
+  }
+
+  /// Send credits for the outbound pipe. Present only when the owning socket is PUB.
+  fn pipe_credits(&self) -> Option<&Arc<PipeCredits>> {
+    None
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError>;

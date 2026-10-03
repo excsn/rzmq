@@ -140,6 +140,7 @@ pub(crate) async fn connect_inproc(
         monitor_tx,
         is_congested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sndtimeo,
+        credits: response.connector_to_binder_credits.clone(),
       };
 
       let cmd = Command::NewConnectionEstablished {
@@ -149,6 +150,7 @@ pub(crate) async fn connect_inproc(
         interaction_model: ConnectionInteractionModel::ViaDirectInproc {
           local_rx: Arc::new(Mutex::new(Some(rx_for_connector))),
           peer_identity,
+          rx_credits: response.binder_to_connector_credits.clone(),
         },
         managing_actor_task_id: None,
       };

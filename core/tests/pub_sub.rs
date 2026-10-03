@@ -1,10 +1,11 @@
 // tests/pub_sub.rs
 
-use rzmq::socket::options::{SUBSCRIBE, UNSUBSCRIBE};
+use rzmq::socket::options::{SNDHWM, SUBSCRIBE, UNSUBSCRIBE};
 use rzmq::socket::SocketEvent;
 use rzmq::{Context, Msg, MsgFlags, SocketType, ZmqError};
 use serial_test::serial;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 mod common;
 
@@ -568,6 +569,72 @@ async fn test_pub_sub_inproc_multipart_sent_frame_by_frame() -> Result<(), ZmqEr
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     assert_frame_by_frame_multipart(&pub_socket, &sub_socket).await?;
+  }
+  ctx.term().await?;
+  Ok(())
+}
+
+// --- Test: Congested subscriber is skipped ---
+
+#[tokio::test]
+#[serial]
+async fn test_pub_sub_congested_subscriber_does_not_block_publisher() -> Result<(), ZmqError> {
+  const TOTAL: usize = 100_000;
+  let ctx = common::test_context();
+  {
+    let pub_socket = ctx.socket(SocketType::Pub)?;
+    pub_socket.set_option(SNDHWM, 1000i32).await?;
+    let endpoint = common::bind_and_resolve_tcp(&pub_socket).await?;
+
+    let fast = ctx.socket(SocketType::Sub)?;
+    fast.set_option_raw(SUBSCRIBE, b"").await?;
+    fast.connect(&endpoint).await?;
+    let slow = ctx.socket(SocketType::Sub)?;
+    slow.set_option_raw(SUBSCRIBE, b"").await?;
+    slow.connect(&endpoint).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let fast_reader = tokio::spawn(async move {
+      let mut received = 0usize;
+      while let Ok(Ok(_)) = tokio::time::timeout(LONG_TIMEOUT, fast.recv_multipart()).await {
+        received += 1;
+      }
+      received
+    });
+
+    let sent = AtomicUsize::new(0);
+    let payload = vec![b'x'; 100];
+    let publish = async {
+      for _ in 0..TOTAL {
+        pub_socket
+          .send_multipart(vec![Msg::from_static(b"topic"), Msg::from_vec(payload.clone())])
+          .await?;
+        sent.fetch_add(1, Ordering::Relaxed);
+      }
+      Ok::<(), ZmqError>(())
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(10), publish).await;
+    assert!(
+      outcome.is_ok(),
+      "PUB stalled after {} of {} messages with a non-reading subscriber",
+      sent.load(Ordering::Relaxed),
+      TOTAL
+    );
+    outcome.unwrap()?;
+
+    let fast_received = fast_reader.await.unwrap();
+
+    let mut slow_received = 0usize;
+    while let Ok(Ok(_)) = tokio::time::timeout(SHORT_TIMEOUT, slow.recv_multipart()).await {
+      slow_received += 1;
+    }
+    assert!(slow_received < TOTAL, "slow subscriber received all {} messages", slow_received);
+    assert!(
+      fast_received > slow_received,
+      "fast subscriber received {} and slow {}",
+      fast_received,
+      slow_received
+    );
   }
   ctx.term().await?;
   Ok(())

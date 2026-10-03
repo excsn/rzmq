@@ -3,6 +3,7 @@ use crate::message::{FrameBatch, Msg};
 use crate::runtime::system_events::ConnectionInteractionModel;
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
+use crate::socket::patterns::PipeCredits;
 use crate::socket::MonitorSender;
 #[cfg(feature = "io-uring")]
 use crate::Blob;
@@ -101,6 +102,7 @@ pub(crate) enum Command {
     rx_from_core: BoundedAsyncReceiver<FrameBatch>,
     core_pipe_read_id_for_incoming_routing: usize,
     incoming_pipe_sender: Option<PipeMessageSender>,
+    credits: Option<Arc<PipeCredits>>,
   },
 
   /// Sent from a TCP/IPC connecter or acceptor directly to SocketCore for ViaSca connections.

@@ -4,7 +4,9 @@ use crate::error::ZmqError;
 use crate::message::{FrameBatch, Msg};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
+use crate::socket::patterns::PipeCredits;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,6 +21,7 @@ pub(crate) struct ScaConnectionIface {
   pipe_sender: BoundedAsyncSender<FrameBatch>,
   pipe_write_id_to_sca: usize,
   sndtimeo: Option<Duration>,
+  credits: Option<Arc<PipeCredits>>,
 }
 
 impl ScaConnectionIface {
@@ -28,6 +31,7 @@ impl ScaConnectionIface {
     pipe_sender: BoundedAsyncSender<FrameBatch>,
     pipe_write_id_to_sca: usize,
     sndtimeo: Option<Duration>,
+    credits: Option<Arc<PipeCredits>>,
   ) -> Self {
     Self {
       sca_stop_mailbox,
@@ -35,6 +39,7 @@ impl ScaConnectionIface {
       pipe_sender,
       pipe_write_id_to_sca,
       sndtimeo,
+      credits,
     }
   }
 }
@@ -123,6 +128,10 @@ impl ISocketConnection for ScaConnectionIface {
       Err(TrySendError::Closed(returned)) => Err((returned, ZmqError::ConnectionClosed)),
       Err(TrySendError::Sent(_)) => unreachable!(),
     }
+  }
+
+  fn pipe_credits(&self) -> Option<&Arc<PipeCredits>> {
+    self.credits.as_ref()
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
