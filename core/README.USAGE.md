@@ -591,6 +591,20 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
 
     Global parameters for zero-copy send pools and the default multishot receive ring are set via `UringConfig` during `initialize_uring_backend()`.
 
+6.  **Choosing the Worker Count**: The backend runs `num_workers` worker threads, each with its own ring and buffer pools. Each connection is assigned to a worker round-robin when it registers and stays there. The default is `ceil(cores / 2) - 2`, clamped to 1–8.
+    ```rust
+    use rzmq::uring::{initialize_uring_backend, UringConfig};
+
+    let uring_cfg = UringConfig {
+        num_workers: 4, // default_uring_num_workers() gives the cores-based value
+        ..Default::default()
+    };
+    initialize_uring_backend(uring_cfg)?;
+    ```
+    One connection always runs on one worker, so extra workers only help when the process has several `io_uring` connections. Set `num_workers: 1` to put every connection on a single ring.
+
+    Each worker registers its own receive buffer ring, so pinned receive memory is `num_workers × default_recv_buffer_count × default_recv_buffer_size` and counts against `RLIMIT_MEMLOCK`. The zero-copy send pool is a total that is split across workers, so it does not grow. If the first worker fails to start, `initialize_uring_backend` returns the error. If a later one fails, the backend continues with fewer workers and logs a warning. With `sqpoll_enabled` each worker also gets its own kernel poll thread.
+
 ## Adaptive I/O Throttling
 
 `rzmq` includes a built-in, probabilistic I/O fairness engine that runs transparently inside each connection's async loop. It prevents one direction of traffic (ingress or egress) from completely starving the other when the workload is asymmetric. This feature is **unique to `rzmq`** and has no equivalent in `libzmq`.

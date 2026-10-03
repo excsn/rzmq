@@ -59,13 +59,15 @@ Configuration for the global `io_uring` backend. This is used when calling `rzmq
     *   `default_recv_multishot: bool`
         *   Global flag to enable or disable the creation of the default `io_uring` provided buffer ring (group ID 0) at worker startup, primarily for multishot receive operations.
     *   `default_recv_buffer_count: usize`
-        *   The number of buffers to provision in the default receive buffer ring.
+        *   The number of buffers to provision in the default receive buffer ring. Each worker registers its own ring of this size.
     *   `default_recv_buffer_size: usize`
         *   The size (in bytes) of each buffer in the default receive buffer ring.
     *   `default_send_buffer_count: usize`
-        *   The number of buffers to provision in the global send buffer pool.
+        *   The total number of zero-copy send buffers across all workers. When `default_send_zerocopy` is true and `num_workers` is greater than 1, each worker gets `default_send_buffer_count / num_workers` slots, minimum 2.
     *   `default_send_buffer_size: usize`
-        *   The size (in bytes) of each buffer in the global send buffer pool.
+        *   The size (in bytes) of each buffer in the send buffer pool.
+    *   `num_workers: usize`
+        *   The number of `UringWorker` threads. Each has its own ring, buffer pools and set of connections. A connection is assigned to a worker round-robin at registration and stays on it for life. `0` is treated as `1`. Pinned receive buffer memory scales with this value and counts against `RLIMIT_MEMLOCK`. With `sqpoll_enabled` each worker gets its own kernel poll thread.
 
 *   **Default Values** (via `UringConfig::default()`):
     *   `ring_entries: 256`
@@ -75,6 +77,7 @@ Configuration for the global `io_uring` backend. This is used when calling `rzmq
     *   `default_recv_buffer_size: rzmq::uring::DEFAULT_IO_URING_RECV_BUFFER_SIZE` (65536)
     *   `default_send_buffer_count: rzmq::uring::DEFAULT_IO_URING_SND_BUFFER_COUNT` (16)
     *   `default_send_buffer_size: rzmq::uring::DEFAULT_IO_URING_SND_BUFFER_SIZE` (65536)
+    *   `num_workers: rzmq::uring::default_uring_num_workers()`
 
 ### `rzmq::socket::AdaptiveThrottleSocketConfig` Struct
 
@@ -352,6 +355,9 @@ Represents significant events occurring within a socket or its connections, used
 
 *   `pub fn initialize_uring_backend(config: UringConfig) -> Result<(), ZmqError>`
     *   Initializes the global `io_uring` backend with the provided configuration. Must be called once before any `io_uring`-based socket operations if custom configuration is desired, or it will be auto-initialized with defaults.
+    *   Spawns `config.num_workers` worker threads. Returns an error if the first worker fails to start. If a later worker fails, for example on `RLIMIT_MEMLOCK`, the backend runs with the workers that started and logs a warning.
+*   `pub fn default_uring_num_workers() -> usize`
+    *   The default for `UringConfig.num_workers`: `ceil(available_parallelism() / 2) - 2`, clamped to `[1, 8]`.
 *   `pub async fn shutdown_uring_backend() -> Result<(), ZmqError>`
     *   Shuts down the global `io_uring` backend, joining worker threads and cleaning up resources.
 

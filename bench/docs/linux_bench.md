@@ -12,7 +12,7 @@
 | Pattern | Features / Flags | Concurrency | Total Messages | Throughput (msg/s) | Throughput Rate (MB/s) | p50 Latency | p99 Latency |
 | :--- | :--- | :---: | :--- | :--- | :--- | :--- | :--- |
 | **ReqRep** | Standard | 1 | 317,038 | 31,704.15 | 1.94 | 29.3 us | 61.8 us |
-| **ReqRep** | `io-uring` | 1 | 404,892 | 40,492.43 | 2.47 | 22.9 us | 37.0 us |
+| **ReqRep** | `io-uring` + `--uring-workers 1` | 1 | 404,892 | 40,492.43 | 2.47 | 22.9 us | 37.0 us |
 | **DealerRouter** | Standard | 1 | 308,810 | 30,847.09 | 1.88 | 30.4 us | 56.9 us |
 | **PushPull** | Standard | 1 | 36,601,649 | 3,660,368.74 | 223.41 | — | — |
 | **PushPull** | Standard | 4 | 61,338,016 | 6,133,238.86 | 374.34 | — | — |
@@ -24,17 +24,17 @@
 | **PushPull** | `--cork` | 1 | 31,791,104 | 3,026,835.40 | 184.74 | — | — |
 | **PushPull** | `--cork` | 4 | 32,103,173 | 3,210,380.06 | 195.95 | — | — |
 | **PushPull** | `--cork` (32 KB msg) | 4 | 5,422,517 | 542,206.15 | 16,943.94 | — | — |
-| **PushPull** | `io-uring` | 1 | 63,357,957 | 6,335,992.08 | 386.72 | — | — |
-| **PushPull** | `io-uring` | 4 | 63,645,623 | 6,363,663.20 | 388.41 | — | — |
-| **PushPull** | `io-uring` + `--cork` | 1 | 57,916,459 | 5,792,037.78 | 353.52 | — | — |
-| **PushPull** | `io-uring` + `--cork` | 4 | 65,276,114 | 6,526,385.38 | 398.34 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` | 1 | 44,693,530 | 4,469,718.31 | 272.81 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` | 4 | 50,435,732 | 5,035,601.18 | 307.35 | — | — |
-| **PushPull** | `io-uring` (32 KB msg) | 1 | 2,291,371 | 229,142.24 | 7,160.70 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` (32 KB msg) | 1 | 2,552,365 | 255,244.75 | 7,976.40 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` (32 KB msg) | 4 | 2,549,252 | 254,907.35 | 7,965.85 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 1 | 2,557,517 | 255,773.78 | 7,992.93 | — | — |
-| **PushPull** | `io-uring` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 4 | 150,823,172 | 251,372.05 | 7,855.38 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` | 1 | 63,357,957 | 6,335,992.08 | 386.72 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` | 4 | 63,645,623 | 6,363,663.20 | 388.41 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` + `--cork` | 1 | 57,916,459 | 5,792,037.78 | 353.52 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` + `--cork` | 4 | 65,276,114 | 6,526,385.38 | 398.34 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` + `--uring-multishot` | 1 | 44,693,530 | 4,469,718.31 | 272.81 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` + `--uring-multishot` | 4 | 50,435,732 | 5,035,601.18 | 307.35 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` (32 KB msg) | 1 | 2,291,371 | 229,142.24 | 7,160.70 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` + `--uring-multishot` (32 KB msg) | 1 | 2,552,365 | 255,244.75 | 7,976.40 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` + `--uring-multishot` (32 KB msg) | 4 | 2,549,252 | 254,907.35 | 7,965.85 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 1 | 2,557,517 | 255,773.78 | 7,992.93 | — | — |
+| **PushPull** | `io-uring` + `--uring-workers 1` + `--uring-multishot` + `--uring-zerocopy` (32 KB msg) | 4 | 150,823,172 | 251,372.05 | 7,855.38 | — | — |
 | **PushPull** | `io-uring` + `--uring-multishot` + `--uring-workers 4` (4 KB msg) | 8 | 33,933,807 | 3,392,113.95 | 13,250.45 | — | — |
 | **PushPull** | `io-uring` + `--uring-multishot` + `--uring-workers 2` (32 KB msg) | 8 | 4,331,656 | 433,012.91 | 13,531.65 | — | — |
 | **PushPull** | `io-uring` + `--uring-multishot` + `--uring-workers 4` (32 KB msg) | 8 | 5,173,896 | 516,581.18 | 16,143.16 | — | — |
@@ -73,7 +73,7 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Command:**
 ```bash
-cargo run --release --bin rzmq_bench --features io-uring -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern req-rep --msg-size 64 --use-io-uring
+cargo run --release --bin rzmq_bench --features io-uring -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern req-rep --msg-size 64 --use-io-uring --uring-workers 1
 ```
 
 **Metrics:**
@@ -281,7 +281,7 @@ cargo run --release --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.
 
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --uring-workers 1
 ```
 
 **Metrics:**
@@ -296,7 +296,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --concurrency 4
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --uring-workers 1 --concurrency 4
 ```
 
 **Metrics:**
@@ -313,7 +313,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --cork
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --uring-workers 1 --cork
 ```
 
 **Metrics:**
@@ -329,7 +329,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --cork --concurrency 4
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --uring-workers 1 --cork --concurrency 4
 ```
 
 **Metrics:**
@@ -346,7 +346,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --uring-multishot
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --uring-workers 1 --uring-multishot
 ```
 
 **Metrics:**
@@ -361,7 +361,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --uring-multishot --concurrency 4
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 64 --use-io-uring --uring-workers 1 --uring-multishot --concurrency 4
 ```
 
 **Metrics:**
@@ -379,7 +379,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 #### Concurrency 1
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --concurrency 1
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-workers 1 --concurrency 1
 ```
 
 **Metrics:**
@@ -393,7 +393,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 #### with Multishot, Concurrency 1
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-multishot --concurrency 1
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-workers 1 --uring-multishot --concurrency 1
 ```
 
 **Metrics:**
@@ -408,7 +408,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 #### with Multishot, Concurrency 4
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-multishot --concurrency 4
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-workers 1 --uring-multishot --concurrency 4
 ```
 
 **Metrics:**
@@ -422,7 +422,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 #### with Multishot and ZeroCopy, Concurrency 1
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-multishot --uring-zerocopy --concurrency 1
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-workers 1 --uring-multishot --uring-zerocopy --concurrency 1
 ```
 
 **Metrics:**
@@ -436,7 +436,7 @@ cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate -
 #### with Multishot and ZeroCopy, Concurrency 4
 **Command:**
 ```bash
-cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-multishot --uring-zerocopy --concurrency 4 --duration 600
+cargo run --release --features io-uring --bin rzmq_bench -- --role orchestrate --endpoint tcp://127.0.0.1:19876 --pattern push-pull --msg-size 32768 --use-io-uring --uring-workers 1 --uring-multishot --uring-zerocopy --concurrency 4 --duration 600
 ```
 
 **Metrics:**
