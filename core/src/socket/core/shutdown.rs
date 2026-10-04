@@ -80,6 +80,11 @@ impl ShutdownCoordinator {
       );
       return;
     }
+    if self.forced {
+      self.linger_deadline = Some(Instant::now());
+      tracing::debug!(handle = core_handle, "LINGER skipped, context termination forced.");
+      return;
+    }
     match linger_duration_option {
       None => {
         self.linger_deadline = None;
@@ -118,11 +123,13 @@ impl ShutdownCoordinator {
     }
     if let Some(deadline) = self.linger_deadline {
       if Instant::now() >= deadline {
-        tracing::debug!(
-          handle = core_handle,
-          "Linger deadline expired. Core pipes_tx empty: {}.",
-          core_pipes_empty
-        );
+        let queued: Vec<(usize, usize)> = core_s_reader
+          .pipes_tx
+          .iter()
+          .filter(|(_, s)| !s.is_empty())
+          .map(|(id, s)| (*id, s.len()))
+          .collect();
+        tracing::debug!(handle = core_handle, ?queued, "Linger deadline expired with messages still queued.");
         return true;
       }
     }

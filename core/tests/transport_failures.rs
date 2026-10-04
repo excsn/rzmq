@@ -1,4 +1,4 @@
-use rzmq::socket::options::SNDTIMEO;
+use rzmq::socket::options::{LINGER, SNDTIMEO};
 use rzmq::{Msg, SocketType, ZmqError};
 use std::fs::{self, File};
 use std::io::Write;
@@ -35,6 +35,7 @@ async fn test_tcp_connect_fail_no_listener() -> Result<(), ZmqError> {
   // The connect pipe accepts it; nothing is listening, so no reply ever comes.
   send_result?;
 
+  req.set_option_raw(LINGER, &(0i32).to_ne_bytes()).await?;
   println!("Terminating context...");
   ctx.term().await?;
   println!("Test test_tcp_connect_fail_no_listener finished.");
@@ -75,6 +76,7 @@ async fn test_ipc_connect_fail_no_listener() -> Result<(), ZmqError> {
   // The connect pipe accepts it; nothing is listening, so no reply ever comes.
   send_result?;
 
+  req.set_option_raw(LINGER, &(0i32).to_ne_bytes()).await?;
   println!("Terminating context...");
   ctx.term().await?;
   // Clean up dummy path if somehow created (shouldn't be)

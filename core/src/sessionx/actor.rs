@@ -807,6 +807,20 @@ where
         tracing::info!(sca_handle = self.handle, "Received ContextTerminating.");
         self.transition_to_shutdown_stream(None).await;
       }
+      SystemEvent::ContextTerminationForced => {
+        tracing::warn!(
+          sca_handle = self.handle,
+          core_pipe_queued = self.core_pipe_manager.len(),
+          "Context termination forced, abandoning linger drain."
+        );
+        self.graceful_drain_requested = false;
+        self.graceful_drain_deadline = None;
+        if self.current_phase == ConnectionPhaseX::Operational {
+          self.current_phase = ConnectionPhaseX::ShuttingDownStream;
+        } else {
+          self.transition_to_shutdown_stream(None).await;
+        }
+      }
       SystemEvent::SocketClosing { socket_id } => {
         if socket_id == self.parent_socket_id {
           self.transition_to_shutdown_stream(None).await;

@@ -224,12 +224,10 @@ pub use throttle::{
 /// A `Result` containing a tuple of (`Arc<dyn ISocket>`, `MailboxSender`) on success.
 /// The `MailboxSender` is for the created `SocketCore`'s single command mailbox.
 pub(crate) fn create_socket_actor(
-  handle: usize,           // The unique handle ID for this new socket.
-  ctx: Context,            // The parent context.
-  socket_type: SocketType, // The desired ZMQ socket pattern.
+  handle: usize,
+  ctx: Context,
+  socket_type: SocketType,
+  initial_options: SocketOptions,
 ) -> Result<(Arc<dyn ISocket>, MailboxSender), ZmqError> {
-  // Create default options. These can be overridden later via `Socket::set_option`.
-  let initial_options = SocketOptions::default();
-  // Delegate to SocketCore's factory method.
   SocketCore::create_and_spawn(handle, ctx, socket_type, initial_options)
 }

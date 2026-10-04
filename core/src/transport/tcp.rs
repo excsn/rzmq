@@ -1159,8 +1159,7 @@ impl TcpConnecter {
             }
           }
         } => {
-          // If the select is aborted by a system event, we stop trying more IPs.
-          return Err(ZmqError::Internal("Connect aborted by system event.".into()));
+          return Err(ZmqError::Internal("Connecter shutdown by system event while connecting.".into()));
         }
         connect_outcome_result = connect_future => {
           match connect_outcome_result {

@@ -44,6 +44,10 @@ pub(crate) enum SystemEvent {
   /// Published by `ContextInner::shutdown`.
   ContextTerminating,
 
+  /// Published by `Context::term` when actors are still running after its wait
+  /// cap. Lingering sockets and sessions give up their drain and close.
+  ContextTerminationForced,
+
   /// Indicates a specific socket (identified by `socket_id`) is closing.
   /// Its child actors (Listeners, Sessions, etc.) should react by shutting down.
   /// Published by `SocketCore` when its shutdown is initiated.
@@ -130,6 +134,7 @@ impl fmt::Debug for SystemEvent {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       SystemEvent::ContextTerminating => write!(f, "ContextTerminating"),
+      SystemEvent::ContextTerminationForced => write!(f, "ContextTerminationForced"),
       SystemEvent::SocketClosing { socket_id } => f
         .debug_struct("SocketClosing")
         .field("socket_id", socket_id)

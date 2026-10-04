@@ -55,7 +55,7 @@ Understanding these core concepts is key to effectively using `rzmq`:
 *   **Asynchronous Model**: All potentially blocking operations (network I/O, waiting for messages) are `async` and need to be `.await`ed within a Tokio runtime.
 *   **Socket Options**: Sockets can be configured with various options (e.g., high-water marks, timeouts, identity) using `Socket::set_option_raw()` or the convenience `Socket::set_option()` for types implementing `ToBytes`.
 *   **Monitoring**: `rzmq` provides a mechanism to monitor socket events (like connection establishment, disconnections, etc.) through a channel obtained via `Socket::monitor()`.
-*   **Graceful Shutdown**: It's crucial to call `Context::term().await` to ensure all sockets are properly closed, pending messages are handled according to `LINGER` options, and background tasks are terminated cleanly.
+*   **Graceful Shutdown**: It's crucial to call `Context::term().await` to ensure all sockets are properly closed, pending messages are delivered according to `LINGER` (default -1, deliver everything queued) and background tasks are terminated cleanly.
 *   **Security**: `rzmq` supports multiple security mechanisms, including NULL (no security), PLAIN (username/password), CURVE (for interoperable encryption with libzmq), and a custom Noise_XX implementation for `rzmq`-to-`rzmq` communication. ZAP is not yet supported.
 
 ## Quick Start
@@ -159,6 +159,8 @@ Manages sockets and shared resources.
     Creates a new, independent `rzmq` context with default internal capacities.
 *   **`pub fn with_capacity(actor_mailbox_capacity: Option<usize>) -> Result<Context, ZmqError>`**
     Creates a new, independent `rzmq` context. `actor_mailbox_capacity` optionally specifies the bounded capacity for internal actor command mailboxes. If `None`, a default capacity is used. The minimum capacity used will be 1.
+*   **`pub fn with_blocky(self, blocky: bool) -> Self`**
+    libzmq's `ZMQ_BLOCKY`. With `false`, sockets this context creates start with `LINGER` 0, so `close` and `term` drop queued messages instead of delivering them. The default is `true`.
 *   **`pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError>`**
     Creates a new `Socket` of the specified `SocketType` associated with this context.
 *   **`pub async fn shutdown(&self) -> Result<(), ZmqError>`**
@@ -514,10 +516,18 @@ async fn monitor_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
 ```
 
 ### Closing Sockets and Context Termination
-*   **`socket.close().await?`**: Initiates a graceful shutdown of a specific socket.
+*   **`socket.close().await?`**: Initiates a graceful shutdown of a specific socket. It returns at once; the socket keeps delivering queued messages in the background for its `LINGER`.
 *   **`ctx.term().await?`**: Shuts down the entire context, including all its sockets and background tasks. This is essential for a clean application exit.
 
-It is important to ensure that `Socket` handles are dropped or explicitly closed, and that `Context::term()` is awaited to allow background actors to terminate and release resources.
+`LINGER` defaults to -1, as in libzmq: a message accepted by `send` before `close` is delivered and `term` waits for it. A socket whose peer never comes back would hold `term` for ever, so `term` forces any socket still lingering after 10 seconds to close and drop what it holds. To drop queued messages at once instead, set `LINGER` to 0 on the socket or create the context with `Context::new()?.with_blocky(false)`.
+
+```rust
+use rzmq::socket::LINGER;
+async fn close_without_waiting(socket: &rzmq::Socket) -> Result<(), rzmq::ZmqError> {
+    socket.set_option(LINGER, 0i32).await?;
+    socket.close().await
+}
+```
 
 ## Supported Socket Types
 

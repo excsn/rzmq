@@ -1,6 +1,7 @@
 use crate::error::{ZmqError, ZmqResult};
 use crate::runtime::mailbox::DEFAULT_MAILBOX_CAPACITY;
 use crate::runtime::{ActorType, EventBus, MailboxSender, SystemEvent, WaitGroup};
+use crate::socket::options::SocketOptions;
 use crate::socket::{Socket, SocketType};
 
 use std::collections::HashMap;
@@ -50,6 +51,8 @@ pub(crate) struct ContextInner {
   /// Used to prevent redundant shutdown operations and to signal actors.
   pub(crate) shutdown_initiated: AtomicBool,
   actor_mailbox_capacity: usize,
+  /// libzmq's ZMQ_BLOCKY: when false, sockets created by this context start with LINGER 0.
+  blocky: AtomicBool,
 }
 
 impl ContextInner {
@@ -80,6 +83,7 @@ impl ContextInner {
       actor_wait_group,
       shutdown_initiated: AtomicBool::new(false),
       actor_mailbox_capacity,
+      blocky: AtomicBool::new(true),
     })
   }
 
@@ -157,24 +161,38 @@ impl ContextInner {
       "Context wait_for_termination starting wait on WG (includes listener task)..."
     );
 
-    // Add a timeout to prevent indefinite blocking if an actor fails to stop correctly.
-    let wait_timeout = Duration::from_secs(10); // Example: 10 second timeout.
-    match tokio::time::timeout(wait_timeout, self.actor_wait_group.wait()).await {
+    let linger_cap = Duration::from_secs(10);
+    if tokio::time::timeout(linger_cap, self.actor_wait_group.wait()).await.is_ok() {
+      tracing::info!(
+        initial_count,
+        final_count = self.actor_wait_group.get_count(),
+        "Context termination complete (WaitGroup reached zero)."
+      );
+      return;
+    }
+
+    let remaining = self.actor_wait_group.get_count();
+    tracing::warn!(
+      remaining,
+      cap = ?linger_cap,
+      "Context term wait cap reached, forcing lingering sockets closed."
+    );
+    if let Err(e) = self.event_bus.publish(SystemEvent::ContextTerminationForced) {
+      tracing::warn!("Publishing ContextTerminationForced failed: {}", e);
+    }
+
+    let forced_cap = Duration::from_secs(5);
+    match tokio::time::timeout(forced_cap, self.actor_wait_group.wait()).await {
       Ok(()) => {
-        tracing::info!(
-          initial_count,
-          final_count = self.actor_wait_group.get_count(),
-          "Context termination complete (WaitGroup reached zero)."
-        );
+        tracing::info!(initial_count, "Context termination complete after forcing.");
       }
       Err(_) => {
         let final_count = self.actor_wait_group.get_count();
         tracing::error!(
-            initial_count,
-            final_count,
-            timeout=?wait_timeout,
-            "Context wait_for_termination timed out! {} actors may not have stopped correctly.",
-            final_count // This count still includes the listener if it hasn't exited.
+          initial_count,
+          final_count,
+          "Context wait_for_termination timed out after forcing! {} actors did not stop.",
+          final_count
         );
       }
     }
@@ -250,14 +268,26 @@ impl Context {
     })
   }
 
+  /// libzmq's ZMQ_BLOCKY. The default is `true`: sockets start with LINGER -1
+  /// and `term` waits for queued messages to be delivered. With `false`, sockets
+  /// this context creates afterwards start with LINGER 0. A socket's own LINGER
+  /// setting overrides either.
+  pub fn with_blocky(self, blocky: bool) -> Self {
+    self.inner.blocky.store(blocky, AtomicOrdering::Release);
+    self
+  }
+
   /// Creates a socket of the specified type associated with this context.
   pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError> {
     let handle = self.inner.next_handle();
     tracing::debug!(socket_type = ?socket_type, handle = handle, "Creating socket");
 
-    // `create_socket_actor` now returns the ISocket logic and the single command_sender.
+    let mut initial_options = SocketOptions::default();
+    if !self.inner.blocky.load(AtomicOrdering::Acquire) {
+      initial_options.linger = Some(Duration::ZERO);
+    }
     let (socket_logic, command_sender) =
-      crate::socket::create_socket_actor(handle, self.clone(), socket_type)?;
+      crate::socket::create_socket_actor(handle, self.clone(), socket_type, initial_options)?;
 
     self.inner.register_socket(handle, command_sender.clone());
 

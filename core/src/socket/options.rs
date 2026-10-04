@@ -123,7 +123,7 @@ pub(crate) struct SocketOptions {
   pub rcvtimeo: Option<Duration>,
   pub sndtimeo: Option<Duration>,
   // Connection Behavior
-  pub linger: Option<Duration>, // ZMQ uses -1 for infinite, 0 for immediate, >0 for ms -> map to Duration
+  pub linger: Option<Duration>, // None = -1 (infinite, the default), Some(ZERO) = 0, Some(d) = d
   pub reconnect_ivl: Option<Duration>, // Initial reconnect interval (None = ZMQ default, often 0 = no reconnect)
   pub reconnect_ivl_max: Option<Duration>, // Max reconnect interval (for exponential backoff)
   pub backlog: Option<u32>,
@@ -184,7 +184,7 @@ impl Default for SocketOptions {
       sndhwm: 256,
       rcvtimeo: None,               // -1 in ZMQ
       sndtimeo: None,               // -1 in ZMQ
-      linger: Some(Duration::ZERO), // 0 in ZMQ (different from socket default!)
+      linger: None, // -1 in ZMQ; Context::with_blocky(false) makes it 0
       reconnect_ivl: Some(Duration::from_millis(DEFAULT_RECONNECT_IVL_MS)),
       reconnect_ivl_max: Some(Duration::ZERO), // ZMQ default is 0 (disable max/backoff)
       backlog: None,

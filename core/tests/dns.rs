@@ -1,6 +1,6 @@
 use rzmq::{
   socket::{
-    options::{RCVTIMEO, RECONNECT_IVL}, SocketEvent, SNDTIMEO
+    options::{LINGER, RCVTIMEO, RECONNECT_IVL}, SocketEvent, SNDTIMEO
   }, SocketType, ZmqError
 };
 use serial_test::serial;
@@ -111,6 +111,7 @@ async fn test_dns_connect_to_non_existent_host_fails() -> Result<(), ZmqError> {
     .await?;
   client.send(rzmq::Msg::from_static(b"queued_until_resolved")).await?;
 
+  client.set_option_raw(LINGER, &(0i32).to_ne_bytes()).await?;
   ctx.term().await?;
   println!("--- Test Finished ---");
   Ok(())

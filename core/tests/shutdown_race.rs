@@ -1,6 +1,6 @@
 use rzmq::{
   socket::{
-    options::{LAST_ENDPOINT, RCVHWM, SNDHWM, SNDTIMEO},
+    options::{LAST_ENDPOINT, LINGER, RCVHWM, SNDHWM, SNDTIMEO},
     MonitorReceiver, SocketEvent,
   },
   Context, Msg, SocketType, ZmqError,
@@ -492,6 +492,7 @@ async fn test_chaotic_shutdown_tcp() -> Result<(), ZmqError> {
     let push = ctx.socket(SocketType::Push)?;
     push.set_option_raw(SNDHWM, &TCP_CHAOS_HWM.to_ne_bytes()).await?;
     push.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?; // Non-blocking send
+    push.set_option_raw(LINGER, &(0i32).to_ne_bytes()).await?;
 
     // Spawn a task to connect
     let connect_pair_index = TCP_CHAOS_ENDPOINT.to_string();

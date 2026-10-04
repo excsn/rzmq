@@ -5,6 +5,7 @@ use crate::socket::core::state::ShutdownPhase;
 use crate::socket::core::{SocketCore, command_processor, pipe_manager, shutdown};
 
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Processes a system event received by the SocketCore.
 /// Returns Ok(()) if processed successfully, or Err(ZmqError) for fatal errors
@@ -26,6 +27,28 @@ pub(crate) async fn process_system_event(
         "SocketCore received ContextTerminating event."
       );
       shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
+    }
+
+    SystemEvent::ContextTerminationForced => {
+      let phase = {
+        let mut coordinator = core_arc.shutdown_coordinator.lock().await;
+        coordinator.forced = true;
+        if coordinator.state == ShutdownPhase::Lingering {
+          coordinator.linger_deadline = Some(Instant::now());
+        }
+        coordinator.state
+      };
+      match phase {
+        ShutdownPhase::Running => {
+          tracing::warn!(handle = core_handle, "Context termination forced before this socket began shutting down.");
+          shutdown::initiate_core_shutdown(core_arc.clone(), socket_logic_strong, false).await;
+        }
+        ShutdownPhase::Lingering => {
+          tracing::warn!(handle = core_handle, "Context termination forced, abandoning LINGER.");
+          shutdown::check_and_advance_linger(core_arc.clone(), socket_logic_strong).await?;
+        }
+        _ => {}
+      }
     }
 
     SystemEvent::SocketClosing { socket_id } => {

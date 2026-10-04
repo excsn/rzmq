@@ -146,6 +146,8 @@ The `Context` is the entry point for creating `rzmq` sockets. It manages shared 
         *   Creates a new, independent context with default internal actor mailbox capacities.
     *   `pub fn with_capacity(actor_mailbox_capacity: Option<usize>) -> Result<Self, ZmqError>`
         *   Creates a new, independent context, allowing specification of the bounded capacity for internal actor command mailboxes. If `None`, `rzmq::runtime::mailbox::DEFAULT_MAILBOX_CAPACITY` is used. Minimum capacity is 1.
+    *   `pub fn with_blocky(self, blocky: bool) -> Self`
+        *   libzmq's `ZMQ_BLOCKY`. Default `true`: sockets start with `LINGER` -1 and `term` waits for queued messages. `false`: sockets created afterwards start with `LINGER` 0. A socket's own `LINGER` overrides either.
 
 *   **Methods**:
     *   `pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError>`
@@ -153,7 +155,7 @@ The `Context` is the entry point for creating `rzmq` sockets. It manages shared 
     *   `pub async fn shutdown(&self) -> Result<(), ZmqError>`
         *   Initiates background shutdown of all sockets and actors created by this context. This is a non-blocking initiation; actual termination happens asynchronously.
     *   `pub async fn term(&self) -> Result<(), ZmqError>`
-        *   Shuts down all sockets and waits for their clean termination. This is the recommended way to ensure all resources are released gracefully before an application exits.
+        *   Shuts down all sockets and waits for their clean termination. Sockets drain queued messages for their `LINGER`. After 10 seconds any socket still lingering is forced closed and its queued messages are dropped.
 
 ### `rzmq::Socket` Struct
 
@@ -392,7 +394,7 @@ Constants for socket option integer IDs.
 *   `pub const MAXMSGSIZE: i32 = 22` - maximum inbound frame size in bytes; value is `i64` (`-1` = unlimited, default)
 *   `pub const SNDHWM: i32 = 23` - Messages queued per peer before the socket's high-water mark action. A `PUB` drops a message for a subscriber at this limit and keeps sending to the others, unless `XPUB_NODROP` is set.
 *   `pub const RCVHWM: i32 = 24`
-*   `pub const LINGER: i32 = 17`
+*   `pub const LINGER: i32 = 17` - how long `close` keeps delivering queued messages; value is `i32` milliseconds (`-1` = until delivered, the default, `0` = drop them at once). `Context::with_blocky(false)` changes the default to `0`.
 *   `pub const SUBSCRIBE: i32 = 6`
 *   `pub const UNSUBSCRIBE: i32 = 7`
 *   `pub const ROUTING_ID: i32 = 5`

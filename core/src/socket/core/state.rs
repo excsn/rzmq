@@ -435,6 +435,8 @@ pub(crate) struct ShutdownCoordinator {
   #[cfg(feature = "inproc")]
   pub(crate) inproc_connections_to_cleanup: Vec<(usize, usize, String)>, // (CoreWriteID, CoreReadID, ConnectorURI)
   pub(crate) linger_deadline: Option<Instant>,
+  /// Set by `ContextTerminationForced`: any linger started afterwards expires at once.
+  pub(crate) forced: bool,
 }
 
 impl Default for ShutdownCoordinator {
@@ -446,6 +448,7 @@ impl Default for ShutdownCoordinator {
       #[cfg(feature = "inproc")]
       inproc_connections_to_cleanup: Vec::new(),
       linger_deadline: None,
+      forced: false,
     }
   }
 }
