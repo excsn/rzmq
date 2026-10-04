@@ -1577,6 +1577,7 @@ dependencies = [
  "clap",
  "hex",
  "rand 0.9.5",
+ "rzmq",
  "xs_x25519-dalek",
 ]
 

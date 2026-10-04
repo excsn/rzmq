@@ -135,6 +135,63 @@ async fn libzmq_curve_client_against_rzmq_curve_server() -> Result<()> {
   Ok(())
 }
 
+/// The server's public key reaches libzmq as Z85 text written by rzmq's encoder,
+/// from the 32 raw bytes `get_option(CURVE_PUBLIC_KEY)` derives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn libzmq_decodes_z85_encoded_by_rzmq() -> Result<()> {
+  common::setup_logging();
+  let (_, secret) = libzmq_keypair()?;
+  let ctx = context()?;
+  let rep = ctx.socket(SocketType::Rep)?;
+  rep.set_option(CURVE_SERVER, true).await?;
+  rep.set_option(CURVE_SECRET_KEY, secret.as_str()).await?;
+  let public_raw = rep.get_option(CURVE_PUBLIC_KEY).await?;
+  assert_eq!(public_raw.len(), 32);
+  let public_z85 = rzmq::security::z85::encode(&public_raw).unwrap();
+  let monitor = rep.monitor_default().await?;
+  let endpoint = common::alloc_endpoint();
+  rep.bind(&endpoint).await?;
+
+  let (_guard, mut reader) =
+    common::spawn_and_wait_ready("curve_req_client.py", &[endpoint.as_str(), public_z85.as_str()], Duration::from_secs(5))?;
+  let outcome = handshake_outcome(&monitor).await?;
+  assert!(matches!(outcome, SocketEvent::HandshakeSucceeded { .. }), "got {:?}", outcome);
+  common::wait_for_line(&mut reader, "HANDSHAKE OK", Duration::from_secs(5))?;
+  Ok(())
+}
+
+/// Keys written by `rzmq keygen curve` work as a server key in rzmq and as the
+/// server's public key in libzmq.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_curve_key_files_are_read_by_rzmq_and_libzmq() -> Result<()> {
+  common::setup_logging();
+  let dir = std::env::temp_dir().join(format!("rzmq_interop_cli_keys_{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  let status = std::process::Command::new("cargo")
+    .args(["run", "-q", "-p", "rzmq_cli", "--", "keygen", "curve", "--name", "server", "--output-dir"])
+    .arg(&dir)
+    .current_dir("..")
+    .status()?;
+  anyhow::ensure!(status.success(), "rzmq keygen curve failed");
+  let secret = std::fs::read_to_string(dir.join("server.curve.sk"))?;
+  let public = std::fs::read_to_string(dir.join("server.curve.pk"))?;
+
+  let ctx = context()?;
+  let rep = ctx.socket(SocketType::Rep)?;
+  rep.set_option(CURVE_SERVER, true).await?;
+  rep.set_option(CURVE_SECRET_KEY, secret.trim()).await?;
+  let monitor = rep.monitor_default().await?;
+  let endpoint = common::alloc_endpoint();
+  rep.bind(&endpoint).await?;
+
+  let (_guard, mut reader) =
+    common::spawn_and_wait_ready("curve_req_client.py", &[endpoint.as_str(), public.trim()], Duration::from_secs(5))?;
+  let outcome = handshake_outcome(&monitor).await?;
+  assert!(matches!(outcome, SocketEvent::HandshakeSucceeded { .. }), "got {:?}", outcome);
+  common::wait_for_line(&mut reader, "HANDSHAKE OK", Duration::from_secs(5))?;
+  Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn libzmq_curve_client_with_wrong_server_key_is_rejected_by_rzmq() -> Result<()> {
   common::setup_logging();

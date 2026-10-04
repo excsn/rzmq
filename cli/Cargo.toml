@@ -23,3 +23,6 @@ clap = { version = "^4.5", features = ["derive"] }
 hex = "^0.4"
 rand = { version = "^0.9" }
 x25519-dalek = { workspace = true }
+
+[dev-dependencies]
+rzmq = { path = "../core", default-features = false }
