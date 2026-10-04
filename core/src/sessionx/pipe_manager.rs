@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::message::FrameBatch;
+use crate::socket::core::state::ConservationCounters;
 use crate::socket::patterns::PipeCredits;
 use fibre::{RecvError, TryRecvError};
 use fibre::mpmc::AsyncReceiver as BoundedAsyncReceiver;
@@ -12,6 +13,7 @@ use super::states::CorePipeManagerXState;
 pub(crate) struct CorePipeManagerX {
   pub(crate) state: CorePipeManagerXState,
   credits: Option<Arc<PipeCredits>>,
+  counters: Option<Arc<ConservationCounters>>,
 }
 
 impl CorePipeManagerX {
@@ -19,6 +21,17 @@ impl CorePipeManagerX {
     Self {
       state: CorePipeManagerXState::new(),
       credits: None,
+      counters: None,
+    }
+  }
+
+  pub(crate) fn counters(&self) -> Option<&Arc<ConservationCounters>> {
+    self.counters.as_ref()
+  }
+
+  fn count_drained(&self, n: usize) {
+    if let Some(c) = &self.counters {
+      ConservationCounters::add(&c.drained, n);
     }
   }
 
@@ -28,12 +41,14 @@ impl CorePipeManagerX {
     rx_from_core: BoundedAsyncReceiver<FrameBatch>,
     core_pipe_read_id_for_incoming_routing: usize,
     credits: Option<Arc<PipeCredits>>,
+    counters: Option<Arc<ConservationCounters>>,
   ) {
     if self.state.is_attached {
       return;
     }
     self.state.rx_from_core = Some(rx_from_core);
     self.credits = credits;
+    self.counters = counters;
     self.state.core_pipe_read_id_for_incoming_routing = Some(core_pipe_read_id_for_incoming_routing);
     self.state.is_attached = true;
   }
@@ -50,6 +65,7 @@ impl CorePipeManagerX {
     if let Some(ref rx) = self.state.rx_from_core {
       let batch = rx.recv().await?;
       self.return_credits(1);
+      self.count_drained(1);
       Ok(batch)
     } else {
       // This indicates a programming error: called before pipes are attached
@@ -75,6 +91,7 @@ impl CorePipeManagerX {
     if let Some(ref rx) = self.state.rx_from_core {
       let batch = rx.try_recv()?;
       self.return_credits(1);
+      self.count_drained(1);
       Ok(batch)
     } else {
       Err(TryRecvError::Disconnected)
@@ -93,6 +110,7 @@ impl CorePipeManagerX {
     if let Some(ref rx) = self.state.rx_from_core {
       let received = rx.try_recv_batch_mut(out, max).unwrap_or(0);
       self.return_credits(received);
+      self.count_drained(received);
       received
     } else {
       0
@@ -122,7 +140,7 @@ mod additional_pipe_manager_tests {
 
     let (tx, rx) = fibre::mpmc::bounded_async::<FrameBatch>(1);
     let _ = tx; // keep sender alive
-    manager.attach(rx, 42, None);
+    manager.attach(rx, 42, None, None);
 
     assert!(manager.is_attached());
     assert_eq!(manager.state.core_pipe_read_id_for_incoming_routing, Some(42));

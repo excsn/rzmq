@@ -11,6 +11,7 @@ use crate::socket::patterns::PipeCredits;
 use fibre::mpmc::{AsyncReceiver, AsyncSender as BoundedAsyncSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::task::JoinHandle;
 
@@ -43,6 +44,36 @@ pub(crate) struct EndpointInfo {
   pub connection_iface: Arc<dyn ISocketConnection>,
   /// Set only for connections driven by a session actor.
   pub throttle: Option<AdaptiveThrottle>,
+}
+
+/// Message conservation for one socket's session-backed pipes. Every message
+/// a pattern hands to a pipe is `sent`; every one a session pulls out is
+/// `drained`; what is still in a pipe at close is `dropped_in_pipes`, so
+/// `sent == drained + dropped_in_pipes` at close or messages leaked. Of the
+/// drained messages, `dropped_in_sessions` were still buffered when their
+/// session exited and never reached the wire. Inproc pipes are the peer's
+/// inbound queue and are not counted.
+#[derive(Debug, Default)]
+pub(crate) struct ConservationCounters {
+  pub sent: AtomicU64,
+  pub drained: AtomicU64,
+  pub dropped_in_pipes: AtomicU64,
+  pub dropped_in_sessions: AtomicU64,
+}
+
+impl ConservationCounters {
+  pub(crate) fn add(counter: &AtomicU64, n: usize) {
+    counter.fetch_add(n as u64, Ordering::Relaxed);
+  }
+
+  pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64) {
+    (
+      self.sent.load(Ordering::Relaxed),
+      self.drained.load(Ordering::Relaxed),
+      self.dropped_in_pipes.load(Ordering::Relaxed),
+      self.dropped_in_sessions.load(Ordering::Relaxed),
+    )
+  }
 }
 
 /// A pipe created by `connect()` and kept across the sessions that drain it.
@@ -157,6 +188,7 @@ pub(crate) struct CoreState {
   #[cfg(feature = "inproc")]
   pub(crate) bound_inproc_names: HashSet<String>,
   pub(crate) monitor_tx: Option<MonitorSender>,
+  pub(crate) counters: Arc<ConservationCounters>,
   pub(crate) last_bound_endpoint: Option<String>,
   pub(crate) bind_or_connect_called: bool,
 }
@@ -176,6 +208,7 @@ impl CoreState {
       #[cfg(feature = "inproc")]
       bound_inproc_names: HashSet::new(),
       monitor_tx: None,
+      counters: Arc::new(ConservationCounters::default()),
       last_bound_endpoint: None,
       bind_or_connect_called: false,
     }

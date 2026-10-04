@@ -14,7 +14,7 @@ use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::inproc_reader;
 use crate::socket::core::pipe_manager;
 
-use crate::socket::core::state::{ConnectPipe, CoreState, EndpointInfo, EndpointType, ShutdownPhase, listener_key};
+use crate::socket::core::state::{ConnectPipe, ConservationCounters, CoreState, EndpointInfo, EndpointType, ShutdownPhase, listener_key};
 use crate::socket::core::{SocketCore, shutdown};
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::socket::options::{self, *};
@@ -648,7 +648,7 @@ async fn ensure_connect_pipe(
   socket_logic: &Arc<dyn ISocket>,
   target_uri: &str,
 ) -> bool {
-  let (sndhwm, sndtimeo, socket_type) = {
+  let (sndhwm, sndtimeo, socket_type, counters) = {
     let cs = core_arc.core_state.read();
     if cs.options.immediate {
       return true;
@@ -656,7 +656,7 @@ async fn ensure_connect_pipe(
     if cs.connect_pipes.contains_key(target_uri) {
       return false;
     }
-    (cs.options.sndhwm.max(1), cs.options.sndtimeo, cs.socket_type)
+    (cs.options.sndhwm.max(1), cs.options.sndtimeo, cs.socket_type, Arc::clone(&cs.counters))
   };
 
   let (tx, rx) = fibre::mpmc::bounded_async::<FrameBatch>(sndhwm);
@@ -664,7 +664,7 @@ async fn ensure_connect_pipe(
   let core_read_id = core_arc.context.inner().next_handle();
   let pending_handle_id = core_arc.context.inner().next_handle();
   let credits = (socket_type == SocketType::Pub).then(|| Arc::new(PipeCredits::new(tx.capacity())));
-  let iface = Arc::new(ScaConnectionIface::unbound(tx.clone(), core_write_id, sndtimeo, credits.clone()));
+  let iface = Arc::new(ScaConnectionIface::unbound(tx.clone(), core_write_id, sndtimeo, credits.clone(), counters));
   let (placeholder_mailbox, _unused_rx) = fibre::mpsc::bounded_async::<Command>(1);
 
   let endpoint_info = EndpointInfo {
@@ -1141,12 +1141,14 @@ async fn handle_new_connection_established(
           socket_logic_strong.pipe_hiccuped(core_read_id).await;
         }
         let incoming_pipe_sender = socket_logic_strong.get_incoming_pipe_sender(core_read_id);
+        let counters = Arc::clone(&core_arc.core_state.read().counters);
         let attach_cmd = Command::ScaInitializePipes {
           sca_handle_id,
           rx_from_core: rx_sca_from_core,
           core_pipe_read_id_for_incoming_routing: core_read_id,
           incoming_pipe_sender,
           credits,
+          counters,
         };
         if sca_mailbox.send(attach_cmd).await.is_err() {
           return Err(ZmqError::Internal(format!(
@@ -1163,9 +1165,9 @@ async fn handle_new_connection_established(
       let core_write_id = core_arc.context.inner().next_handle();
       let core_read_id = core_arc.context.inner().next_handle();
 
-      let (sndtimeo_snapshot, socket_type) = {
+      let (sndtimeo_snapshot, socket_type, counters) = {
         let core_s = core_arc.core_state.read();
-        (core_s.options.sndtimeo, core_s.socket_type)
+        (core_s.options.sndtimeo, core_s.socket_type, Arc::clone(&core_s.counters))
       };
       let credits = (socket_type == SocketType::Pub)
         .then(|| Arc::new(PipeCredits::new(tx_core_to_sca.capacity())));
@@ -1177,6 +1179,7 @@ async fn handle_new_connection_established(
         core_write_id,
         sndtimeo_snapshot,
         credits.clone(),
+        Arc::clone(&counters),
       ));
 
       let endpoint_info = EndpointInfo {
@@ -1237,6 +1240,7 @@ async fn handle_new_connection_established(
         core_pipe_read_id_for_incoming_routing: core_read_id,
         incoming_pipe_sender,
         credits,
+        counters,
       };
 
       if sca_mailbox.send(attach_cmd).await.is_err() {

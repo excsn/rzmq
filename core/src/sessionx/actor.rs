@@ -620,10 +620,15 @@ where
         log_session_diagnostics!(last_log_ms, self, ingress_buffer, egress_buffer, sndhwm, core_carryover);
       }
 
-      // Message-conservation audit: anything still queued when the operational
-      // loop exits dies with this actor unless a later phase drains it. One log
-      // line per connection at shutdown — egress loss becomes provable from the
-      // log instead of inferred.
+      // The loop leaves with egress still buffered only when it is being
+      // abandoned: the graceful drain exits on empty.
+      let abandoned = egress_buffer.pending_messages() + core_carryover.len();
+      if abandoned > 0 {
+        if let Some(counters) = self.core_pipe_manager.counters() {
+          crate::socket::core::state::ConservationCounters::add(&counters.dropped_in_sessions, abandoned);
+        }
+      }
+
       #[cfg(feature = "diagnostics")]
       {
         let residual_egress = egress_buffer.pending_messages();
@@ -720,6 +725,7 @@ where
         core_pipe_read_id_for_incoming_routing,
         incoming_pipe_sender,
         credits,
+        counters,
       } => {
         if self.handle != sca_handle_id {
           tracing::warn!(
@@ -765,7 +771,7 @@ where
         );
         self
           .core_pipe_manager
-          .attach(rx_from_core, core_pipe_read_id_for_incoming_routing, credits);
+          .attach(rx_from_core, core_pipe_read_id_for_incoming_routing, credits, Some(counters));
         tracing::info!(
           sca_handle = self.handle,
           core_read_id = core_pipe_read_id_for_incoming_routing,

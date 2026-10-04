@@ -443,6 +443,22 @@ pub(crate) async fn perform_final_pipe_cleanup(
 
   let (mut pipes_tx_map, mut reader_tasks_map) = {
     let mut core_s = core_arc.core_state.write();
+    let left_in_session_pipes: usize = core_s
+      .endpoints
+      .values()
+      .filter(|ep| ep.connection_iface.as_any().downcast_ref::<crate::sessionx::ScaConnectionIface>().is_some())
+      .filter_map(|ep| ep.pipe_ids)
+      .filter_map(|(write_id, _)| core_s.pipes_tx.get(&write_id))
+      .map(|tx| tx.len())
+      .sum();
+    crate::socket::core::state::ConservationCounters::add(&core_s.counters.dropped_in_pipes, left_in_session_pipes);
+    let (sent, drained, dropped_in_pipes, dropped_in_sessions) = core_s.counters.snapshot();
+    let leaked = sent as i128 - drained as i128 - dropped_in_pipes as i128;
+    if leaked != 0 {
+      tracing::error!(handle = core_handle, sent, drained, dropped_in_pipes, dropped_in_sessions, leaked, "Message conservation: egress leaked");
+    } else {
+      tracing::info!(handle = core_handle, sent, drained, dropped_in_pipes, dropped_in_sessions, "Message conservation at close");
+    }
     (
       std::mem::take(&mut core_s.pipes_tx),
       std::mem::take(&mut core_s.pipe_reader_task_handles),

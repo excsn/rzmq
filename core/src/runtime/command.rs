@@ -103,6 +103,7 @@ pub(crate) enum Command {
     core_pipe_read_id_for_incoming_routing: usize,
     incoming_pipe_sender: Option<PipeMessageSender>,
     credits: Option<Arc<PipeCredits>>,
+    counters: Arc<crate::socket::core::state::ConservationCounters>,
   },
 
   /// Sent from a TCP/IPC connecter or acceptor directly to SocketCore for ViaSca connections.
