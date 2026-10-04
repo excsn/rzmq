@@ -586,10 +586,7 @@ async fn handle_user_connect(
 
   let parse_result = parse_endpoint(&endpoint_uri);
   match parse_result {
-    Ok(Endpoint::Tcp(_, ref parsed_uri_for_connecter))
-    | Ok(Endpoint::Ipc(_, ref parsed_uri_for_connecter)) => {
-      // For TCP/IPC, spawn a Connecter actor.
-      // The URI passed to respawn_connecter_actor should be the one used for connection attempts.
+    Ok(Endpoint::Tcp(_, ref parsed_uri_for_connecter)) => {
       respawn_connecter_actor(
         core_arc.clone(),
         socket_logic,
@@ -597,6 +594,16 @@ async fn handle_user_connect(
       )
       .await;
       let _ = reply_tx.send(Ok(())); // UserConnect is async, Ok(()) means attempt initiated.
+    }
+    #[cfg(feature = "ipc")]
+    Ok(Endpoint::Ipc(_, ref parsed_uri_for_connecter)) => {
+      respawn_connecter_actor(
+        core_arc.clone(),
+        socket_logic,
+        parsed_uri_for_connecter.clone(),
+      )
+      .await;
+      let _ = reply_tx.send(Ok(()));
     }
     #[cfg(feature = "inproc")]
     Ok(Endpoint::Inproc(ref name)) => {
@@ -683,6 +690,7 @@ pub(crate) async fn respawn_connecter_actor(
         parent_socket_id,
       );
     }
+    #[cfg(feature = "inproc")]
     Ok(Endpoint::Inproc(_)) => {
       tracing::warn!(handle = core_handle, %target_uri, "Inproc connections are not respawned via Connecter actor mechanism.");
     }
