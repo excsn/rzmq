@@ -17,7 +17,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingLotRwLock};
 use tokio::sync::{Mutex as TokioMutex, Notify};
-use tokio::task::JoinHandle;
 use tokio::time::timeout as tokio_timeout;
 
 use super::parse_bool_option;
@@ -34,81 +33,6 @@ enum DealerSendTransaction {
 }
 
 #[derive(Debug)]
-struct DealerSocketOutgoingProcessor {
-  core_handle: usize,
-  pending_queue: Arc<TokioMutex<VecDeque<FrameBatch>>>,
-  outgoing_orchestrator: Arc<OutgoingMessageOrchestrator>,
-  queue_activity_notifier: Arc<Notify>,
-  peer_availability_notifier: Arc<Notify>,
-  stop_signal: Arc<Notify>,
-}
-
-impl DealerSocketOutgoingProcessor {
-  pub async fn run(self) {
-    tracing::debug!(
-      "[DealerProc {}] Outgoing queue processor task started.",
-      self.core_handle
-    );
-
-    loop {
-      let mut current_message_to_send_option: Option<FrameBatch> = None;
-
-      tokio::select! {
-        biased;
-        _ = self.stop_signal.notified() => {
-          tracing::debug!("[DealerProc {}] Stop signal received. Exiting processor loop.", self.core_handle);
-          break;
-        }
-        _ = async {
-          tokio::select! {
-            _ = self.queue_activity_notifier.notified() => {
-              tracing::trace!("[DealerProc {}] Woke on queue_activity_notifier.", self.core_handle);
-            },
-            _ = self.peer_availability_notifier.notified() => {
-              tracing::trace!("[DealerProc {}] Woke on peer_availability_notifier.", self.core_handle);
-            },
-          }
-        } => {
-          let mut queue_guard = self.pending_queue.lock().await;
-          if !queue_guard.is_empty() && self.outgoing_orchestrator.has_connections() {
-            current_message_to_send_option = queue_guard.pop_front();
-          }
-        }
-      }
-
-      if let Some(zmtp_frames_for_logical_message) = current_message_to_send_option {
-        tracing::trace!(
-          "[DealerProc {}] Processing message from outgoing queue ({} parts).",
-          self.core_handle,
-          zmtp_frames_for_logical_message.len()
-        );
-
-        match self.outgoing_orchestrator.route_message(zmtp_frames_for_logical_message, false).await {
-          Ok(()) => {}
-          Err((returned, _)) => {
-            tracing::debug!(
-              "[DealerProc {}] route_message failed (all peers full or no peers). Re-queuing.",
-              self.core_handle
-            );
-            self.pending_queue.lock().await.push_front(returned);
-            self.queue_activity_notifier.notify_one();
-          }
-        }
-      } else {
-        tracing::trace!(
-          "[DealerProc {}] No message popped from queue (or conditions not met). Continuing to wait.",
-          self.core_handle
-        );
-      }
-    }
-    tracing::debug!(
-      "[DealerProc {}] Outgoing queue processor task finished execution.",
-      self.core_handle
-    );
-  }
-}
-
-#[derive(Debug)]
 pub(crate) struct DealerSocket {
   core: Arc<SocketCore>,
   outgoing_orchestrator: Arc<OutgoingMessageOrchestrator>,
@@ -116,33 +40,13 @@ pub(crate) struct DealerSocket {
   pending_pipe_senders: ParkingMutex<HashMap<usize, PipeMessageSender>>,
   frame_recv_buffer: ParkingMutex<Option<VecDeque<Msg>>>,
   pipe_read_to_endpoint_uri: ParkingLotRwLock<HashMap<usize, String>>,
-  pending_outgoing_queue: Arc<TokioMutex<VecDeque<FrameBatch>>>,
-  outgoing_queue_activity_notifier: Arc<Notify>,
-  peer_availability_notifier: Arc<Notify>,
-  processor_task_handle: TokioMutex<Option<JoinHandle<()>>>,
-  processor_stop_signal: Arc<Notify>,
   current_send_transaction: TokioMutex<DealerSendTransaction>,
   framing: FramingLatch,
 }
 
 impl DealerSocket {
   pub fn new(core: Arc<SocketCore>) -> Self {
-    let pending_queue_arc = Arc::new(TokioMutex::new(VecDeque::new()));
     let orchestrator_arc = Arc::new(OutgoingMessageOrchestrator::new());
-    let queue_notifier_arc = Arc::new(Notify::new());
-    let peer_notifier_arc = Arc::new(Notify::new());
-    let stop_signal_arc = Arc::new(Notify::new());
-
-    let processor = DealerSocketOutgoingProcessor {
-      core_handle: core.handle,
-      pending_queue: pending_queue_arc.clone(),
-      outgoing_orchestrator: orchestrator_arc.clone(),
-      queue_activity_notifier: queue_notifier_arc.clone(),
-      peer_availability_notifier: peer_notifier_arc.clone(),
-      stop_signal: stop_signal_arc.clone(),
-    };
-
-    let processor_jh = tokio::spawn(processor.run());
     let (max_conn, rcvbatch_count) = {
       let opts = &core.core_state.read().options;
       (opts.max_connections.unwrap_or(1024), opts.rcvbatch_count)
@@ -154,11 +58,6 @@ impl DealerSocket {
       pending_pipe_senders: ParkingMutex::new(HashMap::new()),
       frame_recv_buffer: ParkingMutex::new(None),
       pipe_read_to_endpoint_uri: ParkingLotRwLock::new(HashMap::new()),
-      pending_outgoing_queue: pending_queue_arc,
-      outgoing_queue_activity_notifier: queue_notifier_arc,
-      peer_availability_notifier: peer_notifier_arc,
-      processor_task_handle: TokioMutex::new(Some(processor_jh)),
-      processor_stop_signal: stop_signal_arc,
       current_send_transaction: TokioMutex::new(DealerSendTransaction::Idle),
       framing: FramingLatch::new(dealer_auto_encode),
     }
@@ -270,7 +169,6 @@ impl ISocket for DealerSocket {
   async fn connect(&self, endpoint: &str) -> Result<(), ZmqError> {
     let res = delegate_to_core!(self, UserConnect, endpoint: endpoint.to_string());
     if res.is_ok() {
-      self.peer_availability_notifier.notify_one();
     }
     res
   }
@@ -502,18 +400,6 @@ impl ISocket for DealerSocket {
       Command::Stop => {
         self.ingress_engine.close();
         self.outgoing_orchestrator.deactivate();
-        self.processor_stop_signal.notify_one();
-        if let Some(handle) = self.processor_task_handle.lock().await.take() {
-          if let Err(e) = tokio_timeout(Duration::from_millis(100), handle).await {
-            tracing::warn!(
-              "[Dealer {}] Timeout or error waiting for processor task on close: {:?}",
-              self.core.handle,
-              e
-            );
-          }
-        }
-        self.outgoing_queue_activity_notifier.notify_waiters();
-        self.peer_availability_notifier.notify_waiters();
       }
       _ => return Ok(false),
     }
@@ -522,7 +408,7 @@ impl ISocket for DealerSocket {
   }
 
   fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {
-    self.pending_pipe_senders.lock().remove(&pipe_read_id)
+    self.pending_pipe_senders.lock().get(&pipe_read_id).cloned()
   }
 
   async fn pipe_attached(
@@ -551,9 +437,6 @@ impl ISocket for DealerSocket {
       };
       let sender = self.ingress_engine.register_pipe(pipe_read_id, rcvhwm, rcvbatch_count);
       self.pending_pipe_senders.lock().insert(pipe_read_id, sender);
-
-      self.peer_availability_notifier.notify_one();
-      self.outgoing_queue_activity_notifier.notify_one();
     } else {
       tracing::warn!(
         handle = self.core.handle,
@@ -579,7 +462,6 @@ impl ISocket for DealerSocket {
 
     self.ingress_engine.deregister_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
-    self.peer_availability_notifier.notify_waiters();
   }
 }
 
@@ -590,78 +472,26 @@ impl DealerSocket {
         "Socket is closing or terminated".into(),
       ));
     }
-    let (global_sndtimeo, global_sndhwm) = {
-      let core_s_read = self.core.core_state.read();
-      (
-        core_s_read.options.sndtimeo,
-        core_s_read.options.sndhwm.max(1),
-      )
-    };
-
-    match self.outgoing_orchestrator.route_message(zmtp_wire_frames, false).await {
-      Ok(()) => Ok(()),
-      Err((returned, _)) => {
-        self.queue_message_or_error(returned, global_sndhwm, global_sndtimeo).await
-      }
-    }
-  }
-
-  async fn queue_message_or_error(
-    &self,
-    full_message_parts: FrameBatch,
-    global_sndhwm: usize,
-    global_sndtimeo: Option<Duration>,
-  ) -> Result<(), ZmqError> {
-    tracing::trace!(
-      "[Dealer {}] Attempting to queue message ({} parts).",
-      self.core.handle,
-      full_message_parts.len()
-    );
-    loop {
-      if !self.core.is_running() {
-        return Err(ZmqError::InvalidState(
-          "Socket is closing while trying to queue".into(),
-        ));
-      }
-      {
-        let mut queue_guard = self.pending_outgoing_queue.lock().await;
-        if queue_guard.len() < global_sndhwm {
-          queue_guard.push_back(full_message_parts);
-          self.outgoing_queue_activity_notifier.notify_one();
-          return Ok(());
+    let sndtimeo = self.core.core_state.read().options.sndtimeo;
+    let wait_for_peer = !matches!(sndtimeo, Some(d) if d.is_zero());
+    match sndtimeo {
+      Some(d) if !d.is_zero() => {
+        match tokio_timeout(d, self.outgoing_orchestrator.route_message(zmtp_wire_frames, wait_for_peer)).await {
+          Ok(Ok(())) => Ok(()),
+          Ok(Err((_, e))) => Err(e),
+          Err(_) => Err(ZmqError::Timeout),
         }
       }
-      match global_sndtimeo {
-        Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
-        Some(duration) => {
-          let queue_wait_fut = self.outgoing_queue_activity_notifier.notified();
-          if tokio_timeout(duration, queue_wait_fut).await.is_err() {
-            return Err(ZmqError::Timeout);
-          }
-        }
-        None => {
-          tokio::select! {
-            biased;
-            _ = async { if !self.core.is_running() { futures::future::pending().await } else { futures::future::pending().await } } => {
-              return Err(ZmqError::InvalidState("Socket is closing while waiting for queue space".into()));
-            }
-            _ = self.outgoing_queue_activity_notifier.notified() => {}
-            _ = self.peer_availability_notifier.notified() => {}
-          }
-        }
-      }
+      _ => match self.outgoing_orchestrator.route_message(zmtp_wire_frames, wait_for_peer).await {
+        Ok(()) => Ok(()),
+        Err((_, e)) => Err(e),
+      },
     }
   }
 }
 
 impl Drop for DealerSocket {
   fn drop(&mut self) {
-    self.processor_stop_signal.notify_one();
-    if let Ok(mut guard) = self.processor_task_handle.try_lock() {
-      if let Some(handle) = guard.take() {
-        handle.abort();
-      }
-    }
     if let Ok(mut transaction_guard) = self.current_send_transaction.try_lock() {
       if let DealerSendTransaction::Buffering {
         completion_notifier,

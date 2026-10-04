@@ -569,7 +569,7 @@ impl IpcConnecter {
         loop {
           match system_event_rx.recv().await {
             Ok(SystemEvent::ContextTerminating) => break,
-            Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => break,
+            Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => break,
             Ok(_) => continue,
             Err(_) => break, // Channel closed or lagged
           }

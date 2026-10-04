@@ -4,7 +4,7 @@
 
 mod common;
 
-use rzmq::socket::options::{RCVHWM, RCVTIMEO, SNDHWM, SNDTIMEO};
+use rzmq::socket::options::{IMMEDIATE, RCVHWM, RCVTIMEO, SNDHWM, SNDTIMEO};
 use rzmq::socket::{RCVBUF, SNDBUF, SocketEvent};
 use rzmq::{Msg, MsgFlags, SocketType, ZmqError};
 use std::sync::Arc;
@@ -185,6 +185,9 @@ async fn test_load_balance_disconnect_recovery() -> Result<(), ZmqError> {
   let ep_a = common::bind_and_resolve_tcp(&pull_a).await?;
   let ep_b = common::bind_and_resolve_tcp(&pull_b).await?;
 
+  // Without IMMEDIATE a dead peer keeps its pipe and absorbs its round-robin
+  // share up to SNDHWM until it reconnects.
+  push.set_option(IMMEDIATE, true).await?;
   push.connect(&ep_a).await?;
   push.connect(&ep_b).await?;
   tokio::time::sleep(Duration::from_millis(150)).await;

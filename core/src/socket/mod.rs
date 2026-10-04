@@ -189,6 +189,12 @@ pub(crate) trait ISocket: Send + Sync + 'static {
   /// * `pipe_read_id` - The ID of the pipe (from `SocketCore`'s perspective, its read ID) being detached.
   async fn pipe_detached(&self, pipe_read_id: usize);
 
+  /// Called by `SocketCore` when a new session takes over an existing
+  /// connect-side pipe after a reconnect. The pipe stays attached throughout,
+  /// so state the peer forgot with the old connection (SUB subscriptions) is
+  /// resent here.
+  async fn pipe_hiccuped(&self, _pipe_read_id: usize) {}
+
   /// Returns the ingress `PipeMessageSender` that the session actor should use to push
   /// complete logical messages directly into this socket's per-pipe receive queue.
   ///

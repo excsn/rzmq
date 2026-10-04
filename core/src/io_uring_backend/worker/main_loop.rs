@@ -296,7 +296,7 @@ impl UringWorker {
         let ProtocolConfig::Zmtp(engine_cfg) = protocol_config;
 
         let sndhwm = engine_cfg.sndhwm.max(1);
-        let (egress_tx, egress_rx) = fibre::mpsc::bounded::<crate::message::FrameBatch>(sndhwm);
+        let (egress_tx, egress_rx) = fibre::mpmc::bounded::<crate::message::FrameBatch>(sndhwm);
         let egress_tx_async = egress_tx.to_async();
         let egress_credits = (engine_cfg.socket_type_name == "PUB")
           .then(|| std::sync::Arc::new(crate::socket::patterns::PipeCredits::new(egress_tx_async.capacity())));

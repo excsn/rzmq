@@ -348,8 +348,26 @@ pub(crate) async fn handle_actor_stopping_event(
         }
       }
     }
-    // If the event arrives while Lingering or later, it's a late arrival.
-    // The resource cleanup was still important, but we don't need to touch the counter.
+    // A session lost while lingering is rescheduled like a running one when
+    // its connect pipe still holds messages, so LINGER can deliver them.
+    ShutdownPhase::Lingering if should_consider_reconnect => {
+      if let Some(uri_str) = endpoint_uri_opt {
+        let target_uri = uri_str.to_string();
+        let mut state = core_arc.core_state.write();
+        let pipe_has_messages = state
+          .connect_pipes
+          .get(&target_uri)
+          .and_then(|p| state.pipes_tx.get(&p.core_write_id))
+          .map_or(false, |tx| !tx.is_empty());
+        if pipe_has_messages {
+          let options = state.options.clone();
+          let base = options.reconnect_ivl.unwrap_or(std::time::Duration::from_millis(100));
+          let max = options.reconnect_ivl_max.unwrap_or(std::time::Duration::from_secs(60));
+          let recon_state = state.reconnect_states.entry(target_uri).or_default();
+          recon_state.on_connection_failure(base, max);
+        }
+      }
+    }
     ShutdownPhase::Lingering | ShutdownPhase::CleaningPipes | ShutdownPhase::Finished => {
       tracing::debug!(
           handle = core_handle,

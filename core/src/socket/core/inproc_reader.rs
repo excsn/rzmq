@@ -3,7 +3,7 @@ use crate::runtime::{ActorType, EventBus, SystemEvent};
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::socket::patterns::PipeCredits;
 
-use fibre::mpsc::BoundedAsyncReceiver;
+use fibre::mpmc::AsyncReceiver as BoundedAsyncReceiver;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinHandle;

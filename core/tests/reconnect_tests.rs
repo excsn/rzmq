@@ -125,14 +125,7 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
     "[PUSH {}] Initial send result: {:?}",
     endpoint, initial_send_result
   );
-  assert!(
-    matches!(
-      initial_send_result,
-      Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout)
-    ),
-    "[PUSH {}] Initial send should fail (ResourceLimitReached or Timeout)",
-    endpoint
-  );
+  initial_send_result?;
 
   println!(
     "[SYS {}] Waiting {}ms before starting PULL server...",
@@ -178,6 +171,13 @@ async fn test_push_pull_reconnect_advanced_style() -> Result<(), ZmqError> {
   );
   push_socket.send(Msg::from_static(test_payload)).await?;
   println!("[PUSH {}] Payload sent successfully.", endpoint);
+
+  let queued_ping = common::recv_timeout(
+    &pull_socket,
+    Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64),
+  )
+  .await?;
+  assert_eq!(queued_ping.data().unwrap(), b"Initial PUSH Ping");
 
   println!("[PULL {}] Attempting to receive message...", endpoint);
   let received_msg = common::recv_timeout(
@@ -237,14 +237,7 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
     "[REQ {}] Initial send result: {:?}",
     endpoint, initial_send_result
   );
-  assert!(
-    matches!(
-      initial_send_result,
-      Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout)
-    ),
-    "[REQ {}] Initial send should fail (ResourceLimitReached or Timeout)",
-    endpoint
-  );
+  initial_send_result?;
 
   println!(
     "[SYS {}] Waiting {}ms before starting REP server...",
@@ -281,6 +274,20 @@ async fn test_req_rep_reconnect_advanced_style() -> Result<(), ZmqError> {
         |e| matches!(e, SocketEvent::HandshakeSucceeded { endpoint: ep } if ep.contains(endpoint.strip_prefix("tcp://").unwrap_or(&endpoint)))
     ).await.map_err(|e_str| ZmqError::Internal(format!("[REQ {}] Did not receive HandshakeSucceeded event: {}", endpoint, e_str)))?;
   println!("[REQ {}] Monitor confirmed HandshakeSucceeded.", endpoint);
+
+  let queued_request = common::recv_timeout(
+    &rep_socket,
+    Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64),
+  )
+  .await?;
+  assert_eq!(queued_request.data().unwrap(), b"Initial REQuest");
+  rep_socket.send(Msg::from_static(b"REPly to the queued request")).await?;
+  let queued_reply = common::recv_timeout(
+    &req_socket,
+    Duration::from_millis(CLIENT_RCVTIMEO_MS_MR as u64),
+  )
+  .await?;
+  assert_eq!(queued_reply.data().unwrap(), b"REPly to the queued request");
 
   let req_payload = b"REQ message post-reconnect";
   println!(

@@ -34,7 +34,7 @@ use crate::socket::patterns::PipeCredits;
 
 pub(crate) struct ZmtpSmartConnection {
   fd: RawFd,
-  egress_tx: fibre::mpsc::BoundedAsyncSender<FrameBatch>,
+  egress_tx: fibre::mpmc::AsyncSender<FrameBatch>,
   event_fd: eventfd::EventFD,
   worker_asleep: Arc<AtomicU8>,
   /// Monotonic work-enqueued generation counter shared with the worker loop.
@@ -60,7 +60,7 @@ impl std::fmt::Debug for ZmtpSmartConnection {
 impl ZmtpSmartConnection {
   pub(crate) fn new(
     fd: RawFd,
-    egress_tx: fibre::mpsc::BoundedAsyncSender<FrameBatch>,
+    egress_tx: fibre::mpmc::AsyncSender<FrameBatch>,
     event_fd: eventfd::EventFD,
     worker_asleep: Arc<AtomicU8>,
     work_signal_gen: Arc<AtomicUsize>,
@@ -200,7 +200,7 @@ pub(crate) struct ZmtpUringHandler {
   worker_io_config: Arc<WorkerIoConfig>,
   engine: ZmtpEngine,
   /// Egress channel receiver: SocketCore → handler (via ZmtpSmartConnection → egress_tx).
-  egress_rx: Arc<fibre::mpsc::BoundedSyncReceiver<FrameBatch>>,
+  egress_rx: Arc<fibre::mpmc::Receiver<FrameBatch>>,
   /// Credits returned for each batch drained from `egress_rx`, present when the socket is PUB.
   egress_credits: Option<Arc<PipeCredits>>,
   /// Direct ingress sender: delivers decoded messages straight to the socket's ReadyPipeQueue.
@@ -259,7 +259,7 @@ impl ZmtpUringHandler {
     fd: RawFd,
     worker_io_config: Arc<WorkerIoConfig>,
     engine: ZmtpEngine,
-    egress_rx: Arc<fibre::mpsc::BoundedSyncReceiver<FrameBatch>>,
+    egress_rx: Arc<fibre::mpmc::Receiver<FrameBatch>>,
     egress_credits: Option<Arc<PipeCredits>>,
     use_send_zerocopy: bool,
     use_recv_multishot: bool,

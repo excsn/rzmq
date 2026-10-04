@@ -3,7 +3,7 @@
 use crate::message::FrameBatch;
 use crate::socket::patterns::PipeCredits;
 use fibre::{RecvError, TryRecvError};
-use fibre::mpsc::BoundedAsyncReceiver;
+use fibre::mpmc::AsyncReceiver as BoundedAsyncReceiver;
 use std::sync::Arc;
 
 use super::states::CorePipeManagerXState;
@@ -63,9 +63,7 @@ impl CorePipeManagerX {
   /// This method ensures `CorePipeManagerX` stops trying to use the pipes.
   pub(crate) fn detach_and_clear_pipes(&mut self) {
     let _ = self.state.rx_from_core.take();
-    if let Some(credits) = self.credits.take() {
-      credits.close();
-    }
+    self.credits = None;
     self.state.core_pipe_read_id_for_incoming_routing = None;
     self.state.is_attached = false;
   }
@@ -122,7 +120,7 @@ mod additional_pipe_manager_tests {
     let mut manager = CorePipeManagerX::new();
     assert!(!manager.is_attached());
 
-    let (tx, rx) = fibre::mpsc::bounded_async::<FrameBatch>(1);
+    let (tx, rx) = fibre::mpmc::bounded_async::<FrameBatch>(1);
     let _ = tx; // keep sender alive
     manager.attach(rx, 42, None);
 

@@ -6,18 +6,26 @@ use crate::runtime::{Command, MailboxSender};
 use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::patterns::PipeCredits;
 
+use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use fibre::TrySendError;
-use fibre::mpsc::BoundedAsyncSender;
+use fibre::mpmc::AsyncSender as BoundedAsyncSender;
 use tokio::time::timeout;
+
+/// The session actor currently draining a pipe. A connect-side pipe outlives
+/// its sessions, so this is rebound on every reconnect and empty in between.
+#[derive(Debug, Clone)]
+struct BoundSession {
+  stop_mailbox: MailboxSender,
+  handle_id: usize,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScaConnectionIface {
-  sca_stop_mailbox: MailboxSender,
-  sca_handle_id: usize,
+  session: Arc<RwLock<Option<BoundSession>>>,
   pipe_sender: BoundedAsyncSender<FrameBatch>,
   pipe_write_id_to_sca: usize,
   sndtimeo: Option<Duration>,
@@ -33,14 +41,41 @@ impl ScaConnectionIface {
     sndtimeo: Option<Duration>,
     credits: Option<Arc<PipeCredits>>,
   ) -> Self {
+    let iface = Self::unbound(pipe_sender, pipe_write_id_to_sca, sndtimeo, credits);
+    iface.bind_session(sca_stop_mailbox, sca_handle_id);
+    iface
+  }
+
+  /// A pipe with no session yet: sends queue in the pipe up to its capacity.
+  pub(crate) fn unbound(
+    pipe_sender: BoundedAsyncSender<FrameBatch>,
+    pipe_write_id_to_sca: usize,
+    sndtimeo: Option<Duration>,
+    credits: Option<Arc<PipeCredits>>,
+  ) -> Self {
     Self {
-      sca_stop_mailbox,
-      sca_handle_id,
+      session: Arc::new(RwLock::new(None)),
       pipe_sender,
       pipe_write_id_to_sca,
       sndtimeo,
       credits,
     }
+  }
+
+  pub(crate) fn bind_session(&self, stop_mailbox: MailboxSender, handle_id: usize) {
+    *self.session.write() = Some(BoundSession { stop_mailbox, handle_id });
+  }
+
+  pub(crate) fn unbind_session(&self) {
+    *self.session.write() = None;
+  }
+
+  pub(crate) fn session_handle_id(&self) -> Option<usize> {
+    self.session.read().as_ref().map(|s| s.handle_id)
+  }
+
+  fn sca_handle_id(&self) -> usize {
+    self.session_handle_id().unwrap_or(0)
   }
 }
 
@@ -48,7 +83,7 @@ impl ScaConnectionIface {
 impl ISocketConnection for ScaConnectionIface {
   async fn send_message(&self, msg: Msg) -> Result<(), ZmqError> {
     tracing::trace!(
-      sca_handle = self.sca_handle_id,
+      sca_handle = self.sca_handle_id(),
       pipe_id = self.pipe_write_id_to_sca,
       "ScaConnectionIface sending single message via data pipe."
     );
@@ -75,7 +110,7 @@ impl ISocketConnection for ScaConnectionIface {
 
   async fn send_multipart(&self, msgs: FrameBatch) -> Result<(), ZmqError> {
     tracing::trace!(
-      sca_handle = self.sca_handle_id,
+      sca_handle = self.sca_handle_id(),
       pipe_id = self.pipe_write_id_to_sca,
       num_msgs = msgs.len(),
       "ScaConnectionIface sending multipart via data pipe."
@@ -135,22 +170,19 @@ impl ISocketConnection for ScaConnectionIface {
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
+    let Some(session) = self.session.read().clone() else {
+      return Ok(());
+    };
     tracing::debug!(
       "ScaConnectionIface: Sending Stop command to SCA {}.",
-      self.sca_handle_id
+      session.handle_id
     );
-    // Assuming Command::Stop is a general stop that SCA will handle.
-    // If Stop needs to be targeted, Command::Stop would need a handle_id field.
-    self
-      .sca_stop_mailbox
-      .send(Command::Stop)
-      .await
-      .map_err(|e| {
-        ZmqError::Internal(format!(
-          "Failed to send Stop to SCA {}: {}",
-          self.sca_handle_id, e
-        ))
-      })
+    session.stop_mailbox.send(Command::Stop).await.map_err(|e| {
+      ZmqError::Internal(format!(
+        "Failed to send Stop to SCA {}: {}",
+        session.handle_id, e
+      ))
+    })
   }
 
   fn as_any(&self) -> &dyn std::any::Any {

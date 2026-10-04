@@ -331,7 +331,7 @@ impl ISocket for ReqSocket {
   }
 
   fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {
-    self.pending_pipe_senders.lock().remove(&pipe_read_id)
+    self.pending_pipe_senders.lock().get(&pipe_read_id).cloned()
   }
 
   async fn pipe_attached(

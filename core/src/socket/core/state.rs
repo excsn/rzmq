@@ -7,7 +7,8 @@ use crate::socket::types::SocketType;
 use crate::throttle::AdaptiveThrottle;
 use crate::socket::SocketEvent;
 
-use fibre::mpsc::BoundedAsyncSender;
+use crate::socket::patterns::PipeCredits;
+use fibre::mpmc::{AsyncReceiver, AsyncSender as BoundedAsyncSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,6 +43,20 @@ pub(crate) struct EndpointInfo {
   pub connection_iface: Arc<dyn ISocketConnection>,
   /// Set only for connections driven by a session actor.
   pub throttle: Option<AdaptiveThrottle>,
+}
+
+/// A pipe created by `connect()` and kept across the sessions that drain it.
+/// The sender is also in `CoreState::pipes_tx`; the receiver is cloned for
+/// each session, so messages queued while no session exists stay in the pipe.
+#[derive(Debug)]
+pub(crate) struct ConnectPipe {
+  pub rx: AsyncReceiver<FrameBatch>,
+  pub core_write_id: usize,
+  pub core_read_id: usize,
+  pub credits: Option<Arc<PipeCredits>>,
+  /// Sessions that have drained this pipe so far; the second and later ones
+  /// trigger `ISocket::pipe_hiccuped`.
+  pub sessions: u32,
 }
 
 /// Enum to differentiate between Listener endpoints and active Session (connection) endpoints.
@@ -131,6 +146,8 @@ pub(crate) struct CoreState {
   // --- Reconnection State ---
   /// Maps Target URI -> ReconnectState
   pub(crate) reconnect_states: HashMap<String, ReconnectState>,
+  /// Maps Target URI -> the pipe `connect()` created for it.
+  pub(crate) connect_pipes: HashMap<String, ConnectPipe>,
 
   // --- Mappings for ISocket interaction and event routing ---
   /// Maps a pipe_read_id (actual for sessions, or synthetic for uring FDs) to the endpoint_uri.
@@ -154,6 +171,7 @@ impl CoreState {
       pipe_reader_task_handles: HashMap::new(),
       endpoints: HashMap::new(),
       reconnect_states: HashMap::new(),
+      connect_pipes: HashMap::new(),
       pipe_read_id_to_endpoint_uri: HashMap::new(),
       #[cfg(feature = "inproc")]
       bound_inproc_names: HashSet::new(),

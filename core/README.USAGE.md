@@ -257,7 +257,7 @@ async fn setup_sockets() -> Result<(), ZmqError> {
         Ok(())
     }
     ```
-Connections are asynchronous. `rzmq` handles retries for TCP connections if `RECONNECT_IVL` is set appropriately.
+Connections are asynchronous. `connect()` returns before the connection exists but the socket already has a pipe for that peer. Sends made before the connection is up queue in that pipe up to `SNDHWM` and are delivered in order once the handshake completes. The pipe survives a disconnect, so messages sent while a peer is down are delivered when it reconnects, with `RECONNECT_IVL` governing the retries. A peer that is down therefore keeps taking its share of a `PUSH` or `DEALER` round-robin until its pipe is full. Set `IMMEDIATE` to `true` to attach a peer only while it is connected and skip it otherwise.
 
 ### Sending and Receiving Messages
 *   **Sending (single part):**

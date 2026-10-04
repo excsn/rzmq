@@ -687,6 +687,18 @@ pub(crate) struct ReadyPipeSender<T: Send + 'static> {
   ready_tx: AsyncSender<Arc<PipeSlot<T>>>,
 }
 
+/// A clone shares the pipe's single-producer slot. The producer side is one
+/// session actor at a time: a reconnecting endpoint hands the sender to its
+/// next session only after the previous one has published `ActorStopping`.
+impl<T: Send + 'static> Clone for ReadyPipeSender<T> {
+  fn clone(&self) -> Self {
+    Self {
+      slot: self.slot.clone(),
+      ready_tx: self.ready_tx.clone(),
+    }
+  }
+}
+
 impl<T: Send + 'static> ReadyPipeSender<T> {
   #[cfg(feature = "io-uring")]
   pub fn bind_uring_wakeup(&self, wakeup: UringWakeup) {
@@ -958,6 +970,7 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
 // PipeMessageSender
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub(crate) enum PipeMessageSender {
   DirectAnonymous(ReadyPipeSender<FrameBatch>),
   FilteredAnonymous {

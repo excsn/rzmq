@@ -149,7 +149,8 @@ async fn dealer_burst_sent_during_reconnect_gap_arrives_complete_and_in_order() 
 }
 
 /// With LINGER -1, `close` on a DEALER delivers the messages it sent before its
-/// connection attached.
+/// connection attached, without waiting out a reconnect interval: the connecter
+/// keeps its attempt alive through the socket's linger.
 #[tokio::test]
 #[serial]
 async fn dealer_close_with_infinite_linger_delivers_burst_sent_before_attach() -> Result<(), ZmqError> {
@@ -165,7 +166,7 @@ async fn dealer_close_with_infinite_linger_delivers_burst_sent_before_attach() -
   }
   dealer.close().await?;
 
-  let got = collect_payloads(&router, 20, RECV_TIMEOUT).await;
+  let got = collect_payloads(&router, 20, Duration::from_millis(500)).await;
   assert_eq!(got, expected(1..=20));
   Ok(())
 }

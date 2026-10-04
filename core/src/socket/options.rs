@@ -70,6 +70,10 @@ pub const IO_URING_SNDZEROCOPY: i32 = 1170;
 #[cfg(feature = "io-uring")]
 pub const IO_URING_RCVMULTISHOT: i32 = 1171;
 
+/// IMMEDIATE: attach an outbound pipe only once its connection is up (libzmq
+/// `ZMQ_IMMEDIATE`, id 39 there; 39 is taken by HEARTBEAT_TIMEOUT here). Off by
+/// default, so `connect()` creates the pipe at once and sends queue in it.
+pub const IMMEDIATE: i32 = 1239;
 /// Socket option: Enable/disable TCP_CORK (Linux only).
 /// Value is i32 (0 or 1).
 pub const TCP_CORK: i32 = 1172;
@@ -153,6 +157,7 @@ pub(crate) struct SocketOptions {
   // Add other commonly used options as needed
   // pub heartbeat_ttl: Option<Duration>, // TTL often derived from timeout
   pub tcp_cork: bool,
+  pub immediate: bool,
   pub reuse_port: bool,
   pub sndbuf: Option<usize>,
   pub rcvbuf: Option<usize>,
@@ -198,6 +203,7 @@ impl Default for SocketOptions {
       router_mandatory: false, // Default ZMQ behavior is to drop silently
       allow_zmtp2: true,       // Accept ZMTP/2.0 peers by default (matches libzmq)
       tcp_cork: false,
+      immediate: false,
       reuse_port: false,
       sndbuf: None,
       rcvbuf: None,
@@ -733,6 +739,7 @@ pub(crate) fn apply_core_option_value(
         MAXMSGSIZE => options.maxmsgsize = parse_maxmsgsize_option(value)?,
         MAX_CONNECTIONS => options.max_connections = parse_max_connections_option(value, option_id)?,
         TCP_CORK => options.tcp_cork = parse_bool_option(value)?,
+        IMMEDIATE => options.immediate = parse_bool_option(value)?,
         REUSE_PORT => options.reuse_port = parse_bool_option(value)?,
         ALLOW_ZMTP2 => options.allow_zmtp2 = parse_bool_option(value)?,
         ZAP_DOMAIN => options.zap_domain = Some(parse_string_option(value, option_id)?),
@@ -836,6 +843,7 @@ pub(crate) fn retrieve_core_option_value(
         MAXMSGSIZE => Ok(options.maxmsgsize.to_ne_bytes().to_vec()),
         MAX_CONNECTIONS => Ok(options.max_connections.map_or(-1, |v| v as i32).to_ne_bytes().to_vec()),
         TCP_CORK => Ok((options.tcp_cork as i32).to_ne_bytes().to_vec()),
+        IMMEDIATE => Ok((options.immediate as i32).to_ne_bytes().to_vec()),
         REUSE_PORT => Ok((options.reuse_port as i32).to_ne_bytes().to_vec()),
         ALLOW_ZMTP2 => Ok((options.allow_zmtp2 as i32).to_ne_bytes().to_vec()),
         ZAP_DOMAIN => options.zap_domain.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option ZAP_DOMAIN not set".into())),

@@ -28,18 +28,12 @@ async fn test_tcp_connect_fail_no_listener() -> Result<(), ZmqError> {
   // Allow some time for background connection attempts to fail
   tokio::time::sleep(CONNECT_RETRY_WAIT).await;
 
-  // Attempt to send - should fail as no connection was ever established
-  println!("REQ attempting send (should fail)...");
+  println!("REQ attempting send (queues in the connect pipe)...");
   let send_result = req.send(Msg::from_static(b"Request")).await;
   println!("REQ send result: {:?}", send_result);
 
-  // Expect ResourceLimitReached because SNDTIMEO=0 and no peer available
-  assert!(
-    matches!(send_result, Err(ZmqError::ResourceLimitReached)),
-    "Expected ResourceLimitReached error, got {:?}",
-    send_result
-  );
-  println!("REQ correctly failed with ResourceLimitReached.");
+  // The connect pipe accepts it; nothing is listening, so no reply ever comes.
+  send_result?;
 
   println!("Terminating context...");
   ctx.term().await?;
@@ -74,17 +68,12 @@ async fn test_ipc_connect_fail_no_listener() -> Result<(), ZmqError> {
   // Allow time for background connection attempts to fail
   tokio::time::sleep(CONNECT_RETRY_WAIT).await;
 
-  // Attempt to send - should fail
-  println!("REQ attempting send (should fail)...");
+  println!("REQ attempting send (queues in the connect pipe)...");
   let send_result = req.send(Msg::from_static(b"Request")).await;
   println!("REQ send result: {:?}", send_result);
 
-  assert!(
-    matches!(send_result, Err(ZmqError::ResourceLimitReached)),
-    "Expected ResourceLimitReached error, got {:?}",
-    send_result
-  );
-  println!("REQ correctly failed with ResourceLimitReached.");
+  // The connect pipe accepts it; nothing is listening, so no reply ever comes.
+  send_result?;
 
   println!("Terminating context...");
   ctx.term().await?;

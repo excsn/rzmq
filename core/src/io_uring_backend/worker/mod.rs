@@ -93,7 +93,7 @@ pub struct UringWorker {
   /// Egress channels for `ZmtpUringHandler` connections (SocketCore → worker).
   /// Checked in the pre-sleep double-check to keep the worker awake when batches are pending.
   pub(crate) fd_to_zmtp_egress_rx:
-    HashMap<RawFd, Arc<mpsc::BoundedSyncReceiver<crate::message::FrameBatch>>>,
+    HashMap<RawFd, Arc<fibre::mpmc::Receiver<crate::message::FrameBatch>>>,
   // Configuration values passed at spawn time or from global settings
   cfg_send_zerocopy_enabled: bool,
   cfg_send_buffer_size: usize,

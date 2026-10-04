@@ -14,7 +14,7 @@ use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::inproc_reader;
 use crate::socket::core::pipe_manager;
 
-use crate::socket::core::state::{CoreState, EndpointInfo, EndpointType, ShutdownPhase, listener_key};
+use crate::socket::core::state::{ConnectPipe, CoreState, EndpointInfo, EndpointType, ShutdownPhase, listener_key};
 use crate::socket::core::{SocketCore, shutdown};
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::socket::options::{self, *};
@@ -46,7 +46,16 @@ pub(crate) async fn process_socket_command(
 
   // Check shutdown phase before processing most commands
   let current_shutdown_phase = core_arc.shutdown_coordinator.lock().await.state;
-  if current_shutdown_phase != ShutdownPhase::Running {
+  // A connection for a connect pipe that still holds messages is accepted while
+  // lingering, since that pipe is what LINGER is waiting on.
+  let drains_connect_pipe_while_lingering = current_shutdown_phase == ShutdownPhase::Lingering
+    && match &command {
+      Command::NewConnectionEstablished { target_endpoint_uri, .. } => {
+        core_arc.core_state.read().connect_pipes.contains_key(target_endpoint_uri)
+      }
+      _ => false,
+    };
+  if current_shutdown_phase != ShutdownPhase::Running && !drains_connect_pipe_while_lingering {
     match command {
       // Allow UserClose and Stop even if shutting down to ensure shutdown completes.
       Command::UserClose { reply_tx } => {
@@ -161,7 +170,7 @@ pub(crate) async fn process_socket_command(
       handle_user_connect(core_arc, socket_logic_strong.clone(), endpoint, reply_tx).await;
     }
     Command::UserDisconnect { endpoint, reply_tx } => {
-      handle_user_disconnect(core_arc, endpoint, reply_tx).await;
+      handle_user_disconnect(core_arc, socket_logic_strong, endpoint, reply_tx).await;
     }
     Command::UserUnbind { endpoint, reply_tx } => {
       handle_user_unbind(core_arc, socket_logic_strong, endpoint, reply_tx).await;
@@ -587,22 +596,26 @@ async fn handle_user_connect(
   let parse_result = parse_endpoint(&endpoint_uri);
   match parse_result {
     Ok(Endpoint::Tcp(_, ref parsed_uri_for_connecter)) => {
-      respawn_connecter_actor(
-        core_arc.clone(),
-        socket_logic,
-        parsed_uri_for_connecter.clone(),
-      )
-      .await;
+      if ensure_connect_pipe(&core_arc, &socket_logic, parsed_uri_for_connecter).await {
+        respawn_connecter_actor(
+          core_arc.clone(),
+          socket_logic,
+          parsed_uri_for_connecter.clone(),
+        )
+        .await;
+      }
       let _ = reply_tx.send(Ok(())); // UserConnect is async, Ok(()) means attempt initiated.
     }
     #[cfg(feature = "ipc")]
     Ok(Endpoint::Ipc(_, ref parsed_uri_for_connecter)) => {
-      respawn_connecter_actor(
-        core_arc.clone(),
-        socket_logic,
-        parsed_uri_for_connecter.clone(),
-      )
-      .await;
+      if ensure_connect_pipe(&core_arc, &socket_logic, parsed_uri_for_connecter).await {
+        respawn_connecter_actor(
+          core_arc.clone(),
+          socket_logic,
+          parsed_uri_for_connecter.clone(),
+        )
+        .await;
+      }
       let _ = reply_tx.send(Ok(()));
     }
     #[cfg(feature = "inproc")]
@@ -623,6 +636,71 @@ async fn handle_user_connect(
       let _ = reply_tx.send(Err(ZmqError::UnsupportedTransport(endpoint_uri)));
     }
   }
+}
+
+/// Creates the pipe for an outbound endpoint at `connect()` time and attaches it
+/// to the pattern, so sends made before the connection exists queue in the pipe
+/// up to SNDHWM. The pipe outlives the sessions that drain it; see `ConnectPipe`.
+/// Returns false when the endpoint already has a pipe, in which case its
+/// connecter or session is already running and no second one is started.
+async fn ensure_connect_pipe(
+  core_arc: &Arc<SocketCore>,
+  socket_logic: &Arc<dyn ISocket>,
+  target_uri: &str,
+) -> bool {
+  let (sndhwm, sndtimeo, socket_type) = {
+    let cs = core_arc.core_state.read();
+    if cs.options.immediate {
+      return true;
+    }
+    if cs.connect_pipes.contains_key(target_uri) {
+      return false;
+    }
+    (cs.options.sndhwm.max(1), cs.options.sndtimeo, cs.socket_type)
+  };
+
+  let (tx, rx) = fibre::mpmc::bounded_async::<FrameBatch>(sndhwm);
+  let core_write_id = core_arc.context.inner().next_handle();
+  let core_read_id = core_arc.context.inner().next_handle();
+  let pending_handle_id = core_arc.context.inner().next_handle();
+  let credits = (socket_type == SocketType::Pub).then(|| Arc::new(PipeCredits::new(tx.capacity())));
+  let iface = Arc::new(ScaConnectionIface::unbound(tx.clone(), core_write_id, sndtimeo, credits.clone()));
+  let (placeholder_mailbox, _unused_rx) = fibre::mpsc::bounded_async::<Command>(1);
+
+  let endpoint_info = EndpointInfo {
+    mailbox: placeholder_mailbox,
+    task_handle: None,
+    endpoint_type: EndpointType::Session,
+    endpoint_uri: target_uri.to_string(),
+    pipe_ids: Some((core_write_id, core_read_id)),
+    handle_id: pending_handle_id,
+    target_endpoint_uri: Some(target_uri.to_string()),
+    is_outbound_connection: true,
+    peer_socket_type: None,
+    connection_iface: iface,
+    throttle: None,
+  };
+
+  {
+    let mut cs = core_arc.core_state.write();
+    cs.pipes_tx.insert(core_write_id, tx);
+    cs.endpoints.insert(target_uri.to_string(), endpoint_info);
+    cs.pipe_read_id_to_endpoint_uri.insert(core_read_id, target_uri.to_string());
+    cs.connect_pipes.insert(
+      target_uri.to_string(),
+      ConnectPipe {
+        rx,
+        core_write_id,
+        core_read_id,
+        credits,
+        sessions: 0,
+      },
+    );
+  }
+
+  tracing::debug!(handle = core_arc.handle, uri = %target_uri, core_w_id = core_write_id, core_r_id = core_read_id, "Connect pipe created and attached before connecting.");
+  socket_logic.pipe_attached(core_read_id, core_write_id, None).await;
+  true
 }
 
 /// Spawns a new connecter actor for the given target URI.
@@ -771,6 +849,7 @@ pub(crate) async fn handle_connect_failed_event(
 
 async fn handle_user_disconnect(
   core_arc: Arc<SocketCore>,
+  socket_logic_strong: &Arc<dyn ISocket>,
   endpoint: String,
   reply_tx: oneshot::Sender<Result<(), ZmqError>>,
 ) {
@@ -801,6 +880,21 @@ async fn handle_user_disconnect(
 
   if let Some((uri_to_close, conn_iface)) = endpoint_info_to_close {
     tracing::info!(handle = core_handle, uri = %uri_to_close, "UserDisconnect: Initiating close for connection.");
+    let removed_pipe = {
+      let mut cs = core_arc.core_state.write();
+      cs.connect_pipes.remove(&uri_to_close).map(|pipe| {
+        cs.reconnect_states.remove(&uri_to_close);
+        cs.endpoints.remove(&uri_to_close);
+        cs.remove_pipe_state(pipe.core_write_id, pipe.core_read_id);
+        pipe
+      })
+    };
+    if let Some(pipe) = &removed_pipe {
+      if let Some(credits) = &pipe.credits {
+        credits.close();
+      }
+      socket_logic_strong.pipe_detached(pipe.core_read_id).await;
+    }
     // Closing the connection will trigger ActorStopping from Session/Engine or UringFdError,
     // which will then lead to cleanup_stopped_child_resources.
     match conn_iface.close_connection().await {
@@ -1012,8 +1106,59 @@ async fn handle_new_connection_established(
         tracing::warn!(handle = core_handle, conn_uri = %endpoint_uri_from_event, "ViaSca received unexpected pre-existing ISocketConnection. Ignoring.");
       }
 
+      let existing_pipe = {
+        let mut cs = core_arc.core_state.write();
+        let pipe = cs
+          .connect_pipes
+          .get_mut(&target_endpoint_uri_from_event)
+          .map(|pipe| {
+            pipe.sessions += 1;
+            (pipe.rx.clone(), pipe.core_read_id, pipe.credits.clone(), pipe.sessions)
+          });
+        match pipe {
+          Some(found) => {
+            let ep = cs
+              .endpoints
+              .get_mut(&target_endpoint_uri_from_event)
+              .expect("connect pipe has an EndpointInfo under its target URI");
+            ep.mailbox = sca_mailbox.clone();
+            ep.handle_id = sca_handle_id;
+            ep.throttle = Some(throttle.clone());
+            Some((found, ep.connection_iface.clone()))
+          }
+          None => None,
+        }
+      };
+
+      if let Some(((rx_sca_from_core, core_read_id, credits, sessions), iface)) = existing_pipe {
+        iface
+          .as_any()
+          .downcast_ref::<ScaConnectionIface>()
+          .expect("connect pipe endpoint holds a ScaConnectionIface")
+          .bind_session(sca_mailbox.clone(), sca_handle_id);
+        tracing::debug!(handle = core_handle, sca_id = sca_handle_id, uri = %target_endpoint_uri_from_event, sessions, "Session takes over the connect pipe.");
+        if sessions > 1 {
+          socket_logic_strong.pipe_hiccuped(core_read_id).await;
+        }
+        let incoming_pipe_sender = socket_logic_strong.get_incoming_pipe_sender(core_read_id);
+        let attach_cmd = Command::ScaInitializePipes {
+          sca_handle_id,
+          rx_from_core: rx_sca_from_core,
+          core_pipe_read_id_for_incoming_routing: core_read_id,
+          incoming_pipe_sender,
+          credits,
+        };
+        if sca_mailbox.send(attach_cmd).await.is_err() {
+          return Err(ZmqError::Internal(format!(
+            "Failed to send ScaInitializePipes to SCA {}",
+            sca_handle_id
+          )));
+        }
+        return Ok(());
+      }
+
       let (tx_core_to_sca, rx_sca_from_core) =
-        fibre::mpsc::bounded_async::<FrameBatch>(core_arc.core_state.read().options.sndhwm.max(1));
+        fibre::mpmc::bounded_async::<FrameBatch>(core_arc.core_state.read().options.sndhwm.max(1));
 
       let core_write_id = core_arc.context.inner().next_handle();
       let core_read_id = core_arc.context.inner().next_handle();

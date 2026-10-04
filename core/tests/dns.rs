@@ -104,19 +104,12 @@ async fn test_dns_connect_to_non_existent_host_fails() -> Result<(), ZmqError> {
     panic!("Received an unexpected event type: {:?}", event);
   }
 
-  // Set SNDTIMEO=0 to make the subsequent send call non-blocking.
-  // This prevents the test from hanging when the PUSH socket has no peers.
-  println!("DEBUG: Setting SNDTIMEO=0 before final send check...");
+  // The connect pipe exists from connect(), so a send with SNDTIMEO 0 is
+  // accepted into it up to SNDHWM while the connecter keeps retrying.
   client
     .set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes())
     .await?;
-
-  // An attempt to send should also fail, though the monitor event is the primary check.
-  let send_res = client.send(rzmq::Msg::from_static(b"wont_be_sent")).await;
-  assert!(matches!(
-    send_res,
-    Err(ZmqError::ResourceLimitReached) // With SNDTIMEO=0, we expect ResourceLimitReached, not Timeout
-  ));
+  client.send(rzmq::Msg::from_static(b"queued_until_resolved")).await?;
 
   ctx.term().await?;
   println!("--- Test Finished ---");

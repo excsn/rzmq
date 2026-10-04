@@ -4,7 +4,7 @@ use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::events::{MonitorSender, SocketEvent, clean_endpoint_uri};
 use crate::socket::patterns::PipeCredits;
 use async_trait::async_trait;
-use fibre::mpsc::BoundedAsyncSender;
+use fibre::mpmc::AsyncSender as BoundedAsyncSender;
 use fibre::TrySendError;
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,7 +136,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_successful_direct_send() {
-    let (tx, rx) = fibre::mpsc::bounded_async::<FrameBatch>(1);
+    let (tx, rx) = fibre::mpmc::bounded_async::<FrameBatch>(1);
     let connection = DirectInprocConnection {
       connection_id: 100,
       target_endpoint_uri: "inproc://test-uri".to_string(),
@@ -157,7 +157,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_synchronous_hwm_boundary() {
-    let (tx, _rx) = fibre::mpsc::bounded_async::<FrameBatch>(1);
+    let (tx, _rx) = fibre::mpmc::bounded_async::<FrameBatch>(1);
     let connection = DirectInprocConnection {
       connection_id: 101,
       target_endpoint_uri: "inproc://test-uri".to_string(),
@@ -183,7 +183,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_peer_disconnected_on_send() {
-    let (tx, rx) = fibre::mpsc::bounded_async::<FrameBatch>(1);
+    let (tx, rx) = fibre::mpmc::bounded_async::<FrameBatch>(1);
     let connection = DirectInprocConnection {
       connection_id: 102,
       target_endpoint_uri: "inproc://test-uri".to_string(),

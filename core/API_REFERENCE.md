@@ -398,6 +398,7 @@ Constants for socket option integer IDs.
 *   `pub const ROUTING_ID: i32 = 5`
 *   `pub const RECONNECT_IVL: i32 = 18`
 *   `pub const RECONNECT_IVL_MAX: i32 = 21`
+*   `pub const IMMEDIATE: i32 = 1239` - Boolean, off by default. Off: `connect()` creates the peer's pipe at once, sends queue in it up to `SNDHWM` until the connection is up and the pipe survives reconnects. On: the pipe exists only while a connection is up, so a send with no connected peer blocks or fails per `SNDTIMEO` and a peer that drops is skipped until it is back. libzmq's `ZMQ_IMMEDIATE` is id 39, which rzmq uses for `HEARTBEAT_TIMEOUT`.
 *   `pub const RCVTIMEO: i32 = 27`
 *   `pub const SNDTIMEO: i32 = 28`
 *   `pub const LAST_ENDPOINT: i32 = 32`

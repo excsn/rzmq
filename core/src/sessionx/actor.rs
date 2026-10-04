@@ -728,9 +728,7 @@ where
             "Received ScaInitializePipes for wrong actor. Ignoring."
           );
           drop(rx_from_core);
-          if let Some(credits) = credits {
-            credits.close();
-          }
+          drop(credits);
           return;
         }
         if self.core_pipe_manager.is_attached() {
@@ -739,9 +737,7 @@ where
             "Already attached. Ignoring ScaInitializePipes."
           );
           drop(rx_from_core);
-          if let Some(credits) = credits {
-            credits.close();
-          }
+          drop(credits);
           return;
         }
 
@@ -755,9 +751,7 @@ where
             "Received ScaInitializePipes while shutting down. Dropping pipes."
           );
           drop(rx_from_core);
-          if let Some(credits) = credits {
-            credits.close();
-          }
+          drop(credits);
           return;
         }
 

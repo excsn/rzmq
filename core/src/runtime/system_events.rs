@@ -13,7 +13,7 @@ use crate::message::FrameBatch;
 #[cfg(feature = "inproc")]
 use crate::transport::inproc::types::InprocHandshakeRequest;
 #[cfg(feature = "inproc")]
-use fibre::mpsc::BoundedAsyncReceiver;
+use fibre::mpmc::AsyncReceiver as BoundedAsyncReceiver;
 
 /// Type identifier for different actors in the system.
 /// Used in ActorStarted and ActorStopping events to categorize actors.

@@ -4,7 +4,7 @@ use crate::context::Context;
 use crate::message::FrameBatch;
 use crate::socket::events::MonitorSender;
 
-use fibre::mpsc::BoundedAsyncReceiver;
+use fibre::mpmc::AsyncReceiver as BoundedAsyncReceiver;
 
 /// General configuration and context for the SessionConnectionActorX.
 #[derive(Debug, Clone)] // Clone if it needs to be passed around easily

@@ -796,9 +796,9 @@ impl TcpConnecter {
           ));
           break 'connecter_life_loop;
         }
-        Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => {
+        Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => {
           last_connect_attempt_error = Some(ZmqError::Internal(
-            "Shutdown by parent SocketClosing (pre-connect).".into(),
+            "Shutdown by parent stopping (pre-connect).".into(),
           ));
           break 'connecter_life_loop;
         }
@@ -1153,7 +1153,7 @@ impl TcpConnecter {
           loop {
             match system_event_rx.recv().await {
               Ok(SystemEvent::ContextTerminating) => break,
-              Ok(SystemEvent::SocketClosing { socket_id: sid }) if sid == self.parent_socket_id => break,
+              Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => break,
               Ok(_) => continue,
               Err(_) => break,
             }
@@ -1192,7 +1192,8 @@ impl TcpConnecter {
   ) -> Result<bool, ()> {
     if delay.is_zero() {
       match system_event_rx.try_recv() {
-        Ok(SystemEvent::ContextTerminating) | Ok(SystemEvent::SocketClosing { .. }) => {
+        Ok(SystemEvent::ContextTerminating) => return Ok(false),
+        Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => {
           return Ok(false);
         }
         _ => return Ok(true),
@@ -1210,7 +1211,7 @@ impl TcpConnecter {
       event_res = system_event_rx.recv() => {
         match event_res {
           Ok(SystemEvent::ContextTerminating) => Ok(false),
-          Ok(SystemEvent::SocketClosing { socket_id: s_id }) if s_id == self.parent_socket_id => Ok(false),
+          Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => Ok(false),
           Err(_) => Ok(false),
           Ok(_) => Ok(true),
         }

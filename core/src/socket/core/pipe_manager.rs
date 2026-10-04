@@ -14,10 +14,11 @@ use crate::transport::inproc::{
   handshake::validate_socket_compatibility,
 };
 #[cfg(feature = "inproc")]
-use fibre::mpsc::bounded_async;
+use fibre::mpmc::bounded_async;
 
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use crate::sessionx::ScaConnectionIface;
 
 pub(crate) async fn cleanup_stopped_child_resources(
   core_arc: Arc<SocketCore>,
@@ -67,6 +68,46 @@ pub(crate) async fn cleanup_stopped_child_resources(
     }
   } // Read lock is dropped here.
 
+  // An outbound session whose endpoint keeps its pipe across reconnects: the
+  // pipe, its EndpointInfo and the pattern attachment all stay; only the
+  // session binding is dropped.
+  let keeps_pipe = {
+    let cs = core_arc.core_state.read();
+    let reconnect_enabled = cs.options.reconnect_ivl.map_or(false, |d| !d.is_zero());
+    key_to_remove.as_ref().and_then(|k| cs.endpoints.get(k)).map_or(false, |ep| {
+      !is_full_core_shutdown
+        && ep.endpoint_type == EndpointType::Session
+        && ep.is_outbound_connection
+        && ep.target_endpoint_uri.as_ref().map_or(false, |t| cs.connect_pipes.contains_key(t))
+        && reconnect_enabled
+        && error_opt.map_or(false, |e| !crate::transport::tcp::is_fatal_connect_error(e))
+    })
+  };
+  if keeps_pipe {
+    let key = key_to_remove.expect("keeps_pipe implies a key");
+    let (uri, iface) = {
+      let mut cs = core_arc.core_state.write();
+      let pending_handle_id = core_arc.context.inner().next_handle();
+      let ep = cs.endpoints.get_mut(&key).expect("checked above");
+      ep.handle_id = pending_handle_id;
+      ep.throttle = None;
+      (ep.endpoint_uri.clone(), ep.connection_iface.clone())
+    };
+    if let Some(sca) = iface.as_any().downcast_ref::<ScaConnectionIface>() {
+      sca.unbind_session();
+    }
+    tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, uri = %uri, "Session stopped; connect pipe kept for the next session.");
+    let monitor_event = match error_opt {
+      Some(e @ &ZmqError::SecurityError(_)) | Some(e @ &ZmqError::AuthenticationFailure(_)) => SocketEvent::HandshakeFailed {
+        endpoint: uri,
+        error_msg: e.to_string(),
+      },
+      _ => SocketEvent::Disconnected { endpoint: uri },
+    };
+    core_arc.core_state.read().send_monitor_event(monitor_event);
+    return true;
+  }
+
   if let Some(key) = key_to_remove {
     if let Some(ep_info) = core_arc.core_state.write().endpoints.remove(&key) {
       tracing::debug!(handle=core_handle, child_id=stopped_child_actor_id, uri=%key, "Removed EndpointInfo for stopped child.");
@@ -85,10 +126,16 @@ pub(crate) async fn cleanup_stopped_child_resources(
 
     // Clean up pipe state if it exists.
     if let Some((core_write_id, core_read_id)) = ep_info.pipe_ids {
-      core_arc
-        .core_state
-        .write()
-        .remove_pipe_state(core_write_id, core_read_id);
+      {
+        let mut cs = core_arc.core_state.write();
+        cs.remove_pipe_state(core_write_id, core_read_id);
+        if let Some(target) = &ep_info.target_endpoint_uri {
+          cs.connect_pipes.remove(target);
+        }
+      }
+      if let Some(credits) = ep_info.connection_iface.pipe_credits() {
+        credits.close();
+      }
       detached_pipe_read_id = Some(core_read_id);
       tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, uri=%ep_info.endpoint_uri, "Removed pipe state for stopped child.");
     }

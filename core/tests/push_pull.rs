@@ -281,18 +281,16 @@ async fn test_push_sndtimeo_positive_no_peer() -> Result<(), ZmqError> {
   push.set_option_raw(SNDTIMEO, &snd_timeout_val.to_ne_bytes()).await?;
   println!("Option set.");
 
-  // Connect PUSH - this setup succeeds asynchronously, but no listener exists yet
+  // The connect pipe holds one message; the next send has nowhere to go.
+  push.set_option_raw(SNDHWM, &1i32.to_ne_bytes()).await?;
   println!("Connecting PUSH to {} (no listener)...", endpoint);
   push.connect(endpoint).await?;
   println!("PUSH connect call returned Ok.");
 
-  // Allow some time for potential background tasks (though none should connect)
   tokio::time::sleep(Duration::from_millis(50)).await;
 
-  // Attempt to send msg1 - PUSH has no peers in its LoadBalancer.
-  // It should call load_balancer.wait_for_pipe() which blocks.
-  // The outer tokio::time::timeout in PushSocket::send should expire.
-  println!("PUSH sending Message 1 (should timeout waiting for peer)...");
+  push.send(Msg::from_static(b"Message 0")).await?;
+  println!("PUSH sending Message 1 (should timeout: pipe full, no peer)...");
   let start_time = std::time::Instant::now();
   let send1_result = push.send(Msg::from_static(b"Message 1")).await;
   let elapsed = start_time.elapsed();
@@ -326,21 +324,17 @@ async fn test_push_sndtimeo_positive_no_peer() -> Result<(), ZmqError> {
   push.send(Msg::from_static(b"Message 2")).await?;
   println!("PUSH sent Message 2.");
 
-  // PULL receives msg2
-  println!("PULL receiving Message 2...");
+  // The queued Message 0 arrives first, then Message 2; Message 1 was never accepted.
+  let rec0 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+  assert_eq!(rec0.data().unwrap(), b"Message 0");
   let rec2 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
   assert_eq!(rec2.data().unwrap(), b"Message 2");
-  println!("PULL received Message 2.");
-
-  // PULL attempts recv again - should timeout as msg1 was never successfully sent
-  println!("PULL attempting recv again (should timeout)...");
   let rec1_result = common::recv_timeout(&pull, SHORT_TIMEOUT).await;
   assert!(
     matches!(rec1_result, Err(ZmqError::Timeout)),
     "Expected Timeout error for Message 1, got {:?}",
     rec1_result
   );
-  println!("PULL correctly timed out waiting for Message 1.");
 
   println!("Terminating context...");
   ctx.term().await?;

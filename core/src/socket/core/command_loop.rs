@@ -139,8 +139,9 @@ pub(crate) async fn run_command_loop(
 
         // --- 3. Maintenance (Linger & Reconnects) ---
         _ = maintenance_interval.tick() => {
-          // A. Reconnection Logic (Only if Running)
-          if current_shutdown_phase == ShutdownPhase::Running {
+          // A. Reconnection Logic (while Running, and while Lingering so a
+          // connect pipe with queued messages can still drain)
+          if matches!(current_shutdown_phase, ShutdownPhase::Running | ShutdownPhase::Lingering) {
             let mut uris_to_retry = Vec::new();
             let now = std::time::Instant::now();
             

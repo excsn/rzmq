@@ -229,7 +229,7 @@ impl ISocket for SubSocket {
   }
 
   fn get_incoming_pipe_sender(&self, pipe_read_id: usize) -> Option<PipeMessageSender> {
-    self.pending_pipe_senders.lock().remove(&pipe_read_id)
+    self.pending_pipe_senders.lock().get(&pipe_read_id).cloned()
   }
 
   async fn pipe_attached(
@@ -297,6 +297,25 @@ impl ISocket for SubSocket {
       handle = self.core.handle, socket_type = "SUB", pipe_read_id, ?identity,
       "update_peer_identity called, SUB ignores peer identities."
     );
+  }
+
+  async fn pipe_hiccuped(&self, pipe_read_id: usize) {
+    let Some(endpoint_uri) = self.pipe_read_to_endpoint_uri.read().get(&pipe_read_id).cloned() else {
+      return;
+    };
+    let Some(conn_iface) = self.get_endpoint(&endpoint_uri) else {
+      return;
+    };
+    for topic in self.subscriptions.get_all_topics() {
+      let sub_msg = Self::construct_subscription_message(true, &topic);
+      if self
+        .send_subscription_command_via_iface(&conn_iface, &endpoint_uri, sub_msg)
+        .await
+        .is_err()
+      {
+        break;
+      }
+    }
   }
 
   async fn pipe_detached(&self, pipe_read_id: usize) {

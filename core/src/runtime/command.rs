@@ -12,7 +12,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use fibre::mpmc::{AsyncReceiver, AsyncSender};
-use fibre::mpsc::BoundedAsyncReceiver;
+use fibre::mpmc::AsyncReceiver as BoundedAsyncReceiver;
 use fibre::oneshot;
 use tokio::task::Id as TaskId;
 
