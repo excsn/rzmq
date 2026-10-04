@@ -37,10 +37,11 @@ async fn main() -> Result<(), ZmqError> {
 
   // --- Server (REP) Setup ---
   let server_socket = ctx.socket(SocketType::Rep)?;
-  println!("[Server] Setting LINGER option...");
-  server_socket.set_option(LINGER, 0i32).await?; // Set LINGER option to 0 for quick close
   println!("[Server] Setting PLAIN_SERVER option to true...");
   server_socket.set_option(PLAIN_SERVER, true).await?; // Enable PLAIN server role
+  println!("[Server] Setting the accepted PLAIN_USERNAME and PLAIN_PASSWORD...");
+  server_socket.set_option(PLAIN_USERNAME, username).await?;
+  server_socket.set_option(PLAIN_PASSWORD, password).await?;
   println!("[Server] Binding to {}...", bind_addr);
   server_socket.bind(bind_addr).await?;
   println!("[Server] Bound successfully. Waiting for requests...");

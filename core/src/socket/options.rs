@@ -56,9 +56,10 @@ pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201; // Client uses this for
                                                          // pub const NOISE_XX_ALLOWED_PEERS: i32 = 1203; // Would take a list of PKs
 
 // Security/CURVE
-pub const CURVE_SERVER: i32 = 47; // Matches libzmq's ZMQ_CURVE_SERVER
-pub const CURVE_SECRET_KEY: i32 = 49; // Matches libzmq's ZMQ_CURVE_SECRETKEY
-pub const CURVE_SERVER_KEY: i32 = 48; // Matches libzmq's ZMQ_CURVE_SERVERKEY
+pub const CURVE_SERVER: i32 = 47; // ZMQ_CURVE_SERVER
+pub const CURVE_PUBLIC_KEY: i32 = 48; // ZMQ_CURVE_PUBLICKEY
+pub const CURVE_SECRET_KEY: i32 = 49; // ZMQ_CURVE_SECRETKEY
+pub const CURVE_SERVER_KEY: i32 = 50; // ZMQ_CURVE_SERVERKEY
 
 pub const MAXMSGSIZE: i32 = 22;
 pub const MAX_CONNECTIONS: i32 = 1000;
@@ -244,6 +245,8 @@ pub struct CurveMechanismSocketOptions {
   pub enabled: bool,
   pub server_role: bool, // True if the socket is acting as a CURVE server
   pub secret_key: Option<[u8; 32]>,
+  /// Set explicitly or derived from `secret_key`; informational, the handshake derives its own.
+  pub public_key: Option<[u8; 32]>,
   pub server_public_key: Option<[u8; 32]>, // For clients connecting to a server
 }
 
@@ -654,6 +657,24 @@ pub(crate) fn parse_max_connections_option(
 /// # Returns
 /// `Ok([u8; N])` if the value has the correct length.
 /// `Err(ZmqError::InvalidOptionValue)` if the value's length does not match `N`.
+/// A CURVE key: 32 raw bytes or 40 Z85 characters with an optional trailing NUL.
+#[cfg(feature = "curve")]
+pub(crate) fn parse_curve_key_option(value: &[u8], option_id: i32) -> Result<[u8; 32], ZmqError> {
+  let text = match value {
+    [z85 @ .., 0] if z85.len() == 40 => Some(z85),
+    z85 if z85.len() == 40 => Some(z85),
+    _ => None,
+  };
+  match text {
+    Some(z85) => std::str::from_utf8(z85)
+      .ok()
+      .and_then(crate::security::z85::decode)
+      .and_then(|bytes| bytes.try_into().ok())
+      .ok_or(ZmqError::InvalidOptionValue(option_id)),
+    None => parse_key_option::<32>(value, option_id),
+  }
+}
+
 pub(crate) fn parse_key_option<const N: usize>(
   value: &[u8],
   option_id: i32,
@@ -738,12 +759,17 @@ pub(crate) fn apply_core_option_value(
         }
         #[cfg(feature = "curve")]
         CURVE_SECRET_KEY => {
-          options.curve_options.secret_key = Some(parse_key_option::<32>(value, option_id)?);
+          options.curve_options.secret_key = Some(parse_curve_key_option(value, option_id)?);
+          options.curve_options.enabled = true;
+        }
+        #[cfg(feature = "curve")]
+        CURVE_PUBLIC_KEY => {
+          options.curve_options.public_key = Some(parse_curve_key_option(value, option_id)?);
           options.curve_options.enabled = true;
         }
         #[cfg(feature = "curve")]
         CURVE_SERVER_KEY => {
-          options.curve_options.server_public_key = Some(parse_key_option::<32>(value, option_id)?);
+          options.curve_options.server_public_key = Some(parse_curve_key_option(value, option_id)?);
           options.curve_options.enabled = true;
         }
 
@@ -819,6 +845,28 @@ pub(crate) fn retrieve_core_option_value(
         PLAIN_USERNAME => options.plain_options.username.as_ref().map(|s| s.as_bytes().to_vec()).ok_or(ZmqError::Internal("Option PLAIN_USERNAME not set".into())),
         #[cfg(feature = "plain")]
         PLAIN_PASSWORD => Err(ZmqError::PermissionDenied("PLAIN_PASSWORD is write-only".into())),
+        #[cfg(feature = "curve")]
+        CURVE_SERVER => Ok((options.curve_options.server_role as i32).to_ne_bytes().to_vec()),
+        #[cfg(feature = "curve")]
+        CURVE_SECRET_KEY => Err(ZmqError::PermissionDenied("CURVE_SECRET_KEY is write-only".into())),
+        #[cfg(feature = "curve")]
+        CURVE_PUBLIC_KEY => options
+          .curve_options
+          .public_key
+          .or_else(|| {
+            options.curve_options.secret_key.map(|sk| {
+              use dryoc::types::ByteArray;
+              *dryoc::keypair::StackKeyPair::from_secret_key(sk.into()).public_key.as_array()
+            })
+          })
+          .map(|k| k.to_vec())
+          .ok_or(ZmqError::Internal("Option CURVE_PUBLIC_KEY not set".into())),
+        #[cfg(feature = "curve")]
+        CURVE_SERVER_KEY => options
+          .curve_options
+          .server_public_key
+          .map(|k| k.to_vec())
+          .ok_or(ZmqError::Internal("Option CURVE_SERVER_KEY not set".into())),
 
 
         #[cfg(feature = "noise_xx")]

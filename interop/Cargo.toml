@@ -8,7 +8,7 @@ publish = false
 full = []
 
 [dependencies]
-rzmq = { path = "../core" }
+rzmq = { path = "../core", features = ["curve"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 

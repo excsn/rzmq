@@ -1,4 +1,4 @@
-pub(crate) mod cipher;
+pub(crate) mod framer;
 pub(crate) mod handshake;
 pub(crate) mod mechanism;
 

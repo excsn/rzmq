@@ -39,7 +39,7 @@ The `rzmq` library provides an asynchronous, pure-Rust implementation of ZeroMQ 
     *   **`NOISE_XX`**: A modern and secure handshake protocol based on the Noise Protocol Framework. (Requires the `noise_xx` feature).
 
 *   **Configuration**: Security is configured on a per-socket basis using `Socket::set_option`.
-    *   To act as a server (e.g., a `REP`, `ROUTER`, or `PULL` socket that binds), you must enable the server role for the chosen mechanism (e.g., by setting `PLAIN_SERVER` or `CURVE_SERVER` to `true`) and provide its secret key.
+    *   To act as a server (e.g., a `REP`, `ROUTER` or `PULL` socket that binds), you must enable the server role for the chosen mechanism (e.g., by setting `PLAIN_SERVER` or `CURVE_SERVER` to `true`) and provide what it authenticates against: the accepted `PLAIN_USERNAME` and `PLAIN_PASSWORD` for PLAIN, the secret key for CURVE.
     *   To act as a client, you provide the client's own keys and, for authentication, the public key of the server you intend to connect to (e.g., `CURVE_SERVER_KEY`).
 
 *   **Lifecycle and Monitoring**: The success or failure of the security handshake can be observed using the socket monitoring feature.
@@ -409,12 +409,13 @@ Constants for socket option integer IDs.
 *   `pub const ALLOW_ZMTP2: i32 = 1220` - Allow downgrading the handshake to the legacy ZMTP/2.0 wire protocol when a peer announces it; value is `i32` (`1` = enabled, default; `0` = reject v2 peers). ZMTP/2.0 sessions use NULL security only, exchange identities as bare frames (no `READY`), and have no heartbeats. Set before `bind`/`connect`.
 *   `pub const AUTO_DELIMITER: i32 = 42`
 *   `pub const ZAP_DOMAIN: i32 = 55`
-*   `pub const PLAIN_SERVER: i32 = 44` (Requires `plain` feature)
-*   `pub const PLAIN_USERNAME: i32 = 45` (Requires `plain` feature)
-*   `pub const PLAIN_PASSWORD: i32 = 46` (Requires `plain` feature)
-*   `pub const CURVE_SERVER: i32 = 47` (Requires `curve` feature)
-*   `pub const CURVE_SECRET_KEY: i32 = 49` (Requires `curve` feature)
-*   `pub const CURVE_SERVER_KEY: i32 = 48` (Requires `curve` feature)
+*   `pub const PLAIN_SERVER: i32 = 44` (Requires `plain` feature) - value is `i32` (`0` = client role, the default; non-zero = server role). A server accepts only the username and password set on it with `PLAIN_USERNAME` and `PLAIN_PASSWORD`; with neither set it rejects every client. Applies to connections made after it is set.
+*   `pub const PLAIN_USERNAME: i32 = 45` (Requires `plain` feature) - value is a UTF-8 string. On a client, the username sent in HELLO. On a server, the one username accepted. The wire format carries at most 255 bytes, so a longer value is cut there. Applies to connections made after it is set.
+*   `pub const PLAIN_PASSWORD: i32 = 46` (Requires `plain` feature) - value is a UTF-8 string. On a client, the password sent in HELLO. On a server, the one password accepted. The wire format carries at most 255 bytes, so a longer value is cut there. Applies to connections made after it is set. Get returns `ZmqError::PermissionDenied`.
+*   `pub const CURVE_SERVER: i32 = 47` (Requires `curve` feature) - value is `i32` (`0` = client role, the default; non-zero = server role). A server accepts every client that holds its public key; there is no ZAP, so there is no per-client allow list. Applies to connections made after it is set.
+*   `pub const CURVE_PUBLIC_KEY: i32 = 48` (Requires `curve` feature) - value is a key, 32 raw bytes or 40 Z85 characters with an optional trailing NUL. Optional: the handshake derives the public key from `CURVE_SECRET_KEY`. Get returns the 32 raw bytes, derived when not set.
+*   `pub const CURVE_SECRET_KEY: i32 = 49` (Requires `curve` feature) - value is a key, 32 raw bytes or 40 Z85 characters with an optional trailing NUL. The socket's own long-term secret key, required on both roles. Get returns `ZmqError::PermissionDenied`.
+*   `pub const CURVE_SERVER_KEY: i32 = 50` (Requires `curve` feature) - value is a key, 32 raw bytes or 40 Z85 characters with an optional trailing NUL. The server's long-term public key, required on a client. A server that cannot open the client's HELLO with it drops the connection without a reply. Get returns the 32 raw bytes. The ids match libzmq's `ZMQ_CURVE_*`. The handshake and the data phase are CurveZMQ (RFC 26) as libzmq sends it, so either role interoperates with libzmq.
 *   `pub const NOISE_XX_ENABLED: i32 = 1202` (Requires `noise_xx` feature)
 *   `pub const NOISE_XX_STATIC_SECRET_KEY: i32 = 1200` (Requires `noise_xx` feature)
 *   `pub const NOISE_XX_REMOTE_STATIC_PUBLIC_KEY: i32 = 1201` (Requires `noise_xx` feature)

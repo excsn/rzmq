@@ -134,44 +134,41 @@ async fn test_curve_client_auth_server_pk_mismatch() -> Result<(), ZmqError> {
     .set_option_raw(CURVE_SERVER_KEY, fake_server_keys.public_key.as_slice())
     .await?;
 
-  let mut client_monitor = req_client.monitor_default().await?;
+  let client_monitor = req_client.monitor_default().await?;
+  let server_monitor = rep_server.monitor_default().await?;
   println!(
     "[REQ Client {}] Connecting (expecting server PK mismatch)...",
     endpoint
   );
   req_client.connect(endpoint).await?;
 
-  println!("[REQ Client {}] Waiting for handshake outcome...", endpoint);
-  let event = common::wait_for_monitor_event(&client_monitor, LONG_TIMEOUT, SHORT_TIMEOUT, |e| {
+  // The client's HELLO is sealed to the wrong server key, so the server cannot open
+  // it and drops the connection without a reply, as libzmq does.
+  let server_event = common::wait_for_monitor_event(&server_monitor, LONG_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::HandshakeFailed { .. } | SocketEvent::HandshakeSucceeded { .. })
+  })
+  .await
+  .expect("server should report the handshake outcome");
+  assert!(
+    matches!(server_event, SocketEvent::HandshakeFailed { .. }),
+    "server accepted a client holding the wrong server key: {:?}",
+    server_event
+  );
+
+  let client_event = common::wait_for_monitor_event(&client_monitor, LONG_TIMEOUT, SHORT_TIMEOUT, |e| {
     matches!(
       e,
-      SocketEvent::HandshakeFailed { .. } | SocketEvent::ConnectFailed { .. }
+      SocketEvent::HandshakeFailed { .. }
+        | SocketEvent::HandshakeSucceeded { .. }
+        | SocketEvent::Disconnected { .. }
+        | SocketEvent::ConnectFailed { .. }
     )
   })
-  .await;
-
-  assert!(event.is_ok(), "Client should have emitted a failure event");
-
-  let error_msg = match event.unwrap() {
-    SocketEvent::HandshakeFailed { error_msg, .. } => error_msg,
-    SocketEvent::ConnectFailed { error_msg, .. } => error_msg,
-    _ => panic!("Unexpected event type"),
-  };
-
-  println!(
-    "[REQ Client {}] Received expected failure event: {}",
-    endpoint, error_msg
-  );
+  .await
+  .expect("client should report the connection outcome");
   assert!(
-    error_msg.contains("AuthenticationFailure")
-      || error_msg.contains("Security error")
-      || error_msg.contains("decryption error"),
-    "Error message did not indicate an auth/security failure. Got: {}",
-    error_msg
-  );
-  println!(
-    "[REQ Client {}] Correctly observed handshake failure.",
-    endpoint
+    !matches!(client_event, SocketEvent::HandshakeSucceeded { .. }),
+    "client completed a handshake with the wrong server key"
   );
 
   // --- Teardown ---
@@ -182,7 +179,7 @@ async fn test_curve_client_auth_server_pk_mismatch() -> Result<(), ZmqError> {
 
 #[tokio::test]
 #[serial]
-async fn test_curve_server_pk_mismatch_error_names_welcome_without_source_path() -> Result<(), ZmqError> {
+async fn test_curve_server_pk_mismatch_error_names_hello_without_source_path() -> Result<(), ZmqError> {
   let ctx = common::test_context();
   {
     let server_keys = Keypair::r#gen();
@@ -203,20 +200,20 @@ async fn test_curve_server_pk_mismatch_error_names_welcome_without_source_path()
     req_client
       .set_option_raw(CURVE_SERVER_KEY, fake_server_keys.public_key.as_slice())
       .await?;
-    let client_monitor = req_client.monitor_default().await?;
+    let server_monitor = rep_server.monitor_default().await?;
     req_client.connect(&endpoint).await?;
 
-    let event = common::wait_for_monitor_event(&client_monitor, LONG_TIMEOUT, SHORT_TIMEOUT, |e| {
+    let event = common::wait_for_monitor_event(&server_monitor, LONG_TIMEOUT, SHORT_TIMEOUT, |e| {
       matches!(e, SocketEvent::HandshakeFailed { .. })
     })
     .await
-    .expect("client should report a failed handshake");
+    .expect("server should report a failed handshake");
     let SocketEvent::HandshakeFailed { error_msg, .. } = event else {
       unreachable!()
     };
     assert_eq!(
       error_msg,
-      "Security error: CURVE WELCOME could not be decrypted (wrong server public key?)"
+      "Security error: CURVE HELLO could not be decrypted (client has the wrong server key?)"
     );
   }
   ctx.term().await

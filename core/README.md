@@ -127,7 +127,7 @@ Supports a range of common socket options for fine-tuning behavior, including:
 *   Legacy interop: `ALLOW_ZMTP2` (enable/disable transparent ZMTP/2.0 downgrade for legacy peers; default `true`)
 *   Security:
     *   `PLAIN_SERVER`, `PLAIN_USERNAME`, `PLAIN_PASSWORD` (requires `plain` feature)
-    *   `CURVE_SERVER`, `CURVE_SECRET_KEY`, `CURVE_SERVER_KEY` (requires `curve` feature)
+    *   `CURVE_SERVER`, `CURVE_PUBLIC_KEY`, `CURVE_SECRET_KEY`, `CURVE_SERVER_KEY` (requires `curve` feature)
     *   `NOISE_XX_ENABLED`, `NOISE_XX_STATIC_SECRET_KEY`, `NOISE_XX_REMOTE_STATIC_PUBLIC_KEY` (requires `noise_xx` feature)
 *   Performance/Platform-Specific (`io-uring` feature, Linux-only):
     *   `IO_URING_SESSION_ENABLED` (to enable io_uring for a socket's connections)

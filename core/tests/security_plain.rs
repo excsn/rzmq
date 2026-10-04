@@ -1,8 +1,8 @@
 mod common;
 
 use rzmq::{
-  Socket, SocketType, ZmqError,
-  socket::{LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME, SocketEvent},
+  Msg, Socket, SocketType, ZmqError,
+  socket::{LINGER, PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME, RCVTIMEO, SocketEvent},
 };
 use serial_test::serial;
 use std::time::Duration;
@@ -471,6 +471,33 @@ async fn test_null_client_to_plain_server_fails() {
   // _server_task.abort(); // Not strictly needed if ctx.term() shuts down server socket too, but good for explicit cleanup
   println!("Test test_null_client_to_plain_server_fails finished.");
 }
+/// A reply already sent when a PLAIN REP closes still reaches the REQ.
+#[tokio::test]
+#[serial]
+async fn test_plain_reply_sent_before_rep_closes_is_delivered() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  {
+    let server = ctx.socket(SocketType::Rep)?;
+    server.set_option(PLAIN_SERVER, true).await?;
+    server.set_option(PLAIN_USERNAME, "testuser").await?;
+    server.set_option(PLAIN_PASSWORD, "testpassword").await?;
+    let endpoint = common::bind_and_resolve_tcp(&server).await?;
+
+    let client = ctx.socket(SocketType::Req)?;
+    client.set_option(RCVTIMEO, 2000i32).await?;
+    client.set_option(PLAIN_USERNAME, "testuser").await?;
+    client.set_option(PLAIN_PASSWORD, "testpassword").await?;
+    client.connect(&endpoint).await?;
+
+    client.send(Msg::from_static(b"request")).await?;
+    assert_eq!(common::recv_timeout(&server, Duration::from_secs(5)).await?.data().unwrap(), b"request");
+    server.send(Msg::from_static(b"reply")).await?;
+    server.close().await?;
+    assert_eq!(client.recv().await?.data().unwrap(), b"reply");
+  }
+  ctx.term().await
+}
+
 /// A PLAIN server checks clients against its own PLAIN_USERNAME and
 /// PLAIN_PASSWORD, so one with neither set rejects every client.
 #[tokio::test]

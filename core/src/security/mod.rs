@@ -4,6 +4,7 @@ pub mod mechanism;
 pub(crate) mod null;
 #[cfg(feature = "plain")]
 pub(crate) mod plain;
+pub(crate) mod z85;
 pub mod zap;
 
 pub(crate) use cipher::IDataCipher;
@@ -70,6 +71,7 @@ fn initialize_plain(
   } else {
     plain_mech.set_client_credentials(user_bytes, pass_bytes);
   }
+  plain_mech.set_local_metadata(crate::protocol::zmtp::engine::build_local_ready_props(local_config));
 
   Ok(Box::new(plain_mech))
 }
@@ -81,12 +83,9 @@ fn initialize_curve(
   _engine_handle_for_log: usize,
 ) -> Result<Box<dyn Mechanism>, ZmqError> {
   use crate::security::curve::handshake::CurveHandshake;
-  let handshake = CurveHandshake::new(is_server, local_config)?;
-  Ok(Box::new(CurveMechanism {
-    handshake,
-    status: MechanismStatus::Handshaking,
-    error_reason: None,
-  }))
+  let metadata = crate::protocol::zmtp::engine::build_local_ready_props(local_config);
+  let handshake = CurveHandshake::new(is_server, local_config, metadata)?;
+  Ok(Box::new(CurveMechanism::new(handshake)))
 }
 
 #[cfg(feature = "noise_xx")]

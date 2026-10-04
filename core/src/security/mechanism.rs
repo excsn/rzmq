@@ -51,6 +51,19 @@ pub(crate) trait Mechanism: Send + Sync + fmt::Debug + 'static {
   /// Returns the reason for the error state, if available.
   fn error_reason(&self) -> Option<&str>;
 
+  /// The error to report for the Error state.
+  fn error(&self) -> Option<ZmqError> {
+    self
+      .error_reason()
+      .map(|reason| ZmqError::SecurityError(reason.to_owned()))
+  }
+
+  /// The peer's metadata when the mechanism's own handshake carried it (PLAIN's
+  /// INITIATE and READY). `None` means the engine exchanges READY itself.
+  fn peer_metadata(&self) -> Option<&std::collections::HashMap<String, Vec<u8>>> {
+    None
+  }
+
   /// Called after handshake is Ready. If this mechanism provides data-phase encryption,
   /// it consumes itself and returns an ISecureFramer and the established peer identity.
   /// If it's a non-encrypting mechanism (like NULL), it can return an error or a

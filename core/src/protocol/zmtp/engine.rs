@@ -460,6 +460,9 @@ impl ZmtpEngine {
     if !self.emit_security_token(out) {
       return;
     }
+    if self.fail_on_mechanism_error(out) {
+      return;
+    }
     if self.check_security_complete(out) {
       return;
     }
@@ -485,26 +488,36 @@ impl ZmtpEngine {
         }
       }
 
-      if self.security_mechanism.is_error() {
-        let reason = self
-          .security_mechanism
-          .error_reason()
-          .unwrap_or("unknown")
-          .to_owned();
-        self.phase = ZmtpPhase::Closed;
-        out
-          .app_actions
-          .push(AppAction::PeerError(ZmqError::SecurityError(reason)));
+      if self.fail_on_mechanism_error(out) {
         return;
       }
 
       if !self.emit_security_token(out) {
         return;
       }
+      if self.fail_on_mechanism_error(out) {
+        return;
+      }
       if self.check_security_complete(out) {
         return;
       }
     }
+  }
+
+  /// A mechanism that entered its Error state ends the connection with that error.
+  /// Checked after a produced token as well, since a server's ERROR command is sent
+  /// before the mechanism reports the failure.
+  fn fail_on_mechanism_error(&mut self, out: &mut EngineOutput) -> bool {
+    if !self.security_mechanism.is_error() {
+      return false;
+    }
+    let error = self
+      .security_mechanism
+      .error()
+      .unwrap_or_else(|| ZmqError::SecurityError("unknown".into()));
+    self.phase = ZmtpPhase::Closed;
+    out.app_actions.push(AppAction::PeerError(error));
+    true
   }
 
   /// Calls `produce_token()` and, if a token is ready, encodes and enqueues it.
@@ -544,6 +557,7 @@ impl ZmtpEngine {
     if !self.security_mechanism.is_complete() {
       return false;
     }
+    let carried_metadata = self.security_mechanism.peer_metadata().cloned();
     // Derive the data-phase framer now but hold it in pending_framer.
     // READY frames are exchanged in plain (same as security tokens),
     // so we only activate the encrypted framer after READY completes.
@@ -555,6 +569,11 @@ impl ZmtpEngine {
         return true;
       }
     }
+    if let Some(properties) = carried_metadata {
+      let (peer_socket_type, peer_identity) = Self::peer_properties(&properties);
+      self.complete_handshake(out, peer_identity, peer_socket_type);
+      return true;
+    }
     self.phase = ZmtpPhase::Ready;
     if !self.is_server {
       self.emit_local_ready(out);
@@ -563,6 +582,44 @@ impl ZmtpEngine {
       self.process_ready(out);
     }
     true
+  }
+
+  fn peer_properties(properties: &HashMap<String, Vec<u8>>) -> (Option<String>, Option<Blob>) {
+    let peer_socket_type = properties
+      .get("Socket-Type")
+      .map(|v| String::from_utf8_lossy(v).into_owned());
+    let peer_identity = properties.get("Identity").map(|v| Blob::from(v.clone()));
+    (peer_socket_type, peer_identity)
+  }
+
+  /// Activates the data-phase framer and reports the completed handshake.
+  fn complete_handshake(
+    &mut self,
+    out: &mut EngineOutput,
+    peer_identity: Option<Blob>,
+    peer_socket_type: Option<String>,
+  ) {
+    self.activate_pending_framer();
+    self.phase = ZmtpPhase::Data;
+    self.last_activity_time = Instant::now();
+
+    if self.config.use_cork
+      && matches!(
+        self.config.socket_type_name.as_str(),
+        "PUSH" | "PULL" | "PUB" | "SUB"
+      )
+    {
+      out.net_actions.push(NetAction::SetCork(true));
+    }
+
+    out.app_actions.push(AppAction::HandshakeComplete {
+      peer_identity,
+      peer_socket_type,
+    });
+
+    if !self.network_read_accumulator.is_empty() {
+      self.process_data(out);
+    }
   }
 
   fn process_ready(&mut self, out: &mut EngineOutput) {
@@ -601,44 +658,14 @@ impl ZmtpEngine {
         }
       };
 
-      let peer_socket_type = ready_cmd
-        .properties
-        .get("Socket-Type")
-        .map(|v| String::from_utf8_lossy(v).into_owned());
-      let peer_identity = ready_cmd
-        .properties
-        .get("Identity")
-        .map(|v| Blob::from(v.clone()));
+      let (peer_socket_type, peer_identity) = Self::peer_properties(&ready_cmd.properties);
 
       if self.is_server {
         // Server received client READY → send server READY then complete.
         self.emit_local_ready(out);
       }
 
-      // Activate the encrypted framer now that the plain READY exchange is done.
-      self.activate_pending_framer();
-      self.phase = ZmtpPhase::Data;
-      self.last_activity_time = Instant::now();
-
-      // Enable TCP_CORK for throughput-optimised socket types on transition to Data.
-      if self.config.use_cork
-        && matches!(
-          self.config.socket_type_name.as_str(),
-          "PUSH" | "PULL" | "PUB" | "SUB"
-        )
-      {
-        out.net_actions.push(NetAction::SetCork(true));
-      }
-
-      out.app_actions.push(AppAction::HandshakeComplete {
-        peer_identity,
-        peer_socket_type,
-      });
-
-      // Drain any remaining accumulated bytes into the Data phase handler.
-      if !self.network_read_accumulator.is_empty() {
-        self.process_data(out);
-      }
+      self.complete_handshake(out, peer_identity, peer_socket_type);
       return;
     }
   }
@@ -890,7 +917,7 @@ fn encode_msg(msg: crate::Msg) -> Result<Bytes, ZmqError> {
   Ok(buf.freeze())
 }
 
-fn build_local_ready_props(config: &ZmtpEngineConfig) -> HashMap<String, Vec<u8>> {
+pub(crate) fn build_local_ready_props(config: &ZmtpEngineConfig) -> HashMap<String, Vec<u8>> {
   let mut props = HashMap::new();
   props.insert(
     "Socket-Type".to_string(),

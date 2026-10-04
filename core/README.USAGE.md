@@ -534,11 +534,11 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
 
 *   **NULL**: No security (default). Interoperable with other ZeroMQ implementations using NULL.
 *   **PLAIN** (requires `plain` feature): Username/password based authentication. Interoperable with other ZeroMQ implementations using PLAIN.
-    *   Server: Set `rzmq::socket::PLAIN_SERVER` option to `true` (as `1i32`).
+    *   Server: Set `rzmq::socket::PLAIN_SERVER` to `true` (as `1i32`) and the one username and password it accepts with `rzmq::socket::PLAIN_USERNAME` and `rzmq::socket::PLAIN_PASSWORD`. A client presenting anything else is rejected with `HandshakeFailed`. A server with no username and password set rejects every client. rzmq has no ZAP; the pair on the server socket takes the place of the authenticator a `libzmq` PLAIN server requires.
     *   Client: Set `rzmq::socket::PLAIN_USERNAME` and `rzmq::socket::PLAIN_PASSWORD` options.
-*   **CURVE** (requires `curve` feature): Encrypted and authenticated sessions based on the official CurveZMQ security protocol. This mechanism provides strong security and is designed to be **interoperable** with `libzmq`'s CURVE implementation.
-    *   Server: Set `rzmq::socket::CURVE_SERVER` option to `true` (as `1i32`) and provide its secret key via `rzmq::socket::CURVE_SECRET_KEY`.
-    *   Client: Provide its own secret key via `rzmq::socket::CURVE_SECRET_KEY` and the server's public key via `rzmq::socket::CURVE_SERVER_KEY`.
+*   **CURVE** (requires `curve` feature): Encrypted and authenticated sessions using CurveZMQ (RFC 26), on the wire as `libzmq` sends it, so an rzmq client talks to a `libzmq` server and the other way round. Keys are given as 32 raw bytes or as the 40-character Z85 text that `zmq_curve_keypair` and pyzmq's `zmq.curve_keypair()` produce.
+    *   Server: Set `rzmq::socket::CURVE_SERVER` to `true` (as `1i32`) and its secret key with `rzmq::socket::CURVE_SECRET_KEY`. Every client holding the server's public key is accepted; rzmq has no ZAP, so there is no per-client allow list.
+    *   Client: Set its own secret key with `rzmq::socket::CURVE_SECRET_KEY` and the server's public key with `rzmq::socket::CURVE_SERVER_KEY`. `rzmq::socket::CURVE_PUBLIC_KEY` is optional, since the public key is derived from the secret key.
 *   **Noise_XX** (requires `noise_xx` feature): Encrypted and authenticated sessions using the Noise Protocol Framework (XX handshake pattern). This is a modern security mechanism specific to `rzmq` and **will not interoperate** with `libzmq`'s `CURVE` security. Use it for `rzmq`-to-`rzmq` communication.
     *   Enable with `rzmq::socket::NOISE_XX_ENABLED` option (`true` as `1i32`).
     *   Set `rzmq::socket::NOISE_XX_STATIC_SECRET_KEY` (32-byte array).
