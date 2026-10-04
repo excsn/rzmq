@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod z85;
 
 use anyhow::Result;
 use clap::Parser;

@@ -57,12 +57,12 @@ pub struct CurveArgs {
   #[clap(long, short = 'o', default_value = ".")]
   pub output_dir: PathBuf,
 
-  /// Format for the content stored IN THE KEY FILES
-  #[clap(long, value_parser = clap::builder::PossibleValuesParser::new(["hex", "base64", "binary"]).map(|s| s.to_lowercase()), default_value = "hex")]
+  /// Format for the content stored IN THE KEY FILES. z85 is what libzmq's curve_keygen writes.
+  #[clap(long, value_parser = clap::builder::PossibleValuesParser::new(["z85", "hex", "base64", "binary"]).map(|s| s.to_lowercase()), default_value = "z85")]
   pub file_format: String,
 
   /// Output format for displaying keys on STDOUT
-  #[clap(long, value_parser = clap::builder::PossibleValuesParser::new(["hex", "base64", "rust"]).map(|s| s.to_lowercase()), default_value = "hex")]
+  #[clap(long, value_parser = clap::builder::PossibleValuesParser::new(["z85", "hex", "base64", "rust"]).map(|s| s.to_lowercase()), default_value = "z85")]
   pub display_format: String,
 
   /// Overwrite existing key files without prompting

@@ -6,7 +6,7 @@ Command-line utility for RZMQ, a pure-Rust asynchronous ZeroMQ implementation.
 
 ## Overview
 
-The `rzmq` CLI provides helpful utilities for working with the RZMQ library. Currently, its primary function is to generate cryptographic keypairs for use with RZMQ's security mechanisms, such as Noise_XX.
+The `rzmq` CLI provides helpful utilities for working with the RZMQ library. Currently, its primary function is to generate cryptographic keypairs for use with RZMQ's security mechanisms, CURVE and Noise_XX.
 
 ## Installation
 
@@ -14,7 +14,7 @@ The `rzmq` CLI provides helpful utilities for working with the RZMQ library. Cur
 
 *   Rust and Cargo (latest stable version recommended). You can install them from [rustup.rs](https://rustup.rs/).
 
-### From Crates.io (Once Published)
+### From Crates.io
 
 ```bash
 cargo install rzmq_cli
@@ -125,6 +125,47 @@ async fn setup_socket_with_hex_key(ctx: &Context, sk_file_path: &str) -> Result<
     Ok(socket)
 }
 ```
+
+#### CURVE (Curve25519) Keypair Generation
+
+To generate a long-term keypair for the CURVE security mechanism, the equivalent of libzmq's `curve_keygen`:
+
+```bash
+rzmq keygen curve --name <KEY_NAME> [OPTIONS]
+```
+
+The options are the same as for `noise-xx`, with one difference: the default format for both the files and the display is `z85`, the 40-character text that libzmq's `curve_keygen`, `zmq_z85_encode` and pyzmq's `zmq.curve_keypair()` produce. `hex`, `base64`, `binary` and `rust` remain available.
+
+**File Naming Convention:**
+
+*   Secret Key: `<KEY_NAME>.curve.sk`
+*   Public Key: `<KEY_NAME>.curve.pk`
+
+**Example:**
+
+```bash
+rzmq keygen curve --name server --output-dir ./keys
+```
+
+creates `./keys/server.curve.sk` and `./keys/server.curve.pk`, each holding one Z85 string. Both keys are printed as Z85.
+
+**Using Generated Keys with RZMQ or libzmq:**
+
+The `CURVE_SECRET_KEY`, `CURVE_PUBLIC_KEY` and `CURVE_SERVER_KEY` socket options accept a key as the 40 Z85 characters or as 32 raw bytes, in rzmq and in libzmq alike, so a Z85 key file is passed through as read:
+
+```rust
+use rzmq::socket::options::{CURVE_SECRET_KEY, CURVE_SERVER_KEY};
+use std::fs;
+
+async fn curve_client(ctx: &rzmq::Context) -> Result<rzmq::Socket, anyhow::Error> {
+    let socket = ctx.socket(rzmq::SocketType::Req)?;
+    socket.set_option(CURVE_SECRET_KEY, fs::read_to_string("./keys/client.curve.sk")?.trim()).await?;
+    socket.set_option(CURVE_SERVER_KEY, fs::read_to_string("./keys/server.curve.pk")?.trim()).await?;
+    Ok(socket)
+}
+```
+
+A key written with `--file-format hex` or `base64` has to be decoded to 32 bytes first; `binary` files are read straight into a `[u8; 32]`.
 
 ## Contributing
 

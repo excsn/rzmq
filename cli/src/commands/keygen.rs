@@ -1,4 +1,5 @@
 use crate::cli::{CurveArgs, NoiseXxArgs};
+use crate::z85;
 
 use std::{
   fs::{self, OpenOptions},
@@ -120,6 +121,10 @@ fn generate_keypair_internal(
   let pk_bytes_raw: [u8; 32] = public_key.to_bytes();
 
   let (sk_file_content, pk_file_content) = match args.file_format() {
+    "z85" => (
+      z85::encode(&sk_bytes_raw).unwrap().into_bytes(),
+      z85::encode(&pk_bytes_raw).unwrap().into_bytes(),
+    ),
     "hex" => (
       hex::encode(sk_bytes_raw).into_bytes(),
       hex::encode(pk_bytes_raw).into_bytes(),
@@ -151,6 +156,10 @@ fn generate_keypair_internal(
     args.display_format()
   );
   match args.display_format() {
+    "z85" => {
+      println!("Secret Key (Z85): {}", z85::encode(&sk_bytes_raw).unwrap());
+      println!("Public Key (Z85): {}", z85::encode(&pk_bytes_raw).unwrap());
+    }
     "hex" => {
       println!("Secret Key (Hex): {}", hex::encode(sk_bytes_raw));
       println!("Public Key (Hex): {}", hex::encode(pk_bytes_raw));
@@ -180,10 +189,15 @@ fn generate_keypair_internal(
     "The public key file ({:?}) can be shared with peers.",
     pk_file_path
   );
-  println!("\nRemember: rzmq socket options expect RAW BYTES for keys.");
-  println!(
-    "If your key files are in hex or base64 format, your application will need to decode them before setting the socket options."
-  );
+  if file_ext == "curve" {
+    println!("\nThe CURVE_* socket options take a key as 40 Z85 characters or 32 raw bytes, in rzmq and in libzmq.");
+    println!("Hex and base64 key files must be decoded by the application before setting the options.");
+  } else {
+    println!("\nRemember: rzmq socket options expect RAW BYTES for keys.");
+    println!(
+      "If your key files are in hex or base64 format, your application will need to decode them before setting the socket options."
+    );
+  }
 
   Ok(())
 }
