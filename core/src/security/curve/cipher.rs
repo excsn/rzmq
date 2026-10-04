@@ -95,10 +95,43 @@ impl IDataCipher for CurveDataCipher {
       nonce.as_array(),
       &self.decode_key, // Use the decode key
     )
-    .map_err(|e| ZmqError::AuthenticationFailure(e.to_string()))?;
+    .map_err(|_| ZmqError::AuthenticationFailure("CURVE message authentication failed".into()))?;
 
     self.recv_nonce_counter += 1;
 
     Ok(decrypted)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn cipher_pair() -> (CurveDataCipher, CurveDataCipher) {
+    let a_to_b = [7u8; 32];
+    let b_to_a = [9u8; 32];
+    (
+      CurveDataCipher::new(a_to_b, b_to_a),
+      CurveDataCipher::new(b_to_a, a_to_b),
+    )
+  }
+
+  #[test]
+  fn untampered_frame_decrypts() {
+    let (mut a, mut b) = cipher_pair();
+    let wire = a.encrypt(b"payload").unwrap();
+    assert_eq!(b.decrypt(&wire).unwrap(), b"payload");
+  }
+
+  #[test]
+  fn tampered_frame_fails_authentication_with_fixed_message() {
+    let (mut a, mut b) = cipher_pair();
+    let mut wire = a.encrypt(b"payload").unwrap();
+    let last = wire.len() - 1;
+    wire[last] ^= 0x01;
+    match b.decrypt(&wire) {
+      Err(ZmqError::AuthenticationFailure(msg)) => assert_eq!(msg, "CURVE message authentication failed"),
+      other => panic!("expected AuthenticationFailure, got {:?}", other),
+    }
   }
 }

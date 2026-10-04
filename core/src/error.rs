@@ -161,12 +161,12 @@ impl From<io::Error> for ZmqError {
   }
 }
 
+/// dryoc's error text carries the absolute source path it was raised from, so
+/// it is never passed on.
 #[cfg(feature = "curve")]
 impl From<dryoc::Error> for ZmqError {
-  fn from(e: dryoc::Error) -> Self {
-    // We can map specific dryoc errors later if needed.
-    // For now, a general security error is sufficient.
-    ZmqError::SecurityError(e.to_string())
+  fn from(_: dryoc::Error) -> Self {
+    ZmqError::SecurityError("CURVE cryptographic operation failed".into())
   }
 }
 

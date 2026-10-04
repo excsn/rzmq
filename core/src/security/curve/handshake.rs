@@ -139,14 +139,16 @@ impl CurveHandshake {
         &mut rx, &mut tx, local_pk,  // Server PK (Primary)
         local_sk,  // Server SK
         remote_pk, // Client PK (Peer)
-      )?;
+      )
+      .map_err(|_| ZmqError::SecurityError("CURVE session key derivation failed".into()))?;
     } else {
       // We are Client. Local is Client, Remote is Server.
       dryoc::classic::crypto_kx::crypto_kx_client_session_keys(
         &mut rx, &mut tx, local_pk,  // Client PK (Primary)
         local_sk,  // Client SK
         remote_pk, // Server PK (Peer)
-      )?;
+      )
+      .map_err(|_| ZmqError::SecurityError("CURVE session key derivation failed".into()))?;
     }
 
     Ok((rx, tx))
@@ -261,7 +263,10 @@ impl CurveHandshake {
       cookie_ciphertext,
       nonce.as_array(),
       &k,
-    )?;
+    )
+    .map_err(|_| {
+      ZmqError::SecurityError("CURVE WELCOME could not be decrypted (wrong server public key?)".into())
+    })?;
 
     self.remote_ephemeral_public_key =
       Some(PublicKey::try_from(server_ephemeral_pk_bytes.as_slice())?);
@@ -364,7 +369,8 @@ impl CurveHandshake {
       ciphertext,
       nonce.as_array(),
       &initial_k,
-    )?;
+    )
+    .map_err(|_| ZmqError::SecurityError("CURVE INITIATE could not be decrypted".into()))?;
 
     let decrypted_metadata = decode_metadata(&decrypted_metadata_bytes)?;
     let client_static_pk_slice =
@@ -452,4 +458,56 @@ fn decode_metadata(data: &[u8]) -> Result<HashMap<String, Vec<u8>>, ZmqError> {
     metadata.insert(key, value);
   }
   Ok(metadata)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn handshake_pair() -> (CurveHandshake, CurveHandshake) {
+    let (server_pk, server_sk) = crypto_box_keypair();
+    let (_, client_sk) = crypto_box_keypair();
+    let server_config = ZmtpEngineConfig {
+      curve_local_secret_key: Some(server_sk),
+      ..Default::default()
+    };
+    let client_config = ZmtpEngineConfig {
+      curve_local_secret_key: Some(client_sk),
+      curve_remote_public_key: Some(server_pk),
+      ..Default::default()
+    };
+    (
+      CurveHandshake::new(false, &client_config).unwrap(),
+      CurveHandshake::new(true, &server_config).unwrap(),
+    )
+  }
+
+  fn initiate_token() -> (CurveHandshake, Vec<u8>) {
+    let (mut client, mut server) = handshake_pair();
+    server.process_client_hello(&client.build_client_hello().unwrap()).unwrap();
+    client.process_server_welcome(&server.build_server_welcome().unwrap()).unwrap();
+    let initiate = client.build_client_initiate().unwrap();
+    (server, initiate)
+  }
+
+  #[test]
+  fn untampered_initiate_is_accepted() {
+    let (mut server, initiate) = initiate_token();
+    server.process_client_initiate(&initiate).unwrap();
+  }
+
+  #[test]
+  fn tampered_initiate_fails_with_fixed_message() {
+    let (mut server, mut initiate) = initiate_token();
+    let key_at = initiate
+      .windows(b"Ciphertext".len())
+      .position(|w| w == b"Ciphertext")
+      .unwrap();
+    // Skips the key and the 4-byte value length to land on the MAC.
+    initiate[key_at + b"Ciphertext".len() + 4] ^= 0x01;
+    match server.process_client_initiate(&initiate) {
+      Err(ZmqError::SecurityError(msg)) => assert_eq!(msg, "CURVE INITIATE could not be decrypted"),
+      other => panic!("expected SecurityError, got {:?}", other),
+    }
+  }
 }

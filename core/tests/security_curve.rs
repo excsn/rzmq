@@ -182,6 +182,48 @@ async fn test_curve_client_auth_server_pk_mismatch() -> Result<(), ZmqError> {
 
 #[tokio::test]
 #[serial]
+async fn test_curve_server_pk_mismatch_error_names_welcome_without_source_path() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  {
+    let server_keys = Keypair::r#gen();
+    let client_keys = Keypair::r#gen();
+    let fake_server_keys = Keypair::r#gen();
+
+    let rep_server = ctx.socket(SocketType::Rep)?;
+    rep_server.set_option(CURVE_SERVER, true).await?;
+    rep_server
+      .set_option_raw(CURVE_SECRET_KEY, server_keys.secret_key.as_slice())
+      .await?;
+    let endpoint = common::bind_and_resolve_tcp(&rep_server).await?;
+
+    let req_client = ctx.socket(SocketType::Req)?;
+    req_client
+      .set_option_raw(CURVE_SECRET_KEY, client_keys.secret_key.as_slice())
+      .await?;
+    req_client
+      .set_option_raw(CURVE_SERVER_KEY, fake_server_keys.public_key.as_slice())
+      .await?;
+    let client_monitor = req_client.monitor_default().await?;
+    req_client.connect(&endpoint).await?;
+
+    let event = common::wait_for_monitor_event(&client_monitor, LONG_TIMEOUT, SHORT_TIMEOUT, |e| {
+      matches!(e, SocketEvent::HandshakeFailed { .. })
+    })
+    .await
+    .expect("client should report a failed handshake");
+    let SocketEvent::HandshakeFailed { error_msg, .. } = event else {
+      unreachable!()
+    };
+    assert_eq!(
+      error_msg,
+      "Security error: CURVE WELCOME could not be decrypted (wrong server public key?)"
+    );
+  }
+  ctx.term().await
+}
+
+#[tokio::test]
+#[serial]
 async fn test_curve_dealer_router_encrypted_exchange() -> Result<(), ZmqError> {
   println!("\n--- Starting test_curve_dealer_router_encrypted_exchange ---");
   let ctx = common::test_context();
