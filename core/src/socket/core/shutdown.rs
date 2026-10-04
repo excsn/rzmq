@@ -1,7 +1,8 @@
 use crate::error::ZmqError;
 use crate::runtime::{ActorType, Command, SystemEvent};
 use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::core::state::{CoreState, EndpointType, ShutdownCoordinator, ShutdownPhase};
+use crate::socket::core::state::{ConnectPipe, CoreState, EndpointType, ShutdownCoordinator, ShutdownPhase};
+use crate::socket::patterns::pipe_credits::PipeCredits;
 use crate::socket::core::{pipe_manager, SocketCore};
 use crate::socket::ISocket;
 
@@ -448,7 +449,7 @@ pub(crate) async fn perform_final_pipe_cleanup(
     "SocketCore performing final pipe and resource cleanup."
   );
 
-  let (mut pipes_tx_map, mut reader_tasks_map) = {
+  let (mut pipes_tx_map, mut reader_tasks_map, session_pipes, connect_pipes) = {
     let mut core_s = core_arc.core_state.write();
     let left_in_session_pipes: usize = core_s
       .endpoints
@@ -466,13 +467,36 @@ pub(crate) async fn perform_final_pipe_cleanup(
     } else {
       tracing::info!(handle = core_handle, sent, drained, dropped_in_pipes, dropped_in_sessions, "Message conservation at close");
     }
+    let session_pipes: Vec<(usize, Option<Arc<PipeCredits>>)> = core_s
+      .endpoints
+      .values()
+      .filter(|ep| ep.endpoint_type == EndpointType::Session)
+      .filter_map(|ep| ep.pipe_ids.map(|(_, read_id)| (read_id, ep.connection_iface.pipe_credits().cloned())))
+      .collect();
+    let connect_pipes: Vec<ConnectPipe> = core_s.connect_pipes.drain().map(|(_, pipe)| pipe).collect();
     (
       std::mem::take(&mut core_s.pipes_tx),
       std::mem::take(&mut core_s.pipe_reader_task_handles),
+      session_pipes,
+      connect_pipes,
     )
   };
 
   let _ = pipes_tx_map.drain();
+
+  // A send blocked on a full pipe waits on the channel or on the pipe's
+  // credits; both must close here or it outlives the socket.
+  for pipe in connect_pipes {
+    if let Some(credits) = &pipe.credits {
+      credits.close();
+    }
+  }
+  for (read_id, credits) in session_pipes {
+    if let Some(credits) = credits {
+      credits.close();
+    }
+    socket_logic_strong.pipe_detached(read_id).await;
+  }
 
   for (id, handle) in reader_tasks_map.drain() {
     handle.abort();
