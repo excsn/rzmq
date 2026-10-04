@@ -351,6 +351,13 @@ Represents significant events occurring within a socket or its connections, used
 
 ## 6. Public Functions (Free-standing)
 
+### In `rzmq::security::z85`:
+
+*   `pub fn encode(bytes: &[u8]) -> Option<String>`
+    *   Z85 (RFC 32) text for a byte slice whose length is a multiple of 4; 32 key bytes become 40 characters. `None` for any other length.
+*   `pub fn decode(text: &str) -> Option<Vec<u8>>`
+    *   The bytes for Z85 text whose length is a multiple of 5. `None` on a bad length or a character outside the Z85 alphabet.
+
 ### In `rzmq::uring` (only if `io-uring` feature is enabled):
 
 *   `pub fn initialize_uring_backend(config: UringConfig) -> Result<(), ZmqError>`

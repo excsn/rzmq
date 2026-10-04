@@ -539,6 +539,7 @@ It is important to ensure that `Socket` handles are dropped or explicitly closed
 *   **CURVE** (requires `curve` feature): Encrypted and authenticated sessions using CurveZMQ (RFC 26), on the wire as `libzmq` sends it, so an rzmq client talks to a `libzmq` server and the other way round. Keys are given as 32 raw bytes or as the 40-character Z85 text that `zmq_curve_keypair` and pyzmq's `zmq.curve_keypair()` produce.
     *   Server: Set `rzmq::socket::CURVE_SERVER` to `true` (as `1i32`) and its secret key with `rzmq::socket::CURVE_SECRET_KEY`. Every client holding the server's public key is accepted; rzmq has no ZAP, so there is no per-client allow list.
     *   Client: Set its own secret key with `rzmq::socket::CURVE_SECRET_KEY` and the server's public key with `rzmq::socket::CURVE_SERVER_KEY`. `rzmq::socket::CURVE_PUBLIC_KEY` is optional, since the public key is derived from the secret key.
+    *   `get_option` returns a key as 32 raw bytes; `rzmq::security::z85::encode` turns it into the 40-character text, and `rzmq::security::z85::decode` reads one.
 *   **Noise_XX** (requires `noise_xx` feature): Encrypted and authenticated sessions using the Noise Protocol Framework (XX handshake pattern). This is a modern security mechanism specific to `rzmq` and **will not interoperate** with `libzmq`'s `CURVE` security. Use it for `rzmq`-to-`rzmq` communication.
     *   Enable with `rzmq::socket::NOISE_XX_ENABLED` option (`true` as `1i32`).
     *   Set `rzmq::socket::NOISE_XX_STATIC_SECRET_KEY` (32-byte array).

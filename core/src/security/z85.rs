@@ -1,4 +1,5 @@
-//! Z85 (ZeroMQ RFC 32): 4 bytes to 5 printable characters.
+//! Z85 (ZeroMQ RFC 32): 4 bytes to 5 printable characters, the text form of
+//! CURVE keys that `zmq_z85_encode` and `zmq_z85_decode` produce and read.
 
 const ALPHABET: &[u8; 85] =
   b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
@@ -7,9 +8,8 @@ fn digit_value(c: u8) -> Option<u32> {
   ALPHABET.iter().position(|&a| a == c).map(|p| p as u32)
 }
 
-/// Encodes a byte slice whose length is a multiple of 4.
-#[cfg(test)]
-pub(crate) fn encode(bytes: &[u8]) -> Option<String> {
+/// Encodes a byte slice whose length is a multiple of 4. `None` otherwise.
+pub fn encode(bytes: &[u8]) -> Option<String> {
   if bytes.len() % 4 != 0 {
     return None;
   }
@@ -26,8 +26,9 @@ pub(crate) fn encode(bytes: &[u8]) -> Option<String> {
   Some(out)
 }
 
-/// Decodes a string whose length is a multiple of 5.
-pub(crate) fn decode(text: &str) -> Option<Vec<u8>> {
+/// Decodes a string whose length is a multiple of 5. `None` on a bad length or a
+/// character outside the Z85 alphabet.
+pub fn decode(text: &str) -> Option<Vec<u8>> {
   let bytes = text.as_bytes();
   if bytes.len() % 5 != 0 {
     return None;

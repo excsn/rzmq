@@ -4,7 +4,7 @@ pub mod mechanism;
 pub(crate) mod null;
 #[cfg(feature = "plain")]
 pub(crate) mod plain;
-pub(crate) mod z85;
+pub mod z85;
 pub mod zap;
 
 pub(crate) use cipher::IDataCipher;
