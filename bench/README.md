@@ -36,6 +36,8 @@ cargo run --release --bin rzmq_bench -- \
   --pattern req-rep --duration 10
 ```
 
+Every bench socket pins the options that decide what the counters mean, so a change to a library default cannot move a number: `SNDHWM`/`RCVHWM` from `--hwm`, `LINGER` 0 and, on the PUB, `XPUB_NODROP` so a send only returns once the message is in a subscriber's pipe and sent equals delivered. `--pub-drop` turns `XPUB_NODROP` off to measure the PUB's default drop-at-HWM path; the report then shows the delivered rate as the headline and the count sent but not delivered.
+
 ---
 
 ## Published Result Snapshots

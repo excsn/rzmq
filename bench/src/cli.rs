@@ -74,6 +74,10 @@ pub struct Cli {
   #[arg(long, default_value_t = false)]
   pub cork: bool,
 
+  /// PubSub only: let the PUB drop at SNDHWM for a full subscriber instead of waiting (XPUB_NODROP off); sent then exceeds delivered
+  #[arg(long, default_value_t = false)]
+  pub pub_drop: bool,
+
   /// Output format for the final benchmark metrics report
   #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
   pub output: OutputFormat,

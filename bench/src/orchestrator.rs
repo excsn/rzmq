@@ -100,6 +100,9 @@ async fn run_multi_process_orchestration(args: Cli) -> Result<(), ZmqError> {
   if args.cork {
     base_args.push("--cork".to_string());
   }
+  if args.pub_drop {
+    base_args.push("--pub-drop".to_string());
+  }
   #[cfg(target_os = "linux")]
   if args.pin_cpus {
     base_args.push("--pin-cpus".to_string());

@@ -1,7 +1,7 @@
 use crate::cli::{Cli, Pattern};
 use crate::metrics::{BenchStats, BenchmarkCollector};
 use fibre::mpsc;
-use rzmq::socket::{ADAPTIVE_THROTTLE, RCVBUF, RCVHWM, SNDBUF, SUBSCRIBE, TCP_CORK};
+use rzmq::socket::{ADAPTIVE_THROTTLE, LINGER, RCVBUF, RCVHWM, SNDBUF, SUBSCRIBE, TCP_CORK};
 use rzmq::{Context, SocketType, ZmqError};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
@@ -28,6 +28,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
 
   // Configure common socket options
   socket.set_option(RCVHWM, args.hwm as i32).await?;
+  socket.set_option(LINGER, 0i32).await?;
   socket.set_option(TCP_CORK, args.cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
   socket.set_option(SNDBUF, 4 * 1024 * 1024i32).await?;

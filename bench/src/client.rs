@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use crate::cli::{Cli, Pattern};
 use crate::metrics::{BenchStats, BenchmarkCollector, print_combined_report};
 use hdrhistogram::Histogram;
-use rzmq::socket::{ADAPTIVE_THROTTLE, RCVBUF, SNDBUF, SNDHWM, TCP_CORK};
+use rzmq::socket::{ADAPTIVE_THROTTLE, LINGER, RCVBUF, SNDBUF, SNDHWM, SNDTIMEO, TCP_CORK, XPUB_NODROP};
 use rzmq::{Context, Msg, SocketType, ZmqError};
 use std::sync::{
   Arc,
@@ -115,6 +115,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
           args.endpoint.clone(),
           args.hwm,
           args.cork,
+          args.pub_drop,
           use_io_uring,
           uring_zerocopy,
           uring_multishot,
@@ -164,6 +165,7 @@ pub async fn run_with_context(args: Cli, context: Context) -> Result<BenchStats,
       for i in 0..args.concurrency {
         let socket = context.socket(socket_type)?;
         socket.set_option(SNDHWM, args.hwm as i32).await?;
+        socket.set_option(LINGER, 0i32).await?;
         socket.set_option(TCP_CORK, args.cork).await?;
         socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
         socket.set_option(SNDBUF, 65536i32).await?;
@@ -248,6 +250,7 @@ async fn run_throughput_worker(
   endpoint: String,
   hwm: usize,
   cork: bool,
+  pub_drop: bool,
   use_io_uring: bool,
   uring_zerocopy: bool,
   uring_multishot: bool,
@@ -262,10 +265,15 @@ async fn run_throughput_worker(
 ) -> Result<(), ZmqError> {
   let socket = context.socket(socket_type)?;
   socket.set_option(SNDHWM, hwm as i32).await?;
+  socket.set_option(LINGER, 0i32).await?;
   socket.set_option(TCP_CORK, cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
   socket.set_option(SNDBUF, 4 * 1024 * 1024i32).await?;
   socket.set_option(RCVBUF, 4 * 1024 * 1024i32).await?;
+  if socket_type == SocketType::Pub && !pub_drop {
+    socket.set_option(XPUB_NODROP, true).await?;
+    socket.set_option(SNDTIMEO, 1000i32).await?;
+  }
 
   #[cfg(feature = "io-uring")]
   if use_io_uring {
@@ -337,6 +345,9 @@ async fn run_throughput_worker(
           collector.record_message(msg_size);
         }
       }
+      Err(ZmqError::Timeout) => {
+        msg_counter.fetch_sub(1, Ordering::Relaxed);
+      }
       Err(ZmqError::ConnectionClosed) | Err(ZmqError::InvalidState(_)) => {
         info!(
           "[Throughput Worker {}] Socket was closed. Exiting loop cleanly.",
@@ -383,6 +394,7 @@ async fn run_reqrep_worker(
 ) -> Result<(), ZmqError> {
   let socket = context.socket(SocketType::Req)?;
   socket.set_option(SNDHWM, hwm as i32).await?;
+  socket.set_option(LINGER, 0i32).await?;
   socket.set_option(TCP_CORK, cork).await?;
   socket.set_option(ADAPTIVE_THROTTLE, 0i32).await?;
   socket.set_option(SNDBUF, 65536i32).await?;

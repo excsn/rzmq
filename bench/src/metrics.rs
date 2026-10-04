@@ -392,6 +392,19 @@ fn print_combined_text(
   );
 
   if let Some(srv) = server {
+    let _ = writeln!(out, "{:<25} : {:.2} msg/s", "Delivered", srv.throughput_msg_sec());
+    if client.total_messages > srv.total_messages + srv.total_messages / 20 {
+      let _ = writeln!(
+        out,
+        "{:<25} : {}",
+        "Sent but not delivered",
+        client.total_messages - srv.total_messages
+      );
+    }
+    let _ = writeln!(
+      out,
+      "--------------------------------------------------------"
+    );
     let _ = writeln!(
       out,
       "{:<25}   {:>18}   {:>18}",
