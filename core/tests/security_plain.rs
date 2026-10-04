@@ -471,3 +471,37 @@ async fn test_null_client_to_plain_server_fails() {
   // _server_task.abort(); // Not strictly needed if ctx.term() shuts down server socket too, but good for explicit cleanup
   println!("Test test_null_client_to_plain_server_fails finished.");
 }
+/// A PLAIN server checks clients against its own PLAIN_USERNAME and
+/// PLAIN_PASSWORD, so one with neither set rejects every client.
+#[tokio::test]
+#[serial]
+async fn test_plain_server_without_credentials_rejects_client() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  {
+    let server = ctx.socket(SocketType::Rep)?;
+    server.set_option(PLAIN_SERVER, true).await?;
+    let server_monitor = server.monitor_default().await?;
+    let endpoint = common::bind_and_resolve_tcp(&server).await?;
+
+    let client = ctx.socket(SocketType::Req)?;
+    client.set_option(PLAIN_USERNAME, "testuser").await?;
+    client.set_option(PLAIN_PASSWORD, "testpassword").await?;
+    client.connect(&endpoint).await?;
+
+    let event = common::wait_for_monitor_event(
+      &server_monitor,
+      Duration::from_secs(2),
+      Duration::from_millis(50),
+      |e| matches!(e, SocketEvent::HandshakeFailed { .. } | SocketEvent::HandshakeSucceeded { .. }),
+    )
+    .await
+    .expect("server reported no handshake outcome");
+    match event {
+      SocketEvent::HandshakeFailed { error_msg, .. } => {
+        assert_eq!(error_msg, "Authentication failed: Invalid username or password")
+      }
+      other => panic!("server accepted a client it has no credentials for: {:?}", other),
+    }
+  }
+  ctx.term().await
+}
