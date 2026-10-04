@@ -12,6 +12,25 @@ const SHORT_TIMEOUT: Duration = Duration::from_millis(250);
 const LONG_TIMEOUT: Duration = Duration::from_secs(2);
 const MONITOR_EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// `term()` with a PUSH whose connecter may still be in flight completes
+/// promptly: the connecter stops with its socket instead of holding the
+/// context's wait group to its 10 s timeout.
+#[tokio::test]
+async fn test_context_term_with_connecter_in_flight_is_prompt() -> Result<(), ZmqError> {
+  for _ in 0..20 {
+    let ctx = common::test_context();
+    let bound = ctx.socket(SocketType::Pull)?;
+    let connected = ctx.socket(SocketType::Push)?;
+    let endpoint = common::bind_and_resolve_tcp(&bound).await?;
+    connected.connect(&endpoint).await?;
+    let started = std::time::Instant::now();
+    ctx.term().await?;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(1), "term took {took:?}");
+  }
+  Ok(())
+}
+
 // --- Test: Context termination closes sockets and allows exit ---
 #[tokio::test]
 async fn test_context_term_closes_sockets() -> Result<(), ZmqError> {
