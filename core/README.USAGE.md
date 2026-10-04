@@ -31,6 +31,11 @@ This guide provides a detailed overview of how to use the `rzmq` library, coveri
     *   [Waiting for Every Subscriber (`XPUB_NODROP`)](#waiting-for-every-subscriber-xpub_nodrop)
     *   [Bounding the Wait](#bounding-the-wait)
     *   [Reading the Setting](#reading-the-setting)
+*   [Retrying a Request](#retrying-a-request)
+    *   [Sending Again on the Same Socket (`REQ_RELAXED` and `REQ_CORRELATE`)](#sending-again-on-the-same-socket-req_relaxed-and-req_correlate)
+    *   [Replying When the Requester Has Left](#replying-when-the-requester-has-left)
+    *   [Correlating Through a ROUTER](#correlating-through-a-router)
+    *   [Reading the Settings](#reading-the-settings)
 *   [Error Handling](#error-handling)
 
 ## Introduction
@@ -789,6 +794,109 @@ use rzmq::socket::XPUB_NODROP;
 
 let raw = publisher.get_option(XPUB_NODROP).await?;
 let nodrop = i32::from_ne_bytes(raw.try_into().unwrap()) != 0;
+```
+
+## Retrying a Request
+
+A `REQ` alternates strictly between `send` and `recv`. A request that has not been answered stays outstanding: `recv` returns `ZmqError::Timeout` when `RCVTIMEO` expires, another `recv` waits for the same reply and `send` returns `ZmqError::InvalidState` until a reply has arrived. The `REP` going away changes none of this. Giving up on a request means closing the socket and asking again on a fresh one:
+
+```rust
+use rzmq::socket::RCVTIMEO;
+use rzmq::{Context, Msg, SocketType, ZmqError};
+
+async fn ask(ctx: &Context, endpoint: &str, question: Msg) -> Result<Option<Msg>, ZmqError> {
+    let req = ctx.socket(SocketType::Req)?;
+    req.set_option(RCVTIMEO, 250i32).await?;
+    req.connect(endpoint).await?;
+    req.send(question).await?;
+    match req.recv().await {
+        Ok(reply) => Ok(Some(reply)),
+        Err(ZmqError::Timeout) => {
+            // The request is still outstanding on this socket; the retry needs a new one.
+            req.close().await?;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+```
+
+### Sending Again on the Same Socket (`REQ_RELAXED` and `REQ_CORRELATE`)
+
+With `REQ_RELAXED` set, a `send` while a reply is outstanding abandons that reply, discards any replies already queued and sends to the next peer. A reply to the abandoned request that arrives after the new send looks like any other reply, so set `REQ_CORRELATE` with it. Each request then carries a request-id frame that the `REP` echoes, and a reply with another id is discarded:
+
+```rust
+use rzmq::socket::{RCVTIMEO, REQ_CORRELATE, REQ_RELAXED};
+use rzmq::{Msg, Socket, ZmqError};
+
+async fn ask_with_retry(req: &Socket, question: Msg, attempts: usize) -> Result<Option<Msg>, ZmqError> {
+    req.set_option(RCVTIMEO, 250i32).await?;
+    req.set_option(REQ_RELAXED, 1i32).await?;
+    req.set_option(REQ_CORRELATE, 1i32).await?;
+    for _ in 0..attempts {
+        req.send(question.clone()).await?;
+        match req.recv().await {
+            Ok(reply) => return Ok(Some(reply)),
+            Err(ZmqError::Timeout) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+```
+
+| Options set | A late reply to an abandoned request |
+|---|---|
+| none (default) | cannot happen: `send` returns `ZmqError::InvalidState` while a reply is outstanding |
+| `REQ_RELAXED` | is returned as the reply to the new request if it arrives after the new send |
+| `REQ_RELAXED` and `REQ_CORRELATE` | is discarded |
+
+### Replying When the Requester Has Left
+
+A `REP` holding a request keeps its turn when the requester disconnects. `recv` returns `ZmqError::InvalidState` until the reply is sent, and that `send` drops the reply and returns `Ok(())`. A server loop needs no special case:
+
+```rust
+use rzmq::{Msg, Socket, ZmqError};
+
+async fn serve(rep: &Socket) -> Result<(), ZmqError> {
+    loop {
+        let request = rep.recv().await?;
+        let reply = handle(request).await;
+        // Succeeds whether or not the requester is still there.
+        rep.send(reply).await?;
+    }
+}
+```
+
+### Correlating Through a ROUTER
+
+A `REP` echoes the request-id frame on its own. A `ROUTER` with its default framing strips a leading empty delimiter and inserts one on reply, which does not fit an envelope of `[request id, delimiter]`. Set `AUTO_DELIMITER` to `false` on the `ROUTER` and echo every frame ahead of the body:
+
+```rust
+use rzmq::socket::AUTO_DELIMITER;
+use rzmq::{Msg, Socket, ZmqError};
+
+async fn serve_correlated(router: &Socket) -> Result<(), ZmqError> {
+    router.set_option(AUTO_DELIMITER, false).await?;
+    loop {
+        // [identity, request id, empty delimiter, body]
+        let mut frames = router.recv_multipart().await?;
+        let body = frames.pop().unwrap();
+        frames.push(handle(body).await);
+        router.send_multipart(frames).await?;
+    }
+}
+```
+
+### Reading the Settings
+
+```rust
+use rzmq::socket::{REQ_CORRELATE, REQ_RELAXED};
+
+let raw = req.get_option(REQ_RELAXED).await?;
+let relaxed = i32::from_ne_bytes(raw.try_into().unwrap()) != 0;
+let raw = req.get_option(REQ_CORRELATE).await?;
+let correlate = i32::from_ne_bytes(raw.try_into().unwrap()) != 0;
 ```
 
 ## Error Handling

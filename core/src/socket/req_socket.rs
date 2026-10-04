@@ -3,6 +3,7 @@ use crate::message::{FrameBatch, Msg, MsgFlags};
 use crate::runtime::{Command, MailboxSender};
 use crate::socket::ISocket;
 use crate::socket::core::SocketCore;
+use crate::socket::options::{parse_bool_option, REQ_CORRELATE, REQ_RELAXED};
 use crate::socket::patterns::LoadBalancer;
 use crate::socket::patterns::AddressedIngressEngine;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
@@ -12,15 +13,19 @@ use async_trait::async_trait;
 use parking_lot::Mutex as ParkingLotMutex;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::time::timeout as tokio_timeout;
 
+/// Driven by send and recv only. A pipe going away clears `reply_pipe` and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReqState {
   ReadyToSend,
-  ExpectingReply { target_endpoint_uri: String },
+  /// `reply_pipe` is the pipe the request went out on. `None` once that pipe has
+  /// detached, after which a reply is taken from any pipe.
+  ExpectingReply { reply_pipe: Option<usize> },
 }
 
 #[derive(Debug)]
@@ -32,6 +37,11 @@ pub(crate) struct ReqSocket {
   state: ParkingLotMutex<ReqState>,
   reply_available_notifier: Arc<Notify>,
   pipe_read_to_endpoint_uri: RwLock<HashMap<usize, String>>,
+  /// REQ_RELAXED: send while a reply is outstanding abandons that reply.
+  relaxed: AtomicBool,
+  /// REQ_CORRELATE: requests carry a request-id frame ahead of the delimiter.
+  correlate: AtomicBool,
+  request_id: AtomicU32,
 }
 
 impl ReqSocket {
@@ -48,29 +58,85 @@ impl ReqSocket {
       state: ParkingLotMutex::new(ReqState::ReadyToSend),
       reply_available_notifier: Arc::new(Notify::new()),
       pipe_read_to_endpoint_uri: RwLock::new(HashMap::new()),
+      relaxed: AtomicBool::new(false),
+      correlate: AtomicBool::new(false),
+      request_id: AtomicU32::new(rand::random()),
     }
   }
 
-  fn process_incoming_zmtp_message_for_req(
-    &self,
-    pipe_read_id: usize,
-    mut raw_zmtp_message: FrameBatch,
-  ) -> Result<FrameBatch, ZmqError> {
-    if !raw_zmtp_message.is_empty() && raw_zmtp_message[0].size() == 0 {
-      tracing::trace!(
-        handle = self.core.handle,
-        pipe_id = pipe_read_id,
-        "REQ: Stripped empty ZMTP delimiter from incoming reply."
-      );
-      raw_zmtp_message.remove(0);
-    } else {
-      tracing::warn!(
-        handle = self.core.handle,
-        pipe_id = pipe_read_id,
-        "REQ: Incoming ZMTP reply from pipe did not start with an empty delimiter as expected from REP."
-      );
+  fn expecting_reply(&self) -> bool {
+    matches!(*self.state.lock(), ReqState::ExpectingReply { .. })
+  }
+
+  /// Strips the reply envelope. `None` means the message is not the reply to the
+  /// outstanding request and is discarded: it came from a pipe other than the one
+  /// the request went out on, its request id differs or it has no delimiter.
+  fn accept_reply(&self, pipe_read_id: usize, mut batch: FrameBatch) -> Option<FrameBatch> {
+    if let ReqState::ExpectingReply { reply_pipe: Some(expected) } = *self.state.lock() {
+      if expected != pipe_read_id {
+        tracing::debug!(handle = self.core.handle, pipe_read_id, "REQ: reply from another pipe discarded.");
+        return None;
+      }
     }
-    Ok(raw_zmtp_message)
+    if self.correlate.load(Ordering::Relaxed) {
+      let expected = self.request_id.load(Ordering::Relaxed).to_ne_bytes();
+      let id_matches = batch.len() >= 2 && batch[0].is_more() && batch[0].data() == Some(&expected[..]);
+      if !id_matches {
+        tracing::debug!(handle = self.core.handle, pipe_read_id, "REQ: reply with another request id discarded.");
+        return None;
+      }
+      batch.remove(0);
+    }
+    if batch.is_empty() || batch[0].size() != 0 {
+      tracing::warn!(handle = self.core.handle, pipe_read_id, "REQ: reply without an empty delimiter discarded.");
+      return None;
+    }
+    batch.remove(0);
+    Some(batch)
+  }
+
+  /// Waits for the reply to the outstanding request. Only a delivered reply moves
+  /// the state back to `ReadyToSend`; an error leaves the request outstanding.
+  async fn wait_for_reply(&self, rcvtimeo: Option<Duration>) -> Result<FrameBatch, ZmqError> {
+    let deadline = rcvtimeo.filter(|d| !d.is_zero()).map(|d| Instant::now() + d);
+    let payload = loop {
+      if !self.expecting_reply() {
+        return Err(ZmqError::InvalidState("Socket state changed while waiting for reply"));
+      }
+      let remaining = match deadline {
+        Some(deadline) => {
+          let left = deadline.saturating_duration_since(Instant::now());
+          if left.is_zero() {
+            return Err(ZmqError::Timeout);
+          }
+          Some(left)
+        }
+        None => rcvtimeo,
+      };
+      let notified = self.reply_available_notifier.notified();
+      tokio::select! {
+        biased;
+        _ = notified => {
+          if !self.core.is_running() {
+            return Err(ZmqError::ConnectionClosed);
+          }
+        }
+        res = self.ingress_engine.recv_logical_message(remaining) => {
+          let (pipe_read_id, batch) = res?;
+          if let Some(payload) = self.accept_reply(pipe_read_id, batch) {
+            break payload;
+          }
+        }
+      }
+    };
+    {
+      let mut state = self.state.lock();
+      if matches!(*state, ReqState::ExpectingReply { .. }) {
+        *state = ReqState::ReadyToSend;
+      }
+    }
+    self.reply_available_notifier.notify_waiters();
+    Ok(payload)
   }
 }
 
@@ -108,71 +174,89 @@ impl ISocket for ReqSocket {
 
     if msg.is_more() {
       msg.set_flags(msg.flags() & !MsgFlags::MORE);
-      tracing::trace!(
-        handle = self.core.handle,
-        "REQ send: Cleared MORE flag from user-provided message."
-      );
     }
 
-    // === LOCK SCOPE 1: Check State ===
-    {
-      let current_state_guard = self.state.lock();
-      if !matches!(*current_state_guard, ReqState::ReadyToSend) {
+    // The slot is taken under the lock so concurrent senders see ExpectingReply at
+    // once; it is given back if the send fails.
+    let abandoned_reply = {
+      let mut state = self.state.lock();
+      let abandoned = matches!(*state, ReqState::ExpectingReply { .. });
+      if abandoned && !self.relaxed.load(Ordering::Relaxed) {
         return Err(ZmqError::InvalidState(
           "REQ socket must call recv() before sending again",
         ));
       }
+      *state = ReqState::ExpectingReply { reply_pipe: None };
+      abandoned
+    };
+    if abandoned_reply {
+      self.reply_available_notifier.notify_waiters();
     }
+
+    // Replies still queued belong to earlier requests.
+    while self.ingress_engine.recv_logical_message(Some(Duration::ZERO)).await.is_ok() {}
 
     let timeout_opt: Option<Duration> = { self.core.core_state.read().options.sndtimeo };
 
-    // === ASYNC OPERATION: Find a Peer (No Lock Held) ===
     let peer = loop {
       if let Some(p) = self.load_balancer.get_next_connection() {
         break p;
-      } else {
-        if self.core.command_sender().is_closed() {
-          return Err(ZmqError::InvalidState("Socket terminated".into()));
-        }
-        match timeout_opt {
-          Some(duration) if duration.is_zero() => return Err(ZmqError::ResourceLimitReached),
-          None => self.load_balancer.wait_for_connection().await?,
-          Some(duration) => {
-            match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
-              Ok(res) => res?,
-              Err(_timeout_elapsed) => return Err(ZmqError::Timeout),
-            }
-          }
-        }
+      }
+      if self.core.command_sender().is_closed() {
+        *self.state.lock() = ReqState::ReadyToSend;
+        return Err(ZmqError::InvalidState("Socket terminated".into()));
+      }
+      let waited = match timeout_opt {
+        Some(duration) if duration.is_zero() => Err(ZmqError::ResourceLimitReached),
+        None => self.load_balancer.wait_for_connection().await,
+        Some(duration) => match tokio_timeout(duration, self.load_balancer.wait_for_connection()).await {
+          Ok(res) => res,
+          Err(_) => Err(ZmqError::Timeout),
+        },
+      };
+      if let Err(e) = waited {
+        *self.state.lock() = ReqState::ReadyToSend;
+        return Err(e);
       }
     };
 
+    let reply_pipe = self
+      .pipe_read_to_endpoint_uri
+      .read()
+      .iter()
+      .find(|(_, uri)| **uri == peer.uri)
+      .map(|(id, _)| *id);
+
+    let mut zmtp_frames_to_send = FrameBatch::new();
+    if self.correlate.load(Ordering::Relaxed) {
+      let id = self.request_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+      let mut id_frame = Msg::from_vec(id.to_ne_bytes().to_vec());
+      id_frame.set_flags(MsgFlags::MORE);
+      zmtp_frames_to_send.push(id_frame);
+    }
     let mut empty_delimiter = Msg::new();
     empty_delimiter.set_flags(MsgFlags::MORE);
-    let mut zmtp_frames_to_send = FrameBatch::new();
     zmtp_frames_to_send.push(empty_delimiter);
     zmtp_frames_to_send.push(msg);
 
-    // === ASYNC OPERATION: Send Message (No Lock Held) ===
     match peer.iface.send_multipart(zmtp_frames_to_send).await {
       Ok(()) => {
-        // === LOCK SCOPE 2: Update State on Success ===
-        {
-          let mut current_state_guard = self.state.lock();
-          *current_state_guard = ReqState::ExpectingReply {
-            target_endpoint_uri: peer.uri.clone(),
-          };
-        }
+        *self.state.lock() = ReqState::ExpectingReply { reply_pipe };
         Ok(())
       }
-      Err(ZmqError::ConnectionClosed) => {
-        self.load_balancer.remove_connection(&peer.uri);
-        Err(ZmqError::HostUnreachable(format!(
-          "REQ: Connection to {} closed during send",
-          peer.uri
-        )))
+      Err(e) => {
+        *self.state.lock() = ReqState::ReadyToSend;
+        match e {
+          ZmqError::ConnectionClosed => {
+            self.load_balancer.remove_connection(&peer.uri);
+            Err(ZmqError::HostUnreachable(format!(
+              "REQ: Connection to {} closed during send",
+              peer.uri
+            )))
+          }
+          other => Err(other),
+        }
       }
-      Err(e) => Err(e),
     }
   }
 
@@ -180,80 +264,14 @@ impl ISocket for ReqSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-
+    if !self.expecting_reply() {
+      return Err(ZmqError::InvalidState(
+        "REQ socket must call send() before receiving",
+      ));
+    }
     let rcvtimeo_opt: Option<Duration> = self.core.core_state.read().options.rcvtimeo;
-
-    {
-      let op_state_guard = self.state.lock();
-      if !matches!(*op_state_guard, ReqState::ExpectingReply { .. }) {
-        return Err(ZmqError::InvalidState(
-          "REQ socket must call send() before receiving",
-        ));
-      }
-    }
-
-    let notifier = self.reply_available_notifier.clone();
-    let received_msg_result: Result<Msg, ZmqError>;
-
-    tokio::select! {
-      biased;
-      _ = notifier.notified() => {
-        if !self.core.is_running() {
-          tracing::debug!("REQ recv: Notifier signaled, core not running.");
-          received_msg_result = Err(ZmqError::ConnectionClosed);
-        } else {
-          match self.ingress_engine.recv_logical_message(Some(Duration::ZERO)).await {
-            Ok((_, batch)) => {
-              match self.process_incoming_zmtp_message_for_req(0, batch) {
-                Ok(mut payload) => {
-                  received_msg_result = Ok(if payload.is_empty() { Msg::new() } else { payload.remove(0) });
-                }
-                Err(e) => received_msg_result = Err(e),
-              }
-            }
-            Err(ZmqError::ResourceLimitReached) | Err(ZmqError::Timeout) => {
-              let is_ready = matches!(*self.state.lock(), ReqState::ReadyToSend);
-              if is_ready {
-                tracing::warn!("REQ recv: Notifier signaled, no immediate message. State reset to ReadyToSend.");
-                received_msg_result = Err(ZmqError::InvalidState("Socket state changed while waiting for reply".into()));
-              } else {
-                tracing::error!("REQ recv: Notifier signaled, no immediate message, still ExpectingReply.");
-                received_msg_result = Err(ZmqError::Internal("Receive interrupted by notification".into()));
-              }
-            }
-            Err(e) => received_msg_result = Err(e),
-          }
-        }
-      }
-      res = self.ingress_engine.recv_logical_message(rcvtimeo_opt) => {
-        received_msg_result = match res {
-          Ok((_, batch)) => {
-            match self.process_incoming_zmtp_message_for_req(0, batch) {
-              Ok(mut payload) => Ok(if payload.is_empty() { Msg::new() } else { payload.remove(0) }),
-              Err(e) => Err(e),
-            }
-          }
-          Err(e) => Err(e),
-        };
-      }
-    }
-
-    let mut should_notify = false;
-    {
-      let mut state_guard = self.state.lock();
-      if matches!(*state_guard, ReqState::ExpectingReply { .. }) {
-        let finished = received_msg_result.as_ref().map_or(true, |m| !m.is_more());
-        if finished {
-          *state_guard = ReqState::ReadyToSend;
-          should_notify = true;
-        }
-      }
-    }
-    if should_notify {
-      self.reply_available_notifier.notify_waiters();
-    }
-
-    received_msg_result
+    let mut payload = self.wait_for_reply(rcvtimeo_opt).await?;
+    Ok(if payload.is_empty() { Msg::new() } else { payload.remove(0) })
   }
 
   async fn send_multipart(&self, _frames: FrameBatch) -> Result<(), ZmqError> {
@@ -270,38 +288,34 @@ impl ISocket for ReqSocket {
     if !self.core.is_running() {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
-
-    {
-      let state_guard = self.state.lock();
-      if !matches!(*state_guard, ReqState::ExpectingReply { .. }) {
-        return Err(ZmqError::InvalidState(
-          "REQ socket must call send() before receiving reply",
-        ));
-      }
+    if !self.expecting_reply() {
+      return Err(ZmqError::InvalidState(
+        "REQ socket must call send() before receiving reply",
+      ));
     }
-
     let rcvtimeo_opt: Option<Duration> = self.core.core_state.read().options.rcvtimeo;
-    let result = self.ingress_engine.recv_logical_message(rcvtimeo_opt).await;
-
-    {
-      let mut state_guard = self.state.lock();
-      if matches!(*state_guard, ReqState::ExpectingReply { .. }) {
-        *state_guard = ReqState::ReadyToSend;
-        self.reply_available_notifier.notify_waiters();
-      }
-    }
-
-    match result {
-      Ok((_, batch)) => self.process_incoming_zmtp_message_for_req(0, batch),
-      Err(e) => Err(e),
-    }
+    self.wait_for_reply(rcvtimeo_opt).await
   }
 
-  async fn set_pattern_option(&self, option: i32, _value: &[u8]) -> Result<(), ZmqError> {
-    Err(ZmqError::UnsupportedOption(option))
+  async fn set_pattern_option(&self, option: i32, value: &[u8]) -> Result<(), ZmqError> {
+    match option {
+      REQ_RELAXED => {
+        self.relaxed.store(parse_bool_option(value)?, Ordering::Relaxed);
+        Ok(())
+      }
+      REQ_CORRELATE => {
+        self.correlate.store(parse_bool_option(value)?, Ordering::Relaxed);
+        Ok(())
+      }
+      _ => Err(ZmqError::UnsupportedOption(option)),
+    }
   }
   async fn get_pattern_option(&self, option: i32) -> Result<Vec<u8>, ZmqError> {
-    Err(ZmqError::UnsupportedOption(option))
+    match option {
+      REQ_RELAXED => Ok((self.relaxed.load(Ordering::Relaxed) as i32).to_ne_bytes().to_vec()),
+      REQ_CORRELATE => Ok((self.correlate.load(Ordering::Relaxed) as i32).to_ne_bytes().to_vec()),
+      _ => Err(ZmqError::UnsupportedOption(option)),
+    }
   }
 
   async fn process_command(&self, command: Command) -> Result<bool, ZmqError> {
@@ -350,7 +364,6 @@ impl ISocket for ReqSocket {
 
       self.load_balancer.add_connection(endpoint_uri, iface);
 
-      // Register per-pipe ingress channel (capacity 1: REQ expects one reply at a time).
       let (rcvhwm, rcvbatch_count) = {
         let opts = self.core.core_state.read();
         (opts.options.rcvhwm.max(1), opts.options.rcvbatch_count)
@@ -383,30 +396,14 @@ impl ISocket for ReqSocket {
       "REQ detaching pipe"
     );
 
-    let maybe_endpoint_uri = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id);
-    let mut should_notify = false;
-
-    if let Some(detached_uri) = &maybe_endpoint_uri {
-      self.load_balancer.remove_connection(detached_uri);
-
-      // === LOCK SCOPE: Check and Update State ===
-      {
-        let mut op_state_guard = self.state.lock();
-        if let ReqState::ExpectingReply {
-          ref target_endpoint_uri,
-        } = *op_state_guard
-        {
-          if *target_endpoint_uri == *detached_uri {
-            tracing::warn!(handle = self.core.handle, pipe_id = pipe_read_id, uri = %detached_uri, "Target REP peer detached while REQ was expecting reply. Resetting state and notifying recv.");
-            *op_state_guard = ReqState::ReadyToSend;
-            should_notify = true;
-          }
-        }
-      } // Guard is dropped here
+    if let Some(detached_uri) = self.pipe_read_to_endpoint_uri.write().remove(&pipe_read_id) {
+      self.load_balancer.remove_connection(&detached_uri);
     }
-
-    if should_notify {
-      self.reply_available_notifier.notify_one();
+    {
+      let mut state = self.state.lock();
+      if *state == (ReqState::ExpectingReply { reply_pipe: Some(pipe_read_id) }) {
+        *state = ReqState::ExpectingReply { reply_pipe: None };
+      }
     }
 
     self.ingress_engine.deregister_pipe(pipe_read_id);

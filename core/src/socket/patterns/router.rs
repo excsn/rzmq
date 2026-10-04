@@ -227,6 +227,27 @@ mod additional_router_map_tests {
     assert_eq!(result[0].size(), 0, "First frame must be empty delimiter");
     assert_eq!(result[1].data().unwrap(), b"hello");
   }
+
+  #[test]
+  fn test_req_strategy_manual_framing_passes_envelope_through() {
+    let framing = FramingLatch::new(|_| {});
+    framing.set_manual();
+    let req_strat = ReqPeerStrategy;
+
+    let id_msg = Msg::from_static(b"destination-identity");
+    let payload = FrameBatch::from(vec![
+      Msg::from_static(&[1, 0, 0, 0]),
+      Msg::new(),
+      Msg::from_static(b"hello"),
+    ]);
+
+    let result = req_strat.prepare_wire_frames(id_msg, payload, &framing);
+
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0].data().unwrap(), &[1, 0, 0, 0]);
+    assert_eq!(result[1].size(), 0);
+    assert_eq!(result[2].data().unwrap(), b"hello");
+  }
 }
 
 pub(crate) mod strategies {
@@ -251,8 +272,11 @@ pub(crate) mod strategies {
       &self,
       _destination_identity_msg: Msg,
       payload_frames: FrameBatch,
-      _framing: &FramingLatch,
+      framing: &FramingLatch,
     ) -> FrameBatch {
+      if framing.is_manual() {
+        return payload_frames;
+      }
       let mut zmtp_wire_frames = FrameBatch::with_capacity(1 + payload_frames.len());
       let mut delimiter = Msg::new();
       if !payload_frames.is_empty() {

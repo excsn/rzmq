@@ -181,18 +181,23 @@ impl ISocket for RepSocket {
       }
     };
 
-    let conn_iface: Arc<dyn ISocketConnection> = {
+    // A reply whose requester has gone is dropped and the send succeeds, as libzmq's
+    // ROUTER does without ROUTER_MANDATORY. The pipe id check guards against a new
+    // peer reusing the departed one's endpoint URI.
+    let conn_iface: Option<Arc<dyn ISocketConnection>> = {
       let core_s_read = self.core_state_read();
-      match core_s_read.endpoints.get(&peer_to_reply_to.target_endpoint_uri) {
-        Some(ep_info) => ep_info.connection_iface.clone(),
-        None => {
-          tracing::error!(
-            handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri,
-            "REP send_multipart: ISocketConnection not found. Peer likely disconnected."
-          );
-          return Err(ZmqError::HostUnreachable("Peer disconnected before reply could be sent".into()));
-        }
-      }
+      core_s_read
+        .endpoints
+        .get(&peer_to_reply_to.target_endpoint_uri)
+        .filter(|ep_info| ep_info.pipe_ids.map(|(_, read_id)| read_id) == Some(peer_to_reply_to.source_pipe_read_id))
+        .map(|ep_info| ep_info.connection_iface.clone())
+    };
+    let Some(conn_iface) = conn_iface else {
+      tracing::debug!(
+        handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri,
+        "REP: requester gone, reply dropped."
+      );
+      return Ok(());
     };
 
     let mut zmtp_wire_frames = FrameBatch::with_capacity(
@@ -216,6 +221,10 @@ impl ISocket for RepSocket {
     match conn_iface.send_multipart(zmtp_wire_frames).await {
       Ok(()) => {
         tracing::trace!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP sent complete reply.");
+        Ok(())
+      }
+      Err(ZmqError::ConnectionClosed) => {
+        tracing::debug!(handle = self.core.handle, uri = %peer_to_reply_to.target_endpoint_uri, "REP: requester gone during send, reply dropped.");
         Ok(())
       }
       Err(e) => {
@@ -303,20 +312,8 @@ impl ISocket for RepSocket {
   async fn pipe_detached(&self, pipe_read_id: usize) {
     tracing::debug!(handle = self.core.handle, pipe_read_id, "REP detaching pipe");
     self.pipe_read_id_to_endpoint_uri.write().remove(&pipe_read_id);
-
-    {
-      let mut guard = self.state.lock();
-      if let RepState::ReceivedRequest(ref peer_info) = *guard {
-        if peer_info.source_pipe_read_id == pipe_read_id {
-          tracing::warn!(
-            handle = self.core.handle, pipe_id = pipe_read_id,
-            "Peer disconnected while REP socket held its request. Resetting REP state."
-          );
-          *guard = RepState::ReadyToReceive;
-        }
-      }
-    }
-
+    // The request/reply state is driven by recv and send only. A held request whose
+    // requester has gone stays held and its reply is dropped in send_multipart.
     self.ingress_engine.deregister_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
   }

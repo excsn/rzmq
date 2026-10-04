@@ -314,8 +314,8 @@ Defines the ZeroMQ messaging pattern for a `Socket`.
 *   **Variants**:
     *   `Pub`
     *   `Sub`
-    *   `Req`
-    *   `Rep`
+    *   `Req` - `send` and `recv` alternate. A request stays outstanding until a reply is received: `recv` returns `ZmqError::Timeout` when `RCVTIMEO` expires and may be called again. `send` returns `ZmqError::InvalidState` until then unless `REQ_RELAXED` is set. A peer disconnecting does not change this. A reply from a peer other than the one the request went to is discarded while that peer is connected.
+    *   `Rep` - `recv` and `send` alternate. With a request held, `recv` returns `ZmqError::InvalidState` until the reply is sent. A reply to a requester that has disconnected is dropped and the `send` returns `Ok(())`.
     *   `Dealer`
     *   `Router`
     *   `Push`
@@ -403,6 +403,8 @@ Constants for socket option integer IDs.
 *   `pub const HEARTBEAT_TTL: i32 = 40`
 *   `pub const HANDSHAKE_IVL: i32 = 41`
 *   `pub const ROUTER_MANDATORY: i32 = 33`
+*   `pub const REQ_CORRELATE: i32 = 52` - `REQ` only; value is `i32` (`0` = off, the default; non-zero = each request goes out as `[request id, empty delimiter, body]`, the id a 4-byte native-endian counter, and a reply whose first two frames are not the current id followed by an empty delimiter is discarded). `REP` echoes the envelope unchanged. A `ROUTER` with its default framing does not, so set `AUTO_DELIMITER` to `0` on it and echo every frame ahead of the body. Can be set at any time and applies from the next `send`. Get returns the `i32`. Any other socket type returns `ZmqError::InvalidOption`.
+*   `pub const REQ_RELAXED: i32 = 53` - `REQ` only; value is `i32` (`0` = a `send` while a reply is outstanding returns `ZmqError::InvalidState`, the default; non-zero = the send abandons the outstanding reply, discards replies already queued and goes to the next peer). A reply to the abandoned request that arrives after the new send is returned as the reply to the new one unless `REQ_CORRELATE` is also set. Can be set at any time. Get returns the `i32`. Any other socket type returns `ZmqError::InvalidOption`.
 *   `pub const XPUB_NODROP: i32 = 69` - `PUB` only; value is `i32` (`0` = a subscriber at `SNDHWM` misses the message, the default; non-zero = each send reaches every matched subscriber or none of them). With it set, a send that finds a matched subscriber at `SNDHWM` waits for room as `SNDTIMEO` allows: `0` returns `ZmqError::ResourceLimitReached` at once, a positive value returns `ZmqError::Timeout` when it expires and `-1` (the default) waits until room appears or the subscriber disconnects. A refused, timed-out or cancelled send delivers to no subscriber. Waiting sends complete in arrival order across cloned handles. Can be set at any time. Get returns the `i32`. Any other socket type returns `ZmqError::InvalidOption`.
 *   `pub const ALLOW_ZMTP2: i32 = 1220` - Allow downgrading the handshake to the legacy ZMTP/2.0 wire protocol when a peer announces it; value is `i32` (`1` = enabled, default; `0` = reject v2 peers). ZMTP/2.0 sessions use NULL security only, exchange identities as bare frames (no `READY`), and have no heartbeats. Set before `bind`/`connect`.
 *   `pub const AUTO_DELIMITER: i32 = 42`

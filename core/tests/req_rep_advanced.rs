@@ -1,5 +1,6 @@
 mod common;
 
+use rzmq::socket::options::RCVTIMEO;
 use rzmq::{Msg, SocketType, ZmqError};
 use std::time::Duration;
 
@@ -176,6 +177,7 @@ async fn test_req_rep_rep_disconnects_while_req_waiting() -> Result<(), ZmqError
   println!("Starting test_req_rep_rep_disconnects_while_req_waiting...");
   let ctx = common::test_context();
   let req = ctx.socket(SocketType::Req)?;
+  req.set_option(RCVTIMEO, 250i32).await?;
 
   // Create REP in its own scope to control its lifetime
   let endpoint = "tcp://127.0.0.1:5603"; // Unique port
@@ -211,41 +213,41 @@ async fn test_req_rep_rep_disconnects_while_req_waiting() -> Result<(), ZmqError
   tokio::time::sleep(Duration::from_millis(500)).await; // Try 500ms
 
   // REQ tries to receive reply
-  println!("REQ attempting recv (should fail or timeout)...");
-  let recv_result = common::recv_timeout(&req, LONG_TIMEOUT).await;
-  println!("REQ recv result: {:?}", recv_result);
+  println!("REQ attempting recv (should time out)...");
+  let started = std::time::Instant::now();
+  let recv_result = req.recv().await;
+  let waited = started.elapsed();
+  println!("REQ recv result after {:?}: {:?}", waited, recv_result);
 
-  // *** CHECK THE EXPECTED OUTCOME ***
-  // When the target REP disconnects, ReqSocket::pipe_detached resets the state to ReadyToSend.
-  // The recv() call, upon unblocking (likely due to the timeout in recv_timeout),
-  // detects this state change and returns Err(ZmqError::InvalidState("Socket state changed..."))
+  // libzmq keeps a REQ waiting when its peer goes away, so RCVTIMEO decides.
   assert!(
-    matches!(recv_result, Err(ZmqError::InvalidState(_))), // Expect InvalidState due to reset
-    "Expected InvalidState after REP disconnect, got {:?}",
+    matches!(recv_result, Err(ZmqError::Timeout)),
+    "Expected Timeout after REP disconnect, got {:?}",
     recv_result
   );
-  println!("REQ correctly failed with InvalidState after REP disconnect.");
+  assert!(waited >= Duration::from_millis(200), "recv gave up after {:?}, before RCVTIMEO", waited);
+  println!("REQ timed out after REP disconnect.");
 
-  // Optional: Verify REQ can now send again due to state reset
-  println!("REQ attempting send after REP disconnect (should succeed if state reset)...");
-  // Need a new REP to connect to, otherwise send will block/timeout finding peer
-  let rep2 = ctx.socket(SocketType::Rep)?;
-  rep2.bind(endpoint).await?; // Re-bind on the same endpoint
-  tokio::time::sleep(Duration::from_millis(150)).await; // Allow bind and reconnect
-
-  // This send should now succeed as state was reset
-  let send_again_result = req.send(Msg::from_static(b"Request After Reset")).await;
+  // The request is still outstanding, so the REQ refuses a new one until it is answered.
+  let send_again_result = req.send(Msg::from_static(b"Request After Timeout")).await;
   assert!(
-    send_again_result.is_ok(),
-    "Expected send to succeed after state reset, got {:?}",
+    matches!(send_again_result, Err(ZmqError::InvalidState(_))),
+    "Expected InvalidState sending with a request outstanding, got {:?}",
     send_again_result
   );
-  println!("REQ successfully sent after state reset.");
 
-  // Clean up rep2
-  let _ = rep2.recv().await;
-  let _ = rep2.send(Msg::from_static(b"")).await;
-  let _ = req.recv().await; // Consume reply
+  // Giving up means a fresh REQ socket.
+  req.close().await?;
+  let rep2 = ctx.socket(SocketType::Rep)?;
+  rep2.bind(endpoint).await?;
+  let req2 = ctx.socket(SocketType::Req)?;
+  req2.set_option(RCVTIMEO, 2000i32).await?;
+  req2.connect(endpoint).await?;
+  tokio::time::sleep(Duration::from_millis(150)).await;
+  req2.send(Msg::from_static(b"Fresh Request")).await?;
+  assert_eq!(common::recv_timeout(&rep2, LONG_TIMEOUT).await?.data().unwrap(), b"Fresh Request");
+  rep2.send(Msg::from_static(b"Fresh Reply")).await?;
+  assert_eq!(req2.recv().await?.data().unwrap(), b"Fresh Reply");
 
   println!("Terminating context...");
   ctx.term().await?;
@@ -291,17 +293,17 @@ async fn test_req_rep_req_disconnects_before_reply() -> Result<(), ZmqError> {
   tokio::time::sleep(Duration::from_millis(200)).await;
 
   // REP attempts to send reply
-  println!("REP attempting send reply (should fail)...");
+  println!("REP attempting send reply (should be dropped)...");
   let send_result = rep.send(Msg::from_static(b"Reply")).await;
   println!("REP send result: {:?}", send_result);
 
-  // Expected error: The pipe should be closed.
+  // libzmq drops a reply whose requester has gone and the send succeeds.
   assert!(
-    matches!(send_result, Err(ZmqError::InvalidState(_))),
-    "Expected InvalidState error, got {:?}",
+    send_result.is_ok(),
+    "Expected the reply to a departed REQ to be dropped, got {:?}",
     send_result
   );
-  println!("REP correctly failed to send reply to disconnected REQ.");
+  println!("REP dropped the reply to the disconnected REQ.");
 
   println!("Terminating context...");
   ctx.term().await?;
