@@ -101,3 +101,51 @@ async fn close_wakes_pub_nodrop_send_blocked_on_stalled_subscriber() -> Result<(
   assert_close_wakes(&publisher, blocked).await;
   ctx.term().await
 }
+
+/// With the default LINGER of -1 the socket keeps lingering after `close`,
+/// since the peer never drains. The blocked send must still fail at `close`,
+/// not when the linger ends. The context is dropped rather than terminated so
+/// the test does not wait out term's cap.
+#[tokio::test]
+#[serial]
+async fn close_fails_push_send_blocked_with_no_peer_while_lingering() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  let push = ctx.socket(SocketType::Push)?;
+  push.set_option(SNDHWM, 8i32).await?;
+  push.connect("tcp://127.0.0.1:1").await?;
+
+  let blocked = send_until_blocked(push.clone()).await;
+  assert_close_wakes(&push, blocked).await;
+  Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn close_fails_push_send_blocked_on_stalled_peer_while_lingering() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  let (_pull, endpoint) = stalled_peer(&ctx, SocketType::Pull).await?;
+  let push = ctx.socket(SocketType::Push)?;
+  push.set_option(SNDHWM, 8i32).await?;
+  push.connect(&endpoint).await?;
+  tokio::time::sleep(Duration::from_millis(300)).await;
+
+  let blocked = send_until_blocked(push.clone()).await;
+  assert_close_wakes(&push, blocked).await;
+  Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn close_fails_pub_nodrop_send_blocked_on_stalled_subscriber_while_lingering() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  let (_sub, endpoint) = stalled_peer(&ctx, SocketType::Sub).await?;
+  let publisher = ctx.socket(SocketType::Pub)?;
+  publisher.set_option(SNDHWM, 8i32).await?;
+  publisher.set_option(XPUB_NODROP, true).await?;
+  publisher.connect(&endpoint).await?;
+  tokio::time::sleep(Duration::from_millis(300)).await;
+
+  let blocked = send_until_blocked(publisher.clone()).await;
+  assert_close_wakes(&publisher, blocked).await;
+  Ok(())
+}

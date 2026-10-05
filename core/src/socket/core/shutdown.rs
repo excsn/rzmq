@@ -171,6 +171,7 @@ pub(crate) async fn initiate_core_shutdown(
     return;
   }
   core_arc.is_running_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+  core_arc.closing.cancel();
 
   tracing::info!(
     handle = core_handle,

@@ -19,6 +19,7 @@ use state::ShutdownCoordinator;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
+use tokio_util::sync::CancellationToken;
 
 
 #[derive(Debug)]
@@ -33,6 +34,8 @@ pub struct SocketCore {
   pub(crate) shutdown_coordinator: TokioMutex<ShutdownCoordinator>,
   // Lockless running flag — false as soon as shutdown begins.
   pub(crate) is_running_flag: AtomicBool,
+  /// Cancelled when shutdown begins; a send parked on a full pipe selects on it.
+  pub(crate) closing: CancellationToken,
 }
 
 impl SocketCore {
@@ -56,6 +59,7 @@ impl SocketCore {
       socket_logic: TokioRwLock::new(None),
       shutdown_coordinator: TokioMutex::new(ShutdownCoordinator::default()),
       is_running_flag: AtomicBool::new(true),
+      closing: CancellationToken::new(),
     });
 
     let socket_logic_arc_impl: Arc<dyn ISocket> = match socket_type {

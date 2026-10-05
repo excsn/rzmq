@@ -664,7 +664,14 @@ async fn ensure_connect_pipe(
   let core_read_id = core_arc.context.inner().next_handle();
   let pending_handle_id = core_arc.context.inner().next_handle();
   let credits = (socket_type == SocketType::Pub).then(|| Arc::new(PipeCredits::new(tx.capacity())));
-  let iface = Arc::new(ScaConnectionIface::unbound(tx.clone(), core_write_id, sndtimeo, credits.clone(), counters));
+  let iface = Arc::new(ScaConnectionIface::unbound(
+    tx.clone(),
+    core_write_id,
+    sndtimeo,
+    credits.clone(),
+    counters,
+    core_arc.closing.clone(),
+  ));
   let (placeholder_mailbox, _unused_rx) = fibre::mpsc::bounded_async::<Command>(1);
 
   let endpoint_info = EndpointInfo {
@@ -1180,6 +1187,7 @@ async fn handle_new_connection_established(
         sndtimeo_snapshot,
         credits.clone(),
         Arc::clone(&counters),
+        core_arc.closing.clone(),
       ));
 
       let endpoint_info = EndpointInfo {

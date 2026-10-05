@@ -93,11 +93,18 @@ impl PubSocket {
 
     let deadline = sndtimeo.map(|timeout| Instant::now() + timeout);
     let _waiting = WaiterGuard::enter(&self.nodrop_waiters);
-    let _turn = match deadline {
-      Some(deadline) => tokio::time::timeout_at(deadline, self.nodrop_turn.lock())
-        .await
-        .map_err(|_| ZmqError::Timeout)?,
-      None => self.nodrop_turn.lock().await,
+    let closing = &self.core.closing;
+    let _turn = tokio::select! {
+      biased;
+      turn = async {
+        match deadline {
+          Some(deadline) => tokio::time::timeout_at(deadline, self.nodrop_turn.lock())
+            .await
+            .map_err(|_| ZmqError::Timeout),
+          None => Ok(self.nodrop_turn.lock().await),
+        }
+      } => turn?,
+      _ = closing.cancelled() => return Err(ZmqError::InvalidState("Socket is closing".into())),
     };
     loop {
       let Blocked { frames: returned, credits } =
@@ -114,13 +121,19 @@ impl PubSocket {
       tokio::pin!(drained);
       drained.as_mut().enable();
       if !credits.has_credit() && !credits.is_closed() {
-        match deadline {
-          Some(deadline) => {
-            if tokio::time::timeout_at(deadline, drained).await.is_err() {
-              return Err(ZmqError::Timeout);
+        let wait = async {
+          match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, drained).await.map_err(|_| ZmqError::Timeout),
+            None => {
+              drained.await;
+              Ok(())
             }
           }
-          None => drained.await,
+        };
+        tokio::select! {
+          biased;
+          waited = wait => waited?,
+          _ = closing.cancelled() => return Err(ZmqError::InvalidState("Socket is closing".into())),
         }
       }
       if !self.core.is_running() {

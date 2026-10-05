@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use fibre::TrySendError;
 use fibre::mpmc::AsyncSender as BoundedAsyncSender;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 /// The session actor currently draining a pipe. A connect-side pipe outlives
 /// its sessions, so this is rebound on every reconnect and empty in between.
@@ -32,6 +33,7 @@ pub(crate) struct ScaConnectionIface {
   sndtimeo: Option<Duration>,
   credits: Option<Arc<PipeCredits>>,
   counters: Arc<ConservationCounters>,
+  closing: CancellationToken,
 }
 
 impl ScaConnectionIface {
@@ -43,8 +45,9 @@ impl ScaConnectionIface {
     sndtimeo: Option<Duration>,
     credits: Option<Arc<PipeCredits>>,
     counters: Arc<ConservationCounters>,
+    closing: CancellationToken,
   ) -> Self {
-    let iface = Self::unbound(pipe_sender, pipe_write_id_to_sca, sndtimeo, credits, counters);
+    let iface = Self::unbound(pipe_sender, pipe_write_id_to_sca, sndtimeo, credits, counters, closing);
     iface.bind_session(sca_stop_mailbox, sca_handle_id);
     iface
   }
@@ -56,6 +59,7 @@ impl ScaConnectionIface {
     sndtimeo: Option<Duration>,
     credits: Option<Arc<PipeCredits>>,
     counters: Arc<ConservationCounters>,
+    closing: CancellationToken,
   ) -> Self {
     Self {
       session: Arc::new(RwLock::new(None)),
@@ -64,11 +68,37 @@ impl ScaConnectionIface {
       sndtimeo,
       credits,
       counters,
+      closing,
     }
   }
 
   fn count_sent(&self) {
     ConservationCounters::add(&self.counters.sent, 1);
+  }
+
+  /// Waits for room in a full pipe. Ends on room, on SNDTIMEO or on the
+  /// socket closing, whichever comes first.
+  async fn send_when_room(&self, msgs: FrameBatch) -> Result<(), ZmqError> {
+    let send = self.pipe_sender.send(msgs);
+    let wait = async {
+      match self.sndtimeo {
+        None => send.await.map_err(|_| ZmqError::ConnectionClosed),
+        Some(duration) => match timeout(duration, send).await {
+          Ok(Ok(())) => Ok(()),
+          Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
+          Err(_) => Err(ZmqError::Timeout),
+        },
+      }
+    };
+    let result = tokio::select! {
+      biased;
+      result = wait => result,
+      _ = self.closing.cancelled() => Err(ZmqError::InvalidState("Socket is closing".into())),
+    };
+    if result.is_ok() {
+      self.count_sent();
+    }
+    result
   }
 
   pub(crate) fn bind_session(&self, stop_mailbox: MailboxSender, handle_id: usize) {
@@ -108,17 +138,10 @@ impl ISocketConnection for ScaConnectionIface {
       Err(TrySendError::Full(_)) if self.sndtimeo == Some(Duration::ZERO) => {
         return Err(ZmqError::ResourceLimitReached);
       }
-      Err(TrySendError::Full(returned_fb)) => {
-        let timeout_duration = self.sndtimeo.unwrap_or(Duration::from_secs(30));
-        return match timeout(timeout_duration, self.pipe_sender.send(returned_fb)).await {
-          Ok(Ok(())) => {
-            self.count_sent();
-            Ok(())
-          }
-          Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
-          Err(_) => Err(ZmqError::ResourceLimitReached),
-        };
-      }
+      Err(TrySendError::Full(returned_fb)) => match self.send_when_room(returned_fb).await {
+        Err(ZmqError::Timeout) => Err(ZmqError::ResourceLimitReached),
+        other => other,
+      },
       Err(TrySendError::Sent(_)) => unreachable!(),
     }
   }
@@ -140,17 +163,10 @@ impl ISocketConnection for ScaConnectionIface {
       Err(TrySendError::Full(_)) if self.sndtimeo == Some(Duration::ZERO) => {
         return Err(ZmqError::ResourceLimitReached);
       }
-      Err(TrySendError::Full(returned_msgs)) => {
-        let timeout_duration = self.sndtimeo.unwrap_or(Duration::from_secs(30));
-        return match timeout(timeout_duration, self.pipe_sender.send(returned_msgs)).await {
-          Ok(Ok(())) => {
-            self.count_sent();
-            Ok(())
-          }
-          Ok(Err(_)) => Err(ZmqError::ConnectionClosed),
-          Err(_) => Err(ZmqError::ResourceLimitReached),
-        };
-      }
+      Err(TrySendError::Full(returned_msgs)) => match self.send_when_room(returned_msgs).await {
+        Err(ZmqError::Timeout) => Err(ZmqError::ResourceLimitReached),
+        other => other,
+      },
       Err(TrySendError::Sent(_)) => unreachable!(),
     }
   }
@@ -165,23 +181,7 @@ impl ISocketConnection for ScaConnectionIface {
       Err(TrySendError::Full(returned)) if self.sndtimeo == Some(Duration::ZERO) => {
         Err((returned, ZmqError::ResourceLimitReached))
       }
-      Err(TrySendError::Full(returned)) => match self.sndtimeo {
-        None => match self.pipe_sender.send(returned).await {
-          Ok(()) => {
-            self.count_sent();
-            Ok(())
-          }
-          Err(_) => Err((FrameBatch::new(), ZmqError::ConnectionClosed)),
-        },
-        Some(duration) => match timeout(duration, self.pipe_sender.send(returned)).await {
-          Ok(Ok(())) => {
-            self.count_sent();
-            Ok(())
-          }
-          Ok(Err(_)) => Err((FrameBatch::new(), ZmqError::ConnectionClosed)),
-          Err(_) => Err((FrameBatch::new(), ZmqError::Timeout)),
-        },
-      },
+      Err(TrySendError::Full(returned)) => self.send_when_room(returned).await.map_err(|e| (FrameBatch::new(), e)),
       Err(TrySendError::Sent(_)) => unreachable!(),
     }
   }
