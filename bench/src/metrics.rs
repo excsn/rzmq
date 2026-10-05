@@ -14,6 +14,15 @@ pub struct LatencyReport {
   pub p99_ns: u64,
   pub p999_ns: u64,
   pub max_ns: u64,
+  pub samples: u64,
+  pub p99_to_p999: u64,
+  pub above_p999: u64,
+  pub above_1ms: u64,
+  pub above_5ms: u64,
+}
+
+fn samples_above(hist: &Histogram<u64>, ns: u64) -> u64 {
+  hist.len().saturating_sub(hist.count_between(0, ns))
 }
 
 #[derive(Serialize)]
@@ -151,6 +160,12 @@ impl BenchmarkCollector {
         p99_ns: hist.value_at_quantile(0.99),
         p999_ns: hist.value_at_quantile(0.999),
         max_ns: hist.max(),
+        samples: hist.len(),
+        p99_to_p999: samples_above(&hist, hist.value_at_quantile(0.99))
+          .saturating_sub(samples_above(&hist, hist.value_at_quantile(0.999))),
+        above_p999: samples_above(&hist, hist.value_at_quantile(0.999)),
+        above_1ms: samples_above(&hist, 1_000_000),
+        above_5ms: samples_above(&hist, 5_000_000),
       }
     });
     BenchStats {
@@ -192,6 +207,12 @@ impl BenchmarkCollector {
         p99_ns: hist.value_at_quantile(0.99),
         p999_ns: hist.value_at_quantile(0.999),
         max_ns: hist.max(),
+        samples: hist.len(),
+        p99_to_p999: samples_above(&hist, hist.value_at_quantile(0.99))
+          .saturating_sub(samples_above(&hist, hist.value_at_quantile(0.999))),
+        above_p999: samples_above(&hist, hist.value_at_quantile(0.999)),
+        above_1ms: samples_above(&hist, 1_000_000),
+        above_5ms: samples_above(&hist, 5_000_000),
       }
     });
 
@@ -268,6 +289,11 @@ impl BenchmarkCollector {
       let _ = writeln!(out, "  {:<15} : {:>12}", "p99", fmt_ns(lat.p99_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9", fmt_ns(lat.p999_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "Max", fmt_ns(lat.max_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "samples", lat.samples);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99 to p99.9", lat.p99_to_p999);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "above p99.9", lat.above_p999);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "above 1 ms", lat.above_1ms);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "above 5 ms", lat.above_5ms);
     }
     let _ = writeln!(
       out,
@@ -460,6 +486,11 @@ fn print_combined_text(
       let _ = writeln!(out, "  {:<15} : {:>12}", "p99", fmt_ns(lat.p99_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9", fmt_ns(lat.p999_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "max", fmt_ns(lat.max_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "samples", lat.samples);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99 to p99.9", lat.p99_to_p999);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "above p99.9", lat.above_p999);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "above 1 ms", lat.above_1ms);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "above 5 ms", lat.above_5ms);
     }
   } else {
     let _ = writeln!(
@@ -498,6 +529,11 @@ fn print_combined_text(
       let _ = writeln!(out, "  {:<15} : {:>12}", "p99", fmt_ns(lat.p99_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "p99.9", fmt_ns(lat.p999_ns));
       let _ = writeln!(out, "  {:<15} : {:>12}", "max", fmt_ns(lat.max_ns));
+      let _ = writeln!(out, "  {:<15} : {:>12}", "samples", lat.samples);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "p99 to p99.9", lat.p99_to_p999);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "above p99.9", lat.above_p999);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "above 1 ms", lat.above_1ms);
+      let _ = writeln!(out, "  {:<15} : {:>12}", "above 5 ms", lat.above_5ms);
     }
   }
   let _ = writeln!(
