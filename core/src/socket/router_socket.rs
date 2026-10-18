@@ -1089,6 +1089,24 @@ mod tests {
     sender
   }
 
+  /// `attach` with a real identity in place of the placeholder.
+  fn attach_as(router: &RouterSocket, pipe_id: usize, finalized: bool, identity: &'static [u8]) -> PipeMessageSender {
+    let sender = attach(router, pipe_id, finalized);
+    router.peer_states.write().get_mut(&pipe_id).expect("state").identity = Blob::from_bytes(Bytes::from_static(identity));
+    sender
+  }
+
+  /// Finalizes a pending pipe with `identity`, as `update_peer_identity` does.
+  fn finalize_as(router: &RouterSocket, pipe_id: usize, identity: &'static [u8]) {
+    router.peer_states.write().get_mut(&pipe_id).expect("state").identity = Blob::from_bytes(Bytes::from_static(identity));
+    router.finalize_pipe(pipe_id);
+  }
+
+  /// Batches the ROUTER still holds for `pipe_id` outside its ingress queue.
+  fn retained_batches(router: &RouterSocket, pipe_id: usize) -> usize {
+    router.held_ingress.lock().get(&pipe_id).map_or(0, |q| q.len())
+  }
+
   async fn push(sender: &PipeMessageSender, payload: &'static [u8]) {
     let mut batch = FrameBatch::new();
     batch.push(Msg::from_static(payload));
@@ -1191,4 +1209,132 @@ mod tests {
       assert!(!router.peer_states.read().contains_key(&7));
     }
   }
+  const SIXTEEN: [&[u8]; 16] = [
+    b"0", b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8", b"9", b"10", b"11", b"12", b"13", b"14", b"15",
+  ];
+
+  /// Four RCVTIMEO 0 consumers drain `router` until `detached` is set and the
+  /// queue has stayed empty, returning (identity frame, payload) per message.
+  async fn drain_concurrently(router: &Arc<RouterSocket>, detached: &Arc<AtomicBool>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let consumers: Vec<_> = (0..4)
+      .map(|_| {
+        let router = router.clone();
+        let detached = detached.clone();
+        tokio::spawn(async move {
+          let mut got = Vec::new();
+          let mut empty_after_detach = 0;
+          loop {
+            match router.recv_multipart().await {
+              Ok(frames) => got.push((
+                frames[0].data().unwrap_or_default().to_vec(),
+                frames.last().and_then(|f| f.data()).unwrap_or_default().to_vec(),
+              )),
+              Err(_) => {
+                if detached.load(Ordering::SeqCst) {
+                  empty_after_detach += 1;
+                  if empty_after_detach > 3 {
+                    break;
+                  }
+                }
+                tokio::task::yield_now().await;
+              }
+            }
+          }
+          got
+        })
+      })
+      .collect();
+    let mut got = Vec::new();
+    for consumer in consumers {
+      got.extend(consumer.await.expect("consumer"));
+    }
+    got
+  }
+
+  fn spin(iteration: usize) {
+    for _ in 0..(iteration * 7919) % 2000 {
+      std::hint::spin_loop();
+    }
+  }
+
+  /// Batches popped while their pipe detaches are each delivered once, with the
+  /// pipe's identity.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn batches_popped_while_their_pipe_detaches_keep_its_identity() {
+    let (mut lost, mut misrouted) = (0, 0);
+    for iteration in 0..500 {
+      let router = router();
+      let sender = attach_as(&router, 7, true, b"peer7");
+      for payload in SIXTEEN {
+        push(&sender, payload).await;
+      }
+      drop(sender);
+      let detached = Arc::new(AtomicBool::new(false));
+      let draining = tokio::spawn({
+        let router = router.clone();
+        let detached = detached.clone();
+        async move { drain_concurrently(&router, &detached).await }
+      });
+      spin(iteration);
+      router.pipe_detached(7).await;
+      detached.store(true, Ordering::SeqCst);
+      let mut got = draining.await.expect("drain");
+      got.extend(drain(&router).await.into_iter().map(|p| (b"peer7".to_vec(), p)));
+      lost += SIXTEEN.len().saturating_sub(got.len());
+      misrouted += got.iter().filter(|(id, _)| id.as_slice() != b"peer7").count();
+    }
+    assert_eq!((lost, misrouted), (0, 0), "(lost, misrouted) over 500 detaches");
+  }
+
+  /// A pending pipe that detaches while consumers pop it delivers nothing and
+  /// leaves no batch behind.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn a_pending_pipe_detached_during_recv_retains_nothing() {
+    let (mut delivered, mut retained) = (0, 0);
+    for iteration in 0..500 {
+      let router = router();
+      let sender = attach(&router, 7, false);
+      for payload in SIXTEEN {
+        push(&sender, payload).await;
+      }
+      drop(sender);
+      let detached = Arc::new(AtomicBool::new(false));
+      let draining = tokio::spawn({
+        let router = router.clone();
+        let detached = detached.clone();
+        async move { drain_concurrently(&router, &detached).await }
+      });
+      spin(iteration);
+      router.pipe_detached(7).await;
+      detached.store(true, Ordering::SeqCst);
+      delivered += draining.await.expect("drain").len();
+      retained += retained_batches(&router, 7);
+    }
+    assert_eq!((delivered, retained), (0, 0), "(delivered, retained) over 500 detaches");
+  }
+
+  /// Batches that waited for the pipe's identity keep it when the pipe detaches
+  /// before they are read.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn batches_held_before_finalize_keep_their_identity_after_detach() {
+    let (mut lost, mut misrouted) = (0, 0);
+    for _ in 0..2000 {
+      let router = router();
+      let sender = attach(&router, 7, false);
+      for payload in SIXTEEN {
+        push(&sender, payload).await;
+      }
+      drop(sender);
+      assert!(drain(&router).await.is_empty(), "a pending pipe's batch was delivered");
+      finalize_as(&router, 7, b"peer7");
+      router.pipe_detached(7).await;
+      let detached = Arc::new(AtomicBool::new(true));
+      let mut got = drain_concurrently(&router, &detached).await;
+      got.extend(drain(&router).await.into_iter().map(|p| (b"peer7".to_vec(), p)));
+      lost += SIXTEEN.len().saturating_sub(got.len());
+      misrouted += got.iter().filter(|(id, _)| id.as_slice() != b"peer7").count();
+    }
+    assert_eq!((lost, misrouted), (0, 0), "(lost, misrouted) over 2000 detaches");
+  }
+
 }
