@@ -817,17 +817,19 @@ pub(crate) fn process_all_cqes(
               };
               let _ = ext_ctx.reply_tx.send(Ok(ack));
             }
-            // Clone mailbox and endpoint_uri BEFORE removing handler.
-            let (mailbox_for_close_notify, endpoint_uri_for_notify) = worker
+            // Clone mailbox and endpoint_uri BEFORE removing handler. A handler that
+            // already reported its failure gets no second report.
+            let close_notify = worker
               .handler_manager
               .get_mut(handler_fd)
+              .filter(|h| !h.fd_error_reported())
               .map(|h| {
                 (
                   h.io_config().socket_mailbox.clone(),
                   h.io_config().endpoint_uri.clone(),
+                  !h.handshake_complete(),
                 )
-              })
-              .unzip();
+              });
             if let Some(mut h) = worker.handler_manager.remove_handler(handler_fd) {
               h.fd_has_been_closed();
             }
@@ -846,11 +848,11 @@ pub(crate) fn process_all_cqes(
                 _ => {}
               }
             }
-            if let Some(mailbox) = mailbox_for_close_notify {
-              let endpoint_uri = endpoint_uri_for_notify.unwrap_or_default();
+            if let Some((mailbox, endpoint_uri, during_handshake)) = close_notify {
               let _ = mailbox.try_send(Command::UringFdError {
                 endpoint_uri,
                 error: ZmqError::ConnectionClosed,
+                during_handshake,
               });
             }
           } else {

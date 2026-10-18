@@ -15,7 +15,7 @@ use crate::socket::core::inproc_reader;
 use crate::socket::core::pipe_manager;
 
 use crate::socket::core::state::{ConnectPipe, ConservationCounters, CoreState, EndpointInfo, EndpointType, ShutdownPhase, listener_key};
-use crate::socket::core::{SocketCore, shutdown};
+use crate::socket::core::{SocketCore, connection_lifecycle, shutdown};
 use crate::socket::events::{MonitorSender, SocketEvent};
 use crate::socket::options::{self, *};
 use crate::transport::endpoint::{Endpoint, parse_endpoint};
@@ -80,8 +80,11 @@ pub(crate) async fn process_socket_command(
       // These events can arrive from the UringWorker after we've already initiated a shutdown.
       // It's safe to ignore them as the shutdown process will clean up the corresponding FD.
       #[cfg(feature = "io-uring")]
-      Command::UringFdError { endpoint_uri, error } => {
+      Command::UringFdError { endpoint_uri, error, during_handshake } => {
         tracing::debug!(handle=core_handle, %endpoint_uri, %error, "UringFdError during shutdown — treating as ActorStopping.");
+        if during_handshake {
+          connection_lifecycle::handshake_failed(&core_arc, endpoint_uri.clone(), error.to_string());
+        }
         let handle_id_opt = core_arc
           .core_state
           .read()
@@ -250,6 +253,7 @@ pub(crate) async fn process_socket_command(
         &endpoint_uri,
         &target_endpoint_uri,
         &connection_iface,
+        current_shutdown_phase == ShutdownPhase::Running,
         peer_identity.clone(),
         peer_socket_type.clone(),
         fd,
@@ -287,16 +291,11 @@ pub(crate) async fn process_socket_command(
         is_outbound_connection: is_outbound,
         connection_iface,
         throttle: None,
-        peer_socket_type,
+        peer_socket_type: None,
       };
 
       {
         let mut cs = core_arc.core_state.write();
-        if is_outbound {
-          if let Some(recon_state) = cs.reconnect_states.get_mut(&endpoint_uri) {
-            recon_state.on_connection_success();
-          }
-        }
         if let Some(old) = cs.endpoints.insert(endpoint_uri.clone(), endpoint_info) {
           tracing::warn!(handle=core_handle, %endpoint_uri, "Overwrote existing EndpointInfo on UringConnectionEstablished.");
           if let Some(h) = old.task_handle { h.abort(); }
@@ -312,7 +311,6 @@ pub(crate) async fn process_socket_command(
       socket_logic_strong
         .pipe_attached(synthetic_read_id, synthetic_write_id, peer_identity.as_ref().map(|b| b.as_ref()))
         .await;
-      socket_logic_strong.update_peer_identity(synthetic_read_id, peer_identity).await;
 
       // Direct Ingress Handoff: extract the PipeMessageSender from the socket pattern and
       // deliver it to the worker handler so it can push decoded messages straight to the
@@ -344,13 +342,20 @@ pub(crate) async fn process_socket_command(
         }
       }
 
-      core_arc.core_state.read().send_monitor_event(SocketEvent::HandshakeSucceeded {
-        endpoint: endpoint_uri,
-      });
+      connection_lifecycle::handshake_succeeded(
+        &core_arc,
+        socket_logic_strong,
+        current_shutdown_phase == ShutdownPhase::Running,
+        synthetic_read_id,
+        endpoint_uri,
+        peer_identity,
+        peer_socket_type,
+      )
+      .await;
     }
 
     #[cfg(feature = "io-uring")]
-    Command::UringFdError { endpoint_uri, error } => {
+    Command::UringFdError { endpoint_uri, error, during_handshake } => {
       let (conn_iface_opt, handle_id_opt) = {
         let cs = core_arc.core_state.read();
         let ep = cs.endpoints.get(&endpoint_uri);
@@ -358,15 +363,16 @@ pub(crate) async fn process_socket_command(
       };
       tracing::warn!(handle=core_handle, %endpoint_uri, %error, "UringFdError — closing connection.");
 
-      // No endpoint means the connection failed before its handshake completed,
-      // so the core never registered it: report what a tokio session would.
+      if during_handshake {
+        connection_lifecycle::handshake_failed(&core_arc, endpoint_uri.clone(), error.to_string());
+      }
+      // An accepted connection is registered only once its handshake completes, so
+      // no cleanup reports this one's disconnect.
       if conn_iface_opt.is_none() {
-        let cs = core_arc.core_state.read();
-        cs.send_monitor_event(SocketEvent::HandshakeFailed {
-          endpoint: endpoint_uri.clone(),
-          error_msg: error.to_string(),
-        });
-        cs.send_monitor_event(SocketEvent::Disconnected { endpoint: endpoint_uri.clone() });
+        core_arc
+          .core_state
+          .read()
+          .send_monitor_event(SocketEvent::Disconnected { endpoint: endpoint_uri.clone() });
         return Ok(());
       }
 
@@ -681,6 +687,7 @@ async fn take_over_connect_pipe_uring(
   endpoint_uri: &str,
   target_endpoint_uri: &str,
   connection_iface: &Arc<dyn ISocketConnection>,
+  core_running: bool,
   peer_identity: Option<crate::message::Blob>,
   peer_socket_type: Option<String>,
   fd: std::os::unix::io::RawFd,
@@ -714,12 +721,7 @@ async fn take_over_connect_pipe_uring(
         ep.mailbox = mailbox;
         ep.handle_id = handle_id;
         ep.throttle = None;
-        ep.peer_socket_type = peer_socket_type;
-        let iface = ep.connection_iface.clone();
-        if let Some(recon_state) = cs.reconnect_states.get_mut(target_endpoint_uri) {
-          recon_state.on_connection_success();
-        }
-        Some((found, iface))
+        Some((found, ep.connection_iface.clone()))
       }
       None => None,
     }
@@ -738,7 +740,6 @@ async fn take_over_connect_pipe_uring(
   if sessions > 1 {
     socket_logic.pipe_hiccuped(core_read_id).await;
   }
-  socket_logic.update_peer_identity(core_read_id, peer_identity).await;
 
   let mut worker_tx = uring_conn.worker_op_tx();
   let (reply_tx, reply_rx) = oneshot::oneshot::<Result<UringOpCompletion, ZmqError>>();
@@ -772,9 +773,16 @@ async fn take_over_connect_pipe_uring(
     }
   }
 
-  core_arc.core_state.read().send_monitor_event(SocketEvent::HandshakeSucceeded {
-    endpoint: target_endpoint_uri.to_string(),
-  });
+  connection_lifecycle::handshake_succeeded(
+    core_arc,
+    socket_logic,
+    core_running,
+    core_read_id,
+    target_endpoint_uri.to_string(),
+    peer_identity,
+    peer_socket_type,
+  )
+  .await;
   true
 }
 

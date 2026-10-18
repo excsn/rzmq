@@ -78,7 +78,13 @@ pub(crate) struct ZmtpEngine {
 
   // Holds frames of an in-progress multipart message across on_network_bytes() calls.
   partial_batch: FrameBatch,
+
+  /// When the handshake must have completed, set by `start`.
+  handshake_deadline: Option<Instant>,
 }
+
+/// Handshake deadline when `HANDSHAKE_IVL` is unset.
+pub(crate) const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl ZmtpEngine {
   pub(crate) fn new(is_server: bool, config: Arc<ZmtpEngineConfig>) -> Self {
@@ -101,7 +107,27 @@ impl ZmtpEngine {
       last_ping_sent_time: None,
       waiting_for_pong: false,
       partial_batch: FrameBatch::new(),
+      handshake_deadline: None,
     }
+  }
+
+  fn is_handshaking(&self) -> bool {
+    self.phase != ZmtpPhase::Data && self.phase != ZmtpPhase::Closed
+  }
+
+  /// The instant the handshake must complete by, while it is still in progress.
+  pub fn handshake_deadline(&self) -> Option<Instant> {
+    self.handshake_deadline.filter(|_| self.is_handshaking())
+  }
+
+  /// Fails the handshake with `ZmqError::Timeout` once its deadline has passed.
+  pub fn check_handshake_deadline(&mut self, now: Instant) -> EngineOutput {
+    let mut out = EngineOutput::new();
+    if self.handshake_deadline().is_some_and(|deadline| now >= deadline) {
+      self.phase = ZmtpPhase::Closed;
+      out.app_actions.push(AppAction::PeerError(ZmqError::Timeout));
+    }
+    out
   }
 
   // --- Public accessor API for the Tokio actor ---
@@ -121,6 +147,10 @@ impl ZmtpEngine {
     } else {
       None
     }
+  }
+
+  pub fn heartbeats_enabled(&self) -> bool {
+    self.config.heartbeat_ivl.is_some()
   }
 
   pub fn record_activity(&mut self) {
@@ -167,6 +197,8 @@ impl ZmtpEngine {
   }
 
   pub fn start(&mut self) -> EngineOutput {
+    self.handshake_deadline =
+      Some(Instant::now() + self.config.handshake_timeout.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT));
     // Staged greeting (Stage A): send only the 10-byte version-agnostic signature.
     // The revision byte (Stage B) and version-specific tail (Stage C) are emitted
     // from `process_greeting` once we have seen the peer's signature/revision, so
@@ -256,18 +288,12 @@ impl ZmtpEngine {
       return out;
     }
 
-    if let Some(timeout) = self.config.heartbeat_timeout {
-      if self.waiting_for_pong {
-        if let Some(ping_time) = self.last_ping_sent_time {
-          if now.duration_since(ping_time) >= timeout {
-            self.phase = ZmtpPhase::Closed;
-            out
-              .app_actions
-              .push(AppAction::PeerError(ZmqError::Timeout));
-            return out;
-          }
-        }
-      }
+    if self.get_pong_deadline().is_some_and(|deadline| now >= deadline) {
+      self.phase = ZmtpPhase::Closed;
+      out
+        .app_actions
+        .push(AppAction::PeerError(ZmqError::Timeout));
+      return out;
     }
 
     if let Some(ivl) = self.config.heartbeat_ivl {

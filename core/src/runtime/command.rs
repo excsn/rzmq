@@ -138,6 +138,8 @@ pub(crate) enum Command {
   UringFdError {
     endpoint_uri: String,
     error: ZmqError,
+    /// The connection ended before its ZMTP handshake completed.
+    during_handshake: bool,
   },
 
   /// Edge-triggered ingress backpressure notification from an io_uring connection

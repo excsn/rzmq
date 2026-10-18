@@ -98,6 +98,16 @@ pub(crate) enum SystemEvent {
     peer_identity: Option<Blob>,
     /// The `Socket-Type` name string provided by the peer in its READY command.
     peer_socket_type: Option<String>,
+    /// The endpoint the `HandshakeSucceeded` monitor event names.
+    endpoint_uri: String,
+  },
+
+  /// Published by a session whose connection ended before its ZMTP handshake
+  /// completed. The parent `SocketCore` reports it as `HandshakeFailed`.
+  HandshakeFailed {
+    parent_core_id: usize,
+    endpoint_uri: String,
+    error_msg: String,
   },
 
   /// Published by a Connecter task when a connection attempt fails definitively
@@ -168,12 +178,24 @@ impl fmt::Debug for SystemEvent {
         connection_identifier,
         peer_identity,
         peer_socket_type,
+        endpoint_uri,
       } => f
         .debug_struct("PeerIdentityEstablished")
         .field("parent_core_id", parent_core_id)
         .field("connection_identifier", connection_identifier)
         .field("peer_identity", peer_identity)
         .field("peer_socket_type", peer_socket_type)
+        .field("endpoint_uri", endpoint_uri)
+        .finish(),
+      SystemEvent::HandshakeFailed {
+        parent_core_id,
+        endpoint_uri,
+        error_msg,
+      } => f
+        .debug_struct("HandshakeFailed")
+        .field("parent_core_id", parent_core_id)
+        .field("endpoint_uri", endpoint_uri)
+        .field("error_msg", error_msg)
         .finish(),
       SystemEvent::ConnectionAttemptFailed {
         parent_core_id,

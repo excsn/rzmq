@@ -251,11 +251,12 @@ where
         .take()
         .expect("read_half present at handshake start");
 
-      let hs_timeout = self
-        .zmtp_engine
-        .config()
-        .handshake_timeout
-        .unwrap_or(Duration::from_secs(15));
+      let hs_deadline = tokio::time::Instant::from_std(
+        self
+          .zmtp_engine
+          .handshake_deadline()
+          .unwrap_or_else(|| std::time::Instant::now() + crate::protocol::zmtp::engine::DEFAULT_HANDSHAKE_TIMEOUT),
+      );
 
       'handshake: loop {
         if self.zmtp_engine.phase == ZmtpPhase::Data
@@ -265,8 +266,8 @@ where
           break 'handshake;
         }
 
-        let read_result = tokio::time::timeout(
-          hs_timeout,
+        let read_result = tokio::time::timeout_at(
+          hs_deadline,
           hs_read_half.read_buf(&mut self.handshake_read_buf),
         )
         .await;
@@ -935,6 +936,7 @@ where
           connection_identifier: routing_id,
           peer_identity: final_peer_identity,
           peer_socket_type,
+          endpoint_uri: self.actor_config.connected_endpoint_uri.clone(),
         };
         if self
           .actor_config
@@ -965,10 +967,6 @@ where
           .await;
         return;
       }
-
-      self.actor_config.monitor.emit(SocketEvent::HandshakeSucceeded {
-        endpoint: self.actor_config.connected_endpoint_uri.clone(),
-      });
     }
   }
 
@@ -1093,17 +1091,21 @@ where
   }
 
   /// libzmq `stream_engine_base_t::error`: a connection that ends before its
-  /// handshake completes reports handshake failed. The core reports the
+  /// handshake completes reports handshake failed. The core reports it, then the
   /// Disconnected that follows when this session stops.
   fn report_handshake_failed(&self) {
     let error_msg = self
       .error_for_drop_guard
       .as_ref()
       .map_or_else(|| "ZMTP handshake did not complete".to_string(), |e| e.to_string());
-    self.actor_config.monitor.emit(SocketEvent::HandshakeFailed {
-      endpoint: self.actor_config.connected_endpoint_uri.clone(),
+    let event = SystemEvent::HandshakeFailed {
+      parent_core_id: self.parent_socket_id,
+      endpoint_uri: self.actor_config.connected_endpoint_uri.clone(),
       error_msg,
-    });
+    };
+    if self.actor_config.context.event_bus().publish(event).is_err() {
+      tracing::warn!(sca_handle = self.handle, "Failed to publish HandshakeFailed event.");
+    }
   }
 
   async fn set_fatal_error(&mut self, error: ZmqError) {

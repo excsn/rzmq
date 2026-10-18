@@ -309,6 +309,16 @@ pub trait UringConnectionHandler: Send {
     Arc::new(egress_rx)
   }
 
+  /// Whether the connection completed its handshake.
+  fn handshake_complete(&self) -> bool {
+    true
+  }
+
+  /// Whether the handler has already reported this connection's failure to SocketCore.
+  fn fd_error_reported(&self) -> bool {
+    false
+  }
+
   /// Called by the worker when a `RequestPeerClosePoll` completes with `cqe_result`.
   fn on_peer_close_poll(&mut self, _cqe_result: i32) -> HandlerIoOps {
     HandlerIoOps::new()

@@ -250,6 +250,10 @@ pub(crate) struct ZmtpUringHandler {
   close_requested: bool,
   /// A peer-close poll is in flight; armed for PUSH, which posts no read in the data phase.
   peer_close_poll_armed: bool,
+  /// Set by `AppAction::HandshakeComplete`.
+  handshake_complete: bool,
+  /// Set once a `UringFdError` has been sent for this connection.
+  fd_error_reported: bool,
   /// Clean EOF arrived while ingress batches were still stashed in `spillover`
   /// (typically messages that raced ahead of `AttachIngressSender`). ZMQ semantics
   /// require everything received before the FIN to reach the application, so the
@@ -263,6 +267,9 @@ pub(crate) struct ZmtpUringHandler {
   send_buffer_slot_size: usize,
   /// Reusable scratch space for coalescing egress batches — avoids per-cycle heap allocation.
   coalesce_scratch: Vec<FrameBatch>,
+  /// Engine commands (heartbeat PINGs) written ahead of the next data batch, so they
+  /// share the `write_in_flight` gate instead of racing an in-flight write.
+  priority_egress: Vec<Bytes>,
   write_in_flight: u32,
   event_fd: eventfd::EventFD,
   worker_asleep: Arc<AtomicU8>,
@@ -315,12 +322,15 @@ impl ZmtpUringHandler {
       is_closing: false,
       close_requested: false,
       peer_close_poll_armed: false,
+      handshake_complete: false,
+      fd_error_reported: false,
       eof_drain_pending: false,
       close_deadline: None,
       use_send_zerocopy,
       use_recv_multishot,
       send_buffer_slot_size,
       coalesce_scratch: Vec::with_capacity(sndbatch_count),
+      priority_egress: Vec::new(),
       write_in_flight: 0,
       event_fd,
       worker_asleep,
@@ -387,6 +397,20 @@ impl ZmtpUringHandler {
     }
   }
 
+  /// Reports this connection's failure to SocketCore once, saying whether its
+  /// handshake had completed.
+  fn report_fd_error(&mut self, error: ZmqError) {
+    if self.fd_error_reported {
+      return;
+    }
+    self.fd_error_reported = true;
+    let _ = self.worker_io_config.socket_mailbox.try_send(Command::UringFdError {
+      endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
+      error,
+      during_handshake: !self.handshake_complete,
+    });
+  }
+
   /// Translate an `EngineOutput` into `HandlerIoOps`, with side-effects:
   /// - `AppAction::HandshakeComplete` → send `UringConnectionEstablished` to SocketCore
   /// - `AppAction::DeliverMessage` → push batch to `inbound_data_tx`
@@ -441,6 +465,7 @@ impl ZmtpUringHandler {
           peer_identity,
           peer_socket_type,
         } => {
+          self.handshake_complete = true;
           let cmd = Command::UringConnectionEstablished {
             endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
             target_endpoint_uri: self.worker_io_config.target_endpoint_uri.clone(),
@@ -511,13 +536,7 @@ impl ZmtpUringHandler {
         AppAction::PeerError(e) => {
           warn!(fd = self.fd, err = %e, "ZmtpUringHandler: peer error");
           self.is_closing = true;
-          let _ = self
-            .worker_io_config
-            .socket_mailbox
-            .try_send(Command::UringFdError {
-              endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
-              error: e,
-            });
+          self.report_fd_error(e);
           ops.initiate_close_due_to_error = true;
         }
       }
@@ -664,13 +683,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
         return HandlerIoOps::new();
       }
       info!(fd = self.fd, "ZmtpUringHandler: EOF from peer");
-      let _ = self
-        .worker_io_config
-        .socket_mailbox
-        .try_send(Command::UringFdError {
-          endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
-          error: ZmqError::ConnectionClosed,
-        });
+      self.report_fd_error(ZmqError::ConnectionClosed);
       self.close_requested = true;
       return HandlerIoOps::new().add_blueprint(HandlerSqeBlueprint::RequestClose);
     }
@@ -693,6 +706,9 @@ impl UringConnectionHandler for ZmtpUringHandler {
     if interface.is_write_completion {
       // Unlock the local serialization gate upon write completion
       self.write_in_flight = self.write_in_flight.saturating_sub(1);
+      if cqe_result >= 0 && self.engine.heartbeats_enabled() {
+        self.engine.record_activity();
+      }
     }
 
     if cqe_result < 0 {
@@ -727,13 +743,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
             fd = self.fd,
             "ZmtpUringHandler: deferred EOF drain complete — closing connection"
           );
-          let _ = self
-            .worker_io_config
-            .socket_mailbox
-            .try_send(Command::UringFdError {
-              endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
-              error: ZmqError::ConnectionClosed,
-            });
+          self.report_fd_error(ZmqError::ConnectionClosed);
           self.close_requested = true;
           return HandlerIoOps::new().add_blueprint(HandlerSqeBlueprint::RequestClose);
         }
@@ -743,6 +753,23 @@ impl UringConnectionHandler for ZmtpUringHandler {
 
     // (a) Try to flush stashed batches back into the queue first
     self.try_drain_spillover();
+
+    if !self.is_closing && (self.engine.handshake_deadline().is_some() || self.engine.heartbeats_enabled()) {
+      let now = Instant::now();
+      let expired = self.engine.check_handshake_deadline(now);
+      if !expired.app_actions.is_empty() {
+        return self.apply_engine_output(expired);
+      }
+      let tick = self.engine.on_tick(now);
+      if !tick.app_actions.is_empty() {
+        return self.apply_engine_output(tick);
+      }
+      for net in tick.net_actions {
+        if let NetAction::Send { data, .. } = net {
+          self.priority_egress.push(data);
+        }
+      }
+    }
 
     let mut ops = HandlerIoOps::new();
 
@@ -808,13 +835,23 @@ impl UringConnectionHandler for ZmtpUringHandler {
         crate::socket::core::state::ConservationCounters::add(&counters.drained, drained);
       }
 
-      if drained > 0 {
+      if drained > 0 || !self.priority_egress.is_empty() {
         self.write_in_flight += 1; // Lock the pipeline gate for vectored writes
         let batch_count = drained as u32;
 
         // Generate one highly-coalesced scatter-gather writev SQE
-        match self.engine.frame_batch_vectored(&self.coalesce_scratch) {
-          Ok(bufs) => {
+        let framed = if drained > 0 {
+          self.engine.frame_batch_vectored(&self.coalesce_scratch)
+        } else {
+          Ok(Vec::new())
+        };
+        match framed {
+          Ok(mut bufs) => {
+            if !self.priority_egress.is_empty() {
+              let mut prefixed = std::mem::take(&mut self.priority_egress);
+              prefixed.append(&mut bufs);
+              bufs = prefixed;
+            }
             ops
               .sqe_blueprints
               .push(HandlerSqeBlueprint::RequestSendRawVectored {
@@ -824,13 +861,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
               });
           }
           Err(e) => {
-            let _ = self
-              .worker_io_config
-              .socket_mailbox
-              .try_send(Command::UringFdError {
-                endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
-                error: e,
-              });
+            self.report_fd_error(e);
             ops.initiate_close_due_to_error = true;
           }
         }
@@ -1013,6 +1044,14 @@ impl UringConnectionHandler for ZmtpUringHandler {
     Arc::clone(&self.egress_rx)
   }
 
+  fn handshake_complete(&self) -> bool {
+    self.handshake_complete
+  }
+
+  fn fd_error_reported(&self) -> bool {
+    self.fd_error_reported
+  }
+
   fn on_peer_close_poll(&mut self, cqe_result: i32) -> HandlerIoOps {
     self.peer_close_poll_armed = false;
     if self.is_closing || cqe_result < 0 {
@@ -1021,13 +1060,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
     info!(fd = self.fd, revents = cqe_result, "ZmtpUringHandler: peer closed (poll)");
     self.is_closing = true;
     self.close_requested = true;
-    let _ = self
-      .worker_io_config
-      .socket_mailbox
-      .try_send(Command::UringFdError {
-        endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
-        error: ZmqError::ConnectionClosed,
-      });
+    self.report_fd_error(ZmqError::ConnectionClosed);
     HandlerIoOps::new().add_blueprint(HandlerSqeBlueprint::RequestClose)
   }
 

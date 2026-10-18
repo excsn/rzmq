@@ -1,5 +1,6 @@
 pub(crate) mod command_loop;
 pub(crate) mod command_processor;
+pub(crate) mod connection_lifecycle;
 pub(crate) mod event_processor;
 #[cfg(feature = "inproc")]
 pub(crate) mod inproc_reader;

@@ -2,7 +2,7 @@ use crate::error::ZmqError;
 use crate::runtime::SystemEvent;
 use crate::socket::ISocket;
 use crate::socket::core::state::ShutdownPhase;
-use crate::socket::core::{SocketCore, command_processor, pipe_manager, shutdown};
+use crate::socket::core::{SocketCore, command_processor, connection_lifecycle, pipe_manager, shutdown};
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -92,54 +92,35 @@ pub(crate) async fn process_system_event(
       connection_identifier,
       peer_identity,
       peer_socket_type,
+      endpoint_uri,
     } => {
       if parent_core_id == core_handle {
-        if current_shutdown_phase == ShutdownPhase::Running {
-          tracing::debug!(
-            handle = core_handle,
-            conn_id = connection_identifier,
-            identity = ?peer_identity,
-            "SocketCore processing PeerIdentityEstablished event."
-          );
+        tracing::debug!(
+          handle = core_handle,
+          conn_id = connection_identifier,
+          identity = ?peer_identity,
+          "SocketCore processing PeerIdentityEstablished event."
+        );
+        connection_lifecycle::handshake_succeeded(
+          &core_arc,
+          socket_logic_strong,
+          current_shutdown_phase == ShutdownPhase::Running,
+          connection_identifier,
+          endpoint_uri,
+          peer_identity,
+          peer_socket_type,
+        )
+        .await;
+      }
+    }
 
-          {
-            // Scoped write lock
-            let mut core_s_write = core_arc.core_state.write();
-            // Clone the URI first to release the lookup borrow on the write guard.
-            let uri_opt = core_s_write
-              .pipe_read_id_to_endpoint_uri
-              .get(&connection_identifier)
-              .cloned();
-
-            if let Some(uri) = uri_opt {
-              if let Some(ep_info) = core_s_write.endpoints.get_mut(&uri) {
-                tracing::debug!(
-                    handle = core_handle,
-                    pipe_id = connection_identifier,
-                    peer_type = ?peer_socket_type,
-                    "Updating peer socket type in EndpointInfo."
-                );
-                ep_info.peer_socket_type = peer_socket_type;
-              }
-
-              // 2. Reset reconnect backoff state on successful handshake
-              if let Some(recon_state) = core_s_write.reconnect_states.get_mut(&uri) {
-                recon_state.on_connection_success();
-                tracing::trace!(handle = core_handle, uri = %uri, "Reset reconnect backoff state after success.");
-              }
-            }
-          }
-
-          socket_logic_strong
-            .update_peer_identity(connection_identifier, peer_identity)
-            .await;
-        } else {
-          tracing::debug!(
-            handle = core_handle,
-            conn_id = connection_identifier,
-            "SocketCore ignoring PeerIdentityEstablished during shutdown."
-          );
-        }
+    SystemEvent::HandshakeFailed {
+      parent_core_id,
+      endpoint_uri,
+      error_msg,
+    } => {
+      if parent_core_id == core_handle {
+        connection_lifecycle::handshake_failed(&core_arc, endpoint_uri, error_msg);
       }
     }
 
