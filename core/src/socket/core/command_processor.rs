@@ -358,6 +358,20 @@ pub(crate) async fn process_socket_command(
       };
       tracing::warn!(handle=core_handle, %endpoint_uri, %error, "UringFdError — closing connection.");
 
+      // No endpoint means the connection failed before its handshake completed,
+      // so the core never registered it: report what a tokio session would.
+      if conn_iface_opt.is_none() {
+        let event = match &error {
+          ZmqError::SecurityError(_) | ZmqError::AuthenticationFailure(_) => SocketEvent::HandshakeFailed {
+            endpoint: endpoint_uri.clone(),
+            error_msg: error.to_string(),
+          },
+          _ => SocketEvent::Disconnected { endpoint: endpoint_uri.clone() },
+        };
+        core_arc.core_state.read().send_monitor_event(event);
+        return Ok(());
+      }
+
       if let Some(iface) = conn_iface_opt {
         if let Err(e) = iface.close_connection().await {
           tracing::warn!(handle=core_handle, %endpoint_uri, "close_connection error: {}", e);

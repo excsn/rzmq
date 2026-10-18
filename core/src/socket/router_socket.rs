@@ -71,6 +71,33 @@ pub(crate) struct RouterSocket {
   held_count: AtomicUsize,
   /// Signalled whenever a pipe finalizes, releasing any held batches.
   identity_finalized_notify: Arc<Notify>,
+  /// recv calls between entry and reading the popped batch's identity. A detached
+  /// pipe's state is only removed while no other recv holds a popped batch.
+  recvs_in_progress: AtomicUsize,
+  /// Detached pipes whose state is still kept for queued batches.
+  detached_count: AtomicUsize,
+}
+
+/// Counts one recv in progress; the last one to finish removes drained detached state.
+struct RecvInProgress<'a> {
+  router: &'a RouterSocket,
+}
+
+impl<'a> RecvInProgress<'a> {
+  fn begin(router: &'a RouterSocket) -> Self {
+    router.recvs_in_progress.fetch_add(1, Ordering::SeqCst);
+    Self { router }
+  }
+}
+
+impl Drop for RecvInProgress<'_> {
+  fn drop(&mut self) {
+    if self.router.recvs_in_progress.fetch_sub(1, Ordering::SeqCst) == 1
+      && self.router.detached_count.load(Ordering::SeqCst) > 0
+    {
+      self.router.sweep_detached();
+    }
+  }
 }
 
 impl RouterSocket {
@@ -92,6 +119,8 @@ impl RouterSocket {
       held_ingress: ParkingMutex::new(HashMap::new()),
       held_count: AtomicUsize::new(0),
       identity_finalized_notify: Arc::new(Notify::new()),
+      recvs_in_progress: AtomicUsize::new(0),
+      detached_count: AtomicUsize::new(0),
     }
   }
 
@@ -142,8 +171,12 @@ impl RouterSocket {
     );
   }
 
-  /// Removes a detached pipe's state once nothing of it is left to deliver.
-  fn release_if_detached_drained(&self, pipe_read_id: usize) {
+  /// Removes a detached pipe's state once nothing of it is left to deliver and
+  /// at most `allowed_recvs` recv calls, the caller's own included, are in progress.
+  fn release_if_detached_drained(&self, pipe_read_id: usize, allowed_recvs: usize) {
+    if self.recvs_in_progress.load(Ordering::SeqCst) > allowed_recvs {
+      return;
+    }
     let slot = match self
       .peer_states
       .read()
@@ -158,7 +191,22 @@ impl RouterSocket {
     {
       return;
     }
-    self.peer_states.write().remove(&pipe_read_id);
+    if self.peer_states.write().remove(&pipe_read_id).is_some() {
+      self.detached_count.fetch_sub(1, Ordering::SeqCst);
+    }
+  }
+
+  fn sweep_detached(&self) {
+    let detached: Vec<usize> = self
+      .peer_states
+      .read()
+      .iter()
+      .filter(|(_, s)| s.detached_slot.is_some())
+      .map(|(pid, _)| *pid)
+      .collect();
+    for pid in detached {
+      self.release_if_detached_drained(pid, 0);
+    }
   }
 
   /// Buffers a batch that arrived before its pipe finalized.
@@ -297,7 +345,7 @@ impl RouterSocket {
         (Self::pipe_id_to_placeholder_identity(pipe_read_id), None, false)
       });
     if detached {
-      self.release_if_detached_drained(pipe_read_id);
+      self.release_if_detached_drained(pipe_read_id, 1);
     }
 
     let peer_socket_type = {
@@ -597,8 +645,10 @@ impl ISocket for RouterSocket {
     }
     // Slow path: fetch next complete raw batch, process, return first frame.
     let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
+    let in_progress = RecvInProgress::begin(self);
     let (pipe_read_id, raw_batch) = self.recv_logical_finalized(rcvtimeo_opt).await?;
     let (identity_blob, payload) = self.process_incoming_zmtp_message(pipe_read_id, raw_batch)?;
+    drop(in_progress);
     let mut app_frames = Self::transform_qitem_to_app_frames(identity_blob, payload);
     if app_frames.is_empty() {
       return Ok(Msg::new());
@@ -742,8 +792,10 @@ impl ISocket for RouterSocket {
       return Err(ZmqError::InvalidState("Socket is closing".into()));
     }
     let rcvtimeo_opt = self.core.core_state.read().options.rcvtimeo;
+    let in_progress = RecvInProgress::begin(self);
     let (pipe_read_id, raw_batch) = self.recv_logical_finalized(rcvtimeo_opt).await?;
     let (identity_blob, payload) = self.process_incoming_zmtp_message(pipe_read_id, raw_batch)?;
+    drop(in_progress);
     Ok(Self::transform_qitem_to_app_frames(identity_blob, payload))
   }
 
@@ -976,8 +1028,9 @@ impl ISocket for RouterSocket {
       let slot = self.ingress_engine.detach_pipe(pipe_read_id);
       if let Some(state) = self.peer_states.write().get_mut(&pipe_read_id) {
         state.detached_slot = Some(slot);
+        self.detached_count.fetch_add(1, Ordering::SeqCst);
       }
-      self.release_if_detached_drained(pipe_read_id);
+      self.release_if_detached_drained(pipe_read_id, 0);
     } else {
       self.ingress_engine.deregister_pipe(pipe_read_id);
       self.peer_states.write().remove(&pipe_read_id);

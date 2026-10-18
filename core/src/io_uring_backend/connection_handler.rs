@@ -53,6 +53,9 @@ pub enum HandlerSqeBlueprint {
   },
   /// Request to set the TCP_CORK option on the handler's FD.
   RequestSetCork(bool),
+  /// Request a one-shot poll that completes when the peer closes, for a handler
+  /// that keeps no read armed.
+  RequestPeerClosePoll,
   /// Submit a `SEND_ZC` SQE directly from a pre-registered buffer slot.
   /// The slot was already written by the Tokio side; no copy needed here.
   /// Stays on the worker thread — does NOT need to be `Send`.
@@ -69,7 +72,7 @@ impl HandlerSqeBlueprint {
   pub fn is_ingress(&self) -> bool {
     matches!(
       self,
-      Self::RequestNewRingReadMultishot { .. } | Self::RequestNewAsyncCancel { .. }
+      Self::RequestNewRingReadMultishot { .. } | Self::RequestNewAsyncCancel { .. } | Self::RequestPeerClosePoll
     )
   }
 
@@ -304,6 +307,11 @@ pub trait UringConnectionHandler: Send {
     _counters: Arc<crate::socket::core::state::ConservationCounters>,
   ) -> Arc<fibre::mpmc::Receiver<FrameBatch>> {
     Arc::new(egress_rx)
+  }
+
+  /// Called by the worker when a `RequestPeerClosePoll` completes with `cqe_result`.
+  fn on_peer_close_poll(&mut self, _cqe_result: i32) -> HandlerIoOps {
+    HandlerIoOps::new()
   }
 
   /// Called by the worker when `ResumeConnection` is received from SocketCore.

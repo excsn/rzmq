@@ -44,6 +44,20 @@ pub(crate) fn process_handler_blueprint(
   }
 
   match blueprint {
+    HandlerSqeBlueprint::RequestPeerClosePoll => {
+      let mask = (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) as u32;
+      let user_data = internal_ops.new_op_id(fd, InternalOpType::PeerClosePoll, InternalOpPayload::None);
+      let entry = opcode::PollAdd::new(types::Fd(fd), mask).build().user_data(user_data);
+      unsafe {
+        if sq.push(&entry).is_err() {
+          internal_ops.take_op_details(user_data);
+          return Err(HandlerSqeBlueprint::RequestPeerClosePoll);
+        }
+      }
+      trace!("CQE Processor: Queued peer-close PollAdd SQE (ud:{}) for FD {}.", user_data, fd);
+      Ok(())
+    }
+
     HandlerSqeBlueprint::RequestSetCork(enable) => {
       let cork_val: i32 = if enable { 1 } else { 0 };
       let mut entry = opcode::SetSockOpt::new(
@@ -1254,6 +1268,19 @@ pub(crate) fn process_all_cqes(
               )
             };
 
+            if !handler_output.sqe_blueprints.is_empty() {
+              new_work_generated.push((handler_fd, handler_output.sqe_blueprints));
+            }
+            if handler_output.initiate_close_due_to_error {
+              worker
+                .fds_needing_close_initiated_pass
+                .push_back(handler_fd);
+            }
+          }
+        }
+        InternalOpType::PeerClosePoll => {
+          if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+            let handler_output = handler.on_peer_close_poll(cqe_result);
             if !handler_output.sqe_blueprints.is_empty() {
               new_work_generated.push((handler_fd, handler_output.sqe_blueprints));
             }

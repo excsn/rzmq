@@ -48,6 +48,8 @@ pub(crate) enum InternalOpType {
   SendRawVectored,
   /// `SEND_ZC` from a pre-registered, pre-written buffer slot (Phase 3 zero-copy lease path).
   SendZeroCopyLeased,
+  /// One-shot poll for the peer closing, armed by handlers that keep no read posted.
+  PeerClosePoll,
 }
 
 /// Payload associated with an internal operation, e.g., buffer for send.

@@ -246,6 +246,10 @@ pub(crate) struct ZmtpUringHandler {
   ingress_congestion_notified: AtomicBool,
   multishot_reader: Option<MultishotReader>,
   is_closing: bool,
+  /// Set once a `RequestClose` has been pushed; `is_closing` alone also means reads are stopped.
+  close_requested: bool,
+  /// A peer-close poll is in flight; armed for PUSH, which posts no read in the data phase.
+  peer_close_poll_armed: bool,
   /// Clean EOF arrived while ingress batches were still stashed in `spillover`
   /// (typically messages that raced ahead of `AttachIngressSender`). ZMQ semantics
   /// require everything received before the FIN to reach the application, so the
@@ -309,6 +313,8 @@ impl ZmtpUringHandler {
       ingress_congestion_notified: AtomicBool::new(false),
       multishot_reader: None,
       is_closing: false,
+      close_requested: false,
+      peer_close_poll_armed: false,
       eof_drain_pending: false,
       close_deadline: None,
       use_send_zerocopy,
@@ -635,6 +641,12 @@ impl UringConnectionHandler for ZmtpUringHandler {
     );
 
     if bytes.is_empty() {
+      // A closing handler has already requested its close. The shutdown in
+      // close_initiated is what completed this read. A second close would hit
+      // whatever reused the fd number.
+      if self.is_closing {
+        return HandlerIoOps::new();
+      }
       self.is_closing = true;
       if !self.spillover.is_empty() {
         // Clean FIN with ingress batches still stashed handler-side (typically
@@ -659,6 +671,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
           endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
           error: ZmqError::ConnectionClosed,
         });
+      self.close_requested = true;
       return HandlerIoOps::new().add_blueprint(HandlerSqeBlueprint::RequestClose);
     }
 
@@ -683,12 +696,16 @@ impl UringConnectionHandler for ZmtpUringHandler {
     }
 
     if cqe_result < 0 {
+      if self.is_closing {
+        return HandlerIoOps::new();
+      }
       error!(
         fd = self.fd,
         errno = -cqe_result,
         "ZmtpUringHandler: send SQE failed"
       );
       self.is_closing = true;
+      self.close_requested = true;
       let mut ops = HandlerIoOps::new();
       ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestClose);
       return ops;
@@ -717,6 +734,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
               endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
               error: ZmqError::ConnectionClosed,
             });
+          self.close_requested = true;
           return HandlerIoOps::new().add_blueprint(HandlerSqeBlueprint::RequestClose);
         }
       }
@@ -727,6 +745,17 @@ impl UringConnectionHandler for ZmtpUringHandler {
     self.try_drain_spillover();
 
     let mut ops = HandlerIoOps::new();
+
+    // A PUSH keeps no read posted in the data phase, so a poll is what tells it the
+    // peer has gone.
+    if !self.is_closing
+      && !self.peer_close_poll_armed
+      && self.engine.phase == crate::protocol::zmtp::engine::ZmtpPhase::Data
+      && self.engine.config().socket_type_name == "PUSH"
+    {
+      self.peer_close_poll_armed = true;
+      ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestPeerClosePoll);
+    }
 
     // (a) Re-arm multishot read.
     if !self.is_closing && !self.should_throttle_reads() {
@@ -812,6 +841,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
     if let Some(deadline) = self.close_deadline {
       if Instant::now() >= deadline {
         self.close_deadline = None;
+        self.close_requested = true;
         ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestClose);
       }
     }
@@ -830,16 +860,18 @@ impl UringConnectionHandler for ZmtpUringHandler {
 
   fn close_initiated(&mut self, _interface: &UringWorkerInterface<'_>) -> HandlerIoOps {
     info!(fd = self.fd, "ZmtpUringHandler: close_initiated");
-    if self.is_closing {
+    if self.close_requested {
       return HandlerIoOps::new();
     }
     self.is_closing = true;
+    self.close_requested = true;
     self.close_deadline = None;
     // An in-flight read holds a reference to the socket, so IORING_OP_CLOSE alone
-    // leaves it open and sends no FIN. shutdown() acts on the socket itself: the
-    // peer sees the disconnect and the pending read completes with 0.
+    // leaves it open and sends no FIN. SHUT_RD completes that read with 0 and keeps
+    // the write side, so a send queued ahead of the close, such as a ZMTP ERROR,
+    // still reaches the peer before the FIN.
     unsafe {
-      libc::shutdown(self.fd, libc::SHUT_RDWR);
+      libc::shutdown(self.fd, libc::SHUT_RD);
     }
     let mut ops = HandlerIoOps::new();
     if let Some(ref mut reader) = self.multishot_reader {
@@ -866,6 +898,7 @@ impl UringConnectionHandler for ZmtpUringHandler {
     }
     info!(fd = self.fd, "ZmtpUringHandler: fd_has_been_closed");
     self.is_closing = true;
+    self.close_requested = true;
     self.close_deadline = None;
   }
 
@@ -978,6 +1011,24 @@ impl UringConnectionHandler for ZmtpUringHandler {
     self.egress_credits = credits;
     self.egress_counters = Some(counters);
     Arc::clone(&self.egress_rx)
+  }
+
+  fn on_peer_close_poll(&mut self, cqe_result: i32) -> HandlerIoOps {
+    self.peer_close_poll_armed = false;
+    if self.is_closing || cqe_result < 0 {
+      return HandlerIoOps::new();
+    }
+    info!(fd = self.fd, revents = cqe_result, "ZmtpUringHandler: peer closed (poll)");
+    self.is_closing = true;
+    self.close_requested = true;
+    let _ = self
+      .worker_io_config
+      .socket_mailbox
+      .try_send(Command::UringFdError {
+        endpoint_uri: self.worker_io_config.endpoint_uri.clone(),
+        error: ZmqError::ConnectionClosed,
+      });
+    HandlerIoOps::new().add_blueprint(HandlerSqeBlueprint::RequestClose)
   }
 
   fn resume_ingress(&mut self) {
