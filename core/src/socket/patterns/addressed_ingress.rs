@@ -1,9 +1,10 @@
 use crate::message::FrameBatch;
 use crate::ZmqError;
-use crate::socket::patterns::ready_pipe_queue::{PipeMessageSender, ReadyPipeQueue};
+use crate::socket::patterns::ready_pipe_queue::{PipeMessageSender, PipeSlot, ReadyPipeQueue};
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::Weak;
 
 /// Consumer-local cache of already-popped `(pipe_id, batch)` entries plus the
 /// reusable drain buffer handed to `try_pop_batch`.
@@ -40,6 +41,16 @@ impl AddressedIngressEngine {
     self.queue.deregister_pipe(pipe_id);
     // Drop only the dead pipe's cached messages; other peers' entries survive.
     self.cache.lock().entries.retain(|(pid, _)| *pid != pipe_id);
+  }
+
+  /// Deregisters `pipe_id` but leaves its queued and cached batches poppable.
+  pub fn detach_pipe(&self, pipe_id: usize) -> Weak<PipeSlot<FrameBatch>> {
+    self.queue.deregister_pipe(pipe_id).unwrap_or_default()
+  }
+
+  /// True while a pipe removed with `detach_pipe` still has batches queued or cached.
+  pub fn detached_has_queued(&self, pipe_id: usize, slot: &Weak<PipeSlot<FrameBatch>>) -> bool {
+    slot.upgrade().is_some_and(|s| s.len() > 0) || self.cache.lock().entries.iter().any(|(pid, _)| *pid == pipe_id)
   }
 
   pub fn close(&self) {

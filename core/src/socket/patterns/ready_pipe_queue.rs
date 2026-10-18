@@ -388,7 +388,9 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
     }
   }
 
-  pub fn deregister_pipe(&self, pipe_id: usize) {
+  /// Returns a handle to the removed slot; it upgrades while ready tokens still
+  /// hold the slot, so its queued messages stay poppable.
+  pub fn deregister_pipe(&self, pipe_id: usize) -> Option<Weak<PipeSlot<T>>> {
     let removed = self.pipes.write().remove(&pipe_id);
     // Message-conservation audit. After this removal the slot survives only
     // through ready tokens (Arc clones in ready_rx / held by the consumer).
@@ -417,7 +419,7 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
         );
       }
     }
-    drop(removed);
+    removed.as_ref().map(Arc::downgrade)
   }
 
   pub async fn pop(&self) -> Result<(usize, T), ZmqError> {

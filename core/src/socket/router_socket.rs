@@ -7,13 +7,13 @@ use crate::socket::connection_iface::ISocketConnection;
 use crate::socket::core::SocketCore;
 use crate::socket::options::{AUTO_DELIMITER, ROUTER_MANDATORY};
 use crate::socket::patterns::AddressedIngressEngine;
-use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
+use crate::socket::patterns::ready_pipe_queue::{PipeMessageSender, PipeSlot};
 use crate::socket::patterns::{FramingLatch, RouterMap, WritePipeCoordinator, router_auto_encode};
 
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,6 +35,17 @@ struct ActiveFragmentedSend {
 struct PeerIdentityState {
   identity: Blob,
   finalized: bool,
+  peer_socket_type: Option<String>,
+  /// Set when a finalized pipe detaches; the entry lives until its queued batches are delivered.
+  detached_slot: Option<Weak<PipeSlot<FrameBatch>>>,
+}
+
+/// What `recv` does with a batch popped from a pipe.
+enum PipeGate {
+  Open,
+  Pending,
+  /// Detached before it finalized; its batches are dropped.
+  Gone,
 }
 
 #[derive(Debug)]
@@ -98,6 +109,8 @@ impl RouterSocket {
       .or_insert_with(|| PeerIdentityState {
         identity: Self::pipe_id_to_placeholder_identity(pipe_read_id),
         finalized: true,
+        peer_socket_type: None,
+        detached_slot: None,
       });
     self.identity_finalized_notify.notify_waiters();
   }
@@ -109,6 +122,43 @@ impl RouterSocket {
       .read()
       .get(&pipe_read_id)
       .is_some_and(|s| s.finalized)
+  }
+
+  fn pipe_gate(&self, pipe_read_id: usize) -> PipeGate {
+    match self.peer_states.read().get(&pipe_read_id) {
+      Some(s) if s.finalized => PipeGate::Open,
+      Some(_) => PipeGate::Pending,
+      None => PipeGate::Gone,
+    }
+  }
+
+  /// Drops a batch from a pipe that detached before it finalized.
+  fn drop_gone_batch(&self, _pipe_read_id: usize) {
+    #[cfg(feature = "diagnostics")]
+    tracing::warn!(
+      handle = self.core.handle,
+      pipe_read_id = _pipe_read_id,
+      "[MSG-CONSERVATION] ROUTER dropping batch from a pipe that detached before finalizing"
+    );
+  }
+
+  /// Removes a detached pipe's state once nothing of it is left to deliver.
+  fn release_if_detached_drained(&self, pipe_read_id: usize) {
+    let slot = match self
+      .peer_states
+      .read()
+      .get(&pipe_read_id)
+      .and_then(|s| s.detached_slot.clone())
+    {
+      Some(slot) => slot,
+      None => return,
+    };
+    if self.ingress_engine.detached_has_queued(pipe_read_id, &slot)
+      || self.held_ingress.lock().contains_key(&pipe_read_id)
+    {
+      return;
+    }
+    self.peer_states.write().remove(&pipe_read_id);
   }
 
   /// Buffers a batch that arrived before its pipe finalized.
@@ -172,12 +222,13 @@ impl RouterSocket {
           .ingress_engine
           .recv_logical_message(Some(Duration::ZERO))
           .await?;
-        if self.is_pipe_finalized(pid) {
-          return Ok((pid, batch));
+        match self.pipe_gate(pid) {
+          PipeGate::Open => return Ok((pid, batch)),
+          // Pending: buffer it and re-loop; if nothing else is ready the next
+          // iteration surfaces `ResourceLimitReached` (would-block).
+          PipeGate::Pending => self.hold_pending_batch(pid, batch),
+          PipeGate::Gone => self.drop_gone_batch(pid),
         }
-        // Pending: buffer it and re-loop; if nothing else is ready the next
-        // iteration surfaces `ResourceLimitReached` (would-block).
-        self.hold_pending_batch(pid, batch);
         continue;
       }
 
@@ -200,10 +251,11 @@ impl RouterSocket {
         }
         popped = self.ingress_engine.pop() => {
           let (pid, batch) = popped?;
-          if self.is_pipe_finalized(pid) {
-            return Ok((pid, batch));
+          match self.pipe_gate(pid) {
+            PipeGate::Open => return Ok((pid, batch)),
+            PipeGate::Pending => self.hold_pending_batch(pid, batch),
+            PipeGate::Gone => self.drop_gone_batch(pid),
           }
-          self.hold_pending_batch(pid, batch);
           continue;
         }
         _ = async {
@@ -231,19 +283,22 @@ impl RouterSocket {
     // The 'payload' is the entire message received from the peer, after stripping
     // a single leading delimiter IF the peer is a REQ or DEALER.
 
-    let identity_blob = self
+    let (identity_blob, stored_peer_type, detached) = self
       .peer_states
       .read()
       .get(&pipe_read_id)
-      .map(|state| state.identity.clone())
+      .map(|state| (state.identity.clone(), state.peer_socket_type.clone(), state.detached_slot.is_some()))
       .unwrap_or_else(|| {
         tracing::warn!(
           handle = self.core.handle,
           pipe_id = pipe_read_id,
           "Router: Identity for pipe not found, using placeholder for incoming message."
         );
-        Self::pipe_id_to_placeholder_identity(pipe_read_id)
+        (Self::pipe_id_to_placeholder_identity(pipe_read_id), None, false)
       });
+    if detached {
+      self.release_if_detached_drained(pipe_read_id);
+    }
 
     let peer_socket_type = {
       let core_s = self.core.core_state.read();
@@ -252,7 +307,8 @@ impl RouterSocket {
         .get(&pipe_read_id)
         .and_then(|uri| core_s.endpoints.get(uri))
         .and_then(|ep_info| ep_info.peer_socket_type.clone())
-    };
+    }
+    .or(stored_peer_type);
 
     if self.framing.is_manual() {
       return Ok((identity_blob, raw_zmtp_message));
@@ -773,6 +829,8 @@ impl ISocket for RouterSocket {
         PeerIdentityState {
           identity: identity_to_use,
           finalized: false,
+          peer_socket_type: None,
+          detached_slot: None,
         },
       );
       self.pipe_send_coordinator.add_pipe(pipe_read_id).await;
@@ -845,6 +903,8 @@ impl ISocket for RouterSocket {
         PeerIdentityState {
           identity: new_identity,
           finalized: true,
+          peer_socket_type: peer_socket_type_opt,
+          detached_slot: None,
         },
       );
     } else {
@@ -896,18 +956,27 @@ impl ISocket for RouterSocket {
       }
     }
 
-    self.ingress_engine.deregister_pipe(pipe_read_id);
     self.pending_pipe_senders.lock().remove(&pipe_read_id);
 
-    // Tear down the identity gate for this pipe. Any batches still held for a
-    // pipe that detached before finalizing are dropped: the connection died
-    // before its identity was resolved, so the messages can never be routed
-    // with a real identity (ZMQ permits message loss on disconnect). Wake any
-    // recv waiting on a finalize so it re-evaluates without this pipe.
-    self.peer_states.write().remove(&pipe_read_id);
-    if let Some(dropped) = self.held_ingress.lock().remove(&pipe_read_id) {
-      if !dropped.is_empty() {
-        self.held_count.fetch_sub(dropped.len(), Ordering::AcqRel);
+    // A finalized pipe keeps its identity state until the batches it already
+    // queued are delivered, as libzmq delivers them after the peer disconnects.
+    // A pipe that detached before finalizing has its batches dropped: they can
+    // never be routed with a real identity (ZMQ permits message loss on
+    // disconnect). Wake any recv waiting on a finalize so it re-evaluates
+    // without this pipe.
+    if self.is_pipe_finalized(pipe_read_id) {
+      let slot = self.ingress_engine.detach_pipe(pipe_read_id);
+      if let Some(state) = self.peer_states.write().get_mut(&pipe_read_id) {
+        state.detached_slot = Some(slot);
+      }
+      self.release_if_detached_drained(pipe_read_id);
+    } else {
+      self.ingress_engine.deregister_pipe(pipe_read_id);
+      self.peer_states.write().remove(&pipe_read_id);
+      if let Some(dropped) = self.held_ingress.lock().remove(&pipe_read_id) {
+        if !dropped.is_empty() {
+          self.held_count.fetch_sub(dropped.len(), Ordering::AcqRel);
+        }
       }
     }
     self.identity_finalized_notify.notify_waiters();
