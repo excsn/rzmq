@@ -1,7 +1,7 @@
 use crate::error::ZmqError;
 use crate::message::FrameBatch;
 use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::events::{MonitorSender, SocketEvent, clean_endpoint_uri};
+use crate::socket::events::{MonitorHandle, SocketEvent};
 use crate::socket::patterns::PipeCredits;
 use async_trait::async_trait;
 use fibre::mpmc::AsyncSender as BoundedAsyncSender;
@@ -16,7 +16,7 @@ pub(crate) struct DirectInprocConnection {
   pub connection_id: usize,
   pub target_endpoint_uri: String,
   pub peer_queue_sender: BoundedAsyncSender<FrameBatch>,
-  pub monitor_tx: Option<MonitorSender>,
+  pub monitor: MonitorHandle,
   pub is_congested: Arc<AtomicBool>,
   pub sndtimeo: Option<Duration>,
   pub credits: Option<Arc<PipeCredits>>,
@@ -31,11 +31,9 @@ impl DirectInprocConnection {
       return;
     }
     if !self.is_congested.swap(true, Ordering::AcqRel) {
-      if let Some(ref tx) = self.monitor_tx {
-        let _ = tx.try_send(SocketEvent::ConnectionCongested {
-          endpoint: clean_endpoint_uri(&self.target_endpoint_uri).to_owned(),
-        });
-      }
+      self.monitor.emit(SocketEvent::ConnectionCongested {
+        endpoint: self.target_endpoint_uri.clone(),
+      });
     }
   }
 
@@ -44,11 +42,9 @@ impl DirectInprocConnection {
       return;
     }
     if self.is_congested.swap(false, Ordering::AcqRel) {
-      if let Some(ref tx) = self.monitor_tx {
-        let _ = tx.try_send(SocketEvent::ConnectionUncongested {
-          endpoint: clean_endpoint_uri(&self.target_endpoint_uri).to_owned(),
-        });
-      }
+      self.monitor.emit(SocketEvent::ConnectionUncongested {
+        endpoint: self.target_endpoint_uri.clone(),
+      });
     }
   }
 }
@@ -141,7 +137,7 @@ mod tests {
       connection_id: 100,
       target_endpoint_uri: "inproc://test-uri".to_string(),
       peer_queue_sender: tx,
-      monitor_tx: None,
+      monitor: MonitorHandle::default(),
       is_congested: Arc::new(AtomicBool::new(false)),
       sndtimeo: None,
       credits: None,
@@ -162,7 +158,7 @@ mod tests {
       connection_id: 101,
       target_endpoint_uri: "inproc://test-uri".to_string(),
       peer_queue_sender: tx,
-      monitor_tx: None,
+      monitor: MonitorHandle::default(),
       is_congested: Arc::new(AtomicBool::new(false)),
       sndtimeo: None,
       credits: None,
@@ -188,7 +184,7 @@ mod tests {
       connection_id: 102,
       target_endpoint_uri: "inproc://test-uri".to_string(),
       peer_queue_sender: tx,
-      monitor_tx: None,
+      monitor: MonitorHandle::default(),
       is_congested: Arc::new(AtomicBool::new(false)),
       sndtimeo: None,
       credits: None,

@@ -8,7 +8,7 @@ use crate::protocol::zmtp::greeting::GREETING_LENGTH;
 use crate::runtime::{ActorDropGuard, ActorType, Command, ReusableBoxFuture, SystemEvent};
 use crate::sessionx::regulator::SessionRegulator;
 use crate::socket::ISocket;
-use crate::socket::events::{SocketEvent, clean_endpoint_uri};
+use crate::socket::events::SocketEvent;
 use crate::socket::options::ZmtpEngineConfig;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::socket::ThrottlePriority;
@@ -236,6 +236,7 @@ where
     let initial_out = self.zmtp_engine.start();
     self.apply_engine_output_handshake(initial_out).await;
     if matches!(self.current_phase, ConnectionPhaseX::Terminating) {
+      self.report_handshake_failed();
       self.finalize(actor_drop_guard).await;
       return;
     }
@@ -299,6 +300,9 @@ where
       }
 
       self.read_half = Some(hs_read_half);
+    }
+    if self.zmtp_engine.phase != ZmtpPhase::Data {
+      self.report_handshake_failed();
     }
 
     // Handshake done — wait for ScaInitializePipes before entering Operational.
@@ -575,14 +579,9 @@ where
                   && egress_buffer.pending_messages() < sndhwm
                 {
                   self.is_currently_congested = false;
-                  if let Some(ref tx) = self.actor_config.monitor_tx {
-                    let ep = clean_endpoint_uri(
-                      &self.actor_config.logical_target_endpoint_uri,
-                    ).to_owned();
-                    let _ = tx.try_send(SocketEvent::ConnectionUncongested {
-                      endpoint: ep,
-                    });
-                  }
+                  self.actor_config.monitor.emit(SocketEvent::ConnectionUncongested {
+                    endpoint: self.actor_config.logical_target_endpoint_uri.clone(),
+                  });
                 }
               }
               Err(e) => {
@@ -967,11 +966,9 @@ where
         return;
       }
 
-      if let Some(monitor) = &self.actor_config.monitor_tx {
-        let _ = monitor.try_send(crate::socket::SocketEvent::HandshakeSucceeded {
-          endpoint: self.actor_config.connected_endpoint_uri.clone(),
-        });
-      }
+      self.actor_config.monitor.emit(SocketEvent::HandshakeSucceeded {
+        endpoint: self.actor_config.connected_endpoint_uri.clone(),
+      });
     }
   }
 
@@ -1082,10 +1079,9 @@ where
         }
         if !self.is_currently_congested && egress_buffer.pending_messages() >= sndhwm {
           self.is_currently_congested = true;
-          if let Some(ref tx) = self.actor_config.monitor_tx {
-            let ep = clean_endpoint_uri(&self.actor_config.logical_target_endpoint_uri).to_owned();
-            let _ = tx.try_send(SocketEvent::ConnectionCongested { endpoint: ep });
-          }
+          self.actor_config.monitor.emit(SocketEvent::ConnectionCongested {
+            endpoint: self.actor_config.logical_target_endpoint_uri.clone(),
+          });
         }
       }
       Err(e) => self.set_fatal_error(e).await,
@@ -1094,6 +1090,20 @@ where
     if throttle_guard.should_throttle() {
       yield_now().await;
     }
+  }
+
+  /// libzmq `stream_engine_base_t::error`: a connection that ends before its
+  /// handshake completes reports handshake failed. The core reports the
+  /// Disconnected that follows when this session stops.
+  fn report_handshake_failed(&self) {
+    let error_msg = self
+      .error_for_drop_guard
+      .as_ref()
+      .map_or_else(|| "ZMTP handshake did not complete".to_string(), |e| e.to_string());
+    self.actor_config.monitor.emit(SocketEvent::HandshakeFailed {
+      endpoint: self.actor_config.connected_endpoint_uri.clone(),
+      error_msg,
+    });
   }
 
   async fn set_fatal_error(&mut self, error: ZmqError) {

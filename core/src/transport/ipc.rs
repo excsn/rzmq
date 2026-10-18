@@ -9,7 +9,7 @@ use crate::runtime::{
 };
 use crate::sessionx::actor::SessionConnectionActorX;
 use crate::sessionx::states::ActorConfigX;
-use crate::socket::events::{MonitorSender, SocketEvent};
+use crate::socket::events::{MonitorHandle, SocketEvent};
 use crate::socket::options::SocketOptions;
 use crate::socket::{ISocket, ZmtpEngineConfig};
 
@@ -73,7 +73,7 @@ impl IpcListener {
     options: Arc<SocketOptions>,
     socket_logic: Arc<dyn ISocket>,
     context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
-    monitor_tx: Option<MonitorSender>,
+    monitor: MonitorHandle,
     context: Context,
     parent_socket_id: usize,
   ) -> Result<(GenericMailboxSender, JoinHandle<()>, String), ZmqError> {
@@ -109,7 +109,7 @@ impl IpcListener {
       options.clone(),
       socket_logic,
       context_handle_source.clone(),
-      monitor_tx.clone(),
+      monitor.clone(),
       context.clone(),
       parent_socket_id,
       conn_limiter.clone(),
@@ -231,7 +231,7 @@ impl IpcListener {
     socket_options: Arc<SocketOptions>,
     socket_logic: Arc<dyn ISocket>,
     handle_source: Arc<std::sync::atomic::AtomicUsize>,
-    monitor_tx: Option<MonitorSender>,
+    monitor: MonitorHandle,
     context: Context,
     parent_socket_core_id: usize,
     connection_limiter: Arc<Semaphore>,
@@ -265,12 +265,10 @@ impl IpcListener {
             endpoint_uri
           );
 
-          if let Some(ref tx) = monitor_tx {
-            let _ = tx.try_send(SocketEvent::Accepted {
-              endpoint: endpoint_uri.clone(),
-              peer_addr: peer_addr_str.clone(),
-            });
-          }
+          monitor.emit(SocketEvent::Accepted {
+            endpoint: endpoint_uri.clone(),
+            peer_addr: peer_addr_str.clone(),
+          });
 
           {
             let socket_ref = SockRef::from(&unix_stream);
@@ -293,7 +291,7 @@ impl IpcListener {
           tokio::spawn({
             let context_clone = context.clone();
             let socket_options_clone = socket_options.clone();
-            let monitor_tx_clone = monitor_tx.clone();
+            let monitor_clone = monitor.clone();
             let handle_source_clone = handle_source.clone();
             let actual_connected_uri = connection_specific_uri.clone();
             let logical_uri = endpoint_uri.clone();
@@ -358,7 +356,7 @@ impl IpcListener {
                   handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let actor_conf = ActorConfigX {
                   context: context_clone.clone(),
-                  monitor_tx: monitor_tx_clone,
+                  monitor: monitor_clone,
                   logical_target_endpoint_uri: logical_uri.clone(),
                   connected_endpoint_uri: actual_connected_uri.clone(),
                   is_server_role: true,
@@ -424,12 +422,10 @@ impl IpcListener {
             endpoint_uri,
             e
           );
-          if let Some(ref tx) = monitor_tx {
-            let _ = tx.try_send(SocketEvent::AcceptFailed {
-              endpoint: endpoint_uri.clone(),
-              error_msg: e.to_string(),
-            });
-          }
+          monitor.emit(SocketEvent::AcceptFailed {
+            endpoint: endpoint_uri.clone(),
+            error_msg: e.to_string(),
+          });
           if is_fatal_ipc_accept_error(&e) {
             loop_error_to_report = Some(ZmqError::from_io_endpoint(e, &endpoint_uri));
             break;
@@ -506,7 +502,7 @@ impl IpcConnecter {
     options: Arc<SocketOptions>,
     socket_logic: Arc<dyn ISocket>,
     context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
-    monitor_tx: Option<MonitorSender>,
+    monitor: MonitorHandle,
     context: Context,
     parent_socket_id: usize,
   ) -> JoinHandle<()> {
@@ -521,13 +517,13 @@ impl IpcConnecter {
       socket_logic,
     };
     let task_join_handle =
-      tokio::spawn(connecter_actor.run_connect_attempt(monitor_tx, parent_socket_id));
+      tokio::spawn(connecter_actor.run_connect_attempt(monitor, parent_socket_id));
     task_join_handle
   }
 
   async fn run_connect_attempt(
     self,
-    monitor_tx: Option<MonitorSender>,
+    monitor: MonitorHandle,
     _parent_socket_id_unused: usize,
   ) {
     let connecter_handle = self.handle;
@@ -588,12 +584,10 @@ impl IpcConnecter {
             let actual_connected_uri = format!("ipc://{}", peer_id_str);
             tracing::info!(handle = connecter_handle, uri = %endpoint_uri_original, actual = %actual_connected_uri, "IPC Connect successful");
 
-            if let Some(ref tx) = monitor_tx {
-            let _ = tx.try_send(SocketEvent::Connected {
-              endpoint: endpoint_uri_original.clone(),
-              peer_addr: actual_connected_uri.clone(),
-            });
-            }
+            monitor.emit(SocketEvent::Connected {
+            endpoint: endpoint_uri_original.clone(),
+            peer_addr: actual_connected_uri.clone(),
+          });
 
             #[cfg(feature = "io-uring")]
             let connect_use_io_uring = self.context_options.io_uring.session_enabled
@@ -664,7 +658,7 @@ impl IpcConnecter {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
               let actor_conf = ActorConfigX {
                 context: self.context.clone(),
-                monitor_tx: monitor_tx.clone(),
+                monitor: monitor.clone(),
                 logical_target_endpoint_uri: endpoint_uri_original.clone(),
                 connected_endpoint_uri: actual_connected_uri.clone(),
                 is_server_role: false,
@@ -742,12 +736,10 @@ impl IpcConnecter {
       }
       Err(err) => {
         tracing::error!(handle = connecter_handle, uri = %endpoint_uri_original, error = %err, "IPC Connect final failure");
-        if let Some(ref tx) = monitor_tx {
-          let _ = tx.try_send(SocketEvent::ConnectFailed {
-            endpoint: endpoint_uri_original.clone(),
-            error_msg: err.to_string(),
-          });
-        }
+        monitor.emit(SocketEvent::ConnectFailed {
+          endpoint: endpoint_uri_original.clone(),
+          error_msg: err.to_string(),
+        });
         // Only publish ConnectionAttemptFailed if it wasn't an internal abort
         if !matches!(&err, ZmqError::Internal(s) if s.contains("aborted by system event")) {
           let _ = self

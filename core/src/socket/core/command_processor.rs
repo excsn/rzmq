@@ -361,14 +361,12 @@ pub(crate) async fn process_socket_command(
       // No endpoint means the connection failed before its handshake completed,
       // so the core never registered it: report what a tokio session would.
       if conn_iface_opt.is_none() {
-        let event = match &error {
-          ZmqError::SecurityError(_) | ZmqError::AuthenticationFailure(_) => SocketEvent::HandshakeFailed {
-            endpoint: endpoint_uri.clone(),
-            error_msg: error.to_string(),
-          },
-          _ => SocketEvent::Disconnected { endpoint: endpoint_uri.clone() },
-        };
-        core_arc.core_state.read().send_monitor_event(event);
+        let cs = core_arc.core_state.read();
+        cs.send_monitor_event(SocketEvent::HandshakeFailed {
+          endpoint: endpoint_uri.clone(),
+          error_msg: error.to_string(),
+        });
+        cs.send_monitor_event(SocketEvent::Disconnected { endpoint: endpoint_uri.clone() });
         return Ok(());
       }
 
@@ -467,7 +465,7 @@ async fn handle_user_bind(
       if !reuse_port && has_listener_on(&core_s_read, uri_from_parse) {
         bind_result = Err(ZmqError::AddrInUse(uri_from_parse.clone()));
       } else {
-        let monitor_tx_clone = core_s_read.get_monitor_sender_clone();
+        let monitor = core_s_read.monitor_handle();
         let options_clone = core_s_read.options.clone();
         drop(core_s_read); // Release read lock
 
@@ -479,7 +477,7 @@ async fn handle_user_bind(
           options_clone,
           socket_logic,
           context_clone.inner().next_handle.clone(), // For unique ID generation within listener
-          monitor_tx_clone,
+          monitor,
           context_clone.clone(),
           parent_socket_id,
         ) {
@@ -520,7 +518,7 @@ async fn handle_user_bind(
       if core_s_read.endpoints.contains_key(uri_from_parse) {
         bind_result = Err(ZmqError::AddrInUse(uri_from_parse.clone()));
       } else {
-        let monitor_tx_clone = core_s_read.get_monitor_sender_clone();
+        let monitor = core_s_read.monitor_handle();
         let options_clone = core_s_read.options.clone();
         drop(core_s_read);
 
@@ -532,7 +530,7 @@ async fn handle_user_bind(
           options_clone,
           socket_logic,
           context_clone.inner().next_handle.clone(),
-          monitor_tx_clone,
+          monitor,
           context_clone.clone(),
           parent_socket_id,
         ) {
@@ -870,7 +868,7 @@ pub(crate) async fn respawn_connecter_actor(
       // Don't need parsed addr here, TcpConnecter re-parses from URI
       let core_s_read = core_arc.core_state.read();
       let options_clone = core_s_read.options.clone();
-      let monitor_tx_clone = core_s_read.get_monitor_sender_clone();
+      let monitor = core_s_read.monitor_handle();
 
       let current_attempts = core_s_read
         .reconnect_states
@@ -889,7 +887,7 @@ pub(crate) async fn respawn_connecter_actor(
         options_clone,
         socket_logic,
         handle_source_clone,
-        monitor_tx_clone,
+        monitor,
         context_clone,
         parent_socket_id,
         current_attempts,
@@ -900,7 +898,7 @@ pub(crate) async fn respawn_connecter_actor(
     Ok(Endpoint::Ipc(path_buf, _)) => {
       let core_s_read = core_arc.core_state.read();
       let options_clone = core_s_read.options.clone();
-      let monitor_tx_clone = core_s_read.get_monitor_sender_clone();
+      let monitor = core_s_read.monitor_handle();
       let handle_source_clone = context_clone.inner().next_handle.clone();
       drop(core_s_read);
 
@@ -912,7 +910,7 @@ pub(crate) async fn respawn_connecter_actor(
         options_clone,
         socket_logic,
         handle_source_clone,
-        monitor_tx_clone,
+        monitor,
         context_clone,
         parent_socket_id,
       );
@@ -1215,7 +1213,7 @@ async fn handle_user_monitor(
   monitor_tx: MonitorSender,
   reply_tx: oneshot::Sender<Result<(), ZmqError>>,
 ) {
-  core_arc.core_state.write().monitor_tx = Some(monitor_tx);
+  core_arc.core_state.read().monitor.attach(monitor_tx);
   let _ = reply_tx.send(Ok(()));
 }
 

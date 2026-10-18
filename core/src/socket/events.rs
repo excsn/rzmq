@@ -1,3 +1,5 @@
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Represents significant events occurring within a socket or its connections.
@@ -60,6 +62,72 @@ pub(crate) fn clean_endpoint_uri(uri: &str) -> &str {
   match uri.find('#') {
     Some(pos) => &uri[..pos],
     None => uri,
+  }
+}
+
+impl SocketEvent {
+  /// The event with its endpoint and peer address passed through `clean_endpoint_uri`.
+  pub(crate) fn with_clean_endpoint(mut self) -> Self {
+    let clean = |s: &mut String| {
+      let cleaned = clean_endpoint_uri(s).len();
+      s.truncate(cleaned);
+    };
+    match &mut self {
+      SocketEvent::Accepted { endpoint, peer_addr } | SocketEvent::Connected { endpoint, peer_addr } => {
+        clean(endpoint);
+        clean(peer_addr);
+      }
+      SocketEvent::Listening { endpoint }
+      | SocketEvent::BindFailed { endpoint, .. }
+      | SocketEvent::AcceptFailed { endpoint, .. }
+      | SocketEvent::ConnectDelayed { endpoint, .. }
+      | SocketEvent::ConnectRetried { endpoint, .. }
+      | SocketEvent::ConnectFailed { endpoint, .. }
+      | SocketEvent::Closed { endpoint }
+      | SocketEvent::Disconnected { endpoint }
+      | SocketEvent::HandshakeFailed { endpoint, .. }
+      | SocketEvent::HandshakeSucceeded { endpoint }
+      | SocketEvent::ConnectionCongested { endpoint }
+      | SocketEvent::ConnectionUncongested { endpoint } => clean(endpoint),
+    }
+    self
+  }
+}
+
+/// A socket's monitor, shared by its core and every listener, connecter and
+/// session it spawns. A clone refers to the same slot, so a monitor attached at
+/// any time receives every event emitted after it.
+#[derive(Clone, Default)]
+pub(crate) struct MonitorHandle {
+  slot: Arc<RwLock<Option<MonitorSender>>>,
+}
+
+impl MonitorHandle {
+  /// Replaces any previous sender; its receiver closes once no clone of it is left.
+  pub(crate) fn attach(&self, sender: MonitorSender) {
+    *self.slot.write() = Some(sender);
+  }
+
+  /// Drops the event when no monitor is attached or its buffer is full.
+  pub(crate) fn emit(&self, event: SocketEvent) {
+    if let Some(tx) = self.slot.read().as_ref() {
+      if tx.try_send(event.with_clean_endpoint()).is_err() {
+        tracing::warn!("Failed to send event to monitor channel (full or closed)");
+      }
+    }
+  }
+
+  /// For a site that awaits its send; the slot's guard cannot be held across it.
+  pub(crate) fn sender(&self) -> Option<MonitorSender> {
+    self.slot.read().clone()
+  }
+}
+
+impl std::fmt::Debug for MonitorHandle {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("MonitorHandle")
+      .field("attached", &self.slot.read().is_some())
+      .finish()
   }
 }
 

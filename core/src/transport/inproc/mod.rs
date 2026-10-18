@@ -44,7 +44,7 @@ pub(crate) async fn connect_inproc(
       let err_msg = format!("Inproc endpoint '{}' not bound or not found", name);
       tracing::warn!(connector_core_handle, inproc_name = %name, "{}", err_msg);
       let zmq_err = ZmqError::ConnectionRefused(err_msg.clone());
-      let monitor_tx_opt = core_arc.core_state.read().get_monitor_sender_clone();
+      let monitor_tx_opt = core_arc.core_state.read().monitor_handle().sender();
       if let Some(monitor) = monitor_tx_opt {
         let _ = monitor
           .send(SocketEvent::ConnectFailed {
@@ -117,7 +117,7 @@ pub(crate) async fn connect_inproc(
       // Validate the binder's socket type is compatible with ours.
       if let Err(e) = handshake::validate_socket_compatibility(connector_socket_type, response.binder_socket_type) {
         tracing::warn!(connector_core_handle, inproc_name = %name, "Inproc socket type mismatch: {}", e);
-        let monitor_tx = core_arc.core_state.read().get_monitor_sender_clone();
+        let monitor_tx = core_arc.core_state.read().monitor_handle().sender();
         if let Some(monitor) = monitor_tx {
           let _ = monitor.send(SocketEvent::ConnectFailed {
             endpoint: connector_uri_str,
@@ -129,15 +129,15 @@ pub(crate) async fn connect_inproc(
       }
 
       let peer_identity = response.binder_identity.clone();
-      let (monitor_tx, sndtimeo) = {
+      let (monitor, sndtimeo) = {
         let s = core_arc.core_state.read();
-        (s.get_monitor_sender_clone(), s.options.sndtimeo)
+        (s.monitor_handle(), s.options.sndtimeo)
       };
       let direct_conn = DirectInprocConnection {
         connection_id: connection_handle_id,
         target_endpoint_uri: connection_specific_uri.clone(),
         peer_queue_sender: response.binder_rx_sender,
-        monitor_tx,
+        monitor,
         is_congested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sndtimeo,
         credits: response.connector_to_binder_credits.clone(),
@@ -162,7 +162,7 @@ pub(crate) async fn connect_inproc(
         return;
       }
 
-      let monitor_tx = core_arc.core_state.read().get_monitor_sender_clone();
+      let monitor_tx = core_arc.core_state.read().monitor_handle().sender();
       if let Some(monitor) = monitor_tx {
         let _ = monitor
           .send(SocketEvent::Connected {
@@ -176,7 +176,7 @@ pub(crate) async fn connect_inproc(
     }
     Ok(Err(e)) => {
       tracing::warn!(connector_core_handle, inproc_name = %name, "Inproc connection rejected by binder: {}", e);
-      let monitor_tx = core_arc.core_state.read().get_monitor_sender_clone();
+      let monitor_tx = core_arc.core_state.read().monitor_handle().sender();
       if let Some(monitor) = monitor_tx {
         let _ = monitor
           .send(SocketEvent::ConnectFailed {
@@ -190,7 +190,7 @@ pub(crate) async fn connect_inproc(
     Err(_) => {
       let err_msg = format!("Binder for inproc endpoint '{}' disappeared", name);
       tracing::error!(connector_core_handle, inproc_name = %name, "{}", err_msg);
-      let monitor_tx = core_arc.core_state.read().get_monitor_sender_clone();
+      let monitor_tx = core_arc.core_state.read().monitor_handle().sender();
       if let Some(monitor) = monitor_tx {
         let _ = monitor
           .send(SocketEvent::ConnectFailed {

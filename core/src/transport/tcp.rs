@@ -8,7 +8,7 @@ use crate::runtime::{
 use crate::sessionx::actor::SessionConnectionActorX;
 use crate::sessionx::states::ActorConfigX;
 use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::events::{MonitorSender, SocketEvent};
+use crate::socket::events::{MonitorHandle, SocketEvent};
 use crate::socket::options::{SocketOptions, TcpTransportConfig, ZmtpEngineConfig};
 use crate::socket::{DEFAULT_RECONNECT_IVL_MS, ISocket};
 
@@ -78,7 +78,7 @@ impl TcpListener {
     options: Arc<SocketOptions>,
     socket_logic: Arc<dyn ISocket>,
     context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
-    monitor_tx: Option<MonitorSender>,
+    monitor: MonitorHandle,
     context: Context,
     parent_socket_id: usize,
   ) -> Result<(GenericMailboxSender, JoinHandle<()>, String), ZmqError> {
@@ -164,7 +164,7 @@ impl TcpListener {
       options.clone(),
       socket_logic,
       context_handle_source.clone(),
-      monitor_tx.clone(),
+      monitor.clone(),
       context.clone(),
       parent_socket_id,
       conn_limiter.clone(),
@@ -282,7 +282,7 @@ impl TcpListener {
     socket_options: Arc<SocketOptions>,
     socket_logic: Arc<dyn ISocket>,
     handle_source: Arc<std::sync::atomic::AtomicUsize>,
-    monitor_tx: Option<MonitorSender>,
+    monitor: MonitorHandle,
     context: Context,
     parent_socket_core_id: usize,
     connection_limiter: Arc<Semaphore>,
@@ -322,12 +322,10 @@ impl TcpListener {
             endpoint_uri
           );
 
-          if let Some(ref tx) = monitor_tx {
-            let _ = tx.try_send(SocketEvent::Accepted {
-              endpoint: endpoint_uri.clone(),
-              peer_addr: peer_addr_str.clone(),
-            });
-          }
+          monitor.emit(SocketEvent::Accepted {
+            endpoint: endpoint_uri.clone(),
+            peer_addr: peer_addr_str.clone(),
+          });
 
           let use_io_uring_for_session =
             socket_options.io_uring.session_enabled && cfg!(feature = "io-uring");
@@ -337,7 +335,7 @@ impl TcpListener {
             let context_clone = context.clone();
             let socket_options_clone = socket_options.clone();
             let transport_config_clone = transport_config.clone();
-            let monitor_tx_clone = monitor_tx.clone();
+            let monitor_clone = monitor.clone();
             let endpoint_uri_listener = endpoint_uri.clone();
             let handle_source_clone = handle_source.clone();
             let actual_connected_uri = connection_specific_uri.clone();
@@ -517,7 +515,7 @@ impl TcpListener {
                     handle_source_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                   let actor_conf = ActorConfigX {
                     context: context_clone.clone(),
-                    monitor_tx: monitor_tx_clone,
+                    monitor: monitor_clone,
                     logical_target_endpoint_uri: logical_uri.clone(), // Was `logical_uri` in your original
                     connected_endpoint_uri: actual_connected_uri.clone(),
                     is_server_role: true,
@@ -593,12 +591,10 @@ impl TcpListener {
             endpoint_uri,
             e
           );
-          if let Some(ref tx) = monitor_tx {
-            let _ = tx.try_send(SocketEvent::AcceptFailed {
-              endpoint: endpoint_uri.clone(),
-              error_msg: e.to_string(),
-            });
-          }
+          monitor.emit(SocketEvent::AcceptFailed {
+            endpoint: endpoint_uri.clone(),
+            error_msg: e.to_string(),
+          });
           if is_fatal_accept_error(&e) {
             loop_error_to_report = Some(ZmqError::from_io_endpoint(e, &endpoint_uri));
             break;
@@ -657,7 +653,7 @@ impl TcpConnecter {
     options: Arc<SocketOptions>,
     socket_logic: Arc<dyn ISocket>,
     context_handle_source: Arc<std::sync::atomic::AtomicUsize>,
-    monitor_tx: Option<MonitorSender>,
+    monitor: MonitorHandle,
     context: Context,
     parent_socket_id: usize,
     initial_attempts: u32,
@@ -682,12 +678,12 @@ impl TcpConnecter {
       initial_attempts,
     };
     let task_join_handle =
-      tokio::spawn(connecter_actor.run_connect_loop(monitor_tx, parent_socket_id));
+      tokio::spawn(connecter_actor.run_connect_loop(monitor, parent_socket_id));
 
     task_join_handle
   }
 
-  async fn run_connect_loop(self, monitor_tx: Option<MonitorSender>, parent_socket_id: usize) {
+  async fn run_connect_loop(self, monitor: MonitorHandle, parent_socket_id: usize) {
     let connecter_handle = self.handle;
     let actor_type = ActorType::Connecter;
     let endpoint_uri_clone = self.endpoint.clone();
@@ -756,7 +752,7 @@ impl TcpConnecter {
           .wait_for_retry_delay_internal(
             &mut system_event_rx,
             current_retry_delay,
-            &monitor_tx,
+            &monitor,
             attempt_count as usize + 1,
           )
           .await
@@ -818,7 +814,7 @@ impl TcpConnecter {
       tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: TCP connect attempt #{}", attempt_count);
 
       let single_attempt_outcome: Result<UnifiedConnectOutcome, ZmqError> = self
-        .try_connect_once(&endpoint_uri_clone, &mut system_event_rx, &monitor_tx)
+        .try_connect_once(&endpoint_uri_clone, &mut system_event_rx, &monitor)
         .await;
 
       match single_attempt_outcome {
@@ -876,12 +872,10 @@ impl TcpConnecter {
           // Emit ConnectDelayed only once per actor lifecycle/retry-sequence to avoid log spam.
           // Check if it matches initial_attempts + 1.
           if attempt_count == self.initial_attempts + 1 {
-            if let Some(ref mon_tx) = monitor_tx {
-              let _ = mon_tx.try_send(SocketEvent::ConnectDelayed {
-                endpoint: endpoint_uri_clone.clone(),
-                error_msg: attempt_failure_error.to_string(),
-              });
-            }
+            monitor.emit(SocketEvent::ConnectDelayed {
+              endpoint: endpoint_uri_clone.clone(),
+              error_msg: attempt_failure_error.to_string(),
+            });
           }
         }
       }
@@ -898,12 +892,10 @@ impl TcpConnecter {
             target_endpoint_uri: endpoint_uri_clone.clone(),
             error: final_err.clone(),
           });
-        if let Some(ref mon_tx_final) = monitor_tx {
-          let _ = mon_tx_final.try_send(SocketEvent::ConnectFailed {
-            endpoint: endpoint_uri_clone.clone(),
-            error_msg: final_err.to_string(),
-          });
-        }
+        monitor.emit(SocketEvent::ConnectFailed {
+          endpoint: endpoint_uri_clone.clone(),
+          error_msg: final_err.to_string(),
+        });
       }
     }
 
@@ -919,7 +911,7 @@ impl TcpConnecter {
     &self,
     endpoint_uri_original: &str,
     system_event_rx: &mut broadcast::Receiver<SystemEvent>,
-    monitor_tx: &Option<MonitorSender>,
+    monitor: &MonitorHandle,
   ) -> Result<UnifiedConnectOutcome, ZmqError> {
     let addr_str = endpoint_uri_original
       .strip_prefix("tcp://")
@@ -978,12 +970,10 @@ impl TcpConnecter {
 
             let peer_addr_actual = std_stream.peer_addr().map_err(ZmqError::from)?;
 
-            if let Some(mon_tx) = monitor_tx {
-              let _ = mon_tx.try_send(SocketEvent::Connected {
-                endpoint: endpoint_uri_original.to_string(),
-                peer_addr: format!("tcp://{}", peer_addr_actual),
-              });
-            }
+            monitor.emit(SocketEvent::Connected {
+              endpoint: endpoint_uri_original.to_string(),
+              peer_addr: format!("tcp://{}", peer_addr_actual),
+            });
             apply_tcp_socket_options_to_std(&std_stream, &self.config)?;
             let raw_fd = std_stream.into_raw_fd();
             let mut worker_op_tx = uring::global_state::pick_worker()?;
@@ -1076,12 +1066,10 @@ impl TcpConnecter {
 
           let peer_addr_actual = std_tokio_stream.peer_addr().map_err(ZmqError::from)?;
 
-          if let Some(mon_tx) = monitor_tx {
-            let _ = mon_tx.try_send(SocketEvent::Connected {
-              endpoint: endpoint_uri_original.to_string(),
-              peer_addr: format!("tcp://{}", peer_addr_actual),
-            });
-          }
+          monitor.emit(SocketEvent::Connected {
+            endpoint: endpoint_uri_original.to_string(),
+            peer_addr: format!("tcp://{}", peer_addr_actual),
+          });
 
           apply_tcp_socket_options_to_tokio(&std_tokio_stream, &self.config)?;
 
@@ -1112,7 +1100,7 @@ impl TcpConnecter {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
           let actor_conf = ActorConfigX {
             context: self.context.clone(),
-            monitor_tx: monitor_tx.clone(),
+            monitor: monitor.clone(),
             logical_target_endpoint_uri: endpoint_uri_original.to_string(),
             connected_endpoint_uri: actual_connected_uri.clone(),
             is_server_role: false,
@@ -1186,7 +1174,7 @@ impl TcpConnecter {
     &self,
     system_event_rx: &mut broadcast::Receiver<SystemEvent>,
     delay: Duration,
-    monitor_tx: &Option<MonitorSender>,
+    monitor: &MonitorHandle,
     next_attempt_num: usize,
   ) -> Result<bool, ()> {
     if delay.is_zero() {
@@ -1199,12 +1187,10 @@ impl TcpConnecter {
       }
     }
     tracing::debug!(handle = self.handle, uri = %self.endpoint, ?delay, "Connecter waiting before attempt #{}", next_attempt_num);
-    if let Some(tx) = monitor_tx {
-      let _ = tx.try_send(SocketEvent::ConnectRetried {
-        endpoint: self.endpoint.clone(),
-        interval: delay,
-      });
-    }
+    monitor.emit(SocketEvent::ConnectRetried {
+      endpoint: self.endpoint.clone(),
+      interval: delay,
+    });
     tokio::select! {
       biased;
       event_res = system_event_rx.recv() => {

@@ -2,7 +2,7 @@
 
 use crate::context::Context;
 use crate::message::FrameBatch;
-use crate::socket::events::MonitorSender;
+use crate::socket::events::MonitorHandle;
 
 use fibre::mpmc::AsyncReceiver as BoundedAsyncReceiver;
 
@@ -10,7 +10,7 @@ use fibre::mpmc::AsyncReceiver as BoundedAsyncReceiver;
 #[derive(Debug, Clone)] // Clone if it needs to be passed around easily
 pub(crate) struct ActorConfigX {
   pub context: Context,
-  pub monitor_tx: Option<MonitorSender>,
+  pub monitor: MonitorHandle,
   pub logical_target_endpoint_uri: String,
   pub connected_endpoint_uri: String,
   pub is_server_role: bool,

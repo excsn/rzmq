@@ -97,14 +97,7 @@ pub(crate) async fn cleanup_stopped_child_resources(
       sca.unbind_session();
     }
     tracing::debug!(handle = core_handle, child_id = stopped_child_actor_id, uri = %uri, "Session stopped; connect pipe kept for the next session.");
-    let monitor_event = match error_opt {
-      Some(e @ &ZmqError::SecurityError(_)) | Some(e @ &ZmqError::AuthenticationFailure(_)) => SocketEvent::HandshakeFailed {
-        endpoint: uri,
-        error_msg: e.to_string(),
-      },
-      _ => SocketEvent::Disconnected { endpoint: uri },
-    };
-    core_arc.core_state.read().send_monitor_event(monitor_event);
+    core_arc.core_state.read().send_monitor_event(SocketEvent::Disconnected { endpoint: uri });
     return true;
   }
 
@@ -141,18 +134,11 @@ pub(crate) async fn cleanup_stopped_child_resources(
     }
 
     // Send monitor event for the disconnection/closure.
-    let monitor_event = match (ep_info.endpoint_type, error_opt) {
-      (EndpointType::Session, Some(e @ &ZmqError::SecurityError(_)))
-      | (EndpointType::Session, Some(e @ &ZmqError::AuthenticationFailure(_))) => {
-        SocketEvent::HandshakeFailed {
-          endpoint: ep_info.endpoint_uri.clone(),
-          error_msg: e.to_string(),
-        }
-      }
-      (EndpointType::Session, _) => SocketEvent::Disconnected {
+    let monitor_event = match ep_info.endpoint_type {
+      EndpointType::Session => SocketEvent::Disconnected {
         endpoint: ep_info.endpoint_uri.clone(),
       },
-      (EndpointType::Listener, _) => SocketEvent::Closed {
+      EndpointType::Listener => SocketEvent::Closed {
         endpoint: ep_info.endpoint_uri.clone(),
       },
     };
@@ -256,15 +242,15 @@ pub(crate) async fn process_inproc_binding_request_event(
   // Unblock the connector — it now has the sender to reach us.
   let _ = request.reply_tx.send(Ok(response));
 
-  let (monitor_tx, sndtimeo) = {
+  let (monitor, sndtimeo) = {
     let s = core_arc.core_state.read();
-    (s.get_monitor_sender_clone(), s.options.sndtimeo)
+    (s.monitor_handle(), s.options.sndtimeo)
   };
   let direct_conn = DirectInprocConnection {
     connection_id: binder_core_handle,
     target_endpoint_uri: connector_uri.clone(),
     peer_queue_sender: request.connector_rx_sender,
-    monitor_tx,
+    monitor,
     is_congested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     sndtimeo,
     credits: binder_to_connector_credits,
@@ -286,12 +272,10 @@ pub(crate) async fn process_inproc_binding_request_event(
     return Err(ZmqError::Internal("binder socket core closed".into()));
   }
 
-  if let Some(monitor_tx) = core_arc.core_state.read().get_monitor_sender_clone() {
-    let _ = monitor_tx.try_send(SocketEvent::Accepted {
-      endpoint: connector_uri.clone(),
-      peer_addr: format!("inproc-connector-{}", connector_uri),
-    });
-  }
+  core_arc.core_state.read().send_monitor_event(SocketEvent::Accepted {
+    endpoint: connector_uri.clone(),
+    peer_addr: format!("inproc-connector-{}", connector_uri),
+  });
 
   tracing::info!(binder_handle = binder_core_handle, %connector_uri, "Direct inproc connection established.");
   Ok(())

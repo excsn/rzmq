@@ -1,7 +1,7 @@
 use crate::message::FrameBatch;
 use crate::runtime::MailboxSender;
 use crate::socket::connection_iface::ISocketConnection;
-use crate::socket::events::{MonitorSender, clean_endpoint_uri};
+use crate::socket::events::MonitorHandle;
 use crate::socket::options::SocketOptions;
 use crate::socket::types::SocketType;
 use crate::throttle::AdaptiveThrottle;
@@ -187,7 +187,7 @@ pub(crate) struct CoreState {
 
   #[cfg(feature = "inproc")]
   pub(crate) bound_inproc_names: HashSet<String>,
-  pub(crate) monitor_tx: Option<MonitorSender>,
+  pub(crate) monitor: MonitorHandle,
   pub(crate) counters: Arc<ConservationCounters>,
   pub(crate) last_bound_endpoint: Option<String>,
   pub(crate) bind_or_connect_called: bool,
@@ -207,7 +207,7 @@ impl CoreState {
       pipe_read_id_to_endpoint_uri: HashMap::new(),
       #[cfg(feature = "inproc")]
       bound_inproc_names: HashSet::new(),
-      monitor_tx: None,
+      monitor: MonitorHandle::default(),
       counters: Arc::new(ConservationCounters::default()),
       last_bound_endpoint: None,
       bind_or_connect_called: false,
@@ -266,92 +266,11 @@ impl CoreState {
   }
 
   pub(crate) fn send_monitor_event(&self, event: SocketEvent) {
-    if let Some(ref tx) = self.monitor_tx {
-      let clean = |s: String| -> String { clean_endpoint_uri(&s).to_owned() };
-      let event = match event {
-        SocketEvent::Listening { endpoint } => SocketEvent::Listening {
-          endpoint: clean(endpoint),
-        },
-        SocketEvent::BindFailed {
-          endpoint,
-          error_msg,
-        } => SocketEvent::BindFailed {
-          endpoint: clean(endpoint),
-          error_msg,
-        },
-        SocketEvent::Accepted {
-          endpoint,
-          peer_addr,
-        } => SocketEvent::Accepted {
-          endpoint: clean(endpoint),
-          peer_addr: clean(peer_addr),
-        },
-        SocketEvent::AcceptFailed {
-          endpoint,
-          error_msg,
-        } => SocketEvent::AcceptFailed {
-          endpoint: clean(endpoint),
-          error_msg,
-        },
-        SocketEvent::Connected {
-          endpoint,
-          peer_addr,
-        } => SocketEvent::Connected {
-          endpoint: clean(endpoint),
-          peer_addr: clean(peer_addr),
-        },
-        SocketEvent::ConnectDelayed {
-          endpoint,
-          error_msg,
-        } => SocketEvent::ConnectDelayed {
-          endpoint: clean(endpoint),
-          error_msg,
-        },
-        SocketEvent::ConnectRetried { endpoint, interval } => SocketEvent::ConnectRetried {
-          endpoint: clean(endpoint),
-          interval,
-        },
-        SocketEvent::ConnectFailed {
-          endpoint,
-          error_msg,
-        } => SocketEvent::ConnectFailed {
-          endpoint: clean(endpoint),
-          error_msg,
-        },
-        SocketEvent::Closed { endpoint } => SocketEvent::Closed {
-          endpoint: clean(endpoint),
-        },
-        SocketEvent::Disconnected { endpoint } => SocketEvent::Disconnected {
-          endpoint: clean(endpoint),
-        },
-        SocketEvent::HandshakeFailed {
-          endpoint,
-          error_msg,
-        } => SocketEvent::HandshakeFailed {
-          endpoint: clean(endpoint),
-          error_msg,
-        },
-        SocketEvent::HandshakeSucceeded { endpoint } => SocketEvent::HandshakeSucceeded {
-          endpoint: clean(endpoint),
-        },
-        SocketEvent::ConnectionCongested { endpoint } => SocketEvent::ConnectionCongested {
-          endpoint: clean(endpoint),
-        },
-        SocketEvent::ConnectionUncongested { endpoint } => SocketEvent::ConnectionUncongested {
-          endpoint: clean(endpoint),
-        },
-      };
-      if tx.try_send(event).is_err() {
-        tracing::warn!(
-          socket_handle = self.handle,
-          "Failed to send event to monitor channel (full or closed)"
-        );
-      }
-    }
+    self.monitor.emit(event);
   }
 
-  pub(crate) fn get_monitor_sender_clone(&self) -> Option<MonitorSender> {
-    self.monitor_tx.clone()
+  pub(crate) fn monitor_handle(&self) -> MonitorHandle {
+    self.monitor.clone()
   }
 }
 
