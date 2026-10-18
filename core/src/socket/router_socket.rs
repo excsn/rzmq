@@ -982,3 +982,152 @@ impl ISocket for RouterSocket {
     self.identity_finalized_notify.notify_waiters();
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::context::Context;
+  use crate::runtime::mailbox;
+  use crate::socket::core::CoreState;
+  use crate::socket::core::state::ShutdownCoordinator;
+  use crate::socket::options::SocketOptions;
+  use crate::socket::types::SocketType;
+  use std::sync::atomic::AtomicBool;
+  use std::time::Duration;
+  use tokio::sync::RwLock as TokioRwLock;
+  use tokio_util::sync::CancellationToken;
+
+  /// A ROUTER over a SocketCore whose command loop is never spawned, with
+  /// RCVTIMEO 0 so an empty recv returns at once.
+  fn router() -> Arc<RouterSocket> {
+    let mut options = SocketOptions::default();
+    options.rcvtimeo = Some(Duration::ZERO);
+    let (command_sender, _command_receiver) = mailbox(16);
+    let core = Arc::new(SocketCore {
+      handle: 1,
+      context: Context::new().expect("context"),
+      command_sender,
+      core_state: ParkingRwLock::new(CoreState::new(1, SocketType::Router, options)),
+      socket_logic: TokioRwLock::new(None),
+      shutdown_coordinator: TokioMutex::new(ShutdownCoordinator::default()),
+      is_running_flag: AtomicBool::new(true),
+      closing: CancellationToken::new(),
+    });
+    Arc::new(RouterSocket::new(core))
+  }
+
+  /// Registers `pipe_id` the way `pipe_attached` does, finalized or still
+  /// waiting for the handshake identity.
+  fn attach(router: &RouterSocket, pipe_id: usize, finalized: bool) -> PipeMessageSender {
+    let sender = router.ingress_engine.register_pipe(pipe_id, 16, 16);
+    router.pending_pipe_senders.lock().insert(pipe_id, sender.clone());
+    router.finalize_pipe(pipe_id);
+    if !finalized {
+      router.peer_states.write().get_mut(&pipe_id).expect("state").finalized = false;
+    }
+    sender
+  }
+
+  async fn push(sender: &PipeMessageSender, payload: &'static [u8]) {
+    let mut batch = FrameBatch::new();
+    batch.push(Msg::from_static(payload));
+    sender.send(batch).await.expect("pipe send");
+  }
+
+  async fn drain(router: &RouterSocket) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    while let Ok(frames) = router.recv_multipart().await {
+      got.push(frames.last().and_then(|f| f.data()).unwrap_or_default().to_vec());
+    }
+    got
+  }
+
+  #[tokio::test]
+  async fn finalized_pipe_batches_are_delivered_after_detach_then_state_released() {
+    let router = router();
+    let sender = attach(&router, 7, true);
+    for payload in [b"1", b"2", b"3"] {
+      push(&sender, payload).await;
+    }
+    drop(sender);
+    router.pipe_detached(7).await;
+    assert!(router.peer_states.read().contains_key(&7), "state kept while batches are queued");
+
+    let first = router.recv_multipart().await.expect("first batch");
+    assert_eq!(first.last().and_then(|f| f.data()), Some(b"1".as_slice()));
+    assert!(router.peer_states.read().contains_key(&7), "state kept until the last batch");
+
+    assert_eq!(drain(&router).await, [b"2".to_vec(), b"3".to_vec()]);
+    assert!(!router.peer_states.read().contains_key(&7), "state released after the last batch");
+    assert_eq!(router.held_count.load(Ordering::Acquire), 0);
+  }
+
+  #[tokio::test]
+  async fn finalized_pipe_with_nothing_queued_is_released_at_detach() {
+    let router = router();
+    drop(attach(&router, 7, true));
+    router.pipe_detached(7).await;
+    assert!(!router.peer_states.read().contains_key(&7));
+  }
+
+  #[tokio::test]
+  async fn unfinalized_pipe_batches_are_dropped_at_detach_not_held() {
+    let router = router();
+    let sender = attach(&router, 7, false);
+    push(&sender, b"1").await;
+    push(&sender, b"2").await;
+    drop(sender);
+    router.pipe_detached(7).await;
+
+    assert!(drain(&router).await.is_empty());
+    assert_eq!(router.held_count.load(Ordering::Acquire), 0, "batches left in held_ingress");
+    assert!(router.held_ingress.lock().is_empty());
+    assert!(!router.peer_states.read().contains_key(&7));
+  }
+
+  #[tokio::test]
+  async fn unfinalized_pipe_held_batches_are_dropped_at_detach() {
+    let router = router();
+    let sender = attach(&router, 7, false);
+    push(&sender, b"1").await;
+    drop(sender);
+    assert!(drain(&router).await.is_empty(), "pending pipe's batch is held, not delivered");
+    assert_eq!(router.held_count.load(Ordering::Acquire), 1);
+
+    router.pipe_detached(7).await;
+    assert_eq!(router.held_count.load(Ordering::Acquire), 0);
+    assert!(router.held_ingress.lock().is_empty());
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+  async fn concurrent_recv_on_detached_pipe_delivers_each_batch_once_and_releases_state() {
+    const PAYLOADS: [&[u8]; 16] = [
+      b"0", b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8", b"9", b"10", b"11", b"12", b"13", b"14", b"15",
+    ];
+    for _ in 0..50 {
+      let router = router();
+      let sender = attach(&router, 7, true);
+      for payload in PAYLOADS {
+        push(&sender, payload).await;
+      }
+      drop(sender);
+      router.pipe_detached(7).await;
+
+      let tasks: Vec<_> = (0..4)
+        .map(|_| {
+          let router = router.clone();
+          tokio::spawn(async move { drain(&router).await })
+        })
+        .collect();
+      let mut got = Vec::new();
+      for task in tasks {
+        got.extend(task.await.expect("recv task"));
+      }
+      got.sort();
+      let mut want: Vec<Vec<u8>> = PAYLOADS.iter().map(|p| p.to_vec()).collect();
+      want.sort();
+      assert_eq!(got, want);
+      assert!(!router.peer_states.read().contains_key(&7));
+    }
+  }
+}
