@@ -1,6 +1,6 @@
 use crate::message::FrameBatch;
 use crate::ZmqError;
-use crate::socket::patterns::ready_pipe_queue::{PipeMessageSender, PipeSlot, ReadyPipeQueue};
+use crate::socket::patterns::ready_pipe_queue::{PeerTag, PipeMessageSender, PipeSlot, ReadyPipeQueue};
 
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -9,7 +9,7 @@ use std::sync::Weak;
 /// Consumer-local cache of already-popped `(pipe_id, batch)` entries plus the
 /// reusable drain buffer handed to `try_pop_batch`.
 struct AddressedCache {
-  entries: VecDeque<(usize, FrameBatch)>,
+  entries: VecDeque<(usize, FrameBatch, Option<PeerTag>)>,
   scratch: Vec<FrameBatch>,
 }
 
@@ -40,7 +40,12 @@ impl AddressedIngressEngine {
   pub fn deregister_pipe(&self, pipe_id: usize) {
     self.queue.deregister_pipe(pipe_id);
     // Drop only the dead pipe's cached messages; other peers' entries survive.
-    self.cache.lock().entries.retain(|(pid, _)| *pid != pipe_id);
+    self.cache.lock().entries.retain(|(pid, _, _)| *pid != pipe_id);
+  }
+
+  pub fn register_pipe_gated(&self, pipe_id: usize, capacity: usize, drain_delta: usize, gated: bool, tag: Option<PeerTag>) -> PipeMessageSender {
+    let sender = self.queue.register_pipe_gated(pipe_id, capacity, drain_delta, gated, tag);
+    PipeMessageSender::DirectAddressed { sender }
   }
 
   /// Deregisters `pipe_id` but leaves its queued and cached batches poppable.
@@ -48,9 +53,9 @@ impl AddressedIngressEngine {
     self.queue.deregister_pipe(pipe_id).unwrap_or_default()
   }
 
-  /// True while a pipe removed with `detach_pipe` still has batches queued or cached.
-  pub fn detached_has_queued(&self, pipe_id: usize, slot: &Weak<PipeSlot<FrameBatch>>) -> bool {
-    slot.upgrade().is_some_and(|s| s.len() > 0) || self.cache.lock().entries.iter().any(|(pid, _)| *pid == pipe_id)
+  #[cfg(test)]
+  pub fn cached_for(&self, pipe_id: usize) -> usize {
+    self.cache.lock().entries.iter().filter(|(pid, _, _)| *pid == pipe_id).count()
   }
 
   pub fn close(&self) {
@@ -59,7 +64,31 @@ impl AddressedIngressEngine {
   }
 
   fn pop_cached(&self) -> Option<(usize, FrameBatch)> {
+    self.cache.lock().entries.pop_front().map(|(pid, b, _)| (pid, b))
+  }
+
+  fn pop_cached_tagged(&self) -> Option<(usize, FrameBatch, Option<PeerTag>)> {
     self.cache.lock().entries.pop_front()
+  }
+
+  /// Non-blocking pop that returns the popped batch's peer tag.
+  pub fn try_pop_tagged(&self) -> Option<(usize, FrameBatch, Option<PeerTag>)> {
+    if let Some(item) = self.pop_cached_tagged() {
+      return Some(item);
+    }
+    let head = self.queue.try_pop_tagged()?;
+    self.top_up_cache();
+    Some(head)
+  }
+
+  /// Blocking pop that returns the popped batch's peer tag.
+  pub async fn pop_tagged(&self) -> Result<(usize, FrameBatch, Option<PeerTag>), ZmqError> {
+    if let Some(item) = self.pop_cached_tagged() {
+      return Ok(item);
+    }
+    let head = self.queue.pop_tagged().await?;
+    self.top_up_cache();
+    Ok(head)
   }
 
   /// Opportunistically drains whatever is immediately ready into the cache,
@@ -72,9 +101,9 @@ impl AddressedIngressEngine {
     while cache.entries.len() < self.batch_max {
       let budget = self.batch_max - cache.entries.len();
       let mut scratch = std::mem::take(&mut cache.scratch);
-      match self.queue.try_pop_batch(&mut scratch, budget) {
-        Some((pipe_id, _n)) => {
-          cache.entries.extend(scratch.drain(..).map(|b| (pipe_id, b)));
+      match self.queue.try_pop_batch_tagged(&mut scratch, budget) {
+        Some((pipe_id, _n, tag)) => {
+          cache.entries.extend(scratch.drain(..).map(|b| (pipe_id, b, tag.clone())));
           cache.scratch = scratch;
         }
         None => {

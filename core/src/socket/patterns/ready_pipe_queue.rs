@@ -108,7 +108,23 @@ fn queued_of(counts: u64) -> usize {
 /// Extracts the reservation count from a packed counter value.
 #[inline(always)]
 fn reserved_of(counts: u64) -> usize {
-  (counts >> 32) as usize
+  ((counts & !GATED) >> 32) as usize
+}
+
+/// Set while a pipe's slot may not be made ready (its peer has not finalized).
+const GATED: u64 = 1 << 63;
+
+/// True when a commit that saw `prev` must publish the slot's ready token.
+#[inline(always)]
+fn opens_ready(prev: u64) -> bool {
+  queued_of(prev) == 0 && prev & GATED == 0
+}
+
+/// The peer a slot's messages came from, carried with every popped message.
+#[derive(Clone)]
+pub(crate) struct PeerTag {
+  pub identity: crate::message::Blob,
+  pub kind: u8,
 }
 
 /// Diagnostic invariant audit (debug / `diagnostics` builds only).
@@ -156,6 +172,7 @@ fn audit_slot<T: Send + 'static>(slot: &PipeSlot<T>, site: &str, occupancy: impl
 
 pub(crate) struct PipeSlot<T: Send + 'static> {
   pub(crate) pipe_id: usize,
+  pub(crate) peer: std::sync::OnceLock<PeerTag>,
   tx: ExclusiveCell<spsc::BoundedAsyncSender<T>>,
   rx: ExclusiveCell<spsc::BoundedAsyncReceiver<T>>,
   /// Channel capacity, mirrored here so observers never touch `rx`/`tx`.
@@ -351,6 +368,18 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
     capacity: usize,
     drain_delta: usize,
   ) -> ReadyPipeSender<T> {
+    self.register_pipe_gated(pipe_id, capacity, drain_delta, false, None)
+  }
+
+  /// `gated`: the slot gets no ready token until `ReadyPipeSender::open_gate`.
+  pub fn register_pipe_gated(
+    &self,
+    pipe_id: usize,
+    capacity: usize,
+    drain_delta: usize,
+    gated: bool,
+    tag: Option<PeerTag>,
+  ) -> ReadyPipeSender<T> {
     let mut pipes = self.pipes.write();
 
     if let Some(slot) = pipes.get(&pipe_id) {
@@ -364,12 +393,17 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
     #[cfg(feature = "io-uring")]
     let uring_wakeup = Arc::new(OnceLock::new());
 
+    let peer = std::sync::OnceLock::new();
+    if let Some(tag) = tag {
+      let _ = peer.set(tag);
+    }
     let slot = Arc::new(PipeSlot {
       pipe_id,
+      peer,
       tx: ExclusiveCell::new(tx),
       rx: ExclusiveCell::new(rx),
       capacity: capacity.max(1),
-      counts: AtomicU64::new(0),
+      counts: AtomicU64::new(if gated { GATED } else { 0 }),
       lwm: pipe_lwm(capacity, drain_delta),
       audit_reported: AtomicBool::new(false),
       #[cfg(feature = "diagnostics")]
@@ -420,6 +454,65 @@ impl<T: Send + 'static> ReadyPipeQueue<T> {
       }
     }
     removed.as_ref().map(Arc::downgrade)
+  }
+
+  /// One message from the slot whose token the caller holds, with the slot's tag.
+  fn take_one_tagged(&self, slot: Arc<PipeSlot<T>>) -> Option<(usize, T, Option<PeerTag>)> {
+    // SAFETY: the caller holds this slot's ready token.
+    let item = unsafe { slot.rx.get_mut() }.try_recv().ok()?;
+    let prev = slot
+      .counts
+      .fetch_sub(RESERVED_ONE + QUEUED_ONE, Ordering::AcqRel);
+    #[cfg(feature = "diagnostics")]
+    slot.total_popped.fetch_add(1, Ordering::Relaxed);
+    if queued_of(prev) > 1 {
+      push_ready_token(&self.ready_tx, &slot, "pop_tagged spinning on ready_tx");
+    }
+    #[cfg(feature = "io-uring")]
+    if slot.is_drained() {
+      if let Some(wakeup) = slot.uring_wakeup.get() {
+        if wakeup.worker_asleep.load(Ordering::Relaxed) == WAKEUP_STATE_SLEEPING
+          && wakeup
+            .worker_asleep
+            .compare_exchange(WAKEUP_STATE_SLEEPING, WAKEUP_STATE_SIGNALED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+          let _ = wakeup.event_fd.write(1);
+        }
+      }
+    }
+    Some((slot.pipe_id, item, slot.peer.get().cloned()))
+  }
+
+  pub fn try_pop_tagged(&self) -> Option<(usize, T, Option<PeerTag>)> {
+    loop {
+      let slot = self.ready_rx.try_recv().ok()?;
+      if let Some(r) = self.take_one_tagged(slot) {
+        return Some(r);
+      }
+    }
+  }
+
+  pub async fn pop_tagged(&self) -> Result<(usize, T, Option<PeerTag>), ZmqError> {
+    loop {
+      let slot = self
+        .ready_rx
+        .recv()
+        .await
+        .map_err(|_| ZmqError::InvalidState("ready queue closed"))?;
+      if let Some(r) = self.take_one_tagged(slot) {
+        return Ok(r);
+      }
+    }
+  }
+
+  pub fn try_pop_batch_tagged(&self, out: &mut Vec<T>, max: usize) -> Option<(usize, usize, Option<PeerTag>)> {
+    loop {
+      let slot = self.ready_rx.try_recv().ok()?;
+      if let Some((pid, n)) = self.drain_slot(&slot, out, max) {
+        return Some((pid, n, slot.peer.get().cloned()));
+      }
+    }
   }
 
   pub async fn pop(&self) -> Result<(usize, T), ZmqError> {
@@ -702,6 +795,18 @@ impl<T: Send + 'static> Clone for ReadyPipeSender<T> {
 }
 
 impl<T: Send + 'static> ReadyPipeSender<T> {
+  /// Sets the slot's peer tag and lets it become ready, publishing its token if
+  /// messages arrived while it was gated. A commit that saw the gate set did not
+  /// publish, so exactly one of the two does.
+  pub fn open_gate(&self, tag: PeerTag) {
+    let Some(slot) = self.slot.upgrade() else { return };
+    let _ = slot.peer.set(tag);
+    let prev = slot.counts.fetch_and(!GATED, Ordering::AcqRel);
+    if prev & GATED != 0 && queued_of(prev) > 0 {
+      push_ready_token(&self.ready_tx, &slot, "open_gate spinning on ready_tx");
+    }
+  }
+
   #[cfg(feature = "io-uring")]
   pub fn bind_uring_wakeup(&self, wakeup: UringWakeup) {
     if let Some(slot) = self.slot.upgrade() {
@@ -736,7 +841,7 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     slot.total_committed.fetch_add(1, Ordering::Relaxed);
     reservation.commit();
 
-    if queued_of(prev) == 0
+    if opens_ready(prev)
       && !push_ready_token(&self.ready_tx, &slot, "send spinning on ready_tx")
     {
       return Err(ZmqError::ConnectionClosed);
@@ -763,7 +868,7 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
     slot.total_committed.fetch_add(1, Ordering::Relaxed);
     reservation.commit();
 
-    if queued_of(prev) == 0 {
+    if opens_ready(prev) {
       // 0→1 transition. Closed ready channel is ignored here (matches the
       // pre-helper behavior: the item is already committed to the pipe).
       push_ready_token(&self.ready_tx, &slot, "try_send spinning on ready_tx");
@@ -811,7 +916,7 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
           // Inline increment — consumer may pop the item before the batch ends;
           // updating immediately keeps queued >= physical channel occupancy.
           let prev = slot.counts.fetch_add(QUEUED_ONE, Ordering::AcqRel);
-          if queued_of(prev) == 0 {
+          if opens_ready(prev) {
             had_zero_transition = true;
           }
         }
@@ -874,7 +979,7 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
           .total_committed
           .fetch_add(sent_this_pass as u64, Ordering::Relaxed);
 
-        if queued_of(prev) == 0
+        if opens_ready(prev)
           && !push_ready_token(&self.ready_tx, &slot, "send_batch_mut spinning on ready_tx")
         {
           return Err(ZmqError::ConnectionClosed);
@@ -924,7 +1029,7 @@ impl<T: Send + 'static> ReadyPipeSender<T> {
       #[cfg(feature = "diagnostics")]
       slot.total_committed.fetch_add(1, Ordering::Relaxed);
 
-      if queued_of(prev) == 0
+      if opens_ready(prev)
         && !push_ready_token(&self.ready_tx, &slot, "send_batch_mut spinning on ready_tx")
       {
         return Err(ZmqError::ConnectionClosed);
@@ -1043,6 +1148,13 @@ impl PipeMessageSender {
       Self::FilteredAnonymous { sender, .. } => sender.bind_uring_wakeup(wakeup),
       Self::DirectAddressed { sender } => sender.bind_uring_wakeup(wakeup),
       Self::SubscriptionSink { .. } => {}
+    }
+  }
+
+  /// Opens a gated addressed slot; a no-op for the other variants.
+  pub fn open_gate(&self, tag: PeerTag) {
+    if let Self::DirectAddressed { sender } = self {
+      sender.open_gate(tag);
     }
   }
 
@@ -1172,7 +1284,7 @@ impl PipeMessageSender {
                 sent_batches += 1;
                 total_frames += frame_count;
                 let prev = slot.counts.fetch_add(QUEUED_ONE, Ordering::AcqRel);
-                if queued_of(prev) == 0 {
+                if opens_ready(prev) {
                   had_zero_transition = true;
                 }
               }
