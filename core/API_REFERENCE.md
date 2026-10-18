@@ -148,6 +148,8 @@ The `Context` is the entry point for creating `rzmq` sockets. It manages shared 
         *   Creates a new, independent context, allowing specification of the bounded capacity for internal actor command mailboxes. If `None`, `rzmq::runtime::mailbox::DEFAULT_MAILBOX_CAPACITY` is used. Minimum capacity is 1.
     *   `pub fn with_blocky(self, blocky: bool) -> Self`
         *   libzmq's `ZMQ_BLOCKY`. Default `true`: sockets start with `LINGER` -1 and `term` waits for queued messages. `false`: sockets created afterwards start with `LINGER` 0. A socket's own `LINGER` overrides either.
+    *   `pub fn with_io_uring_sessions(self, enabled: bool) -> Self` (Requires `io-uring` feature)
+        *   `true`: sockets created afterwards start with `IO_URING_SESSION_ENABLED` set. Default `false`. A socket's own `IO_URING_SESSION_ENABLED` overrides either.
 
 *   **Methods**:
     *   `pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError>`

@@ -53,6 +53,9 @@ pub(crate) struct ContextInner {
   actor_mailbox_capacity: usize,
   /// libzmq's ZMQ_BLOCKY: when false, sockets created by this context start with LINGER 0.
   blocky: AtomicBool,
+  /// When true, sockets created by this context start with IO_URING_SESSION_ENABLED set.
+  #[cfg(feature = "io-uring")]
+  io_uring_sessions: AtomicBool,
 }
 
 impl ContextInner {
@@ -84,6 +87,8 @@ impl ContextInner {
       shutdown_initiated: AtomicBool::new(false),
       actor_mailbox_capacity,
       blocky: AtomicBool::new(true),
+      #[cfg(feature = "io-uring")]
+      io_uring_sessions: AtomicBool::new(false),
     })
   }
 
@@ -277,6 +282,15 @@ impl Context {
     self
   }
 
+  /// With `true`, sockets this context creates afterwards start with
+  /// `IO_URING_SESSION_ENABLED` set, so their TCP sessions run on io_uring. The
+  /// default is `false`. A socket's own `IO_URING_SESSION_ENABLED` setting overrides either.
+  #[cfg(feature = "io-uring")]
+  pub fn with_io_uring_sessions(self, enabled: bool) -> Self {
+    self.inner.io_uring_sessions.store(enabled, AtomicOrdering::Release);
+    self
+  }
+
   /// Creates a socket of the specified type associated with this context.
   pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError> {
     let handle = self.inner.next_handle();
@@ -285,6 +299,10 @@ impl Context {
     let mut initial_options = SocketOptions::default();
     if !self.inner.blocky.load(AtomicOrdering::Acquire) {
       initial_options.linger = Some(Duration::ZERO);
+    }
+    #[cfg(feature = "io-uring")]
+    if self.inner.io_uring_sessions.load(AtomicOrdering::Acquire) {
+      initial_options.io_uring.session_enabled = true;
     }
     let (socket_logic, command_sender) =
       crate::socket::create_socket_actor(handle, self.clone(), socket_type, initial_options)?;

@@ -161,6 +161,8 @@ Manages sockets and shared resources.
     Creates a new, independent `rzmq` context. `actor_mailbox_capacity` optionally specifies the bounded capacity for internal actor command mailboxes. If `None`, a default capacity is used. The minimum capacity used will be 1.
 *   **`pub fn with_blocky(self, blocky: bool) -> Self`**
     libzmq's `ZMQ_BLOCKY`. With `false`, sockets this context creates start with `LINGER` 0, so `close` and `term` drop queued messages instead of delivering them. The default is `true`.
+*   **`pub fn with_io_uring_sessions(self, enabled: bool) -> Self`** (requires the `io-uring` feature)
+    With `true`, sockets this context creates start with `IO_URING_SESSION_ENABLED` set, so their TCP sessions use the `io_uring` backend. The default is `false`.
 *   **`pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError>`**
     Creates a new `Socket` of the specified `SocketType` associated with this context.
 *   **`pub async fn shutdown(&self) -> Result<(), ZmqError>`**
@@ -602,6 +604,7 @@ async fn close_without_waiting(socket: &rzmq::Socket) -> Result<(), rzmq::ZmqErr
     // req_socket.set_option(rzmq::socket::IO_URING_SESSION_ENABLED, 1i32).await?;
     // Now, TCP connections made by/to this req_socket will attempt to use the io_uring backend.
     ```
+    To turn it on for every socket a context creates, build the context with `Context::new()?.with_io_uring_sessions(true)`.
 5.  **`io_uring` Specific Socket Options**: (Optional)
     Once `IO_URING_SESSION_ENABLED` is set, you can further influence behavior with:
     *   `rzmq::socket::TCP_CORK`: (Boolean `1i32` or `0i32`) Enable/disable TCP corking for better batching.
