@@ -2,7 +2,8 @@ mod common;
 
 use anyhow::Result;
 use rzmq::socket::SUBSCRIBE;
-use rzmq::{SocketType, context::context};
+use rzmq::{SocketType};
+use common::context;
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

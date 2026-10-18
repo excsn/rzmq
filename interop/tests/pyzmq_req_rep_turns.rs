@@ -2,7 +2,8 @@ mod common;
 
 use anyhow::Result;
 use rzmq::socket::options::{RCVTIMEO, REQ_CORRELATE, REQ_RELAXED};
-use rzmq::{Msg, Socket, SocketType, context::context};
+use rzmq::{Msg, Socket, SocketType};
+use common::context;
 use std::time::Duration;
 
 /// Answers `count` requests with `re:<request>`, holding the reply to `slow` for 400 ms.

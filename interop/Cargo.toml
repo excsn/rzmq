@@ -6,6 +6,7 @@ publish = false
 
 [features]
 full = []
+io-uring = ["rzmq/io-uring"]
 
 [dependencies]
 rzmq = { path = "../core", features = ["curve"] }

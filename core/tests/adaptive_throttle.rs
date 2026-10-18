@@ -88,8 +88,12 @@ async fn test_throttle_config_rejected_after_bind_or_connect() -> Result<(), Zmq
   Ok(())
 }
 
+/// Adaptive throttle is a tokio session feature, so the tests that read its state return early on the io_uring backend.
 #[tokio::test]
 async fn test_throttle_stats_per_connection() -> Result<(), ZmqError> {
+  if common::io_uring_requested() {
+    return Ok(());
+  }
   let ctx = common::test_context();
   let push = ctx.socket(SocketType::Push)?;
   let pull = ctx.socket(SocketType::Pull)?;
@@ -163,6 +167,9 @@ async fn wait_for_empty_stats(socket: &Socket) -> Result<(), ZmqError> {
 
 #[tokio::test]
 async fn test_throttle_stats_entry_removed_on_disconnect() -> Result<(), ZmqError> {
+  if common::io_uring_requested() {
+    return Ok(());
+  }
   let ctx = common::test_context();
   let push = ctx.socket(SocketType::Push)?;
   let pull = ctx.socket(SocketType::Pull)?;
@@ -182,6 +189,9 @@ async fn test_throttle_stats_entry_removed_on_disconnect() -> Result<(), ZmqErro
 
 #[tokio::test]
 async fn test_throttle_stats_ipc() -> Result<(), ZmqError> {
+  if common::io_uring_requested() {
+    return Ok(());
+  }
   let ctx = common::test_context();
   let push = ctx.socket(SocketType::Push)?;
   let pull = ctx.socket(SocketType::Pull)?;
@@ -235,6 +245,9 @@ async fn wait_for_balance(socket: &Socket, balance: i32) -> Result<ThrottleStats
 
 #[tokio::test]
 async fn test_throttle_config_credit_per_message_applies() -> Result<(), ZmqError> {
+  if common::io_uring_requested() {
+    return Ok(());
+  }
   let (ctx, pull) = pull_stats_after_traffic(AdaptiveThrottleSocketConfig {
     credit_per_message: 7,
     yield_after_n_consecutive: u32::MAX,
@@ -252,6 +265,9 @@ async fn test_throttle_config_credit_per_message_applies() -> Result<(), ZmqErro
 
 #[tokio::test]
 async fn test_throttle_config_yield_after_n_consecutive_applies() -> Result<(), ZmqError> {
+  if common::io_uring_requested() {
+    return Ok(());
+  }
   let (ctx, pull) = pull_stats_after_traffic(AdaptiveThrottleSocketConfig {
     credit_per_message: 7,
     yield_after_n_consecutive: 1,
@@ -268,6 +284,9 @@ async fn test_throttle_config_yield_after_n_consecutive_applies() -> Result<(), 
 
 #[tokio::test]
 async fn test_throttle_disabled_leaves_state_untouched() -> Result<(), ZmqError> {
+  if common::io_uring_requested() {
+    return Ok(());
+  }
   let (ctx, pull) = pull_stats_after_traffic(AdaptiveThrottleSocketConfig {
     enabled: false,
     ..Default::default()

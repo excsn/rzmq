@@ -32,6 +32,28 @@ pub fn setup_logging() {
   });
 }
 
+/// Creates the rzmq context for a test. `RZMQ_TEST_IO_URING=1` runs its TCP
+/// sessions on io_uring.
+pub fn context() -> Result<rzmq::Context, rzmq::ZmqError> {
+  let ctx = rzmq::context::context()?;
+  Ok(with_requested_backend(ctx))
+}
+
+fn io_uring_requested() -> bool {
+  std::env::var("RZMQ_TEST_IO_URING").is_ok_and(|v| v == "1")
+}
+
+#[cfg(feature = "io-uring")]
+fn with_requested_backend(ctx: rzmq::Context) -> rzmq::Context {
+  ctx.with_io_uring_sessions(io_uring_requested())
+}
+
+#[cfg(not(feature = "io-uring"))]
+fn with_requested_backend(ctx: rzmq::Context) -> rzmq::Context {
+  assert!(!io_uring_requested(), "RZMQ_TEST_IO_URING=1 needs the io-uring feature");
+  ctx
+}
+
 /// Kills and reaps the child python peer when the test ends (pass *or* panic),
 /// which is also what keeps a long-lived peer's TCP connection open until the
 /// test is done with it.

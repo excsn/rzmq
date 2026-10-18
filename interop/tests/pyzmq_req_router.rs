@@ -1,7 +1,8 @@
 mod common;
 
 use anyhow::Result;
-use rzmq::{Msg, SocketType, ZmqError, context::context};
+use rzmq::{Msg, SocketType, ZmqError};
+use common::context;
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

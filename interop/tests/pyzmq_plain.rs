@@ -3,7 +3,8 @@ mod common;
 use anyhow::Result;
 use rzmq::socket::options::{PLAIN_PASSWORD, PLAIN_SERVER, PLAIN_USERNAME, RCVTIMEO};
 use rzmq::socket::{MonitorReceiver, SocketEvent};
-use rzmq::{Msg, Socket, SocketType, context::context};
+use rzmq::{Msg, Socket, SocketType};
+use common::context;
 use std::time::Duration;
 
 const USER: &str = "testuser";

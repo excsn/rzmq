@@ -1,7 +1,8 @@
 mod common;
 
 use anyhow::Result;
-use rzmq::{Msg, SocketType, context::context, socket::options};
+use rzmq::{Msg, SocketType, socket::options};
+use common::context;
 use std::time::Duration;
 
 /// Test A: rzmq ROUTER (Manual) <-> pyzmq DEALER (Raw)

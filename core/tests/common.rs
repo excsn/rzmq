@@ -43,7 +43,24 @@ fn setup_tracing() {
 // Helper to create a context
 pub fn test_context() -> Context {
   setup_tracing(); // Ensure tracing is initialized before creating context
-  rzmq::Context::new().expect("Failed to create test context")
+  let ctx = rzmq::Context::new().expect("Failed to create test context");
+  with_requested_backend(ctx)
+}
+
+/// `RZMQ_TEST_IO_URING=1` runs every socket's TCP sessions on io_uring.
+pub fn io_uring_requested() -> bool {
+  std::env::var("RZMQ_TEST_IO_URING").is_ok_and(|v| v == "1")
+}
+
+#[cfg(feature = "io-uring")]
+fn with_requested_backend(ctx: Context) -> Context {
+  ctx.with_io_uring_sessions(io_uring_requested())
+}
+
+#[cfg(not(feature = "io-uring"))]
+fn with_requested_backend(ctx: Context) -> Context {
+  assert!(!io_uring_requested(), "RZMQ_TEST_IO_URING=1 needs the io-uring feature");
+  ctx
 }
 
 // Helper to generate unique IPC endpoints for tests
