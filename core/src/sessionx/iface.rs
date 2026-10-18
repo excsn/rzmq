@@ -8,6 +8,8 @@ use crate::socket::core::state::ConservationCounters;
 use crate::socket::patterns::PipeCredits;
 
 use parking_lot::RwLock;
+#[cfg(feature = "io-uring")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +18,9 @@ use fibre::TrySendError;
 use fibre::mpmc::AsyncSender as BoundedAsyncSender;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(feature = "io-uring")]
+use crate::io_uring_backend::zmtp_handler::ZmtpSmartConnection;
 
 /// The session actor currently draining a pipe. A connect-side pipe outlives
 /// its sessions, so this is rebound on every reconnect and empty in between.
@@ -34,6 +39,12 @@ pub(crate) struct ScaConnectionIface {
   credits: Option<Arc<PipeCredits>>,
   counters: Arc<ConservationCounters>,
   closing: CancellationToken,
+  /// The io_uring connection draining this pipe, when one has taken it over.
+  #[cfg(feature = "io-uring")]
+  uring: Arc<RwLock<Option<Arc<ZmtpSmartConnection>>>>,
+  /// Mirrors `uring.is_some()` so a send skips the lock on the tokio path.
+  #[cfg(feature = "io-uring")]
+  uring_bound: Arc<AtomicBool>,
 }
 
 impl ScaConnectionIface {
@@ -69,11 +80,29 @@ impl ScaConnectionIface {
       credits,
       counters,
       closing,
+      #[cfg(feature = "io-uring")]
+      uring: Arc::new(RwLock::new(None)),
+      #[cfg(feature = "io-uring")]
+      uring_bound: Arc::new(AtomicBool::new(false)),
     }
   }
 
+  /// Counts an enqueued message and wakes the io_uring worker draining the pipe, if any.
   fn count_sent(&self) {
     ConservationCounters::add(&self.counters.sent, 1);
+    #[cfg(feature = "io-uring")]
+    if self.uring_bound.load(Ordering::Acquire) {
+      if let Some(conn) = self.uring.read().as_ref() {
+        conn.signal_worker();
+      }
+    }
+  }
+
+  /// Binds the pipe to the io_uring connection that now drains it.
+  #[cfg(feature = "io-uring")]
+  pub(crate) fn bind_uring(&self, conn: Arc<ZmtpSmartConnection>) {
+    *self.uring.write() = Some(conn);
+    self.uring_bound.store(true, Ordering::Release);
   }
 
   /// Waits for room in a full pipe. Ends on room, on SNDTIMEO or on the
@@ -107,6 +136,11 @@ impl ScaConnectionIface {
 
   pub(crate) fn unbind_session(&self) {
     *self.session.write() = None;
+    #[cfg(feature = "io-uring")]
+    {
+      self.uring_bound.store(false, Ordering::Release);
+      *self.uring.write() = None;
+    }
   }
 
   pub(crate) fn session_handle_id(&self) -> Option<usize> {
@@ -203,6 +237,13 @@ impl ISocketConnection for ScaConnectionIface {
   }
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
+    #[cfg(feature = "io-uring")]
+    {
+      let uring = self.uring.read().clone();
+      if let Some(conn) = uring {
+        return conn.close_connection().await;
+      }
+    }
     let Some(session) = self.session.read().clone() else {
       return Ok(());
     };

@@ -295,6 +295,16 @@ pub trait UringConnectionHandler: Send {
   /// to the socket's `ReadyPipeQueue`, bypassing any intermediate Tokio task.
   fn attach_ingress(&mut self, _sender: PipeMessageSender) {}
 
+  /// Called by the worker when `AdoptEgressReceiver` is received from SocketCore.
+  /// Returns the receiver the handler drains from now on.
+  fn adopt_egress(
+    &mut self,
+    egress_rx: fibre::mpmc::Receiver<FrameBatch>,
+    _credits: Option<Arc<crate::socket::patterns::PipeCredits>>,
+  ) -> Arc<fibre::mpmc::Receiver<FrameBatch>> {
+    Arc::new(egress_rx)
+  }
+
   /// Called by the worker when `ResumeConnection` is received from SocketCore.
   /// The handler clears throttle state and re-arms reads.
   fn resume_ingress(&mut self) {}

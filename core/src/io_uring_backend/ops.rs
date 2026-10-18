@@ -1,6 +1,8 @@
 #![cfg(feature = "io-uring")]
 
+use crate::message::FrameBatch;
 use crate::runtime::MailboxSyncSender;
+use crate::socket::patterns::PipeCredits;
 use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::socket::ZmtpEngineConfig;
 use crate::ZmqError;
@@ -95,6 +97,16 @@ pub enum UringOpRequest {
     ingress_sender: PipeMessageSender,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
+  /// Makes the handler drain `egress_rx` in place of the channel it was registered
+  /// with. Sent by SocketCore when an outbound connection takes over the pipe
+  /// `connect()` created, so messages queued before the handshake go out first.
+  AdoptEgressReceiver {
+    user_data: UserData,
+    fd: RawFd,
+    egress_rx: fibre::mpmc::Receiver<FrameBatch>,
+    credits: Option<Arc<PipeCredits>>,
+    reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
+  },
   /// Signals the handler to resume reading after HWM throttling. Sent by SocketCore
   /// when the per-pipe queue drains below the low-water mark.
   ResumeConnection {
@@ -118,6 +130,7 @@ impl UringOpRequest {
       | Self::Connect { user_data, .. }
       | Self::RegisterExternalZmtpFd { user_data, .. }
       | Self::AttachIngressSender { user_data, .. }
+      | Self::AdoptEgressReceiver { user_data, .. }
       | Self::ResumeConnection { user_data, .. }
       | Self::StartFdReadLoop { user_data, .. }
       | Self::ShutdownConnectionHandler { user_data, .. } => *user_data,
@@ -134,6 +147,7 @@ impl UringOpRequest {
       Self::Connect { .. } => "Connect".to_string(),
       Self::RegisterExternalZmtpFd { .. } => "RegisterExternalZmtpFd".to_string(),
       Self::AttachIngressSender { .. } => "AttachIngressSender".to_string(),
+      Self::AdoptEgressReceiver { .. } => "AdoptEgressReceiver".to_string(),
       Self::ResumeConnection { .. } => "ResumeConnection".to_string(),
       Self::StartFdReadLoop { .. } => "StartFdReadLoop".to_string(),
       Self::ShutdownConnectionHandler { .. } => "ShutdownConnectionHandler".to_string(),
@@ -220,6 +234,11 @@ impl fmt::Debug for UringOpRequest {
         .field("user_data", user_data)
         .field("fd", fd)
         .finish_non_exhaustive(),
+      UringOpRequest::AdoptEgressReceiver { user_data, fd, .. } => f
+        .debug_struct("AdoptEgressReceiver")
+        .field("user_data", user_data)
+        .field("fd", fd)
+        .finish_non_exhaustive(),
       UringOpRequest::ResumeConnection { user_data, fd, .. } => f
         .debug_struct("ResumeConnection")
         .field("user_data", user_data)
@@ -257,6 +276,10 @@ pub enum UringOpCompletion {
     fd: RawFd,
   },
   AttachIngressSenderSuccess {
+    user_data: UserData,
+    fd: RawFd,
+  },
+  AdoptEgressReceiverSuccess {
     user_data: UserData,
     fd: RawFd,
   },
@@ -328,6 +351,11 @@ impl fmt::Debug for UringOpCompletion {
         .finish(),
       UringOpCompletion::AttachIngressSenderSuccess { user_data, fd } => f
         .debug_struct("AttachIngressSenderSuccess")
+        .field("user_data", user_data)
+        .field("fd", fd)
+        .finish(),
+      UringOpCompletion::AdoptEgressReceiverSuccess { user_data, fd } => f
+        .debug_struct("AdoptEgressReceiverSuccess")
         .field("user_data", user_data)
         .field("fd", fd)
         .finish(),

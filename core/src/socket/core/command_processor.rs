@@ -53,6 +53,10 @@ pub(crate) async fn process_socket_command(
       Command::NewConnectionEstablished { target_endpoint_uri, .. } => {
         core_arc.core_state.read().connect_pipes.contains_key(target_endpoint_uri)
       }
+      #[cfg(feature = "io-uring")]
+      Command::UringConnectionEstablished { target_endpoint_uri, .. } => {
+        core_arc.core_state.read().connect_pipes.contains_key(target_endpoint_uri)
+      }
       _ => false,
     };
   if current_shutdown_phase != ShutdownPhase::Running && !drains_connect_pipe_while_lingering {
@@ -239,6 +243,20 @@ pub(crate) async fn process_socket_command(
       peer_identity,
       fd,
     } => {
+      if take_over_connect_pipe_uring(
+        &core_arc,
+        socket_logic_strong,
+        &endpoint_uri,
+        &target_endpoint_uri,
+        &connection_iface,
+        peer_identity.clone(),
+        fd,
+      )
+      .await
+      {
+        return Ok(());
+      }
+
       let is_outbound = {
         let cs = core_arc.core_state.read();
         !cs.endpoints.values().any(|ep| {
@@ -329,9 +347,14 @@ pub(crate) async fn process_socket_command(
       let (conn_iface_opt, synthetic_read_id_opt, handle_id_opt) = {
         let cs = core_arc.core_state.read();
         let ep = cs.endpoints.get(&endpoint_uri);
+        // A connect pipe's detach is decided by cleanup_stopped_child_resources,
+        // which keeps the pipe attached for the next connection.
+        let is_connect_pipe = ep
+          .and_then(|e| e.target_endpoint_uri.as_ref())
+          .is_some_and(|t| cs.connect_pipes.contains_key(t));
         (
           ep.map(|e| e.connection_iface.clone()),
-          ep.and_then(|e| e.pipe_ids.map(|pids| pids.1)),
+          ep.filter(|_| !is_connect_pipe).and_then(|e| e.pipe_ids.map(|pids| pids.1)),
           ep.map(|e| e.handle_id),
         )
       };
@@ -636,6 +659,108 @@ async fn handle_user_connect(
       let _ = reply_tx.send(Err(ZmqError::UnsupportedTransport(endpoint_uri)));
     }
   }
+}
+
+/// Hands the pipe `connect()` created for `target_endpoint_uri` to a new io_uring
+/// connection, as `handle_new_connection_established` does for a tokio session:
+/// the worker drains the pipe's receiver, inbound messages route to the pipe's
+/// read id and the endpoint keeps its pattern attachment. Returns false when the
+/// target has no connect pipe.
+#[cfg(feature = "io-uring")]
+async fn take_over_connect_pipe_uring(
+  core_arc: &Arc<SocketCore>,
+  socket_logic: &Arc<dyn ISocket>,
+  endpoint_uri: &str,
+  target_endpoint_uri: &str,
+  connection_iface: &Arc<dyn ISocketConnection>,
+  peer_identity: Option<crate::message::Blob>,
+  fd: std::os::unix::io::RawFd,
+) -> bool {
+  use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest};
+  use crate::io_uring_backend::zmtp_handler::ZmtpSmartConnection;
+
+  let core_handle = core_arc.handle;
+  let Some(uring_conn) = connection_iface
+    .as_any()
+    .downcast_ref::<ZmtpSmartConnection>()
+    .map(|conn| Arc::new(conn.clone()))
+  else {
+    return false;
+  };
+
+  let taken = {
+    let mut cs = core_arc.core_state.write();
+    let pipe = cs.connect_pipes.get_mut(target_endpoint_uri).map(|pipe| {
+      pipe.sessions += 1;
+      (pipe.rx.clone(), pipe.core_read_id, pipe.credits.clone(), pipe.sessions)
+    });
+    match pipe {
+      Some(found) => {
+        let handle_id = core_arc.context.inner().next_handle();
+        let mailbox = core_arc.command_sender();
+        let ep = cs
+          .endpoints
+          .get_mut(target_endpoint_uri)
+          .expect("connect pipe has an EndpointInfo under its target URI");
+        ep.mailbox = mailbox;
+        ep.handle_id = handle_id;
+        ep.throttle = None;
+        Some((found, ep.connection_iface.clone()))
+      }
+      None => None,
+    }
+  };
+  let Some(((rx, core_read_id, credits, sessions), iface)) = taken else {
+    return false;
+  };
+
+  iface
+    .as_any()
+    .downcast_ref::<ScaConnectionIface>()
+    .expect("connect pipe endpoint holds a ScaConnectionIface")
+    .bind_uring(Arc::clone(&uring_conn));
+  tracing::debug!(handle = core_handle, %endpoint_uri, uri = %target_endpoint_uri, fd, sessions, queued = rx.len(), "io_uring connection takes over the connect pipe.");
+
+  if sessions > 1 {
+    socket_logic.pipe_hiccuped(core_read_id).await;
+  }
+  socket_logic.update_peer_identity(core_read_id, peer_identity).await;
+
+  let mut worker_tx = uring_conn.worker_op_tx();
+  let (reply_tx, reply_rx) = oneshot::oneshot::<Result<UringOpCompletion, ZmqError>>();
+  let adopt = UringOpRequest::AdoptEgressReceiver {
+    user_data: core_arc.context.inner().next_handle() as u64,
+    fd,
+    egress_rx: rx.to_sync(),
+    credits,
+    reply_tx,
+  };
+  if let Err(e) = worker_tx.send(adopt).await {
+    tracing::warn!(handle = core_handle, %endpoint_uri, "AdoptEgressReceiver send failed: {:?}", e);
+  } else if !matches!(reply_rx.recv().await, Ok(Ok(UringOpCompletion::AdoptEgressReceiverSuccess { .. }))) {
+    tracing::warn!(handle = core_handle, %endpoint_uri, "AdoptEgressReceiver was not acknowledged.");
+  }
+  uring_conn.signal_worker();
+
+  if let Some(ingress_sender) = socket_logic.get_incoming_pipe_sender(core_read_id) {
+    let (reply_tx, reply_rx) = oneshot::oneshot::<Result<UringOpCompletion, ZmqError>>();
+    let attach = UringOpRequest::AttachIngressSender {
+      user_data: core_arc.context.inner().next_handle() as u64,
+      fd,
+      ingress_sender,
+      reply_tx,
+    };
+    if let Err(e) = worker_tx.send(attach).await {
+      tracing::warn!(handle = core_handle, %endpoint_uri, "AttachIngressSender send failed: {:?}", e);
+    } else if !matches!(reply_rx.recv().await, Ok(Ok(UringOpCompletion::AttachIngressSenderSuccess { .. }))) {
+      tracing::warn!(handle = core_handle, %endpoint_uri, "AttachIngressSender was not acknowledged.");
+    }
+  }
+
+  core_arc.core_state.read().send_monitor_event(SocketEvent::HandshakeSucceeded {
+    endpoint: target_endpoint_uri.to_string(),
+  });
+  true
 }
 
 /// Creates the pipe for an outbound endpoint at `connect()` time and attaches it

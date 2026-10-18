@@ -32,6 +32,7 @@ use crate::socket::patterns::ready_pipe_queue::PipeMessageSender;
 use crate::socket::patterns::PipeCredits;
 
 
+#[derive(Clone)]
 pub(crate) struct ZmtpSmartConnection {
   fd: RawFd,
   egress_tx: fibre::mpmc::AsyncSender<FrameBatch>,
@@ -85,7 +86,7 @@ impl ZmtpSmartConnection {
     self.worker_op_tx.clone()
   }
 
-  fn signal_worker(&self) {
+  pub(crate) fn signal_worker(&self) {
     // Monotonic work-signal bump (Release): pairs with the worker's Acquire load
     // in the spin loop so the enqueued batch is visible without probing the channel.
     // Must happen on every successful enqueue, including while the worker is spinning
@@ -926,6 +927,17 @@ impl UringConnectionHandler for ZmtpUringHandler {
     // Clear any throttle that may have been set before the sender arrived.
     self.is_throttled.store(false, Ordering::Release);
     self.notify_ingress_congestion(false);
+  }
+
+  fn adopt_egress(
+    &mut self,
+    egress_rx: fibre::mpmc::Receiver<FrameBatch>,
+    credits: Option<Arc<PipeCredits>>,
+  ) -> Arc<fibre::mpmc::Receiver<FrameBatch>> {
+    debug!(fd = self.fd, queued = egress_rx.len(), "ZmtpUringHandler: adopted connect pipe as egress");
+    self.egress_rx = Arc::new(egress_rx);
+    self.egress_credits = credits;
+    Arc::clone(&self.egress_rx)
   }
 
   fn resume_ingress(&mut self) {
