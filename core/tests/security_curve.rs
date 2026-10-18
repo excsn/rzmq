@@ -158,17 +158,15 @@ async fn test_curve_client_auth_server_pk_mismatch() -> Result<(), ZmqError> {
   let client_event = common::wait_for_monitor_event(&client_monitor, LONG_TIMEOUT, SHORT_TIMEOUT, |e| {
     matches!(
       e,
-      SocketEvent::HandshakeFailed { .. }
-        | SocketEvent::HandshakeSucceeded { .. }
-        | SocketEvent::Disconnected { .. }
-        | SocketEvent::ConnectFailed { .. }
+      SocketEvent::HandshakeFailed { .. } | SocketEvent::HandshakeSucceeded { .. } | SocketEvent::Disconnected { .. }
     )
   })
   .await
-  .expect("client should report the connection outcome");
+  .expect("client should report the handshake outcome");
   assert!(
-    !matches!(client_event, SocketEvent::HandshakeSucceeded { .. }),
-    "client completed a handshake with the wrong server key"
+    matches!(client_event, SocketEvent::HandshakeFailed { .. }),
+    "client should report HandshakeFailed before Disconnected: {:?}",
+    client_event
   );
 
   // --- Teardown ---
