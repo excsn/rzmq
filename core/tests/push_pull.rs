@@ -199,7 +199,19 @@ async fn test_push_pull_inproc_multiple_clients() -> Result<(), ZmqError> {
 
 // --- Test: PUSH HWM and SNDTIMEO=0 ---
 
-// Keep the SNDTIMEO=0 test as it works correctly
+const HWM_PAYLOAD_LEN: usize = 64 * 1024;
+const HWM_MAX_SENDS: u64 = 10_000;
+
+fn hwm_numbered(n: u64) -> Msg {
+  let mut payload = vec![0u8; HWM_PAYLOAD_LEN];
+  payload[..8].copy_from_slice(&n.to_be_bytes());
+  Msg::from_vec(payload)
+}
+
+fn hwm_seq(msg: &Msg) -> u64 {
+  u64::from_be_bytes(msg.data().expect("payload")[..8].try_into().expect("sequence prefix"))
+}
+
 #[tokio::test]
 async fn test_push_pull_hwm_sndtimeo_0() -> Result<(), ZmqError> {
   println!("Starting test_push_pull_hwm_sndtimeo_0...");
@@ -223,41 +235,38 @@ async fn test_push_pull_hwm_sndtimeo_0() -> Result<(), ZmqError> {
   push.connect(endpoint).await?;
   tokio::time::sleep(Duration::from_millis(150)).await;
 
-  // Send msg1 - should succeed
-  println!("PUSH sending Message 1 (should succeed)...");
-  push.send(Msg::from_static(b"Message 1")).await?;
-  println!("PUSH sent Message 1.");
+  // The pipe holds one message, but whatever drains it moves messages on into the
+  // socket buffers, so how many sends fit depends on drain timing. Large payloads
+  // fill those buffers within a bounded number of sends.
+  println!("PUSH sending until a send is refused...");
+  let mut accepted: u64 = 0;
+  loop {
+    match push.send(hwm_numbered(accepted)).await {
+      Ok(()) => {
+        accepted += 1;
+        assert!(accepted < HWM_MAX_SENDS, "PUSH accepted {} sends without refusing one", accepted);
+      }
+      Err(ZmqError::ResourceLimitReached) => break,
+      Err(e) => return Err(e),
+    }
+  }
+  assert!(accepted >= 1, "the first send should be accepted");
+  println!("PUSH refused send {} with ResourceLimitReached.", accepted);
 
-  // Send msg2 - should fail immediately as HWM=1 on the Core->Session pipe is full
-  // because PULL hasn't called recv() yet.
-  println!("PUSH sending Message 2 (should fail EAGAIN)...");
-  let send2_result = push.send(Msg::from_static(b"Message 2")).await;
-  assert!(
-    matches!(send2_result, Err(ZmqError::ResourceLimitReached)),
-    "Expected ResourceLimitReached error, got {:?}",
-    send2_result
-  );
-  println!("PUSH correctly failed with ResourceLimitReached.");
-
-  // PULL receives msg1, freeing up space in the pipe/PUSH buffer
-  println!("PULL receiving Message 1...");
-  let rec1 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
-  assert_eq!(rec1.data().unwrap(), b"Message 1");
-  println!("PULL received Message 1.");
+  for n in 0..accepted {
+    let msg = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+    assert_eq!(hwm_seq(&msg), n, "messages arrive in send order");
+  }
+  println!("PULL received all {} accepted messages.", accepted);
 
   // Allow time for buffer to clear
   tokio::time::sleep(Duration::from_millis(50)).await;
 
-  // PUSH sends msg2 again - should succeed now
-  println!("PUSH sending Message 2 again (should succeed)...");
-  push.send(Msg::from_static(b"Message 2")).await?;
-  println!("PUSH sent Message 2 again.");
-
-  // PULL receives msg2
-  println!("PULL receiving Message 2...");
-  let rec2 = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
-  assert_eq!(rec2.data().unwrap(), b"Message 2");
-  println!("PULL received Message 2.");
+  println!("PUSH sending the refused message again (should succeed)...");
+  push.send(hwm_numbered(accepted)).await?;
+  let msg = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+  assert_eq!(hwm_seq(&msg), accepted);
+  println!("PULL received the resent message.");
 
   println!("Terminating context...");
   ctx.term().await?;
