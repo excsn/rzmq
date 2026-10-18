@@ -397,10 +397,11 @@ impl UringWorker {
         fd,
         egress_rx,
         credits,
+        counters,
         reply_tx,
       } => {
         if let Some(handler) = self.handler_manager.get_mut(fd) {
-          let adopted = handler.adopt_egress(egress_rx, credits);
+          let adopted = handler.adopt_egress(egress_rx, credits, counters);
           self.fd_to_zmtp_egress_rx.insert(fd, adopted);
           let _ = reply_tx.send(Ok(UringOpCompletion::AdoptEgressReceiverSuccess { user_data, fd }));
         } else {

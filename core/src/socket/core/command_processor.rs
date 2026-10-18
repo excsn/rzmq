@@ -241,6 +241,7 @@ pub(crate) async fn process_socket_command(
       target_endpoint_uri,
       connection_iface,
       peer_identity,
+      peer_socket_type,
       fd,
     } => {
       if take_over_connect_pipe_uring(
@@ -250,6 +251,7 @@ pub(crate) async fn process_socket_command(
         &target_endpoint_uri,
         &connection_iface,
         peer_identity.clone(),
+        peer_socket_type.clone(),
         fd,
       )
       .await
@@ -285,11 +287,16 @@ pub(crate) async fn process_socket_command(
         is_outbound_connection: is_outbound,
         connection_iface,
         throttle: None,
-        peer_socket_type: None,
+        peer_socket_type,
       };
 
       {
         let mut cs = core_arc.core_state.write();
+        if is_outbound {
+          if let Some(recon_state) = cs.reconnect_states.get_mut(&endpoint_uri) {
+            recon_state.on_connection_success();
+          }
+        }
         if let Some(old) = cs.endpoints.insert(endpoint_uri.clone(), endpoint_info) {
           tracing::warn!(handle=core_handle, %endpoint_uri, "Overwrote existing EndpointInfo on UringConnectionEstablished.");
           if let Some(h) = old.task_handle { h.abort(); }
@@ -344,19 +351,10 @@ pub(crate) async fn process_socket_command(
 
     #[cfg(feature = "io-uring")]
     Command::UringFdError { endpoint_uri, error } => {
-      let (conn_iface_opt, synthetic_read_id_opt, handle_id_opt) = {
+      let (conn_iface_opt, handle_id_opt) = {
         let cs = core_arc.core_state.read();
         let ep = cs.endpoints.get(&endpoint_uri);
-        // A connect pipe's detach is decided by cleanup_stopped_child_resources,
-        // which keeps the pipe attached for the next connection.
-        let is_connect_pipe = ep
-          .and_then(|e| e.target_endpoint_uri.as_ref())
-          .is_some_and(|t| cs.connect_pipes.contains_key(t));
-        (
-          ep.map(|e| e.connection_iface.clone()),
-          ep.filter(|_| !is_connect_pipe).and_then(|e| e.pipe_ids.map(|pids| pids.1)),
-          ep.map(|e| e.handle_id),
-        )
+        (ep.map(|e| e.connection_iface.clone()), ep.map(|e| e.handle_id))
       };
       tracing::warn!(handle=core_handle, %endpoint_uri, %error, "UringFdError — closing connection.");
 
@@ -365,17 +363,15 @@ pub(crate) async fn process_socket_command(
           tracing::warn!(handle=core_handle, %endpoint_uri, "close_connection error: {}", e);
         }
       }
-      if let Some(s_read_id) = synthetic_read_id_opt {
-        socket_logic_strong.pipe_detached(s_read_id).await;
-      }
-      pipe_manager::cleanup_stopped_child_resources(
+      // The pattern detach happens in cleanup_stopped_child_resources, which keeps
+      // a connect pipe attached for the next connection.
+      shutdown::handle_actor_stopping_event(
         core_arc.clone(),
         socket_logic_strong,
         handle_id_opt.unwrap_or(0),
         ActorType::Session,
         Some(&endpoint_uri),
         Some(&error),
-        current_shutdown_phase != ShutdownPhase::Running,
       )
       .await;
     }
@@ -674,6 +670,7 @@ async fn take_over_connect_pipe_uring(
   target_endpoint_uri: &str,
   connection_iface: &Arc<dyn ISocketConnection>,
   peer_identity: Option<crate::message::Blob>,
+  peer_socket_type: Option<String>,
   fd: std::os::unix::io::RawFd,
 ) -> bool {
   use crate::io_uring_backend::ops::{UringOpCompletion, UringOpRequest};
@@ -705,7 +702,12 @@ async fn take_over_connect_pipe_uring(
         ep.mailbox = mailbox;
         ep.handle_id = handle_id;
         ep.throttle = None;
-        Some((found, ep.connection_iface.clone()))
+        ep.peer_socket_type = peer_socket_type;
+        let iface = ep.connection_iface.clone();
+        if let Some(recon_state) = cs.reconnect_states.get_mut(target_endpoint_uri) {
+          recon_state.on_connection_success();
+        }
+        Some((found, iface))
       }
       None => None,
     }
@@ -733,6 +735,7 @@ async fn take_over_connect_pipe_uring(
     fd,
     egress_rx: rx.to_sync(),
     credits,
+    counters: Arc::clone(&core_arc.core_state.read().counters),
     reply_tx,
   };
   if let Err(e) = worker_tx.send(adopt).await {

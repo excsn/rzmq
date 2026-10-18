@@ -301,6 +301,7 @@ pub trait UringConnectionHandler: Send {
     &mut self,
     egress_rx: fibre::mpmc::Receiver<FrameBatch>,
     _credits: Option<Arc<crate::socket::patterns::PipeCredits>>,
+    _counters: Arc<crate::socket::core::state::ConservationCounters>,
   ) -> Arc<fibre::mpmc::Receiver<FrameBatch>> {
     Arc::new(egress_rx)
   }

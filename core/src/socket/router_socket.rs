@@ -964,7 +964,15 @@ impl ISocket for RouterSocket {
     // never be routed with a real identity (ZMQ permits message loss on
     // disconnect). Wake any recv waiting on a finalize so it re-evaluates
     // without this pipe.
-    if self.is_pipe_finalized(pipe_read_id) {
+    let already_detached = self
+      .peer_states
+      .read()
+      .get(&pipe_read_id)
+      .is_some_and(|s| s.detached_slot.is_some());
+    if already_detached {
+      // A repeated detach must not replace the slot handle: the queued batches
+      // would look drained and the state would go before they are delivered.
+    } else if self.is_pipe_finalized(pipe_read_id) {
       let slot = self.ingress_engine.detach_pipe(pipe_read_id);
       if let Some(state) = self.peer_states.write().get_mut(&pipe_read_id) {
         state.detached_slot = Some(slot);

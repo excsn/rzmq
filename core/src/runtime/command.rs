@@ -126,6 +126,8 @@ pub(crate) enum Command {
     target_endpoint_uri: String,
     connection_iface: Arc<dyn ISocketConnection>,
     peer_identity: Option<Blob>,
+    /// The peer's ZMTP `Socket-Type`, which patterns read to frame messages for it.
+    peer_socket_type: Option<String>,
     /// Raw file descriptor for this connection — used to route `AttachIngressSender`
     /// to the correct worker handler.
     fd: RawFd,

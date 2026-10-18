@@ -105,6 +105,7 @@ pub enum UringOpRequest {
     fd: RawFd,
     egress_rx: fibre::mpmc::Receiver<FrameBatch>,
     credits: Option<Arc<PipeCredits>>,
+    counters: Arc<crate::socket::core::state::ConservationCounters>,
     reply_tx: oneshot::Sender<Result<UringOpCompletion, ZmqError>>,
   },
   /// Signals the handler to resume reading after HWM throttling. Sent by SocketCore

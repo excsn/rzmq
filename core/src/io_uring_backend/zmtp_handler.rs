@@ -182,13 +182,38 @@ impl ISocketConnection for ZmtpSmartConnection {
     self.credits.as_ref()
   }
 
+  /// Asks the owning worker to close the fd and waits for the close to complete,
+  /// so the peer sees the disconnect.
   async fn close_connection(&self) -> Result<(), ZmqError> {
-    Ok(())
+    let (reply_tx, reply_rx) = fibre::oneshot::oneshot();
+    let req = crate::io_uring_backend::ops::UringOpRequest::ShutdownConnectionHandler {
+      user_data: next_close_user_data(),
+      fd: self.fd,
+      reply_tx,
+    };
+    let mut worker_op_tx = self.worker_op_tx.clone();
+    worker_op_tx
+      .send(req)
+      .await
+      .map_err(|e| ZmqError::Internal(format!("UringWorker op channel error for close: {}", e)))?;
+    match tokio::time::timeout(Duration::from_secs(5), reply_rx.recv()).await {
+      Ok(Ok(Ok(_))) => Ok(()),
+      Ok(Ok(Err(e))) => Err(e),
+      Ok(Err(_)) => Err(ZmqError::Internal("UringWorker reply channel error for close".into())),
+      Err(_) => Err(ZmqError::Timeout),
+    }
   }
 
   fn as_any(&self) -> &dyn Any {
     self
   }
+}
+
+/// `user_data` for close requests. Bit 63 keeps them apart from context handles,
+/// which the other external ops use.
+fn next_close_user_data() -> u64 {
+  static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  (1 << 63) | NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Protocol-aware io_uring connection handler.
@@ -204,6 +229,8 @@ pub(crate) struct ZmtpUringHandler {
   egress_rx: Arc<fibre::mpmc::Receiver<FrameBatch>>,
   /// Credits returned for each batch drained from `egress_rx`, present when the socket is PUB.
   egress_credits: Option<Arc<PipeCredits>>,
+  /// The socket's conservation counters, present once a connect pipe is adopted as egress.
+  egress_counters: Option<Arc<crate::socket::core::state::ConservationCounters>>,
   /// Direct ingress sender: delivers decoded messages straight to the socket's ReadyPipeQueue.
   /// Set by `attach_ingress` after SocketCore completes pipe registration.
   ingress_sender: Option<PipeMessageSender>,
@@ -275,6 +302,7 @@ impl ZmtpUringHandler {
       engine,
       egress_rx,
       egress_credits,
+      egress_counters: None,
       ingress_sender: None,
       spillover: VecDeque::new(),
       is_throttled: AtomicBool::new(false),
@@ -412,6 +440,7 @@ impl ZmtpUringHandler {
             target_endpoint_uri: self.worker_io_config.target_endpoint_uri.clone(),
             connection_iface: self.worker_io_config.connection_iface.clone(),
             peer_identity,
+            peer_socket_type,
             fd: self.fd,
           };
           if let Err(e) = self.worker_io_config.socket_mailbox.try_send(cmd) {
@@ -746,6 +775,9 @@ impl UringConnectionHandler for ZmtpUringHandler {
       if let Some(ref credits) = self.egress_credits {
         credits.release(drained);
       }
+      if let Some(ref counters) = self.egress_counters {
+        crate::socket::core::state::ConservationCounters::add(&counters.drained, drained);
+      }
 
       if drained > 0 {
         self.write_in_flight += 1; // Lock the pipeline gate for vectored writes
@@ -803,6 +835,12 @@ impl UringConnectionHandler for ZmtpUringHandler {
     }
     self.is_closing = true;
     self.close_deadline = None;
+    // An in-flight read holds a reference to the socket, so IORING_OP_CLOSE alone
+    // leaves it open and sends no FIN. shutdown() acts on the socket itself: the
+    // peer sees the disconnect and the pending read completes with 0.
+    unsafe {
+      libc::shutdown(self.fd, libc::SHUT_RDWR);
+    }
     let mut ops = HandlerIoOps::new();
     if let Some(ref mut reader) = self.multishot_reader {
       if let Some(cancel_bp) = reader.prepare_cancel_intent() {
@@ -933,10 +971,12 @@ impl UringConnectionHandler for ZmtpUringHandler {
     &mut self,
     egress_rx: fibre::mpmc::Receiver<FrameBatch>,
     credits: Option<Arc<PipeCredits>>,
+    counters: Arc<crate::socket::core::state::ConservationCounters>,
   ) -> Arc<fibre::mpmc::Receiver<FrameBatch>> {
     debug!(fd = self.fd, queued = egress_rx.len(), "ZmtpUringHandler: adopted connect pipe as egress");
     self.egress_rx = Arc::new(egress_rx);
     self.egress_credits = credits;
+    self.egress_counters = Some(counters);
     Arc::clone(&self.egress_rx)
   }
 
