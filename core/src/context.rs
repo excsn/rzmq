@@ -139,15 +139,8 @@ impl ContextInner {
     {
       tracing::info!("Context shutdown initiated.");
       // Publish the global termination event. All actors should listen for this.
-      if let Err(e) = self.event_bus.publish(SystemEvent::ContextTerminating) {
-        tracing::warn!(
-          "Publishing ContextTerminating event failed (receivers={}): {}",
-          self.event_bus.subscriber_count(),
-          e
-        );
-      } else {
-        tracing::debug!("Published ContextTerminating event via bus.");
-      }
+      let recipients = self.event_bus.publish(SystemEvent::ContextTerminating);
+      tracing::debug!(recipients, "Published ContextTerminating event via bus.");
       // Actors rely on the ContextTerminating event (or SocketClosing from their parents) to stop.
     } else {
       tracing::debug!("Context shutdown already initiated.");
@@ -182,9 +175,7 @@ impl ContextInner {
       cap = ?linger_cap,
       "Context term wait cap reached, forcing lingering sockets closed."
     );
-    if let Err(e) = self.event_bus.publish(SystemEvent::ContextTerminationForced) {
-      tracing::warn!("Publishing ContextTerminationForced failed: {}", e);
-    }
+    self.event_bus.publish(SystemEvent::ContextTerminationForced);
 
     let forced_cap = Duration::from_secs(5);
     match tokio::time::timeout(forced_cap, self.actor_wait_group.wait()).await {
@@ -353,14 +344,7 @@ impl Context {
       actor_type,
       parent_id,
     };
-    if let Err(e) = self.inner.event_bus().publish(event) {
-      tracing::warn!(
-        actor_handle = handle_id,
-        ?actor_type,
-        "Failed to publish ActorStarted event: {}",
-        e
-      );
-    }
+    self.inner.event_bus().publish(event);
 
     let wg = &self.inner.actor_wait_group; // Borrow the WaitGroup
     wg.add(1); // Increment WaitGroup for the newly started actor.
@@ -384,20 +368,7 @@ impl Context {
       error,
     };
 
-    // --- Attempt to publish the event (best effort) ---
-    if let Err(e) = self.inner.event_bus().publish(event) {
-      // Check if already panicking to avoid making things worse, especially if during active shutdown phase.
-      if !std::thread::panicking() {
-        warn!(
-          "WARN: Failed to publish ActorStopping event for handle {}: {} (receivers={})",
-          handle_id,
-          e,
-          self.inner.event_bus().subscriber_count()
-        );
-      }
-      // Note: Even if publish fails, we MUST decrement the WaitGroup below.
-    } else {
-    }
+    self.inner.event_bus().publish(event);
 
     // --- Unconditionally decrement the WaitGroup ---
     // This is the crucial part to ensure termination completes even if the

@@ -4,6 +4,7 @@ use crate::runtime::Command;
 use crate::runtime::MailboxSender;
 use crate::socket::ISocket;
 use crate::socket::events::{DEFAULT_MONITOR_CAPACITY, MonitorReceiver};
+use fibre::TrySendError;
 use fibre::mpsc::bounded_async;
 use fibre::oneshot;
 use std::fmt;
@@ -41,9 +42,37 @@ pub enum SocketType {
   Pull,
 }
 
+/// Shared by every clone of one `Socket`. When the last clone drops without
+/// `close()`, the socket stops as `close()` would, LINGER included.
+struct StopOnLastDrop {
+  core_command_sender: MailboxSender,
+  closed: Arc<AtomicBool>,
+}
+
+impl Drop for StopOnLastDrop {
+  fn drop(&mut self) {
+    if self
+      .closed
+      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+      .is_err()
+    {
+      return;
+    }
+    if let Err(TrySendError::Full(stop)) = self.core_command_sender.try_send(Command::Stop) {
+      if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        let sender = self.core_command_sender.clone();
+        runtime.spawn(async move {
+          let _ = sender.send(stop).await;
+        });
+      }
+    }
+  }
+}
+
 /// The public handle for interacting with an rzmq socket.
 /// This struct provides the user-facing API for socket operations.
 /// Handles are cloneable (`Arc`-based), allowing them to be shared across tasks.
+/// Dropping the last clone closes the socket as `close()` does.
 /// Operations on this handle are delegated to an underlying actor (`SocketCore`)
 /// that manages the socket's state and pattern logic.
 #[derive(Clone)]
@@ -55,6 +84,7 @@ pub struct Socket {
   // This is used to send user-initiated commands (like bind, connect, send, recv) to the core actor.
   pub(crate) core_command_sender: MailboxSender,
   pub(crate) closed: Arc<AtomicBool>,
+  _stop_on_last_drop: Arc<StopOnLastDrop>,
 }
 
 impl Socket {
@@ -66,10 +96,15 @@ impl Socket {
   /// * `socket_impl` - An `Arc` to the `ISocket` trait object that implements the socket's pattern logic.
   /// * `core_command_sender` - The `MailboxSender` for the `SocketCore` actor managing this socket.
   pub(crate) fn new(socket_impl: Arc<dyn ISocket>, core_command_sender: MailboxSender) -> Self {
+    let closed = Arc::new(AtomicBool::new(false));
     Self {
       inner: socket_impl,
+      _stop_on_last_drop: Arc::new(StopOnLastDrop {
+        core_command_sender: core_command_sender.clone(),
+        closed: closed.clone(),
+      }),
       core_command_sender,
-      closed: Arc::new(AtomicBool::new(false)),
+      closed,
     }
   }
 

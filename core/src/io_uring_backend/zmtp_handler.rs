@@ -534,7 +534,14 @@ impl ZmtpUringHandler {
           }
         }
         AppAction::PeerError(e) => {
-          warn!(fd = self.fd, err = %e, "ZmtpUringHandler: peer error");
+          let uri = &self.worker_io_config.endpoint_uri;
+          if self.handshake_complete {
+            error!(fd = self.fd, uri = %uri, err = %e, "ZmtpUringHandler: fatal error on {} after its handshake: {}", uri, e);
+          } else if matches!(e, ZmqError::ConnectionClosed) {
+            debug!(fd = self.fd, uri = %uri, err = %e, "ZmtpUringHandler: handshake failed on {}: {}", uri, e);
+          } else {
+            info!(fd = self.fd, uri = %uri, err = %e, "ZmtpUringHandler: handshake failed on {}: {}", uri, e);
+          }
           self.is_closing = true;
           self.report_fd_error(e);
           ops.initiate_close_due_to_error = true;

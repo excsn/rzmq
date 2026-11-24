@@ -145,7 +145,7 @@ pub(crate) async fn publish_socket_closing_event(
   socket_id: usize,
 ) {
   let event = SystemEvent::SocketClosing { socket_id };
-  if context.event_bus().publish(event).is_err() {
+  if context.event_bus().publish(event) == 0 {
     // Borrow error from SendError is not Clone.
     tracing::warn!(
       socket_handle = socket_id,
@@ -303,7 +303,9 @@ pub(crate) async fn handle_actor_stopping_event(
   error_opt: Option<&ZmqError>,
 ) {
   let core_handle = core_arc.handle;
-  
+  let ended_in_handshake =
+    endpoint_uri_opt.is_some_and(|uri| core_arc.core_state.write().handshake_failures.remove(uri));
+
   // First, perform the resource cleanup regardless of the shutdown phase.
   // This function returns true if the cleanup might warrant a reconnect.
   let should_consider_reconnect = pipe_manager::cleanup_stopped_child_resources(
@@ -321,14 +323,42 @@ pub(crate) async fn handle_actor_stopping_event(
 
   match coordinator.state {
     ShutdownPhase::Running => {
-      // Child stopped unexpectedly.
-      tracing::warn!(
+      let uri = endpoint_uri_opt.unwrap_or("<no endpoint>");
+      match error_opt {
+        None => tracing::debug!(
           handle = core_handle,
           child_id = stopped_actor_id,
           ?stopped_actor_type,
-          uri = ?endpoint_uri_opt,
-          "Child stopped unexpectedly while Core Running."
-      );
+          "Child {:?} {} stopped.",
+          stopped_actor_type, uri
+        ),
+        Some(error) if ended_in_handshake => tracing::debug!(
+          handle = core_handle,
+          child_id = stopped_actor_id,
+          "Session {} ended before its handshake completed: {}",
+          uri, error
+        ),
+        Some(ZmqError::ConnectionClosed) if stopped_actor_type == ActorType::Session => tracing::debug!(
+          handle = core_handle,
+          child_id = stopped_actor_id,
+          "Peer of session {} closed the connection.",
+          uri
+        ),
+        // A connecter reports its failure itself before it stops.
+        Some(error) if stopped_actor_type == ActorType::Connecter => tracing::debug!(
+          handle = core_handle,
+          child_id = stopped_actor_id,
+          "Child {:?} {} stopped: {}",
+          stopped_actor_type, uri, error
+        ),
+        Some(error) => tracing::warn!(
+          handle = core_handle,
+          child_id = stopped_actor_id,
+          ?stopped_actor_type,
+          "Child {:?} {} stopped unexpectedly while Core Running: {}",
+          stopped_actor_type, uri, error
+        ),
+      }
       // Only reconnect if the cleanup indicated it was an outbound session that failed.
       if should_consider_reconnect {
         if let Some(uri_str) = endpoint_uri_opt {
@@ -531,9 +561,9 @@ pub(crate) async fn perform_final_pipe_cleanup(
     {
       let mut core_state = core_arc.core_state.write();
       if !core_state.endpoints.is_empty() {
-        tracing::warn!(
+        tracing::debug!(
           handle = core_handle,
-          "Endpoints map not empty. Forcing clear. Rem: {}",
+          "Closing the {} endpoints still registered at final cleanup.",
           core_state.endpoints.len()
         );
         for (_key, ep) in core_state.endpoints.drain() {
@@ -543,8 +573,15 @@ pub(crate) async fn perform_final_pipe_cleanup(
     }
 
     for (uri, ep_type, iface) in endpoints_to_force_close {
+      // A connect pipe with no connection has nothing to report: its endpoint
+      // never connected or its last session already reported Disconnected.
+      let has_connection = iface
+        .as_any()
+        .downcast_ref::<crate::sessionx::ScaConnectionIface>()
+        .map_or(true, |sca| sca.has_connection());
       let _ = iface.close_connection().await;
       let event = match ep_type {
+        EndpointType::Session if !has_connection => continue,
         EndpointType::Session => crate::socket::SocketEvent::Disconnected { endpoint: uri },
         EndpointType::Listener => crate::socket::SocketEvent::Closed { endpoint: uri },
       };

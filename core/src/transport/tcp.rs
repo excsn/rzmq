@@ -1,8 +1,8 @@
 use crate::context::Context;
 use crate::error::ZmqError;
 use crate::runtime::{
-  ActorDropGuard, ActorType, Command, MailboxReceiver as GenericMailboxReceiver,
-  MailboxSender as GenericMailboxSender, SystemEvent, mailbox,
+  ActorDropGuard, ActorType, Command, EventReceiver, MailboxReceiver as GenericMailboxReceiver,
+  MailboxSender as GenericMailboxSender, Subscriber, SystemEvent, event_bus::TryRecvError, mailbox,
   system_events::ConnectionInteractionModel,
 };
 use crate::sessionx::actor::SessionConnectionActorX;
@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::Semaphore;
 use tokio::task::{Id as TaskId, JoinHandle};
 use tokio::time::sleep;
 use tracing::info;
@@ -188,7 +188,7 @@ impl TcpListener {
     let listener_cmd_loop_handle = self.handle;
     let endpoint_uri_clone_log = self.endpoint.clone();
     let event_bus = self.context.event_bus();
-    let mut system_event_rx = event_bus.subscribe();
+    let mut system_event_rx = event_bus.subscribe(Subscriber::ChildOf(parent_socket_id));
     tracing::debug!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener command loop started");
     let mut final_error_for_actor_stopping: Option<ZmqError> = None;
 
@@ -206,21 +206,16 @@ impl TcpListener {
           biased;
           event_result = system_event_rx.recv() => {
             match event_result {
-              Ok(SystemEvent::ContextTerminating) => {
+              Some(SystemEvent::ContextTerminating) => {
                 tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "TCP Listener received ContextTerminating, stopping accept loop.");
                 self.listener_handle.abort(); break;
               }
-              Ok(SystemEvent::SocketClosing{ socket_id }) if socket_id == self.parent_socket_id => {
+              Some(SystemEvent::SocketClosing{ socket_id }) if socket_id == self.parent_socket_id => {
                 tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, parent_id = self.parent_socket_id, "TCP Listener received SocketClosing for parent, stopping accept loop.");
                 self.listener_handle.abort(); break;
               }
-              Ok(_) => {}
-              Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, skipped = n, "System event bus lagged!");
-                self.listener_handle.abort();
-                final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus lagged".into())); break;
-              }
-              Err(broadcast::error::RecvError::Closed) => {
+              Some(_) => {}
+              None => {
                 tracing::error!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "System event bus closed unexpectedly!");
                 self.listener_handle.abort();
                 final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus closed".into())); break;
@@ -620,6 +615,36 @@ type UnifiedConnectOutcome = (
   String,         // actual_peer_uri
 );
 
+/// How one connect attempt ended without a connection.
+enum AttemptEnd {
+  /// The context terminated or the parent socket stopped.
+  Stopped,
+  Failed(ZmqError),
+}
+
+impl From<ZmqError> for AttemptEnd {
+  fn from(error: ZmqError) -> Self {
+    Self::Failed(error)
+  }
+}
+
+enum ConnecterEnd {
+  Connected,
+  /// The context terminated or the parent socket stopped.
+  Stopped,
+  Failed(ZmqError),
+}
+
+impl ConnecterEnd {
+  /// The failure the parent socket and its monitor are told about.
+  fn failure(&self) -> Option<&ZmqError> {
+    match self {
+      Self::Failed(error) => Some(error),
+      Self::Connected | Self::Stopped => None,
+    }
+  }
+}
+
 pub(crate) struct TcpConnecter {
   handle: usize,
   endpoint: String,
@@ -736,40 +761,32 @@ impl TcpConnecter {
     }
 
     let mut attempt_count = self.initial_attempts;
-    let mut system_event_rx = self.context.event_bus().subscribe();
-    let mut last_connect_attempt_error: Option<ZmqError> = None;
+    let mut system_event_rx = self
+      .context
+      .event_bus()
+      .subscribe(Subscriber::ChildOf(parent_socket_id));
+    let mut last_failure: Option<ZmqError> = None;
 
-    'connecter_life_loop: loop {
+    let end = 'connecter_life_loop: loop {
       // Wait condition: Only wait if this is a retry *within* this actor's life.
-      // If attempt_count == initial_attempts, it means SocketCore just spawned us
-      // after waiting the appropriate delay, so we should try immediately.
-      if attempt_count > self.initial_attempts {
+      // On the first pass SocketCore just spawned us after waiting the
+      // appropriate delay, so we should try immediately.
+      if let Some(failure) = last_failure.take() {
         if no_retry_after_first_connect_fail {
           tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: Retries disabled. Stopping after first failure.");
-          break 'connecter_life_loop;
+          break 'connecter_life_loop ConnecterEnd::Failed(failure);
         }
-        match self
+        let delay_elapsed = self
           .wait_for_retry_delay_internal(
             &mut system_event_rx,
             current_retry_delay,
             &monitor,
             attempt_count as usize + 1,
           )
-          .await
-        {
-          Ok(true) => {}
-          Ok(false) => {
-            last_connect_attempt_error = Some(ZmqError::Internal(
-              "Connecter shutdown by event retry delay.".into(),
-            ));
-            break 'connecter_life_loop;
-          }
-          Err(()) => {
-            last_connect_attempt_error = Some(ZmqError::Internal(
-              "Connecter shutdown error retry delay.".into(),
-            ));
-            break 'connecter_life_loop;
-          }
+          .await;
+        if !delay_elapsed {
+          tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: stopped while waiting to retry {}.", endpoint_uri_clone);
+          break 'connecter_life_loop ConnecterEnd::Stopped;
         }
         if current_retry_delay > Duration::ZERO
           && reconnect_ivl_max_opt.map_or(true, |max_d| max_d > Duration::ZERO)
@@ -785,41 +802,25 @@ impl TcpConnecter {
       }
       attempt_count += 1;
 
-      match system_event_rx.try_recv() {
-        Ok(SystemEvent::ContextTerminating) => {
-          last_connect_attempt_error = Some(ZmqError::Internal(
-            "Shutdown by ContextTerminating (pre-connect).".into(),
-          ));
-          break 'connecter_life_loop;
-        }
-        Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => {
-          last_connect_attempt_error = Some(ZmqError::Internal(
-            "Shutdown by parent stopping (pre-connect).".into(),
-          ));
-          break 'connecter_life_loop;
-        }
-        Err(broadcast::error::TryRecvError::Closed) => {
-          last_connect_attempt_error =
-            Some(ZmqError::Internal("Event bus closed (pre-connect).".into()));
-          break 'connecter_life_loop;
-        }
-        Err(broadcast::error::TryRecvError::Lagged(_)) => {
-          last_connect_attempt_error =
-            Some(ZmqError::Internal("Event bus lagged (pre-connect).".into()));
-          break 'connecter_life_loop;
-        }
-        _ => {}
+      let stop_is_pending = match system_event_rx.try_recv() {
+        Ok(event) => self.stops_on(&event),
+        Err(TryRecvError::Disconnected) => true,
+        Err(TryRecvError::Empty) => false,
+      };
+      if stop_is_pending {
+        tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: stopped before TCP connect attempt #{} to {}.", attempt_count, endpoint_uri_clone);
+        break 'connecter_life_loop ConnecterEnd::Stopped;
       }
 
-      tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: TCP connect attempt #{}", attempt_count);
+      tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: TCP connect attempt #{} to {}", attempt_count, endpoint_uri_clone);
 
-      let single_attempt_outcome: Result<UnifiedConnectOutcome, ZmqError> = self
+      let single_attempt_outcome: Result<UnifiedConnectOutcome, AttemptEnd> = self
         .try_connect_once(&endpoint_uri_clone, &mut system_event_rx, &monitor)
         .await;
 
       match single_attempt_outcome {
         Ok((connection_iface_opt, interaction_model, managing_actor_task_id, actual_peer_uri)) => {
-          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, actual_peer = %actual_peer_uri, "Connecter: TCP connect successful.");
+          tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, actual_peer = %actual_peer_uri, "Connecter: TCP connect to {} succeeded on attempt #{}.", endpoint_uri_clone, attempt_count);
 
           // For the UringFd path, try_connect_once pre-sends NewConnectionEstablished before
           // registering with the worker (guaranteeing FIFO ordering in SocketCore's mailbox).
@@ -840,33 +841,33 @@ impl TcpConnecter {
                 "Connecter: Failed to send NewConnectionEstablished to socket mailbox for {}.",
                 endpoint_uri_clone
               );
-              last_connect_attempt_error = Some(ZmqError::Internal(
+              break 'connecter_life_loop ConnecterEnd::Failed(ZmqError::Internal(
                 "Socket mailbox closed during NewConnectionEstablished".into(),
               ));
-            } else {
-              last_connect_attempt_error = None;
             }
-          } else {
-            last_connect_attempt_error = None;
           }
-          break 'connecter_life_loop;
+          break 'connecter_life_loop ConnecterEnd::Connected;
         }
-        Err(attempt_failure_error) => {
-          last_connect_attempt_error = Some(attempt_failure_error.clone());
+        Err(AttemptEnd::Stopped) => {
+          tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: stopped during TCP connect attempt #{} to {}.", attempt_count, endpoint_uri_clone);
+          break 'connecter_life_loop ConnecterEnd::Stopped;
+        }
+        Err(AttemptEnd::Failed(attempt_failure_error)) => {
+          if is_fatal_connect_error(&attempt_failure_error) {
+            tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %attempt_failure_error, "Connecter: giving up on {} after TCP connect attempt #{}: {}", endpoint_uri_clone, attempt_count, attempt_failure_error);
+            break 'connecter_life_loop ConnecterEnd::Failed(attempt_failure_error);
+          }
 
-          tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %attempt_failure_error, "Connecter: TCP connect attempt #{} failed.", attempt_count);
-
-          if is_fatal_connect_error(&attempt_failure_error)
-            || matches!(&attempt_failure_error, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus error"))
-          {
-            tracing::error!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %attempt_failure_error, "Connecter: Fatal error. Stopping.");
-            break 'connecter_life_loop;
+          if attempt_count == self.initial_attempts + 1 {
+            tracing::warn!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %attempt_failure_error, "Connecter: TCP connect attempt #{} to {} failed: {}", attempt_count, endpoint_uri_clone, attempt_failure_error);
+          } else {
+            tracing::debug!(handle = connecter_handle, uri = %endpoint_uri_clone, error = %attempt_failure_error, "Connecter: TCP connect attempt #{} to {} failed: {}", attempt_count, endpoint_uri_clone, attempt_failure_error);
           }
 
           // If we fail on the very first attempt (freshly spawned) AND retries are disabled, stop.
           if no_retry_after_first_connect_fail && attempt_count == 1 {
             tracing::info!(handle = connecter_handle, uri = %endpoint_uri_clone, "Connecter: No retry, stopping after first fail.");
-            break 'connecter_life_loop;
+            break 'connecter_life_loop ConnecterEnd::Failed(attempt_failure_error);
           }
 
           // Emit ConnectDelayed only once per actor lifecycle/retry-sequence to avoid log spam.
@@ -877,32 +878,25 @@ impl TcpConnecter {
               error_msg: attempt_failure_error.to_string(),
             });
           }
+          last_failure = Some(attempt_failure_error);
         }
       }
-    }
+    };
 
-    if let Some(ref final_err) = last_connect_attempt_error {
-      if !matches!(final_err, ZmqError::Internal(s) if s.contains("shutdown by") || s.contains("event bus error"))
-      {
-        let _ = self
-          .context
-          .event_bus()
-          .publish(SystemEvent::ConnectionAttemptFailed {
-            parent_core_id: self.parent_socket_id,
-            target_endpoint_uri: endpoint_uri_clone.clone(),
-            error: final_err.clone(),
-          });
-        monitor.emit(SocketEvent::ConnectFailed {
-          endpoint: endpoint_uri_clone.clone(),
-          error_msg: final_err.to_string(),
+    if let Some(final_err) = end.failure() {
+      let _ = self
+        .context
+        .event_bus()
+        .publish(SystemEvent::ConnectionAttemptFailed {
+          parent_core_id: self.parent_socket_id,
+          target_endpoint_uri: endpoint_uri_clone.clone(),
+          error: final_err.clone(),
         });
-      }
     }
 
-    if let Some(err) = last_connect_attempt_error.take() {
-      actor_drop_guard.set_error(err);
-    } else {
-      actor_drop_guard.waive();
+    match end {
+      ConnecterEnd::Connected | ConnecterEnd::Stopped => actor_drop_guard.waive(),
+      ConnecterEnd::Failed(err) => actor_drop_guard.set_error(err),
     }
     tracing::info!(handle = connecter_handle, uri = %self.endpoint, "TCP Connecter actor task fully stopped.");
   }
@@ -910,17 +904,21 @@ impl TcpConnecter {
   async fn try_connect_once(
     &self,
     endpoint_uri_original: &str,
-    system_event_rx: &mut broadcast::Receiver<SystemEvent>,
+    system_event_rx: &mut EventReceiver,
     monitor: &MonitorHandle,
-  ) -> Result<UnifiedConnectOutcome, ZmqError> {
+  ) -> Result<UnifiedConnectOutcome, AttemptEnd> {
     let addr_str = endpoint_uri_original
       .strip_prefix("tcp://")
       .unwrap_or(endpoint_uri_original);
 
     // Perform a fresh, async DNS lookup on each connection attempt.
-    let addrs_iter = tokio::net::lookup_host(addr_str).await.map_err(|e| {
-      ZmqError::DnsResolutionFailed(format!("Failed to resolve '{}': {}", addr_str, e))
-    })?;
+    let addrs_iter = tokio::select! {
+      biased;
+      _ = self.stop_requested(system_event_rx) => return Err(AttemptEnd::Stopped),
+      resolved = tokio::net::lookup_host(addr_str) => resolved.map_err(|e| {
+        ZmqError::DnsResolutionFailed(format!("Failed to resolve '{}': {}", addr_str, e))
+      })?,
+    };
 
     let mut last_error: Option<ZmqError> = None;
 
@@ -1137,17 +1135,8 @@ impl TcpConnecter {
 
       tokio::select! {
         biased;
-        _ = async {
-          loop {
-            match system_event_rx.recv().await {
-              Ok(SystemEvent::ContextTerminating) => break,
-              Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => break,
-              Ok(_) => continue,
-              Err(_) => break,
-            }
-          }
-        } => {
-          return Err(ZmqError::Internal("Connecter shutdown by system event while connecting.".into()));
+        _ = self.stop_requested(system_event_rx) => {
+          return Err(AttemptEnd::Stopped);
         }
         connect_outcome_result = connect_future => {
           match connect_outcome_result {
@@ -1162,28 +1151,30 @@ impl TcpConnecter {
     }
 
     // If the loop finishes without returning, all attempts failed.
-    Err(last_error.unwrap_or_else(|| {
+    Err(AttemptEnd::Failed(last_error.unwrap_or_else(|| {
       ZmqError::HostUnreachable(format!(
         "No IP addresses found or all attempts failed for {}",
         addr_str
       ))
-    }))
+    })))
   }
 
+  /// Returns true once `delay` has passed and false when a stop arrives first.
   async fn wait_for_retry_delay_internal(
     &self,
-    system_event_rx: &mut broadcast::Receiver<SystemEvent>,
+    system_event_rx: &mut EventReceiver,
     delay: Duration,
     monitor: &MonitorHandle,
     next_attempt_num: usize,
-  ) -> Result<bool, ()> {
+  ) -> bool {
     if delay.is_zero() {
-      match system_event_rx.try_recv() {
-        Ok(SystemEvent::ContextTerminating) => return Ok(false),
-        Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => {
-          return Ok(false);
+      loop {
+        match system_event_rx.try_recv() {
+          Ok(event) if self.stops_on(&event) => return false,
+          Ok(_) => continue,
+          Err(TryRecvError::Empty) => return true,
+          Err(TryRecvError::Disconnected) => return false,
         }
-        _ => return Ok(true),
       }
     }
     tracing::debug!(handle = self.handle, uri = %self.endpoint, ?delay, "Connecter waiting before attempt #{}", next_attempt_num);
@@ -1193,15 +1184,28 @@ impl TcpConnecter {
     });
     tokio::select! {
       biased;
-      event_res = system_event_rx.recv() => {
-        match event_res {
-          Ok(SystemEvent::ContextTerminating) => Ok(false),
-          Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => Ok(false),
-          Err(_) => Ok(false),
-          Ok(_) => Ok(true),
-        }
+      _ = self.stop_requested(system_event_rx) => false,
+      _ = tokio::time::sleep(delay) => true,
+    }
+  }
+
+  /// Resolves once the context terminates, the parent socket stops or the
+  /// event bus is gone.
+  async fn stop_requested(&self, system_event_rx: &mut EventReceiver) {
+    loop {
+      match system_event_rx.recv().await {
+        Some(event) if self.stops_on(&event) => return,
+        Some(_) => {}
+        None => return,
       }
-      _ = tokio::time::sleep(delay) => Ok(true),
+    }
+  }
+
+  fn stops_on(&self, event: &SystemEvent) -> bool {
+    match event {
+      SystemEvent::ContextTerminating => true,
+      SystemEvent::ActorStopping { handle_id, .. } => *handle_id == self.parent_socket_id,
+      _ => false,
     }
   }
 }
@@ -1340,4 +1344,17 @@ fn apply_tcp_socket_options_to_std(
     socket_ref.set_recv_buffer_size(size)?;
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn a_connecter_stopped_by_shutdown_reports_no_connect_failure() {
+    assert!(ConnecterEnd::Stopped.failure().is_none());
+    assert!(ConnecterEnd::Connected.failure().is_none());
+    let refused = ZmqError::ConnectionRefused("tcp://127.0.0.1:1".into());
+    assert!(matches!(ConnecterEnd::Failed(refused).failure(), Some(ZmqError::ConnectionRefused(_))));
+  }
 }

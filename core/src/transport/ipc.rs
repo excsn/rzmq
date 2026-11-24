@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use socket2::SockRef;
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::Semaphore;
 use tokio::task::{Id as TaskId, JoinHandle};
 use tokio::time::sleep;
 
@@ -134,7 +134,7 @@ impl IpcListener {
     let listener_cmd_loop_handle = self.handle;
     let endpoint_uri_clone_log = self.endpoint.clone();
     let event_bus = self.context.event_bus();
-    let mut system_event_rx = event_bus.subscribe();
+    let mut system_event_rx = event_bus.subscribe(crate::runtime::Subscriber::ChildOf(parent_handle_id));
     let listener_abort_handle = self.listener_handle.take();
 
     let mut actor_drop_guard = ActorDropGuard::new(
@@ -154,21 +154,16 @@ impl IpcListener {
           biased;
           event_result = system_event_rx.recv() => {
             match event_result {
-              Ok(SystemEvent::ContextTerminating) => {
+              Some(SystemEvent::ContextTerminating) => {
                 tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "IPC Listener received ContextTerminating, stopping accept loop.");
                 if let Some(h) = &listener_abort_handle { h.abort(); } break;
               }
-              Ok(SystemEvent::SocketClosing{ socket_id }) if socket_id == self.parent_socket_id => {
+              Some(SystemEvent::SocketClosing{ socket_id }) if socket_id == self.parent_socket_id => {
                 tracing::info!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, parent_id = self.parent_socket_id, "IPC Listener received SocketClosing for parent, stopping accept loop.");
                 if let Some(h) = &listener_abort_handle { h.abort(); } break;
               }
-              Ok(_) => {}
-              Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, skipped = n, "System event bus lagged for IPC Listener command loop!");
-                if let Some(h) = &listener_abort_handle { h.abort(); }
-                final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus lagged (IPC)".into())); break;
-              }
-              Err(broadcast::error::RecvError::Closed) => {
+              Some(_) => {}
+              None => {
                 tracing::error!(handle = listener_cmd_loop_handle, uri = %endpoint_uri_clone_log, "System event bus closed unexpectedly for IPC Listener command loop!");
                 if let Some(h) = &listener_abort_handle { h.abort(); }
                 final_error_for_actor_stopping = Some(ZmqError::Internal("Listener event bus closed (IPC)".into())); break;
@@ -555,7 +550,10 @@ impl IpcConnecter {
       .context_options
       .handshake_ivl
       .unwrap_or_else(|| Duration::from_secs(5));
-    let mut system_event_rx = self.context.event_bus().subscribe(); // For early abort
+    let mut system_event_rx = self
+      .context
+      .event_bus()
+      .subscribe(crate::runtime::Subscriber::ChildOf(self.parent_socket_id));
 
     let connect_future = UnixStream::connect(&self.path);
 
@@ -564,10 +562,10 @@ impl IpcConnecter {
       _ = async { // Early abort if context/socket is closing
         loop {
           match system_event_rx.recv().await {
-            Ok(SystemEvent::ContextTerminating) => break,
-            Ok(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => break,
-            Ok(_) => continue,
-            Err(_) => break, // Channel closed or lagged
+            Some(SystemEvent::ContextTerminating) => break,
+            Some(SystemEvent::ActorStopping { handle_id, .. }) if handle_id == self.parent_socket_id => break,
+            Some(_) => continue,
+            None => break,
           }
         }
       } => {
@@ -735,13 +733,15 @@ impl IpcConnecter {
         }
       }
       Err(err) => {
-        tracing::error!(handle = connecter_handle, uri = %endpoint_uri_original, error = %err, "IPC Connect final failure");
-        monitor.emit(SocketEvent::ConnectFailed {
-          endpoint: endpoint_uri_original.clone(),
-          error_msg: err.to_string(),
-        });
-        // Only publish ConnectionAttemptFailed if it wasn't an internal abort
-        if !matches!(&err, ZmqError::Internal(s) if s.contains("aborted by system event")) {
+        tracing::error!(handle = connecter_handle, uri = %endpoint_uri_original, error = %err, "IPC connect to {} failed: {}", endpoint_uri_original, err);
+        // The socket's core emits ConnectFailed for a ConnectionAttemptFailed.
+        // An internal abort is not published, so it is emitted here.
+        if matches!(&err, ZmqError::Internal(s) if s.contains("aborted by system event")) {
+          monitor.emit(SocketEvent::ConnectFailed {
+            endpoint: endpoint_uri_original.clone(),
+            error_msg: err.to_string(),
+          });
+        } else {
           let _ = self
             .context
             .event_bus()

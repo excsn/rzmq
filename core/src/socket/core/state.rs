@@ -191,6 +191,8 @@ pub(crate) struct CoreState {
   pub(crate) counters: Arc<ConservationCounters>,
   pub(crate) last_bound_endpoint: Option<String>,
   pub(crate) bind_or_connect_called: bool,
+  /// Endpoints whose session reported a failed handshake and has not stopped yet.
+  pub(crate) handshake_failures: std::collections::HashSet<String>,
 }
 
 impl CoreState {
@@ -211,6 +213,7 @@ impl CoreState {
       counters: Arc::new(ConservationCounters::default()),
       last_bound_endpoint: None,
       bind_or_connect_called: false,
+      handshake_failures: std::collections::HashSet::new(),
     }
   }
 

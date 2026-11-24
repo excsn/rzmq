@@ -18,14 +18,18 @@ impl SessionRegulator {
   /// Checks the session uptime against the minimum lifespan.
   /// If the session is dying too young (churn), this method sleeps
   /// for the remainder of the required time.
-  pub async fn enforce_min_lifespan(&self) {
+  pub async fn enforce_min_lifespan(&self, endpoint_uri: &str) {
     let uptime = self.started_at.elapsed();
     if uptime < self.min_lifespan {
       let penalty = self.min_lifespan - uptime;
       tracing::warn!(
+        uri = %endpoint_uri,
         uptime_ms = uptime.as_millis(),
         penalty_ms = penalty.as_millis(),
-        "SessionRegulator: Session died too quickly (churn detected). Enforcing penalty wait."
+        "SessionRegulator: Session {} died too quickly, {} ms after it started (churn detected). Enforcing a {} ms penalty wait.",
+        endpoint_uri,
+        uptime.as_millis(),
+        penalty.as_millis()
       );
       sleep(penalty).await;
     }
@@ -42,7 +46,7 @@ mod additional_regulator_tests {
     let regulator = SessionRegulator::new(Duration::from_millis(100));
 
     let start = Instant::now();
-    regulator.enforce_min_lifespan().await;
+    regulator.enforce_min_lifespan("tcp://test").await;
     let elapsed = start.elapsed();
 
     assert!(
@@ -59,7 +63,7 @@ mod additional_regulator_tests {
     tokio::time::sleep(Duration::from_millis(15)).await;
 
     let start = Instant::now();
-    regulator.enforce_min_lifespan().await;
+    regulator.enforce_min_lifespan("tcp://test").await;
     let elapsed = start.elapsed();
 
     assert!(

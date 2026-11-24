@@ -84,7 +84,7 @@ impl SocketCore {
       *socket_logic_weak_ref_guard = Some(Arc::downgrade(&socket_logic_arc_impl));
     }
 
-    let system_event_receiver = context.event_bus().subscribe();
+    let system_event_receiver = context.event_bus().subscribe(crate::runtime::Subscriber::Core(handle));
     let core_arc_for_task = socket_core_arc.clone();
     let socket_logic_for_task = socket_logic_arc_impl.clone(); // Pass strong Arc to task
 

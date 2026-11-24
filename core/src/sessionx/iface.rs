@@ -134,6 +134,16 @@ impl ScaConnectionIface {
     *self.session.write() = Some(BoundSession { stop_mailbox, handle_id });
   }
 
+  /// False for a connect pipe whose endpoint has no session or io_uring
+  /// connection right now.
+  pub(crate) fn has_connection(&self) -> bool {
+    #[cfg(feature = "io-uring")]
+    if self.uring_bound.load(Ordering::Acquire) {
+      return true;
+    }
+    self.session.read().is_some()
+  }
+
   pub(crate) fn unbind_session(&self) {
     *self.session.write() = None;
     #[cfg(feature = "io-uring")]

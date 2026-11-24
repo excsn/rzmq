@@ -102,7 +102,7 @@ pub(crate) async fn connect_inproc(
     handshake_request: Arc::new(Mutex::new(Some(request))),
   };
 
-  if core_arc.context.event_bus().publish(request_event).is_err() {
+  if core_arc.context.event_bus().publish(request_event) == 0 {
     tracing::error!(connector_core_handle, inproc_name = %name, "Failed to publish InprocBindingRequest to EventBus.");
     let _ = reply_tx_user.send(Err(ZmqError::Internal(
       "Event bus publish failed for inproc connect request".into(),

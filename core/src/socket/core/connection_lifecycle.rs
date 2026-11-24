@@ -46,8 +46,7 @@ pub(crate) async fn handshake_succeeded(
 
 /// Reports `HandshakeFailed` for a connection that ended before its handshake completed.
 pub(crate) fn handshake_failed(core_arc: &Arc<SocketCore>, endpoint_uri: String, error_msg: String) {
-  core_arc
-    .core_state
-    .read()
-    .send_monitor_event(SocketEvent::HandshakeFailed { endpoint: endpoint_uri, error_msg });
+  let mut cs = core_arc.core_state.write();
+  cs.handshake_failures.insert(endpoint_uri.clone());
+  cs.send_monitor_event(SocketEvent::HandshakeFailed { endpoint: endpoint_uri, error_msg });
 }

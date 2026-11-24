@@ -187,7 +187,7 @@ The public handle for an `rzmq` socket. Provides methods for network operations,
     *   `pub async fn get_option(&self, option: i32) -> Result<Vec<u8>, ZmqError>`
         *   Gets a socket option value as a `Vec<u8>`.
     *   `pub async fn close(&self) -> Result<(), ZmqError>`
-        *   Initiates a graceful shutdown of the socket.
+        *   Initiates a graceful shutdown of the socket. Dropping the last clone of a `Socket` without calling `close` does the same.
     *   `pub async fn monitor(&self, capacity: usize) -> Result<MonitorReceiver, ZmqError>`
         *   Creates a monitoring channel for this socket with the specified event capacity.
     *   `pub async fn monitor_default(&self) -> Result<MonitorReceiver, ZmqError>`

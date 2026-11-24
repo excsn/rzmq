@@ -519,6 +519,7 @@ async fn monitor_example(socket: &rzmq::Socket) -> Result<(), ZmqError> {
 
 ### Closing Sockets and Context Termination
 *   **`socket.close().await?`**: Initiates a graceful shutdown of a specific socket. It returns at once; the socket keeps delivering queued messages in the background for its `LINGER`.
+*   **Dropping the last clone of a `Socket`** closes it the same way, `LINGER` included. A clone keeps the socket open for as long as it lives.
 *   **`ctx.term().await?`**: Shuts down the entire context, including all its sockets and background tasks. This is essential for a clean application exit.
 
 `LINGER` defaults to -1, as in libzmq: a message accepted by `send` before `close` is delivered and `term` waits for it. A socket whose peer never comes back would hold `term` for ever, so `term` forces any socket still lingering after 10 seconds to close and drop what it holds. To drop queued messages at once instead, set `LINGER` to 0 on the socket or create the context with `Context::new()?.with_blocky(false)`.

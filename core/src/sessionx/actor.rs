@@ -25,7 +25,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, broadcast};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::{JoinHandle, yield_now};
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
@@ -58,11 +58,13 @@ pub(crate) struct SessionConnectionActorX<S: ZmtpStdStream> {
   core_pipe_manager: CorePipeManagerX,
 
   command_mailbox_receiver: MailboxReceiver,
-  system_event_receiver: broadcast::Receiver<SystemEvent>,
+  system_event_receiver: crate::runtime::EventReceiver,
 
   pending_peer_identity_from_handshake: Option<Blob>,
   pending_peer_socket_type: Option<String>,
   error_for_drop_guard: Option<ZmqError>,
+  handshake_completed: bool,
+  failed_after_handshake: bool,
 
   ping_check_timer: Option<tokio::time::Interval>,
 
@@ -158,7 +160,10 @@ where
       .handshake_timeout
       .map(|d| TokioInstant::now() + d);
 
-    let system_event_receiver = actor_config.context.event_bus().subscribe();
+    let system_event_receiver = actor_config
+      .context
+      .event_bus()
+      .subscribe(crate::runtime::Subscriber::ChildOf(parent_socket_id));
 
     let rcv_timeout = engine_config
       .rcvtimeo
@@ -186,6 +191,8 @@ where
       pending_peer_identity_from_handshake: None,
       pending_peer_socket_type: None,
       error_for_drop_guard: None,
+      handshake_completed: false,
+      failed_after_handshake: false,
       ping_check_timer,
       handshake_deadline,
       socket_logic,
@@ -274,11 +281,6 @@ where
 
         match read_result {
           Err(_elapsed) => {
-            tracing::warn!(
-              sca_handle = self.handle,
-              uri = %self.actor_config.connected_endpoint_uri,
-              "Overall ZMTP handshake timed out."
-            );
             self.set_fatal_error(ZmqError::Timeout).await;
             break 'handshake;
           }
@@ -455,11 +457,8 @@ where
 
           maybe_event = self.system_event_receiver.recv() => {
             match maybe_event {
-              Ok(event) => self.process_system_event(event).await,
-              Err(broadcast::error::RecvError::Lagged(n)) => {
-                self.set_fatal_error(ZmqError::Internal(format!("System event lagged by {}", n))).await;
-              }
-              Err(broadcast::error::RecvError::Closed) => {
+              Some(event) => self.process_system_event(event).await,
+              None => {
                 self.set_fatal_error(ZmqError::Internal("System event channel closed".into())).await;
               }
             }
@@ -487,12 +486,16 @@ where
           // LINGER deadline expired mid-drain: give up and FIN. Real message
           // loss (matching ZMQ linger semantics) — always logged.
           _ = drain_deadline_future, if self.graceful_drain_requested && self.graceful_drain_deadline.is_some() => {
+            let (egress_pending, carryover, core_pipe_queued) =
+              (egress_buffer.pending_messages(), core_carryover.len(), self.core_pipe_manager.len());
             tracing::warn!(
               sca_handle = self.handle,
-              egress_pending = egress_buffer.pending_messages(),
-              core_carryover = core_carryover.len(),
-              core_pipe_queued = self.core_pipe_manager.len(),
-              "SCA: LINGER deadline expired during graceful drain — discarding remaining egress"
+              uri = %self.actor_config.connected_endpoint_uri,
+              egress_pending,
+              core_carryover = carryover,
+              core_pipe_queued,
+              "SCA LINGER deadline expired on {} during graceful drain, discarding {} queued for egress, {} carried over and {} in the core pipe.",
+              self.actor_config.connected_endpoint_uri, egress_pending, carryover, core_pipe_queued
             );
             self.graceful_drain_requested = false;
             self.graceful_drain_deadline = None;
@@ -563,7 +566,12 @@ where
                 }
               }
               Err(ZmqError::ConnectionClosed) => {
-                tracing::info!(sca_handle = self.handle, "Peer closed connection.");
+                tracing::info!(
+                  sca_handle = self.handle,
+                  uri = %self.actor_config.connected_endpoint_uri,
+                  "Peer closed connection {}.",
+                  self.actor_config.connected_endpoint_uri
+                );
                 self.transition_to_shutdown_stream(Some(ZmqError::ConnectionClosed)).await;
               }
               Err(e) => self.set_fatal_error(e).await,
@@ -689,8 +697,6 @@ where
   }
 
   async fn finalize(mut self, mut actor_drop_guard: ActorDropGuard) {
-    let had_error = self.error_for_drop_guard.is_some();
-
     if let Some(err) = self.error_for_drop_guard.take() {
       actor_drop_guard.set_error(err);
     } else {
@@ -699,8 +705,11 @@ where
 
     drop(actor_drop_guard);
 
-    if had_error {
-      self.session_regulator.enforce_min_lifespan().await;
+    if self.failed_after_handshake {
+      self
+        .session_regulator
+        .enforce_min_lifespan(&self.actor_config.connected_endpoint_uri)
+        .await;
     }
 
     tracing::info!(
@@ -893,6 +902,7 @@ where
         } => {
           self.pending_peer_identity_from_handshake = peer_identity;
           self.pending_peer_socket_type = peer_socket_type;
+          self.handshake_completed = true;
           self.current_phase = ConnectionPhaseX::WaitingForPipes;
           self.handshake_deadline = None;
           self.check_and_transition_to_operational().await;
@@ -943,7 +953,7 @@ where
           .context
           .event_bus()
           .publish(event)
-          .is_err()
+          == 0
         {
           tracing::warn!(
             sca_handle = self.handle,
@@ -1103,13 +1113,34 @@ where
       endpoint_uri: self.actor_config.connected_endpoint_uri.clone(),
       error_msg,
     };
-    if self.actor_config.context.event_bus().publish(event).is_err() {
+    if self.actor_config.context.event_bus().publish(event) == 0 {
       tracing::warn!(sca_handle = self.handle, "Failed to publish HandshakeFailed event.");
     }
   }
 
+  /// libzmq reports a connection that ends before its handshake completes as an
+  /// event and nothing else, whether the peer closed, reset, timed out or sent
+  /// a bad greeting. Any peer can cause one at will, so none of them is logged
+  /// above info.
   async fn set_fatal_error(&mut self, error: ZmqError) {
-    tracing::error!(sca_handle = self.handle, uri = %self.actor_config.connected_endpoint_uri, err = %error, "SCA fatal error.");
+    let uri = &self.actor_config.connected_endpoint_uri;
+    if self.handshake_completed || matches!(error, ZmqError::Internal(_)) {
+      tracing::error!(
+        sca_handle = self.handle,
+        uri = %uri,
+        phase = ?self.current_phase,
+        err = %error,
+        "SCA fatal error on {} during {:?}: {}",
+        uri, self.current_phase, error
+      );
+    } else if matches!(error, ZmqError::ConnectionClosed) {
+      tracing::debug!(sca_handle = self.handle, uri = %uri, err = %error, "SCA handshake failed on {}: {}", uri, error);
+    } else {
+      tracing::info!(sca_handle = self.handle, uri = %uri, err = %error, "SCA handshake failed on {}: {}", uri, error);
+    }
+    if self.handshake_completed {
+      self.failed_after_handshake = true;
+    }
 
     if self.error_for_drop_guard.is_none() {
       self.error_for_drop_guard = Some(error);
@@ -1129,7 +1160,12 @@ where
           tracing::debug!(sca_handle = self.handle, "Write half shutdown successful.");
         }
         Err(e) => {
-          tracing::warn!(sca_handle = self.handle, error = %e, "Error during write half shutdown.");
+          tracing::debug!(
+            sca_handle = self.handle,
+            error = %e,
+            "Write half shutdown after the fatal error on {} failed: {}",
+            self.actor_config.connected_endpoint_uri, e
+          );
         }
       }
     }
@@ -1215,7 +1251,12 @@ where
           tracing::debug!(sca_handle = self.handle, "Write half shutdown successful.");
         }
         Err(e) => {
-          tracing::warn!(sca_handle = self.handle, error = %e, "Error during write half shutdown.");
+          tracing::warn!(
+            sca_handle = self.handle,
+            error = %e,
+            "Error during write half shutdown on {}: {}",
+            self.actor_config.connected_endpoint_uri, e
+          );
           if self.error_for_drop_guard.is_none() {
             self.error_for_drop_guard = Some(ZmqError::from_io_endpoint(e, "graceful shutdown"));
           }

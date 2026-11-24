@@ -14,7 +14,7 @@ pub(crate) use command::Command;
 pub(crate) use mailbox::{mailbox, MailboxReceiver, MailboxSender, MailboxSyncSender};
 
 // System Coordination
-pub(crate) use event_bus::EventBus;
+pub(crate) use event_bus::{EventBus, EventReceiver, Subscriber};
 pub use system_events::ActorType;
 pub(crate) use system_events::SystemEvent;
 

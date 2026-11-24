@@ -1,5 +1,5 @@
 use crate::error::ZmqError;
-use crate::runtime::{ActorDropGuard, ActorType, MailboxReceiver, SystemEvent};
+use crate::runtime::{ActorDropGuard, ActorType, EventReceiver, MailboxReceiver};
 use crate::socket::core::state::ShutdownPhase;
 use crate::socket::core::{command_processor, event_processor, shutdown, SocketCore};
 use crate::socket::ISocket;
@@ -7,7 +7,6 @@ use crate::Command;
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tokio::time::{interval, Interval};
 
 /// The main actor loop for `SocketCore`.
@@ -16,7 +15,7 @@ pub(crate) async fn run_command_loop(
   core_arc: Arc<SocketCore>,
   socket_logic_strong: Arc<dyn ISocket>,
   command_receiver: MailboxReceiver,
-  mut system_event_rx: broadcast::Receiver<SystemEvent>,
+  mut system_event_rx: EventReceiver,
 ) {
   let core_handle = core_arc.handle;
   let context_clone_for_stop = core_arc.context.clone(); // For publishing ActorStopping
@@ -66,7 +65,7 @@ pub(crate) async fn run_command_loop(
         // Only listen to system events if not fully finished shutting down.
         event_result = system_event_rx.recv(), if current_shutdown_phase != ShutdownPhase::Finished => {
             match event_result {
-                Ok(event) => {
+                Some(event) => {
                     // Delegate to event_processor module
                     if let Err(e) = event_processor::process_system_event(
                         core_arc.clone(),
@@ -85,15 +84,7 @@ pub(crate) async fn run_command_loop(
                         // Loop will break due to ShutdownPhase::Finished or next error check
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(handle = core_handle, skipped = n, "System event bus lagged for SocketCore!");
-                    // Potentially treat as critical error and initiate shutdown if not already underway
-                    if current_shutdown_phase == ShutdownPhase::Running {
-                        final_error_for_actorstop = Some(ZmqError::Internal("SocketCore: Event bus lagged".into()));
-                        shutdown::initiate_core_shutdown(core_arc.clone(), &socket_logic_strong, true).await;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => {
+                None => {
                     tracing::error!(handle = core_handle, "System event bus closed unexpectedly!");
                     final_error_for_actorstop = Some(ZmqError::Internal("SocketCore: Event bus closed".into()));
                     if current_shutdown_phase == ShutdownPhase::Running {

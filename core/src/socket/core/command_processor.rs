@@ -953,7 +953,7 @@ pub(crate) async fn handle_connect_failed_event(
   error: ZmqError,
 ) {
   let core_handle = core_arc.handle;
-  tracing::warn!(handle = core_handle, uri = %target_uri, error = %error, "ConnectionAttemptFailed event received.");
+  tracing::debug!(handle = core_handle, uri = %target_uri, error = %error, "Connect to {} failed: {}", target_uri, error);
 
   // Emit monitor event
   let monitor_event = SocketEvent::ConnectFailed {
@@ -995,10 +995,11 @@ pub(crate) async fn handle_connect_failed_event(
       uri = %target_uri,
       attempt = recon_state.current_attempts,
       next_attempt_in = ?delay,
-      "Connection failed. Scheduling reconnect via passive backoff."
+      "Connection to {} failed. Scheduling reconnect via passive backoff.",
+      target_uri
     );
   } else {
-    tracing::info!(handle = core_handle, uri = %target_uri, "Connection failed, reconnect not enabled or error is fatal.");
+    tracing::info!(handle = core_handle, uri = %target_uri, "Connection to {} failed, reconnect not enabled or error is fatal.", target_uri);
   }
 }
 

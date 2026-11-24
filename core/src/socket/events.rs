@@ -1,3 +1,4 @@
+use fibre::TrySendError;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,11 +109,18 @@ impl MonitorHandle {
     *self.slot.write() = Some(sender);
   }
 
-  /// Drops the event when no monitor is attached or its buffer is full.
+  /// Drops the event when no monitor is attached, its receiver is gone or its
+  /// buffer is full.
   pub(crate) fn emit(&self, event: SocketEvent) {
     if let Some(tx) = self.slot.read().as_ref() {
-      if tx.try_send(event.with_clean_endpoint()).is_err() {
-        tracing::warn!("Failed to send event to monitor channel (full or closed)");
+      match tx.try_send(event.with_clean_endpoint()) {
+        Ok(()) => {}
+        Err(TrySendError::Full(event)) => {
+          tracing::warn!("Monitor channel is full, dropped {:?}", event);
+        }
+        Err(TrySendError::Closed(event) | TrySendError::Sent(event)) => {
+          tracing::trace!("Monitor receiver is gone, dropped {:?}", event);
+        }
       }
     }
   }
