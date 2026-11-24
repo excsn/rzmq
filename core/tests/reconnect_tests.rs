@@ -568,3 +568,89 @@ async fn test_dealer_router_multiple_disconnect_reconnect_cycle() -> Result<(), 
   ctx.term().await?;
   Ok(())
 }
+
+/// Unrelated `SystemEvent`s on the shared context EventBus (e.g. sibling sockets
+/// starting and closing) must not abort `RECONNECT_IVL` backoff into a tight retry
+/// spin-loop, nor terminate reconnection.
+#[tokio::test]
+#[serial]
+async fn test_tcp_reconnect_backoff_not_aborted_by_sibling_system_events() -> Result<(), ZmqError> {
+  let endpoint = free_tcp_endpoint();
+  let ctx = common::test_context();
+
+  let push_socket = ctx.socket(SocketType::Push)?;
+  let reconnect_ivl_ms: i32 = 400;
+  let push_monitor_rx = configure_client_socket_for_reconnect_with_monitor(
+    &push_socket,
+    &endpoint,
+    reconnect_ivl_ms,
+    CLIENT_SNDTIMEO_MS_MR,
+    CLIENT_RCVTIMEO_MS_MR,
+  )
+  .await?;
+  push_socket.connect(&endpoint).await?;
+
+  let _ = common::wait_for_monitor_event(
+    &push_monitor_rx,
+    Duration::from_secs(2),
+    Duration::from_millis(20),
+    |e| matches!(e, SocketEvent::ConnectRetried { .. }),
+  )
+  .await
+  .map_err(|e| ZmqError::Internal(format!("Never saw initial ConnectRetried: {}", e)))?;
+
+  for _ in 0..16 {
+    let sibling = ctx.socket(SocketType::Push)?;
+    sibling.close().await?;
+    sleep(Duration::from_millis(10)).await;
+  }
+
+  let mut extra_retries = 0usize;
+  while let Ok(Ok(event)) =
+    tokio::time::timeout(Duration::from_millis(5), push_monitor_rx.recv()).await
+  {
+    if matches!(event, SocketEvent::ConnectRetried { .. }) {
+      extra_retries += 1;
+    }
+  }
+  assert!(
+    extra_retries <= 2,
+    "Expected backoff to suppress tight reconnect retries during sibling SystemEvent burst, got {} extra ConnectRetried events in ~160ms with RECONNECT_IVL={}ms",
+    extra_retries,
+    reconnect_ivl_ms
+  );
+
+  let pull_socket = ctx.socket(SocketType::Pull)?;
+  configure_server_socket_for_test(
+    &pull_socket,
+    &endpoint,
+    SERVER_SNDTIMEO_MS_MR,
+    SERVER_RCVTIMEO_MS_MR,
+  )
+  .await?;
+  pull_socket.bind(&endpoint).await?;
+
+  let _ = common::wait_for_monitor_event(
+    &push_monitor_rx,
+    Duration::from_secs(3),
+    Duration::from_millis(25),
+    |e| {
+      matches!(
+        e,
+        SocketEvent::HandshakeSucceeded { endpoint: ep }
+          if ep.contains(endpoint.strip_prefix("tcp://").unwrap_or(&endpoint))
+      )
+    },
+  )
+  .await
+  .map_err(|e| ZmqError::Internal(format!("PUSH did not reconnect after sibling burst: {}", e)))?;
+
+  push_socket
+    .send(Msg::from_static(b"post-burst-reconnect"))
+    .await?;
+  let received = common::recv_timeout(&pull_socket, Duration::from_secs(1)).await?;
+  assert_eq!(received.data().unwrap(), b"post-burst-reconnect");
+
+  ctx.term().await?;
+  Ok(())
+}

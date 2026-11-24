@@ -213,7 +213,7 @@ async fn test_throttle_stats_ipc() -> Result<(), ZmqError> {
 
 const RECEIVED: u32 = 10;
 
-async fn pull_stats_after_traffic(cfg: AdaptiveThrottleSocketConfig) -> Result<(rzmq::Context, Socket), ZmqError> {
+async fn pull_stats_after_traffic(cfg: AdaptiveThrottleSocketConfig) -> Result<(rzmq::Context, Socket, Socket), ZmqError> {
   let ctx = common::test_context();
   let push = ctx.socket(SocketType::Push)?;
   let pull = ctx.socket(SocketType::Pull)?;
@@ -229,7 +229,7 @@ async fn pull_stats_after_traffic(cfg: AdaptiveThrottleSocketConfig) -> Result<(
   for _ in 0..RECEIVED {
     common::recv_timeout(&pull, Duration::from_secs(3)).await?;
   }
-  Ok((ctx, pull))
+  Ok((ctx, push, pull))
 }
 
 async fn wait_for_balance(socket: &Socket, balance: i32) -> Result<ThrottleStats, ZmqError> {
@@ -248,7 +248,7 @@ async fn test_throttle_config_credit_per_message_applies() -> Result<(), ZmqErro
   if common::io_uring_requested() {
     return Ok(());
   }
-  let (ctx, pull) = pull_stats_after_traffic(AdaptiveThrottleSocketConfig {
+  let (ctx, _push, pull) = pull_stats_after_traffic(AdaptiveThrottleSocketConfig {
     credit_per_message: 7,
     yield_after_n_consecutive: u32::MAX,
     ..Default::default()
@@ -268,7 +268,7 @@ async fn test_throttle_config_yield_after_n_consecutive_applies() -> Result<(), 
   if common::io_uring_requested() {
     return Ok(());
   }
-  let (ctx, pull) = pull_stats_after_traffic(AdaptiveThrottleSocketConfig {
+  let (ctx, _push, pull) = pull_stats_after_traffic(AdaptiveThrottleSocketConfig {
     credit_per_message: 7,
     yield_after_n_consecutive: 1,
     ..Default::default()
@@ -287,7 +287,7 @@ async fn test_throttle_disabled_leaves_state_untouched() -> Result<(), ZmqError>
   if common::io_uring_requested() {
     return Ok(());
   }
-  let (ctx, pull) = pull_stats_after_traffic(AdaptiveThrottleSocketConfig {
+  let (ctx, _push, pull) = pull_stats_after_traffic(AdaptiveThrottleSocketConfig {
     enabled: false,
     ..Default::default()
   })

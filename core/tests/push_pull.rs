@@ -1,6 +1,6 @@
 // tests/push_pull.rs
 
-use rzmq::socket::options::{RCVHWM, SNDHWM, SNDTIMEO};
+use rzmq::socket::options::{RCVHWM, RECONNECT_IVL, SNDHWM, SNDTIMEO};
 use rzmq::{Context, Msg, Socket, SocketType, ZmqError};
 use std::time::Duration;
 mod common; // Import common helpers
@@ -292,6 +292,7 @@ async fn test_push_sndtimeo_positive_no_peer() -> Result<(), ZmqError> {
 
   // The connect pipe holds one message; the next send has nowhere to go.
   push.set_option_raw(SNDHWM, &1i32.to_ne_bytes()).await?;
+  push.set_option_raw(RECONNECT_IVL, &50i32.to_ne_bytes()).await?;
   println!("Connecting PUSH to {} (no listener)...", endpoint);
   push.connect(endpoint).await?;
   println!("PUSH connect call returned Ok.");

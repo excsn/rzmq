@@ -1,5 +1,5 @@
 use rzmq::socket::options::SNDTIMEO;
-use rzmq::socket::SocketEvent;
+use rzmq::socket::{MonitorReceiver, SocketEvent};
 use rzmq::{Msg, SocketType, ZmqError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +28,128 @@ async fn test_context_term_with_connecter_in_flight_is_prompt() -> Result<(), Zm
     let took = started.elapsed();
     assert!(took < Duration::from_secs(1), "term took {took:?}");
   }
+  Ok(())
+}
+
+/// Runs `scenario` on a runtime whose blocking pool is one thread and holds
+/// that thread until `scenario` returns. tokio resolves a hostname on the
+/// blocking pool, so a connecter's lookup stays pending for the whole scenario.
+fn run_with_dns_lookups_held<F>(scenario: impl FnOnce() -> F) -> (Duration, Result<(), ZmqError>)
+where
+  F: std::future::Future<Output = Result<(), ZmqError>>,
+{
+  let runtime = tokio::runtime::Builder::new_current_thread()
+    .enable_all()
+    .max_blocking_threads(1)
+    .build()
+    .expect("runtime");
+  runtime.block_on(async {
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (holding_tx, holding) = tokio::sync::oneshot::channel::<()>();
+    let holder = task::spawn_blocking(move || {
+      let _ = holding_tx.send(());
+      let _ = held.recv();
+    });
+    holding.await.expect("blocking thread held");
+
+    let started = std::time::Instant::now();
+    let outcome = timeout(Duration::from_secs(30), scenario()).await;
+    let took = started.elapsed();
+
+    drop(release);
+    holder.await.expect("holder");
+    (took, outcome.expect("scenario finished"))
+  })
+}
+
+#[test]
+fn test_context_term_during_a_connecters_dns_lookup_is_prompt() -> Result<(), ZmqError> {
+  let (took, outcome) = run_with_dns_lookups_held(|| async {
+    let ctx = common::test_context();
+    let connected = ctx.socket(SocketType::Push)?;
+    connected.connect("tcp://localhost:5870").await?;
+    ctx.term().await
+  });
+  assert!(took < Duration::from_secs(1), "term took {took:?}");
+  outcome
+}
+
+#[test]
+fn test_socket_close_during_a_connecters_dns_lookup_is_prompt() -> Result<(), ZmqError> {
+  let (took, outcome) = run_with_dns_lookups_held(|| async {
+    let ctx = common::test_context();
+    let connected = ctx.socket(SocketType::Push)?;
+    connected.connect("tcp://localhost:5871").await?;
+    connected.close().await?;
+    ctx.term().await
+  });
+  assert!(took < Duration::from_secs(1), "close and term took {took:?}");
+  outcome
+}
+
+/// Every event still queued on `monitor` once its socket has stopped.
+async fn events_until_monitor_closes(monitor: &MonitorReceiver) -> Vec<SocketEvent> {
+  let mut events = Vec::new();
+  while let Ok(Ok(event)) = timeout(SHORT_TIMEOUT, monitor.recv()).await {
+    events.push(event);
+  }
+  events
+}
+
+fn disconnected_count(events: &[SocketEvent]) -> usize {
+  events.iter().filter(|e| matches!(e, SocketEvent::Disconnected { .. })).count()
+}
+
+/// libzmq raises `ZMQ_EVENT_DISCONNECTED` from the engine of a connection
+/// (`stream_engine_base_t::error`). An endpoint that never connected has none.
+#[tokio::test]
+async fn test_closing_a_socket_that_never_connected_emits_no_disconnected_event() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  let unused_port = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port").local_addr().expect("local addr").port();
+  let endpoint = format!("tcp://127.0.0.1:{unused_port}");
+  let push = ctx.socket(SocketType::Push)?;
+  let monitor = push.monitor_default().await?;
+  push.connect(&endpoint).await?;
+  common::wait_for_monitor_event(&monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::ConnectDelayed { .. })
+  })
+  .await
+  .expect("first connect attempt fails");
+
+  push.close().await?;
+  ctx.term().await?;
+
+  let events = events_until_monitor_closes(&monitor).await;
+  assert_eq!(disconnected_count(&events), 0, "events after close: {events:#?}");
+  Ok(())
+}
+
+#[tokio::test]
+async fn test_a_peer_that_left_before_close_is_reported_disconnected_once() -> Result<(), ZmqError> {
+  let ctx = common::test_context();
+  let pull = ctx.socket(SocketType::Pull)?;
+  let endpoint = common::bind_and_resolve_tcp(&pull).await?;
+  let push = ctx.socket(SocketType::Push)?;
+  let monitor = push.monitor_default().await?;
+  push.connect(&endpoint).await?;
+  common::wait_for_monitor_event(&monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::HandshakeSucceeded { .. })
+  })
+  .await
+  .expect("handshake");
+
+  pull.close().await?;
+  common::wait_for_monitor_event(&monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::Disconnected { .. })
+  })
+  .await
+  .expect("the peer leaving is reported");
+
+  push.close().await?;
+  ctx.term().await?;
+
+  let events = events_until_monitor_closes(&monitor).await;
+  assert_eq!(disconnected_count(&events), 0, "events after close: {events:#?}");
   Ok(())
 }
 
@@ -448,5 +570,89 @@ async fn test_concurrent_term_and_op() -> Result<(), ZmqError> {
   }
 
   println!("Test test_concurrent_term_and_op finished.");
+  Ok(())
+}
+
+/// Dropping the last `Socket` handle without explicitly calling `close().await`
+/// must still stop its `SocketCore` actor and disconnect peers cleanly.
+#[tokio::test]
+async fn test_socket_drop_without_close_stops_actor_and_disconnects_peer() -> anyhow::Result<()> {
+  let ctx = common::test_context();
+  let push = ctx.socket(SocketType::Push)?;
+  let push_monitor = push.monitor_default().await?;
+  let endpoint = common::bind_and_resolve_tcp(&push).await?;
+
+  {
+    let pull = ctx.socket(SocketType::Pull)?;
+    pull.connect(&endpoint).await?;
+
+    common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+      matches!(e, SocketEvent::HandshakeSucceeded { .. })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("HandshakeSucceeded wait failed: {}", e))?;
+
+    push.send(Msg::from_static(b"before-drop")).await?;
+    let msg = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+    assert_eq!(msg.data().unwrap(), b"before-drop");
+  }
+
+  common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::Disconnected { .. })
+  })
+  .await
+  .map_err(|e| anyhow::anyhow!("Peer did not observe Disconnected after Socket drop: {}", e))?;
+
+  push.set_option_raw(SNDTIMEO, &(0i32).to_ne_bytes()).await?;
+  let send_res = push.send(Msg::from_static(b"after-drop")).await;
+  assert!(
+    matches!(send_res, Err(ZmqError::ResourceLimitReached)),
+    "Expected ResourceLimitReached after dropped peer disconnected, got {:?}",
+    send_res
+  );
+
+  ctx.term().await?;
+  Ok(())
+}
+
+/// Dropping a cloned `Socket` handle keeps the socket alive while another
+/// clone still exists. The actor stops once the last clone is dropped.
+#[tokio::test]
+async fn test_socket_clone_drop_keeps_socket_alive_until_last_handle_drops() -> anyhow::Result<()> {
+  let ctx = common::test_context();
+  let push = ctx.socket(SocketType::Push)?;
+  let push_monitor = push.monitor_default().await?;
+  let endpoint = common::bind_and_resolve_tcp(&push).await?;
+
+  let pull = ctx.socket(SocketType::Pull)?;
+  pull.connect(&endpoint).await?;
+
+  common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::HandshakeSucceeded { .. })
+  })
+  .await
+  .map_err(|e| anyhow::anyhow!("HandshakeSucceeded wait failed: {}", e))?;
+
+  let pull_clone = pull.clone();
+  drop(pull_clone);
+  tokio::time::sleep(Duration::from_millis(50)).await;
+
+  push.send(Msg::from_static(b"still-alive")).await?;
+  let msg = common::recv_timeout(&pull, LONG_TIMEOUT).await?;
+  assert_eq!(msg.data().unwrap(), b"still-alive");
+
+  drop(pull);
+  common::wait_for_monitor_event(&push_monitor, MONITOR_EVENT_TIMEOUT, SHORT_TIMEOUT, |e| {
+    matches!(e, SocketEvent::Disconnected { .. })
+  })
+  .await
+  .map_err(|e| {
+    anyhow::anyhow!(
+      "Peer did not observe Disconnected after final Socket clone dropped: {}",
+      e
+    )
+  })?;
+
+  ctx.term().await?;
   Ok(())
 }
