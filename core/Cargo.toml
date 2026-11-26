@@ -1,6 +1,6 @@
 [package]
 name = "rzmq"
-version = "0.5.28"
+version = "0.5.29"
 edition = "2024"
 license = "MPL-2.0"
 publish = true
@@ -12,6 +12,14 @@ repository = "https://github.com/excsn/rzmq"
 homepage = "https://github.com/excsn/rzmq"
 keywords = ["zeromq", "messaging", "async", "network", "io_uring"]
 categories = ["asynchronous", "network-programming", "concurrency"]
+include = [
+  "/src/**/*.rs",
+  "/Cargo.toml",
+  "/LICENSE.md",
+  "/README.md",
+  "/README.USAGE.md",
+  "/API_REFERENCE.md",
+]
 
 [features]
 full = ["default", "ipc", "inproc", "plain", "noise_xx", "curve"]
