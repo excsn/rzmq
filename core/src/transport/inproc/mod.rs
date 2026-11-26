@@ -87,7 +87,7 @@ pub(crate) async fn connect_inproc(
   // Channel on which the connector receives frames from the binder.
   let (tx_to_connector, rx_for_connector) = bounded_async::<FrameBatch>(rcvhwm);
 
-  let (reply_tx, reply_rx) = oneshot::oneshot();
+  let (reply_tx, mut reply_rx) = oneshot::oneshot();
   let request = InprocHandshakeRequest {
     connector_id: connector_core_handle,
     connector_socket_type,
