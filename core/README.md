@@ -15,7 +15,7 @@ It provides a familiar ZeroMQ-style API within the Rust async ecosystem, **striv
 
 TCP Loopback PUSH/PULL Sockets Fan-In, 10-second window, Adaptive Throttling disabled.
 
-<sub>Linux release build, AMD Ryzen 5 7640U Balanced Power Profile.</sub>
+<sub>Linux release build, AMD Ryzen 5 7640U.</sub>
 
 Standard, 4 PUSH | **6.1 M msg/s** - 64 B | **~17 GB/s** - 32 KB · cork
 
