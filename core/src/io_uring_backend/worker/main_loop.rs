@@ -988,9 +988,9 @@ pub(crate) fn run_worker_loop(worker: &mut UringWorker) -> Result<(), ZmqError> 
               .internal_op_tracker
               .op_to_details
               .iter()
-              .any(|(_, d)| {
+              .any(|(_, op)| {
                 matches!(
-                  d.op_type,
+                  op.details.op_type,
                   super::InternalOpType::Send
                     | super::InternalOpType::SendZeroCopy
                     | super::InternalOpType::SendRawVectored

@@ -11,6 +11,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tracing::{debug, error, info, trace, warn};
 
+/// How long a requested close waits for its in-flight write. Below the 5 s a
+/// `UringFdConnection::close_connection` waits for the close to be confirmed.
+const CLOSE_WRITE_DRAIN_LIMIT: Duration = Duration::from_secs(4);
+
 use crate::ZmqError;
 use crate::io_uring_backend::{
   buffer_manager::BufferRingManager,
@@ -271,6 +275,9 @@ pub(crate) struct ZmtpUringHandler {
   /// share the `write_in_flight` gate instead of racing an in-flight write.
   priority_egress: Vec<Bytes>,
   write_in_flight: u32,
+  /// A requested close is waiting for `write_in_flight` to reach zero before
+  /// it closes the fd. `close_deadline` bounds the wait.
+  close_after_write: bool,
   event_fd: eventfd::EventFD,
   worker_asleep: Arc<AtomicU8>,
   /// Diagnostic: first instant reads were observed un-armed while the connection is
@@ -332,6 +339,7 @@ impl ZmtpUringHandler {
       coalesce_scratch: Vec::with_capacity(sndbatch_count),
       priority_egress: Vec::new(),
       write_in_flight: 0,
+      close_after_write: false,
       event_fd,
       worker_asleep,
       #[cfg(feature = "diagnostics")]
@@ -399,6 +407,13 @@ impl ZmtpUringHandler {
 
   /// Reports this connection's failure to SocketCore once, saying whether its
   /// handshake had completed.
+  fn close_now(&mut self) -> HandlerIoOps {
+    self.close_after_write = false;
+    self.close_deadline = None;
+    self.close_requested = true;
+    HandlerIoOps::new().add_blueprint(HandlerSqeBlueprint::RequestClose)
+  }
+
   fn report_fd_error(&mut self, error: ZmqError) {
     if self.fd_error_reported {
       return;
@@ -421,6 +436,7 @@ impl ZmtpUringHandler {
     for net in output.net_actions {
       match net {
         NetAction::Send { data, zc_eligible } => {
+          self.write_in_flight += 1;
           if zc_eligible && self.use_send_zerocopy && data.len() >= self.engine.config().zc_send_threshold {
             ops
               .sqe_blueprints
@@ -716,6 +732,9 @@ impl UringConnectionHandler for ZmtpUringHandler {
       if cqe_result >= 0 && self.engine.heartbeats_enabled() {
         self.engine.record_activity();
       }
+      if self.close_after_write && self.write_in_flight == 0 {
+        return self.close_now();
+      }
     }
 
     if cqe_result < 0 {
@@ -878,6 +897,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
     // (c) Non-blocking delayed close check.
     if let Some(deadline) = self.close_deadline {
       if Instant::now() >= deadline {
+        if self.close_after_write {
+          debug!(fd = self.fd, writes = self.write_in_flight, "ZmtpUringHandler: write still in flight at the close deadline");
+        }
+        self.close_after_write = false;
         self.close_deadline = None;
         self.close_requested = true;
         ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestClose);
@@ -901,8 +924,10 @@ impl UringConnectionHandler for ZmtpUringHandler {
     if self.close_requested {
       return HandlerIoOps::new();
     }
+    if self.close_after_write {
+      return self.close_now();
+    }
     self.is_closing = true;
-    self.close_requested = true;
     self.close_deadline = None;
     // An in-flight read holds a reference to the socket, so IORING_OP_CLOSE alone
     // leaves it open and sends no FIN. SHUT_RD completes that read with 0 and keeps
@@ -917,6 +942,12 @@ impl UringConnectionHandler for ZmtpUringHandler {
         ops.sqe_blueprints.push(cancel_bp);
       }
     }
+    if self.write_in_flight > 0 {
+      self.close_after_write = true;
+      self.close_deadline = Some(Instant::now() + CLOSE_WRITE_DRAIN_LIMIT);
+      return ops;
+    }
+    self.close_requested = true;
     ops.sqe_blueprints.push(HandlerSqeBlueprint::RequestClose);
     ops
   }
@@ -1097,5 +1128,9 @@ impl UringConnectionHandler for ZmtpUringHandler {
       fd = self.fd,
       "ZmtpUringHandler: buffer ring exhausted (ENOBUFS) — transient"
     );
+  }
+
+  fn on_write_failed(&mut self) {
+    self.write_in_flight = 0;
   }
 }

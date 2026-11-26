@@ -3,7 +3,7 @@
 use crate::io_uring_backend::ops::UserData;
 use crate::io_uring_backend::send_buffer_pool::RegisteredSendBufferId;
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
 
 /// Simple, protocol-agnostic scatter-gather batch for raw vectored writes.
@@ -95,14 +95,29 @@ pub(crate) struct InternalOpDetails {
 /// Internal op user_data IDs are offset by this constant so they never overlap with
 /// external (app-visible) op IDs, which are allocated from the range 1..INTERNAL_OP_BASE.
 const INTERNAL_OP_BASE: u64 = 1_000_000_000;
+const SLOT_BITS: u32 = 32;
+const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
+
+/// A tracked op and the generation its `user_data` carries. A slab slot is
+/// reused once freed, so the generation is what tells a late CQE of an earlier
+/// op in the same slot from the op that holds it now.
+#[derive(Debug)]
+pub(crate) struct TrackedOp {
+  generation: u32,
+  pub(crate) details: InternalOpDetails,
+}
 
 #[derive(Debug)]
 pub(crate) struct InternalOpTracker {
-  /// Hot path: O(1) direct-index lookup via `user_data - INTERNAL_OP_BASE`.
-  pub(crate) op_to_details: slab::Slab<InternalOpDetails>,
+  /// Hot path: O(1) direct-index lookup via the slot bits of `user_data`.
+  pub(crate) op_to_details: slab::Slab<TrackedOp>,
   /// Cold path: holds entries for in-flight SEND_ZC operations awaiting a second
   /// notification CQE with the same `user_data`. Typically empty; bounded by active ZC sends.
   pending_notifications: HashMap<UserData, InternalOpDetails>,
+  /// Ops still in the kernel whose fd has been closed. Their CQEs only release
+  /// what the op holds; the fd number may already belong to a new connection.
+  orphaned: HashSet<UserData>,
+  next_generation: u32,
 }
 
 impl InternalOpTracker {
@@ -110,7 +125,28 @@ impl InternalOpTracker {
     Self {
       op_to_details: slab::Slab::new(),
       pending_notifications: HashMap::new(),
+      orphaned: HashSet::new(),
+      next_generation: 0,
     }
+  }
+
+  fn encode(slot: usize, generation: u32) -> UserData {
+    INTERNAL_OP_BASE + (((generation as u64) << SLOT_BITS) | slot as u64)
+  }
+
+  /// The slab slot of `user_data` if that slot still holds the op it names.
+  fn live_slot(&self, user_data: UserData) -> Option<usize> {
+    if user_data < INTERNAL_OP_BASE {
+      return None;
+    }
+    let raw = user_data - INTERNAL_OP_BASE;
+    let slot = (raw & SLOT_MASK) as usize;
+    let generation = (raw >> SLOT_BITS) as u32;
+    self
+      .op_to_details
+      .get(slot)
+      .filter(|op| op.generation == generation)
+      .map(|_| slot)
   }
 
   /// Allocates a new `UserData` for an internal operation, stores its details, and returns the ID.
@@ -120,36 +156,35 @@ impl InternalOpTracker {
     op_type: InternalOpType,
     payload: InternalOpPayload,
   ) -> UserData {
-    let key = self.op_to_details.insert(InternalOpDetails {
-      fd,
-      op_type,
-      payload,
+    let generation = self.next_generation;
+    self.next_generation = self.next_generation.wrapping_add(1);
+    let slot = self.op_to_details.insert(TrackedOp {
+      generation,
+      details: InternalOpDetails {
+        fd,
+        op_type,
+        payload,
+      },
     });
-    key as u64 + INTERNAL_OP_BASE
+    Self::encode(slot, generation)
   }
 
   pub fn take_op_details(&mut self, user_data: UserData) -> Option<InternalOpDetails> {
-    if user_data < INTERNAL_OP_BASE {
-      return None;
+    if !self.orphaned.is_empty() {
+      self.orphaned.remove(&user_data);
     }
-    let key = (user_data - INTERNAL_OP_BASE) as usize;
-    if self.op_to_details.contains(key) {
-      Some(self.op_to_details.remove(key))
-    } else {
-      self.pending_notifications.remove(&user_data)
+    match self.live_slot(user_data) {
+      Some(slot) => Some(self.op_to_details.remove(slot).details),
+      None => self.pending_notifications.remove(&user_data),
     }
   }
 
   #[allow(dead_code)]
   pub fn get_op_details(&self, user_data: UserData) -> Option<&InternalOpDetails> {
-    if user_data < INTERNAL_OP_BASE {
-      return None;
+    match self.live_slot(user_data) {
+      Some(slot) => Some(&self.op_to_details[slot].details),
+      None => self.pending_notifications.get(&user_data),
     }
-    let key = (user_data - INTERNAL_OP_BASE) as usize;
-    self
-      .op_to_details
-      .get(key)
-      .or_else(|| self.pending_notifications.get(&user_data))
   }
 
   /// Re-registers details for a SEND_ZC op that expects a second notification CQE with the
@@ -169,45 +204,87 @@ impl InternalOpTracker {
     self
       .op_to_details
       .iter()
-      .map(|(k, _)| k as u64 + INTERNAL_OP_BASE)
+      .map(|(slot, op)| Self::encode(slot, op.generation))
       .chain(self.pending_notifications.keys().copied())
       .collect()
   }
 
-  pub fn remove_ops_for_fd(&mut self, fd_to_remove: RawFd) -> Vec<InternalOpDetails> {
-    let slab_keys: Vec<usize> = self
-      .op_to_details
-      .iter()
-      .filter(|(_, v)| v.fd == fd_to_remove)
-      .map(|(k, _)| k)
-      .collect();
-    let mut removed: Vec<InternalOpDetails> = slab_keys
-      .into_iter()
-      .map(|k| self.op_to_details.remove(k))
-      .collect();
+  pub fn is_orphaned(&self, user_data: UserData) -> bool {
+    !self.orphaned.is_empty() && self.orphaned.contains(&user_data)
+  }
 
-    let notif_keys: Vec<UserData> = self
-      .pending_notifications
-      .iter()
-      .filter(|(_, d)| d.fd == fd_to_remove)
-      .map(|(k, _)| *k)
-      .collect();
-    for k in notif_keys {
-      if let Some(d) = self.pending_notifications.remove(&k) {
-        removed.push(d);
+  /// Marks every op still tracked for `fd` as orphaned and returns their types.
+  /// Each keeps its `user_data` and payload until its final CQE.
+  pub fn orphan_ops_for_fd(&mut self, fd: RawFd) -> Vec<InternalOpType> {
+    let mut orphaned_types = Vec::new();
+    for (slot, op) in self.op_to_details.iter() {
+      if op.details.fd == fd {
+        let user_data = Self::encode(slot, op.generation);
+        if self.orphaned.insert(user_data) {
+          orphaned_types.push(op.details.op_type);
+        }
       }
     }
-    removed
+    for (user_data, details) in self.pending_notifications.iter() {
+      if details.fd == fd && self.orphaned.insert(*user_data) {
+        orphaned_types.push(details.op_type);
+      }
+    }
+    orphaned_types
   }
 
   pub(crate) fn has_pending_read_op(&self, fd_to_check: RawFd) -> bool {
     // pending_notifications holds ZC send continuations, never reads
-    self.op_to_details.iter().any(|(_, d)| {
-      d.fd == fd_to_check
+    self.op_to_details.iter().any(|(slot, op)| {
+      op.details.fd == fd_to_check
         && matches!(
-          d.op_type,
+          op.details.op_type,
           InternalOpType::RingRead | InternalOpType::RingReadMultishot
         )
+        && !self.is_orphaned(Self::encode(slot, op.generation))
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn a_late_cqe_of_a_freed_op_does_not_reach_the_op_reusing_its_slot() {
+    let mut tracker = InternalOpTracker::new();
+    let first = tracker.new_op_id(7, InternalOpType::SendRawVectored, InternalOpPayload::None);
+    assert!(tracker.take_op_details(first).is_some());
+
+    let second = tracker.new_op_id(9, InternalOpType::EventFdPoll, InternalOpPayload::None);
+    assert_ne!(first, second);
+    assert!(tracker.get_op_details(first).is_none());
+    assert!(tracker.take_op_details(first).is_none());
+    assert_eq!(tracker.take_op_details(second).map(|d| d.fd), Some(9));
+  }
+
+  #[test]
+  fn an_orphaned_op_keeps_its_user_data_until_its_final_cqe() {
+    let mut tracker = InternalOpTracker::new();
+    let write = tracker.new_op_id(7, InternalOpType::SendRawVectored, InternalOpPayload::None);
+    let read = tracker.new_op_id(7, InternalOpType::RingReadMultishot, InternalOpPayload::None);
+    let other = tracker.new_op_id(8, InternalOpType::RingRead, InternalOpPayload::None);
+
+    assert_eq!(
+      tracker.orphan_ops_for_fd(7),
+      vec![InternalOpType::SendRawVectored, InternalOpType::RingReadMultishot]
+    );
+    assert!(tracker.is_orphaned(write) && tracker.is_orphaned(read));
+    assert!(!tracker.is_orphaned(other));
+    assert!(!tracker.has_pending_read_op(7), "an orphaned read does not count for a new connection on fd 7");
+
+    let reused = tracker.new_op_id(7, InternalOpType::RingRead, InternalOpPayload::None);
+    assert!(!tracker.is_orphaned(reused));
+    assert_ne!(reused, write);
+    assert_ne!(reused, read);
+
+    assert_eq!(tracker.take_op_details(write).map(|d| d.op_type), Some(InternalOpType::SendRawVectored));
+    assert!(!tracker.is_orphaned(write));
+    assert!(tracker.is_orphaned(read));
   }
 }

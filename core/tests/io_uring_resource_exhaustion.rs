@@ -128,11 +128,7 @@ async fn test_zerocopy_send_buffer_pool_starvation() -> Result<(), ZmqError> {
               break;
             }
           }
-          Err(ZmqError::Timeout) => {
-            if received >= TOTAL_MSGS {
-              break;
-            }
-          }
+          Err(ZmqError::Timeout) => break,
           Err(e) => return Err(e),
         }
       }

@@ -682,6 +682,11 @@ pub(crate) fn process_all_cqes(
       continue;
     }
 
+    if worker.internal_op_tracker.is_orphaned(cqe_user_data) {
+      retire_orphan_cqe(worker, cqe_user_data, cqe_flags);
+      continue;
+    }
+
     let mut op_details_taken_for_final_processing: Option<InternalOpDetails> = None;
     let mut is_multishot_read_pending_more = false;
     let mut was_delegated_to_multishot_handler = false;
@@ -833,20 +838,12 @@ pub(crate) fn process_all_cqes(
             if let Some(mut h) = worker.handler_manager.remove_handler(handler_fd) {
               h.fd_has_been_closed();
             }
-            // Drop all queued write blueprints and in-flight send buffer allocations
-            // for this fd so they are freed immediately rather than leaking.
+            // Queued blueprints never reached the kernel. Ops that did keep their
+            // user_data and payload until their final CQE.
             worker.work_map.remove(&handler_fd);
-            let removed_ops = worker.internal_op_tracker.remove_ops_for_fd(handler_fd);
-            for op in removed_ops {
-              match op.payload {
-                InternalOpPayload::SendZeroCopy { send_buf_id, .. }
-                | InternalOpPayload::SendZeroCopyLeased { send_buf_id } => {
-                  if let Some(pool) = &worker.send_buffer_pool {
-                    pool.release_buffer(send_buf_id);
-                  }
-                }
-                _ => {}
-              }
+            let orphaned = worker.internal_op_tracker.orphan_ops_for_fd(handler_fd);
+            if !orphaned.is_empty() {
+              debug!(fd = handler_fd, op_types = ?orphaned, "CQE Processor: ops still in flight at close are kept until they complete.");
             }
             if let Some((mailbox, endpoint_uri, during_handshake)) = close_notify {
               let _ = mailbox.try_send(Command::UringFdError {
@@ -959,6 +956,9 @@ pub(crate) fn process_all_cqes(
                     fd = handler_fd,
                     errno, "EAGAIN on leased ZC send — no original data for retry. Closing."
                   );
+                  if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+                    handler.on_write_failed();
+                  }
                   worker
                     .fds_needing_close_initiated_pass
                     .push_back(handler_fd);
@@ -984,6 +984,9 @@ pub(crate) fn process_all_cqes(
                   fd = handler_fd,
                   errno, "Send recovery failed: payload structure mismatch. Closing connection."
                 );
+                if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+                  handler.on_write_failed();
+                }
                 worker
                   .fds_needing_close_initiated_pass
                   .push_back(handler_fd);
@@ -1015,6 +1018,9 @@ pub(crate) fn process_all_cqes(
             }
             let zmq_err = ZmqError::from(std::io::Error::from_raw_os_error(errno));
             error!(fd = handler_fd, error = %zmq_err, "Fatal write error during Send operation. Closing connection.");
+            if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+              handler.on_write_failed();
+            }
             worker
               .fds_needing_close_initiated_pass
               .push_back(handler_fd);
@@ -1103,6 +1109,9 @@ pub(crate) fn process_all_cqes(
                   fd = handler_fd,
                   "Partial write on unexpected payload type. Closing."
                 );
+                if let Some(handler) = worker.handler_manager.get_mut(handler_fd) {
+                  handler.on_write_failed();
+                }
                 worker
                   .fds_needing_close_initiated_pass
                   .push_back(handler_fd);
@@ -1311,4 +1320,32 @@ pub(crate) fn process_all_cqes(
   }
 
   Ok((num_processed, new_work_generated))
+}
+
+/// Handles a CQE of an op whose fd closed while it was in the kernel: returns
+/// any provided buffer it consumed to the ring and, on its final CQE, releases
+/// what it holds. Nothing reaches a handler, since the fd number may already
+/// belong to another connection.
+fn retire_orphan_cqe(worker: &mut UringWorker, cqe_user_data: u64, cqe_flags: u32) {
+  if let Some(buffer_id) = cqueue::buffer_select(cqe_flags) {
+    if let Some(buffer_manager) = &worker.buffer_manager {
+      if let Err(e) = buffer_manager.reprovide_buffer(buffer_id) {
+        warn!(ud = cqe_user_data, buffer_id, "CQE Processor: reprovide for an orphaned op failed: {:?}", e);
+      }
+    }
+  }
+  let is_notify = (cqe_flags & CQE_F_NOTIFY_FLAG) != 0;
+  let more_to_come = !is_notify && (cqe_flags & IOURING_CQE_F_MORE) != 0;
+  if more_to_come {
+    return;
+  }
+  if let Some(op) = worker.internal_op_tracker.take_op_details(cqe_user_data) {
+    if let InternalOpPayload::SendZeroCopy { send_buf_id, .. } | InternalOpPayload::SendZeroCopyLeased { send_buf_id } =
+      op.payload
+    {
+      if let Some(pool) = &worker.send_buffer_pool {
+        pool.release_buffer(send_buf_id);
+      }
+    }
+  }
 }

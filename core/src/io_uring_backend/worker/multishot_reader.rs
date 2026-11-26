@@ -184,7 +184,11 @@ impl MultishotReader {
             self.fd,
             cqe_ud
           );
-          self.acknowledge_pause();
+          self.active_op_user_data = None;
+          self.is_active = false;
+          if self.cancel_op_user_data.is_none() {
+            self.acknowledge_pause();
+          }
           return Ok((ops_to_return, true));
         }
         if errno == libc::ENOBUFS {
@@ -322,20 +326,25 @@ impl MultishotReader {
       let is_cancel_success = cqe_res == 0 || cqe_res == -libc::ENOENT;
       if !is_cancel_success {
         tracing::warn!(
-          "[MultishotReader FD={}] ASYNC_CANCEL (ud {}) returned unexpected result {}; proceeding to Paused anyway.",
+          "[MultishotReader FD={}] ASYNC_CANCEL (ud {}) returned unexpected result {}; the read stays tracked until its final CQE.",
           self.fd,
           cqe_ud,
           cqe_res
         );
       } else {
         tracing::debug!(
-          "[MultishotReader FD={}] ASYNC_CANCEL (ud {}) confirmed (res {}). Transitioning to Paused.",
+          "[MultishotReader FD={}] ASYNC_CANCEL (ud {}) confirmed (res {}).",
           self.fd,
           cqe_ud,
           cqe_res
         );
       }
-      self.acknowledge_pause();
+      // The read stays tracked until its own final CQE: a cancel that lost the
+      // race (-EALREADY) leaves it armed and still delivering data.
+      self.cancel_op_user_data = None;
+      if !self.is_active {
+        self.acknowledge_pause();
+      }
       return Ok((ops_to_return, true));
     } else {
       // This CQE was not for this MultishotReader. This should ideally not be reached

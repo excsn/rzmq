@@ -284,6 +284,11 @@ pub trait UringConnectionHandler: Send {
   /// as a transient event. The multishot op is marked inactive and re-armed next `prepare_sqes`.
   fn on_buffer_ring_exhausted(&mut self) {}
 
+  /// Called when a send of this handler failed and the worker is closing the
+  /// connection. The send produces no completion through
+  /// `handle_internal_sqe_completion`.
+  fn on_write_failed(&mut self) {}
+
   /// Returns true if this handler has spillover bytes that can now be forwarded to the Tokio
   /// side because the inbound channel has drained below capacity. Used by the worker's
   /// pre-sleep double-check to avoid a TOCTOU deadlock: if the inbound channel was full
