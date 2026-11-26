@@ -1307,10 +1307,7 @@ async fn handle_new_connection_established(
           counters,
         };
         if sca_mailbox.send(attach_cmd).await.is_err() {
-          return Err(ZmqError::Internal(format!(
-            "Failed to send ScaInitializePipes to SCA {}",
-            sca_handle_id
-          )));
+          shutdown::release_unattached_session(core_arc, socket_logic_strong, sca_handle_id, &endpoint_uri_from_event).await;
         }
         return Ok(());
       }
@@ -1401,10 +1398,8 @@ async fn handle_new_connection_established(
       };
 
       if sca_mailbox.send(attach_cmd).await.is_err() {
-        return Err(ZmqError::Internal(format!(
-          "Failed to send ScaInitializePipes to SCA {}",
-          sca_handle_id
-        )));
+        shutdown::release_unattached_session(core_arc, socket_logic_strong, sca_handle_id, &endpoint_uri_from_event).await;
+        return Ok(());
       }
 
       tracing::debug!(

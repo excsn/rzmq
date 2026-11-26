@@ -294,6 +294,60 @@ async fn close_active_connections(
   futures::future::join_all(close_futs).await;
 }
 
+/// Records a failed connection for `uri`; the command loop starts the
+/// reconnect once its backoff delay has passed.
+fn schedule_session_reconnect(core_arc: &SocketCore, uri: &str) {
+  let mut state = core_arc.core_state.write();
+  let options = state.options.clone();
+
+  // Default to 100ms if not set, consistent with ZMQ defaults
+  let base = options.reconnect_ivl.unwrap_or(std::time::Duration::from_millis(100));
+  let max = options.reconnect_ivl_max.unwrap_or(std::time::Duration::from_secs(60));
+
+  let recon_state = state.reconnect_states.entry(uri.to_string()).or_default();
+  let delay = recon_state.on_connection_failure(base, max);
+
+  tracing::info!(
+    handle = core_arc.handle,
+    uri = %uri,
+    attempt = recon_state.current_attempts,
+    next_attempt_in = ?delay,
+    "Session stopped. Scheduled for reconnect via passive backoff."
+  );
+}
+
+/// Releases a session that ended before the core attached its pipes. Its
+/// `ActorStopping` may already have been handled while the core did not yet
+/// know the session, in which case no further event will clean it up. If the
+/// event is still queued, it finds nothing left to clean.
+pub(crate) async fn release_unattached_session(
+  core_arc: Arc<SocketCore>,
+  socket_logic_strong: &Arc<dyn ISocket>,
+  sca_handle_id: usize,
+  endpoint_uri: &str,
+) {
+  tracing::debug!(
+    handle = core_arc.handle,
+    sca_id = sca_handle_id,
+    uri = %endpoint_uri,
+    "Session {} ended before its pipes were attached.",
+    endpoint_uri
+  );
+  let should_reconnect = pipe_manager::cleanup_stopped_child_resources(
+    core_arc.clone(),
+    socket_logic_strong,
+    sca_handle_id,
+    ActorType::Session,
+    Some(endpoint_uri),
+    Some(&ZmqError::ConnectionClosed),
+    false,
+  )
+  .await;
+  if should_reconnect {
+    schedule_session_reconnect(&core_arc, endpoint_uri);
+  }
+}
+
 pub(crate) async fn handle_actor_stopping_event(
   core_arc: Arc<SocketCore>,
   socket_logic_strong: &Arc<dyn ISocket>,
@@ -362,28 +416,7 @@ pub(crate) async fn handle_actor_stopping_event(
       // Only reconnect if the cleanup indicated it was an outbound session that failed.
       if should_consider_reconnect {
         if let Some(uri_str) = endpoint_uri_opt {
-          let target_uri = uri_str.to_string();
-
-          // Calculate delay and update state
-          let mut state = core_arc.core_state.write();
-          let options = state.options.clone();
-          
-          // Default to 100ms if not set, consistent with ZMQ defaults
-          let base = options.reconnect_ivl.unwrap_or(std::time::Duration::from_millis(100));
-          let max = options.reconnect_ivl_max.unwrap_or(std::time::Duration::from_secs(60));
-
-          let recon_state = state.reconnect_states.entry(target_uri.clone()).or_default();
-          let delay = recon_state.on_connection_failure(base, max);
-
-          tracing::info!(
-            handle = core_handle,
-            uri = %target_uri,
-            attempt = recon_state.current_attempts,
-            next_attempt_in = ?delay,
-            "Session stopped. Scheduled for reconnect via passive backoff."
-          );
-          
-          // Note: We do NOT spawn a task here. The main command_loop will pick this up.
+          schedule_session_reconnect(&core_arc, uri_str);
         }
       }
     }
