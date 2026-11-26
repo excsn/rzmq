@@ -311,7 +311,7 @@ impl IpcListener {
                     match uring::global_state::pick_worker() {
                       Ok(mut worker_op_tx) => {
                         let user_data = context_clone.inner().next_handle() as u64;
-                        let (reply_tx, reply_rx) = fibre_oneshot();
+                        let (reply_tx, mut reply_rx) = fibre_oneshot();
                         let engine_cfg =
                           Arc::new(ZmtpEngineConfig::from(&*socket_options_clone));
                         let reg_ok = worker_op_tx.send(WorkerUringOpRequest::RegisterExternalZmtpFd {
@@ -608,7 +608,7 @@ impl IpcConnecter {
                   match uring::global_state::pick_worker() {
                     Ok(mut worker_op_tx) => {
                       let user_data = self.context.inner().next_handle() as u64;
-                      let (reply_tx, reply_rx) = fibre_oneshot();
+                      let (reply_tx, mut reply_rx) = fibre_oneshot();
                       let engine_cfg =
                         Arc::new(ZmtpEngineConfig::from(&*self.context_options));
                       let reg_ok = worker_op_tx.send(WorkerUringOpRequest::RegisterExternalZmtpFd {

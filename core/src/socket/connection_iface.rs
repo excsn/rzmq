@@ -180,7 +180,7 @@ impl ISocketConnection for UringFdConnection {
 
   async fn close_connection(&self) -> Result<(), ZmqError> {
     // Closing is an async request to the worker.
-    let (reply_tx, reply_rx) = oneshot();
+    let (reply_tx, mut reply_rx) = oneshot();
     let unique_user_data = self.context.inner().next_handle() as u64;
     let req = UringOpRequest::ShutdownConnectionHandler {
       user_data: unique_user_data,

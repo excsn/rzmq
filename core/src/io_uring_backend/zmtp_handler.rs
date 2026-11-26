@@ -185,7 +185,7 @@ impl ISocketConnection for ZmtpSmartConnection {
   /// Asks the owning worker to close the fd and waits for the close to complete,
   /// so the peer sees the disconnect.
   async fn close_connection(&self) -> Result<(), ZmqError> {
-    let (reply_tx, reply_rx) = fibre::oneshot::oneshot();
+    let (reply_tx, mut reply_rx) = fibre::oneshot::oneshot();
     let req = crate::io_uring_backend::ops::UringOpRequest::ShutdownConnectionHandler {
       user_data: next_close_user_data(),
       fd: self.fd,

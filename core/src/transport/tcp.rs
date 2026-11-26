@@ -381,7 +381,7 @@ impl TcpListener {
 
                         let mut worker_op_tx = uring::global_state::pick_worker().unwrap();
                         let user_data_for_op = context_clone.inner().next_handle() as u64;
-                        let (reply_tx_for_op, reply_rx_for_op) = oneshot();
+                        let (reply_tx_for_op, mut reply_rx_for_op) = oneshot();
                         let engine_cfg =
                           Arc::new(ZmtpEngineConfig::from(&*socket_options_clone));
 
@@ -977,7 +977,7 @@ impl TcpConnecter {
             let mut worker_op_tx = uring::global_state::pick_worker()?;
 
             let user_data_for_op = self.context.inner().next_handle() as u64;
-            let (reply_tx_for_op, reply_rx_for_op) = oneshot();
+            let (reply_tx_for_op, mut reply_rx_for_op) = oneshot();
 
             let actual_peer_uri_str = format!("tcp://{}", peer_addr_actual);
             let engine_cfg = Arc::new(ZmtpEngineConfig::from(&*self.socket_options));

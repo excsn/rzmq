@@ -319,7 +319,7 @@ pub(crate) async fn process_socket_command(
         match owning_worker_tx {
           Some(mut worker_tx) => {
             let ud = core_arc.context.inner().next_handle() as u64;
-            let (reply_tx, reply_rx) = oneshot::oneshot::<Result<crate::io_uring_backend::ops::UringOpCompletion, crate::ZmqError>>();
+            let (reply_tx, mut reply_rx) = oneshot::oneshot::<Result<crate::io_uring_backend::ops::UringOpCompletion, crate::ZmqError>>();
             let req = crate::io_uring_backend::ops::UringOpRequest::AttachIngressSender {
               user_data: ud,
               fd,
@@ -742,7 +742,7 @@ async fn take_over_connect_pipe_uring(
   }
 
   let mut worker_tx = uring_conn.worker_op_tx();
-  let (reply_tx, reply_rx) = oneshot::oneshot::<Result<UringOpCompletion, ZmqError>>();
+  let (reply_tx, mut reply_rx) = oneshot::oneshot::<Result<UringOpCompletion, ZmqError>>();
   let adopt = UringOpRequest::AdoptEgressReceiver {
     user_data: core_arc.context.inner().next_handle() as u64,
     fd,
@@ -759,7 +759,7 @@ async fn take_over_connect_pipe_uring(
   uring_conn.signal_worker();
 
   if let Some(ingress_sender) = socket_logic.get_incoming_pipe_sender(core_read_id) {
-    let (reply_tx, reply_rx) = oneshot::oneshot::<Result<UringOpCompletion, ZmqError>>();
+    let (reply_tx, mut reply_rx) = oneshot::oneshot::<Result<UringOpCompletion, ZmqError>>();
     let attach = UringOpRequest::AttachIngressSender {
       user_data: core_arc.context.inner().next_handle() as u64,
       fd,
